@@ -24,6 +24,7 @@ impl PageIo {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(path)?
         };
         Self::try_lock(&file)?;

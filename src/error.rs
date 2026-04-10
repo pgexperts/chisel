@@ -41,7 +41,10 @@ impl fmt::Display for ChiselError {
             }
             ChiselError::CorruptSuperblock => write!(f, "no valid superblock found"),
             ChiselError::FileSizeMismatch { expected, actual } => {
-                write!(f, "file size mismatch: expected {expected} bytes, got {actual}")
+                write!(
+                    f,
+                    "file size mismatch: expected {expected} bytes, got {actual}"
+                )
             }
             ChiselError::InvalidMagic => write!(f, "invalid magic number"),
             ChiselError::LockFailed => write!(f, "failed to acquire exclusive file lock"),

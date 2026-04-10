@@ -1,11 +1,11 @@
-use chisel::page::{self, PAGE_SIZE, PAGE_BODY_SIZE};
-use chisel::superblock::Superblock;
-use chisel::page::{MAGIC, FORMAT_VERSION, PAGE_ID_NONE};
-use chisel::page_io::PageIo;
-use chisel::page_cache::PageCache;
-use chisel::freemap::FreeMap;
 use chisel::data_page::DataPage;
-use chisel::handle_table::{HandleTable, HandleEntry, HandleFlags, ENTRIES_PER_LEAF};
+use chisel::freemap::FreeMap;
+use chisel::handle_table::{HandleEntry, HandleFlags, HandleTable, ENTRIES_PER_LEAF};
+use chisel::page::{self, PAGE_BODY_SIZE, PAGE_SIZE};
+use chisel::page::{FORMAT_VERSION, MAGIC, PAGE_ID_NONE};
+use chisel::page_cache::PageCache;
+use chisel::page_io::PageIo;
+use chisel::superblock::Superblock;
 use chisel::Chisel;
 use tempfile::NamedTempFile;
 
@@ -78,14 +78,24 @@ fn test_superblock_checksum_validation() {
 #[test]
 fn test_superblock_selection() {
     let sb1 = Superblock {
-        magic: MAGIC, format_version: FORMAT_VERSION, txn_counter: 5,
-        root_handle_table_page: 2, root_freemap_page: 3,
-        total_pages: 10, next_handle: 3, page_size: PAGE_SIZE as u32,
+        magic: MAGIC,
+        format_version: FORMAT_VERSION,
+        txn_counter: 5,
+        root_handle_table_page: 2,
+        root_freemap_page: 3,
+        total_pages: 10,
+        next_handle: 3,
+        page_size: PAGE_SIZE as u32,
     };
     let sb2 = Superblock {
-        magic: MAGIC, format_version: FORMAT_VERSION, txn_counter: 7,
-        root_handle_table_page: 4, root_freemap_page: 5,
-        total_pages: 12, next_handle: 5, page_size: PAGE_SIZE as u32,
+        magic: MAGIC,
+        format_version: FORMAT_VERSION,
+        txn_counter: 7,
+        root_handle_table_page: 4,
+        root_freemap_page: 5,
+        total_pages: 12,
+        next_handle: 5,
+        page_size: PAGE_SIZE as u32,
     };
     let buf1 = sb1.serialize();
     let buf2 = sb2.serialize();
@@ -96,9 +106,14 @@ fn test_superblock_selection() {
 #[test]
 fn test_superblock_selection_with_one_corrupt() {
     let sb1 = Superblock {
-        magic: MAGIC, format_version: FORMAT_VERSION, txn_counter: 5,
-        root_handle_table_page: 2, root_freemap_page: 3,
-        total_pages: 10, next_handle: 3, page_size: PAGE_SIZE as u32,
+        magic: MAGIC,
+        format_version: FORMAT_VERSION,
+        txn_counter: 5,
+        root_handle_table_page: 2,
+        root_freemap_page: 3,
+        total_pages: 10,
+        next_handle: 3,
+        page_size: PAGE_SIZE as u32,
     };
     let sb2_buf = [0u8; PAGE_SIZE];
     let buf1 = sb1.serialize();
@@ -327,7 +342,7 @@ fn test_data_page_update_same_size() {
     let mut buf = [0u8; PAGE_SIZE];
     DataPage::init_page(&mut buf);
     let slot = DataPage::insert(&mut buf, b"hello").unwrap();
-    DataPage::update(&mut buf, slot, b"world").unwrap();
+    assert!(DataPage::update(&mut buf, slot, b"world"));
     assert_eq!(DataPage::read(&buf, slot).unwrap(), b"world");
 }
 
@@ -363,7 +378,11 @@ fn test_handle_table_insert_and_lookup() {
     let mut cache = PageCache::new(io, 64);
     let mut ht = HandleTable::new();
     let root = ht.create_root(&mut cache).unwrap();
-    let entry = HandleEntry { page_id: 10, slot_index: 3, flags: HandleFlags::Live };
+    let entry = HandleEntry {
+        page_id: 10,
+        slot_index: 3,
+        flags: HandleFlags::Live,
+    };
     let new_root = ht.insert(&mut cache, root, 0, &entry).unwrap();
     let found = ht.lookup(&mut cache, new_root, 0).unwrap().unwrap();
     assert_eq!(found.page_id, 10);
@@ -378,7 +397,11 @@ fn test_handle_table_multiple_entries() {
     let mut ht = HandleTable::new();
     let mut root = ht.create_root(&mut cache).unwrap();
     for i in 0..10u64 {
-        let entry = HandleEntry { page_id: 100 + i, slot_index: i as u16, flags: HandleFlags::Live };
+        let entry = HandleEntry {
+            page_id: 100 + i,
+            slot_index: i as u16,
+            flags: HandleFlags::Live,
+        };
         root = ht.insert(&mut cache, root, i, &entry).unwrap();
     }
     for i in 0..10u64 {
@@ -395,7 +418,11 @@ fn test_handle_table_cow_returns_new_root() {
     let mut cache = PageCache::new(io, 64);
     let mut ht = HandleTable::new();
     let root1 = ht.create_root(&mut cache).unwrap();
-    let entry = HandleEntry { page_id: 10, slot_index: 0, flags: HandleFlags::Live };
+    let entry = HandleEntry {
+        page_id: 10,
+        slot_index: 0,
+        flags: HandleFlags::Live,
+    };
     let root2 = ht.insert(&mut cache, root1, 0, &entry).unwrap();
     assert_ne!(root1, root2);
 }
@@ -408,7 +435,11 @@ fn test_handle_table_grows_to_two_levels() {
     let mut ht = HandleTable::new();
     let mut root = ht.create_root(&mut cache).unwrap();
     for i in 0..(ENTRIES_PER_LEAF as u64 + 10) {
-        let entry = HandleEntry { page_id: i, slot_index: 0, flags: HandleFlags::Live };
+        let entry = HandleEntry {
+            page_id: i,
+            slot_index: 0,
+            flags: HandleFlags::Live,
+        };
         root = ht.insert(&mut cache, root, i, &entry).unwrap();
     }
     for i in 0..(ENTRIES_PER_LEAF as u64 + 10) {
@@ -424,7 +455,11 @@ fn test_handle_table_delete() {
     let mut cache = PageCache::new(io, 64);
     let mut ht = HandleTable::new();
     let mut root = ht.create_root(&mut cache).unwrap();
-    let entry = HandleEntry { page_id: 10, slot_index: 0, flags: HandleFlags::Live };
+    let entry = HandleEntry {
+        page_id: 10,
+        slot_index: 0,
+        flags: HandleFlags::Live,
+    };
     root = ht.insert(&mut cache, root, 0, &entry).unwrap();
     root = ht.delete(&mut cache, root, 0).unwrap();
     let found = ht.lookup(&mut cache, root, 0).unwrap();

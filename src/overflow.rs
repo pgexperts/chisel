@@ -20,7 +20,7 @@ impl Overflow {
     /// Write a value as a chain of overflow pages. Returns the page ID of the first page.
     pub fn write(cache: &mut PageCache, value: &[u8]) -> Result<u64> {
         let total_length = value.len() as u64;
-        let num_pages = (value.len() + OVERFLOW_PAYLOAD - 1) / OVERFLOW_PAYLOAD;
+        let num_pages = value.len().div_ceil(OVERFLOW_PAYLOAD);
 
         let mut page_ids = Vec::with_capacity(num_pages);
         for _ in 0..num_pages {

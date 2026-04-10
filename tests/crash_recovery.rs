@@ -1,8 +1,8 @@
-use chisel::{Chisel, Options};
 use chisel::page::PAGE_SIZE;
-use tempfile::NamedTempFile;
+use chisel::{Chisel, Options};
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
+use tempfile::NamedTempFile;
 
 #[test]
 fn test_recovery_after_clean_close() {
@@ -86,9 +86,12 @@ fn test_recovery_both_superblocks_corrupt() {
 fn test_file_not_found_without_create() {
     let path = std::path::PathBuf::from("/tmp/chisel_nonexistent_test.db");
     let _ = fs::remove_file(&path);
-    let result = Chisel::open(&path, Options {
-        create_if_missing: false,
-        ..Default::default()
-    });
+    let result = Chisel::open(
+        &path,
+        Options {
+            create_if_missing: false,
+            ..Default::default()
+        },
+    );
     assert!(result.is_err());
 }

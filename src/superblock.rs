@@ -63,7 +63,7 @@ impl Superblock {
     pub fn select(buffers: &[[u8; PAGE_SIZE]]) -> Option<Superblock> {
         buffers
             .iter()
-            .filter_map(|buf| Superblock::deserialize(buf))
+            .filter_map(Superblock::deserialize)
             .max_by_key(|sb| sb.txn_counter)
     }
 

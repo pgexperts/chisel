@@ -1,5 +1,5 @@
-use chisel::page_io::PageIo;
 use chisel::page_cache::PageCache;
+use chisel::page_io::PageIo;
 use chisel::transaction::TransactionManager;
 use tempfile::NamedTempFile;
 

@@ -76,8 +76,7 @@ impl TransactionManager {
     pub fn open_existing(mut cache: PageCache) -> Result<TransactionManager> {
         let buf_a = cache.io_mut().read_page(0)?;
         let buf_b = cache.io_mut().read_page(1)?;
-        let sb = Superblock::select(&[buf_a, buf_b])
-            .ok_or(ChiselError::CorruptSuperblock)?;
+        let sb = Superblock::select(&[buf_a, buf_b]).ok_or(ChiselError::CorruptSuperblock)?;
 
         let page_count = cache.io_mut().page_count()?;
         if page_count < sb.total_pages {
@@ -110,9 +109,8 @@ impl TransactionManager {
                     }
                     depth += 1;
                     let child_offset = page::DATA_PAGE_HEADER_SIZE;
-                    let child = u64::from_le_bytes(
-                        buf[child_offset..child_offset + 8].try_into().unwrap(),
-                    );
+                    let child =
+                        u64::from_le_bytes(buf[child_offset..child_offset + 8].try_into().unwrap());
                     if child == 0 {
                         break;
                     }
@@ -170,7 +168,11 @@ impl TransactionManager {
         };
         let buf = sb.serialize();
         // Write to the inactive superblock (alternate between 0 and 1).
-        let inactive = if self.txn_counter % 2 == 0 { 0 } else { 1 };
+        let inactive = if self.txn_counter.is_multiple_of(2) {
+            0
+        } else {
+            1
+        };
         self.cache.io_mut().write_page(inactive, &buf)?;
         self.cache.io_mut().fsync()?;
 
@@ -357,7 +359,11 @@ impl TransactionManager {
 
         let entry = self
             .handle_table
-            .lookup(&mut self.cache, self.current_roots.handle_table_page, handle)?
+            .lookup(
+                &mut self.cache,
+                self.current_roots.handle_table_page,
+                handle,
+            )?
             .ok_or(ChiselError::InvalidHandle(handle))?;
 
         if entry.flags == HandleFlags::Overflow {
@@ -407,7 +413,11 @@ impl TransactionManager {
 
         let entry = self
             .handle_table
-            .lookup(&mut self.cache, self.current_roots.handle_table_page, handle)?
+            .lookup(
+                &mut self.cache,
+                self.current_roots.handle_table_page,
+                handle,
+            )?
             .ok_or(ChiselError::InvalidHandle(handle))?;
 
         if entry.flags == HandleFlags::Overflow {

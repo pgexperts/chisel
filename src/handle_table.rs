@@ -4,16 +4,16 @@
 // All mutations use copy-on-write and return a new root page ID.
 
 use crate::error::Result;
-use crate::page::{self, PageType, PAGE_SIZE, CHECKSUM_OFFSET, DATA_PAGE_HEADER_SIZE, PAGE_ID_NONE};
+use crate::page::{
+    self, PageType, CHECKSUM_OFFSET, DATA_PAGE_HEADER_SIZE, PAGE_ID_NONE, PAGE_SIZE,
+};
 use crate::page_cache::PageCache;
 
 const ENTRY_SIZE: usize = 16;
-pub const ENTRIES_PER_LEAF: usize =
-    (CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE) / ENTRY_SIZE; // 510
+pub const ENTRIES_PER_LEAF: usize = (CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE) / ENTRY_SIZE; // 510
 
 const CHILD_PTR_SIZE: usize = 8;
-const PTRS_PER_INTERIOR: usize =
-    (CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE) / CHILD_PTR_SIZE; // 1021
+const PTRS_PER_INTERIOR: usize = (CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE) / CHILD_PTR_SIZE; // 1021
 
 // Page flags byte: distinguishes leaf from interior.
 const FLAG_LEAF: u8 = 0x01;
@@ -52,6 +52,12 @@ pub struct HandleEntry {
 
 pub struct HandleTable {
     depth: u32, // 0 = root is a leaf, 1 = one level of interior, etc.
+}
+
+impl Default for HandleTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HandleTable {
@@ -107,12 +113,7 @@ impl HandleTable {
     }
 
     /// Mark a handle as deleted. Returns the new root page ID (COW).
-    pub fn delete(
-        &mut self,
-        cache: &mut PageCache,
-        root: u64,
-        handle: u64,
-    ) -> Result<u64> {
+    pub fn delete(&mut self, cache: &mut PageCache, root: u64, handle: u64) -> Result<u64> {
         let deleted_entry = HandleEntry {
             page_id: 0,
             slot_index: 0,
@@ -122,11 +123,7 @@ impl HandleTable {
     }
 
     /// Iterate over all live entries. Returns (handle, HandleEntry) pairs.
-    pub fn iter_live(
-        &self,
-        cache: &mut PageCache,
-        root: u64,
-    ) -> Result<Vec<(u64, HandleEntry)>> {
+    pub fn iter_live(&self, cache: &mut PageCache, root: u64) -> Result<Vec<(u64, HandleEntry)>> {
         if root == PAGE_ID_NONE {
             return Ok(Vec::new());
         }
@@ -222,13 +219,8 @@ impl HandleTable {
                 child_page
             };
 
-            let new_child = self.insert_recursive(
-                cache,
-                actual_child,
-                handle % child_span,
-                entry,
-                level - 1,
-            )?;
+            let new_child =
+                self.insert_recursive(cache, actual_child, handle % child_span, entry, level - 1)?;
 
             let buf = cache.get_mut(new_page)?;
             let offset = DATA_PAGE_HEADER_SIZE + child_idx * CHILD_PTR_SIZE;
@@ -239,12 +231,7 @@ impl HandleTable {
         }
     }
 
-    fn find_leaf(
-        &self,
-        cache: &mut PageCache,
-        page_id: u64,
-        handle: u64,
-    ) -> Result<(u64, usize)> {
+    fn find_leaf(&self, cache: &mut PageCache, page_id: u64, handle: u64) -> Result<(u64, usize)> {
         if self.depth == 0 {
             let index = (handle % ENTRIES_PER_LEAF as u64) as usize;
             return Ok((page_id, index));
@@ -303,8 +290,7 @@ impl HandleTable {
                 (0..PTRS_PER_INTERIOR)
                     .map(|i| {
                         let offset = DATA_PAGE_HEADER_SIZE + i * CHILD_PTR_SIZE;
-                        let child =
-                            u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+                        let child = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
                         (i, child)
                     })
                     .filter(|(_, child)| *child != 0)
