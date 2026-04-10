@@ -98,7 +98,12 @@ impl PageCache {
 
     /// Truncate the file to `n` pages.
     pub fn truncate(&mut self, n: u64) -> Result<()> {
-        let to_remove: Vec<u64> = self.entries.keys().filter(|&&id| id >= n).copied().collect();
+        let to_remove: Vec<u64> = self
+            .entries
+            .keys()
+            .filter(|&&id| id >= n)
+            .copied()
+            .collect();
         for id in to_remove {
             self.entries.remove(&id);
             self.lru.retain(|&lid| lid != id);
@@ -122,7 +127,7 @@ impl PageCache {
 
     /// Check if a page is dirty in the cache.
     pub fn is_dirty(&self, page_id: u64) -> bool {
-        self.entries.get(&page_id).map_or(false, |e| e.dirty)
+        self.entries.get(&page_id).is_some_and(|e| e.dirty)
     }
 
     fn load_page(&mut self, page_id: u64) -> Result<()> {
@@ -153,7 +158,7 @@ impl PageCache {
                 .lru
                 .iter()
                 .rev()
-                .find(|&&id| !self.entries.get(&id).map_or(true, |e| e.dirty))
+                .find(|&&id| !self.entries.get(&id).is_none_or(|e| e.dirty))
                 .copied();
             match victim {
                 Some(id) => {

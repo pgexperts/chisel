@@ -3,7 +3,7 @@
 // The slot directory grows forward from the header; value data grows backward
 // from the checksum. When they meet, the page is full.
 
-use crate::page::{PageType, PAGE_SIZE, CHECKSUM_OFFSET, DATA_PAGE_HEADER_SIZE};
+use crate::page::{PageType, CHECKSUM_OFFSET, DATA_PAGE_HEADER_SIZE, PAGE_SIZE};
 
 const SLOT_ENTRY_SIZE: usize = 6; // offset(2) + length(2) + flags(2)
 const SLOT_FLAG_LIVE: u16 = 0x0001;
@@ -34,11 +34,7 @@ impl DataPage {
     pub fn free_space(buf: &[u8; PAGE_SIZE]) -> usize {
         let free_start = u16::from_le_bytes(buf[4..6].try_into().unwrap()) as usize;
         let free_end = u16::from_le_bytes(buf[6..8].try_into().unwrap()) as usize;
-        if free_end > free_start {
-            free_end - free_start
-        } else {
-            0
-        }
+        free_end.saturating_sub(free_start)
     }
 
     /// Insert a value into the page. Returns the slot index, or None if the page is full.
@@ -59,8 +55,7 @@ impl DataPage {
         // Write slot directory entry at free_start.
         let slot_offset = free_start;
         buf[slot_offset..slot_offset + 2].copy_from_slice(&(data_offset as u16).to_le_bytes());
-        buf[slot_offset + 2..slot_offset + 4]
-            .copy_from_slice(&(value.len() as u16).to_le_bytes());
+        buf[slot_offset + 2..slot_offset + 4].copy_from_slice(&(value.len() as u16).to_le_bytes());
         buf[slot_offset + 4..slot_offset + 6].copy_from_slice(&SLOT_FLAG_LIVE.to_le_bytes());
 
         // Update header.
@@ -89,40 +84,32 @@ impl DataPage {
     /// Update a value in-place. If the new value fits in the old slot's space,
     /// it's written directly. If larger, the old space becomes a hole and new
     /// data is allocated from the free region.
-    pub fn update(
-        buf: &mut [u8; PAGE_SIZE],
-        slot: u16,
-        value: &[u8],
-    ) -> std::result::Result<(), ()> {
+    pub fn update(buf: &mut [u8; PAGE_SIZE], slot: u16, value: &[u8]) -> bool {
         if slot >= Self::slot_count(buf) {
-            return Err(());
+            return false;
         }
         let (old_offset, old_length, flags) = Self::read_slot_entry(buf, slot);
         if flags != SLOT_FLAG_LIVE {
-            return Err(());
+            return false;
         }
 
         if value.len() <= old_length {
             buf[old_offset..old_offset + value.len()].copy_from_slice(value);
             Self::write_slot_length(buf, slot, value.len() as u16);
-            Ok(())
+            true
         } else {
             let free_end = u16::from_le_bytes(buf[6..8].try_into().unwrap()) as usize;
             let free_start = u16::from_le_bytes(buf[4..6].try_into().unwrap()) as usize;
-            let available = if free_end > free_start {
-                free_end - free_start
-            } else {
-                0
-            };
+            let available = free_end.saturating_sub(free_start);
             if available < value.len() {
-                return Err(());
+                return false;
             }
             let new_offset = free_end - value.len();
             buf[new_offset..new_offset + value.len()].copy_from_slice(value);
             Self::write_slot_offset(buf, slot, new_offset as u16);
             Self::write_slot_length(buf, slot, value.len() as u16);
             buf[6..8].copy_from_slice(&(new_offset as u16).to_le_bytes());
-            Ok(())
+            true
         }
     }
 
