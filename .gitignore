@@ -1,2 +1,7 @@
 .superpowers/
 .worktrees/
+
+
+# Added by cargo
+
+/target

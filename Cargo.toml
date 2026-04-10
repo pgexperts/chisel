@@ -1,0 +1,12 @@
+[package]
+name = "chisel"
+version = "0.1.0"
+edition = "2021"
+description = "Transactional slot-based storage engine with shadow paging"
+
+[dependencies]
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
