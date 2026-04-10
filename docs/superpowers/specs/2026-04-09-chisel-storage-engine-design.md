@@ -57,7 +57,24 @@ bytes 8184..8192  checksum: u64 (XXH3 over bytes 0..8184)
 
 The checksum is positioned at the end of the page so that a torn write that doesn't reach the checksum is automatically detected.
 
-**Future extension:** The superblock count can be increased beyond 2 to trade commit performance for additional durability. The selection algorithm ("highest valid txn_counter") generalizes to any number of copies.
+**Future extension:** The superblock count can be increased beyond 2 to trade commit performance for additional durability. The selection algorithm ("highest valid txn_counter") generalizes to any number of copies. The superblock count is specified in `Options` and passed to `Chisel::open`.
+
+### File Initialization
+
+When `Chisel::open` encounters a nonexistent or empty file (with `create_if_missing: true`):
+
+1. Write **Page 0** (Superblock A): magic, format version, `txn_counter: 1`, root pointers set to `u64::MAX` (sentinel for "not yet allocated"), `total_pages: 2`, `next_handle: 0`, valid checksum.
+2. Write **Page 1** (Superblock B): zeroed (invalid checksum, so Superblock A wins selection).
+3. `fsync`.
+
+The resulting file is 16KB — two superblocks, no data. The handle table and freemap pages are allocated lazily on the first `allocate()` inside a transaction. This avoids pre-allocating structure for an empty database.
+
+When `Chisel::open` encounters an existing file:
+
+1. Acquire exclusive `flock`.
+2. Read all superblocks, validate checksums, select the one with the highest valid `txn_counter`.
+3. Verify file size is consistent with `total_pages`.
+4. Load root pointers into memory. Ready for operations.
 
 ### Common Page Header (All Non-Superblock Pages)
 
@@ -321,6 +338,7 @@ struct Options {
     cache_size: usize,         // Max cached pages (default: 1024)
     create_if_missing: bool,   // Create file if absent (default: true)
     read_only: bool,           // No transactions allowed
+    superblock_count: usize,   // Number of superblock copies (default: 2, future extension)
 }
 
 struct DefragOptions {
