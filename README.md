@@ -101,6 +101,14 @@ Options {
 - Rust stable (edition 2021)
 - macOS or Linux (uses `flock` for file locking)
 
+## Roadmap
+
+- **Pack multiple values per data page** — currently each value gets its own page; packing small values together will significantly reduce file size and improve cache efficiency
+- **Wire the free page map into the allocator** — the bitmap is built but allocations currently extend the file; reusing free pages will eliminate file growth after delete-heavy workloads
+- **Selective defragmentation** — consolidate only sparse pages instead of re-inserting every value
+- **Configurable superblock count** — trade commit performance for additional crash durability (3+ superblock copies)
+- **Python bindings** — PyO3-based wrapper exposing the full Chisel API to Python, including context managers for transactions and savepoints
+
 ## License
 
 TBD
