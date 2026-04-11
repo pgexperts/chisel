@@ -1,6 +1,23 @@
 // lib.rs — Chisel: a transactional slot-based storage engine.
-// This module provides the public API. It wraps TransactionManager
-// and exposes a clean interface.
+//
+// Role in system: top of the dependency graph. This file is a thin surface
+// over `TransactionManager`; it owns no storage logic of its own. Its job is
+// to (a) present a stable public API, (b) translate `Options` into the right
+// open/create path, and (c) re-export error and result types. All real work
+// lives below in `transaction.rs` and further down.
+//
+// Concurrency model: a `Chisel` value is NOT `Sync` and is intended for
+// single-threaded use. All mutating methods take `&mut self`, which by
+// construction serializes access through the borrow checker. There is no
+// internal locking beyond that.
+//
+// Process model: `PageIo` acquires an exclusive advisory `flock` on open, so
+// at most one `Chisel` (in any process, on the same host/filesystem) can hold
+// a given database file at a time. A second `open()` on the same path returns
+// `LockFailed` rather than blocking.
+//
+// Durability model: see `transaction.rs`. Commits are shadow-paged and
+// finalized by a superblock swap; there is no WAL and no background writer.
 
 pub mod data_page;
 pub mod defrag;
@@ -23,6 +40,12 @@ use page_cache::PageCache;
 use page_io::PageIo;
 use transaction::TransactionManager;
 
+/// Open-time options. These are consumed once during `Chisel::open` and not
+/// retained on the live handle; changing them later requires reopening.
+///
+/// `cache_size` is a count of pages (not bytes), passed directly to the LRU
+/// `PageCache`. `read_only` still takes an exclusive `flock` — it only
+/// suppresses writes at the application layer.
 #[derive(Debug, Clone)]
 pub struct Options {
     pub cache_size: usize,
@@ -40,12 +63,45 @@ impl Default for Options {
     }
 }
 
+/// A live handle to an open Chisel database.
+///
+/// Owns (transitively) the exclusive file lock, the page cache, and the
+/// current in-memory view of the superblock roots. Dropping a `Chisel`
+/// releases the page cache and closes the underlying file, which in turn
+/// releases the `flock` (the lock is tied to the file descriptor, so drop
+/// order is what matters — not an explicit unlock call).
+///
+/// IMPORTANT: dropping without calling `commit()` on an in-flight transaction
+/// discards that transaction. Shadow paging guarantees the on-disk state is
+/// still the last committed state, not a partial write.
+///
+/// Poison model (see ISSUES.md I1): if any method returns a fatal error
+/// (I/O failure, checksum mismatch, corrupt superblock, commit protocol
+/// failure), the `Chisel` handle becomes *poisoned*. Every subsequent call
+/// — including reads — returns `ChiselError::Poisoned`. The only legal
+/// recovery is to drop this `Chisel` and call `Chisel::open` again; the
+/// shadow-paging crash-recovery path on reopen returns the database to the
+/// last durable state. This mirrors `std::sync::Mutex` poisoning and is
+/// necessary because Linux `fsync` semantics (fsyncgate, 2018) do not
+/// permit safely retrying a failed fsync — the kernel may have discarded
+/// the dirty pages before reporting the error.
 pub struct Chisel {
     txm: TransactionManager,
 }
 
 impl Chisel {
-    /// Open or create a Chisel database.
+    /// Open or create a Chisel database at `path`.
+    ///
+    /// The "exists" check deliberately treats a zero-length file as
+    /// nonexistent: a freshly-created-but-unwritten file (e.g. from a crash
+    /// between `creat(2)` and the first superblock write, or from a user
+    /// `touch`) has no valid superblock and must go through the
+    /// `create_new` path. Without this, `open_existing` would try to parse
+    /// an empty file and fail with a corruption error.
+    ///
+    /// Acquires an exclusive `flock` on the file before any parsing, so a
+    /// second concurrent `open()` on the same path fails fast with
+    /// `LockFailed` rather than racing on the superblock.
     pub fn open(path: &Path, options: Options) -> Result<Chisel> {
         let file_exists = path.exists()
             && std::fs::metadata(path)
@@ -68,22 +124,44 @@ impl Chisel {
         Ok(Chisel { txm })
     }
 
+    /// Explicit close. Exists for API symmetry and so callers can observe a
+    /// `Result` at teardown; functionally identical to letting the value
+    /// drop, since release of the flock and file descriptor happens in
+    /// `Drop`. The `Result` return is currently always `Ok`, but is kept so
+    /// future implementations can surface fsync/close errors without a
+    /// breaking change.
     pub fn close(self) -> Result<()> {
         drop(self);
         Ok(())
     }
 
+    /// Begin a new transaction. All mutating operations below require an
+    /// active transaction; `allocate`/`update`/`delete` will return
+    /// `NoActiveTransaction` otherwise. Only one transaction is active at a
+    /// time — there is no nesting beyond savepoints.
     pub fn begin(&mut self) -> Result<()> {
         self.txm.begin()
     }
 
+    /// Commit the active transaction. Performs two fsyncs (dirty data pages,
+    /// then the alternate superblock) before returning — this is the point
+    /// at which changes become durable. A crash before the superblock fsync
+    /// leaves the previous committed state intact.
     pub fn commit(&mut self) -> Result<()> {
         self.txm.commit()
     }
 
+    /// Abort the active transaction. Pages written during the transaction
+    /// become unreachable garbage (they are never linked from a superblock),
+    /// so rollback is effectively free — no undo log to replay.
     pub fn rollback(&mut self) -> Result<()> {
         self.txm.rollback()
     }
+
+    // Savepoint API: named marks within the active transaction. Implemented
+    // by snapshotting the in-memory roots — cheap because the on-disk pages
+    // written since the savepoint are simply abandoned on `rollback_to`, the
+    // same way a full rollback abandons the whole transaction.
 
     pub fn savepoint(&mut self, name: &str) -> Result<()> {
         self.txm.savepoint(name)
@@ -97,29 +175,99 @@ impl Chisel {
         self.txm.release(name)
     }
 
+    /// Store `value` and return a freshly minted stable handle. Handles are
+    /// u64 identifiers assigned from a monotonic counter in the superblock;
+    /// they are never reused within a database's lifetime and are stable
+    /// across updates, defrag, and reopens. Physical location may change;
+    /// the handle will not.
     pub fn allocate(&mut self, value: &[u8]) -> Result<u64> {
         self.txm.allocate(value)
     }
 
-    pub fn read(&mut self, handle: u64) -> Result<Vec<u8>> {
+    /// Read the current value for `handle`. Takes `&self` — the page cache
+    /// is mutated on miss (LRU bookkeeping, page loading) via interior
+    /// mutability (see F3 in ISSUES.md). The returned `Vec<u8>` is a copy;
+    /// the cache retains its own page. Not `Sync` — a `Chisel` is single-
+    /// threaded by design, so this `&self` only enables `&self`-taking
+    /// read APIs in downstream wrappers (e.g. the client's `StorageEngine`
+    /// trait), not cross-thread sharing.
+    pub fn read(&self, handle: u64) -> Result<Vec<u8>> {
         self.txm.read(handle)
     }
 
+    /// Replace the value for `handle`. The handle is preserved; the value
+    /// is written to a new slot (and, if it crosses the inline threshold,
+    /// to a new overflow chain). The handle-table entry is rewritten via
+    /// COW, so the update is invisible until commit.
     pub fn update(&mut self, handle: u64, value: &[u8]) -> Result<()> {
         self.txm.update(handle, value)
     }
 
+    /// Remove a handle. The handle itself is retired (not reused); any
+    /// overflow pages it owned are queued for release on commit.
     pub fn delete(&mut self, handle: u64) -> Result<()> {
         self.txm.delete(handle)
     }
 
-    pub fn handles(&mut self) -> Result<Vec<u64>> {
+    /// Delete many handles in one transaction (ISSUES.md F1 / I12).
+    ///
+    /// Motivating use case (from the primary Chisel client): bulk
+    /// operations like `drop_table` / `drop_index_table` need to remove
+    /// large handle sets without leaking pages. This is a convenience
+    /// wrapper around a loop of `delete()` calls inside the caller's
+    /// active transaction — the atomicity guarantee comes from the
+    /// enclosing transaction, not from anything special in this method.
+    ///
+    /// On error, partial progress remains visible in the current
+    /// transaction: rollback or commit to decide whether the half-done
+    /// batch should be kept.
+    pub fn delete_many(&mut self, handles: &[u64]) -> Result<()> {
+        self.txm.delete_many(handles)
+    }
+
+    /// Bind `name` to `handle` in the named-root table (ISSUES.md F2).
+    /// Names are short mnemonic labels for long-lived handles — typically
+    /// one or two per database (e.g. a meta B-tree root). Requires an
+    /// active transaction; becomes durable on commit, reverts on
+    /// rollback/rollback_to. See `TransactionManager::set_root_name` for
+    /// validation rules and the fixed table-size limit.
+    pub fn set_root_name(&mut self, name: &str, handle: u64) -> Result<()> {
+        self.txm.set_root_name(name, handle)
+    }
+
+    /// Look up a named root. Returns `Ok(None)` if the name is not bound.
+    /// Reads see the transactional view (pending sets/clears are visible
+    /// inside an active transaction). Takes `&self` (F3).
+    pub fn get_root_name(&self, name: &str) -> Result<Option<u64>> {
+        self.txm.get_root_name(name)
+    }
+
+    /// Remove a named root. No-op if the name is not bound. Requires an
+    /// active transaction; becomes durable on commit.
+    pub fn clear_root_name(&mut self, name: &str) -> Result<()> {
+        self.txm.clear_root_name(name)
+    }
+
+    /// Enumerate all live handles. Walks the handle-table radix tree; cost
+    /// is proportional to the number of live handles, not to the historical
+    /// maximum. Order is unspecified and callers must not depend on it.
+    /// Takes `&self` for the same reason `read` does (F3).
+    pub fn handles(&self) -> Result<Vec<u64>> {
         self.txm.handles()
     }
 
-    pub fn stats(&mut self) -> Result<stats::Stats> {
+    /// Summary statistics derived by scanning the current handle table and
+    /// querying the underlying file length. `file_size_bytes` is computed
+    /// from `page_count * PAGE_SIZE` rather than `stat(2)` so it reflects
+    /// the page-aligned view the engine has, not any trailing partial page
+    /// that might exist mid-extend.
+    pub fn stats(&self) -> Result<stats::Stats> {
+        // Both calls below route through the poison-aware wrappers on
+        // TransactionManager, so a fatal I/O error in either one will
+        // poison the manager just as if it had come from `read()` or
+        // `commit()`. Takes `&self` (F3) — `stats` is semantically a read.
         let handles = self.txm.handles()?;
-        let page_count = self.txm.cache_mut().file_page_count()?;
+        let page_count = self.txm.file_page_count()?;
         Ok(stats::Stats {
             handle_count: handles.len() as u64,
             total_pages: page_count,
@@ -127,6 +275,19 @@ impl Chisel {
         })
     }
 
+    /// Returns true if this database handle has been poisoned by a
+    /// previous fatal error. A poisoned handle returns
+    /// `ChiselError::Poisoned` from every operation; the caller must drop
+    /// it and reopen the database to recover. See the type-level docs for
+    /// the full recovery protocol.
+    pub fn is_poisoned(&self) -> bool {
+        self.txm.is_poisoned()
+    }
+
+    /// Run a defragmentation pass. The caller must have an active
+    /// transaction (see `defrag.rs` for why). This method does NOT begin or
+    /// commit one on the caller's behalf — defrag is composable with other
+    /// work in the same transaction and atomic with it on commit.
     pub fn defrag(&mut self, options: defrag::DefragOptions) -> Result<defrag::DefragStats> {
         defrag::defrag(&mut self.txm, &options)
     }

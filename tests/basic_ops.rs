@@ -52,6 +52,7 @@ fn test_superblock_roundtrip() {
         total_pages: 100,
         next_handle: 50,
         page_size: PAGE_SIZE as u32,
+        named_roots: [chisel::superblock::NamedRoot::EMPTY; chisel::superblock::NAMED_ROOT_COUNT],
     };
     let buf = sb.serialize();
     let sb2 = Superblock::deserialize(&buf).unwrap();
@@ -69,6 +70,7 @@ fn test_superblock_checksum_validation() {
         total_pages: 2,
         next_handle: 0,
         page_size: PAGE_SIZE as u32,
+        named_roots: [chisel::superblock::NamedRoot::EMPTY; chisel::superblock::NAMED_ROOT_COUNT],
     };
     let mut buf = sb.serialize();
     buf[10] ^= 0xFF;
@@ -86,6 +88,7 @@ fn test_superblock_selection() {
         total_pages: 10,
         next_handle: 3,
         page_size: PAGE_SIZE as u32,
+        named_roots: [chisel::superblock::NamedRoot::EMPTY; chisel::superblock::NAMED_ROOT_COUNT],
     };
     let sb2 = Superblock {
         magic: MAGIC,
@@ -96,6 +99,7 @@ fn test_superblock_selection() {
         total_pages: 12,
         next_handle: 5,
         page_size: PAGE_SIZE as u32,
+        named_roots: [chisel::superblock::NamedRoot::EMPTY; chisel::superblock::NAMED_ROOT_COUNT],
     };
     let buf1 = sb1.serialize();
     let buf2 = sb2.serialize();
@@ -114,6 +118,7 @@ fn test_superblock_selection_with_one_corrupt() {
         total_pages: 10,
         next_handle: 3,
         page_size: PAGE_SIZE as u32,
+        named_roots: [chisel::superblock::NamedRoot::EMPTY; chisel::superblock::NAMED_ROOT_COUNT],
     };
     let sb2_buf = [0u8; PAGE_SIZE];
     let buf1 = sb1.serialize();
@@ -371,11 +376,21 @@ fn test_data_page_max_value() {
 
 // --- Handle table tests ---
 
-#[test]
-fn test_handle_table_insert_and_lookup() {
+// Helper: handle-table tests need pages 0/1 reserved (the real
+// database puts the superblock there) so that new_page() never
+// returns 0, which would collide with the "no child allocated" zero
+// sentinel inside interior nodes (ISSUES.md I8).
+fn ht_cache(max_pages: usize) -> PageCache {
     let file = NamedTempFile::new().unwrap();
     let io = PageIo::open(file.path(), false).unwrap();
-    let mut cache = PageCache::new(io, 64);
+    let mut cache = PageCache::new(io, max_pages);
+    cache.set_next_page_id(2);
+    cache
+}
+
+#[test]
+fn test_handle_table_insert_and_lookup() {
+    let mut cache = ht_cache(64);
     let mut ht = HandleTable::new();
     let root = ht.create_root(&mut cache).unwrap();
     let entry = HandleEntry {
@@ -391,9 +406,7 @@ fn test_handle_table_insert_and_lookup() {
 
 #[test]
 fn test_handle_table_multiple_entries() {
-    let file = NamedTempFile::new().unwrap();
-    let io = PageIo::open(file.path(), false).unwrap();
-    let mut cache = PageCache::new(io, 64);
+    let mut cache = ht_cache(64);
     let mut ht = HandleTable::new();
     let mut root = ht.create_root(&mut cache).unwrap();
     for i in 0..10u64 {
@@ -413,9 +426,7 @@ fn test_handle_table_multiple_entries() {
 
 #[test]
 fn test_handle_table_cow_returns_new_root() {
-    let file = NamedTempFile::new().unwrap();
-    let io = PageIo::open(file.path(), false).unwrap();
-    let mut cache = PageCache::new(io, 64);
+    let mut cache = ht_cache(64);
     let mut ht = HandleTable::new();
     let root1 = ht.create_root(&mut cache).unwrap();
     let entry = HandleEntry {
@@ -429,9 +440,7 @@ fn test_handle_table_cow_returns_new_root() {
 
 #[test]
 fn test_handle_table_grows_to_two_levels() {
-    let file = NamedTempFile::new().unwrap();
-    let io = PageIo::open(file.path(), false).unwrap();
-    let mut cache = PageCache::new(io, 256);
+    let mut cache = ht_cache(256);
     let mut ht = HandleTable::new();
     let mut root = ht.create_root(&mut cache).unwrap();
     for i in 0..(ENTRIES_PER_LEAF as u64 + 10) {
@@ -450,9 +459,7 @@ fn test_handle_table_grows_to_two_levels() {
 
 #[test]
 fn test_handle_table_delete() {
-    let file = NamedTempFile::new().unwrap();
-    let io = PageIo::open(file.path(), false).unwrap();
-    let mut cache = PageCache::new(io, 64);
+    let mut cache = ht_cache(64);
     let mut ht = HandleTable::new();
     let mut root = ht.create_root(&mut cache).unwrap();
     let entry = HandleEntry {
@@ -501,7 +508,7 @@ fn test_chisel_reopen() {
         db.close().unwrap();
     }
     {
-        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        let db = Chisel::open(&path, Default::default()).unwrap();
         assert_eq!(db.read(handle).unwrap(), b"survive reopen");
         db.close().unwrap();
     }
