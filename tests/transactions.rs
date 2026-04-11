@@ -142,7 +142,7 @@ fn test_reopen_preserves_data() {
     {
         let io = PageIo::open(&path, false).unwrap();
         let cache = PageCache::new(io, 64);
-        let mut txm = TransactionManager::open_existing(cache).unwrap();
+        let txm = TransactionManager::open_existing(cache).unwrap();
         let data = txm.read(handle).unwrap();
         assert_eq!(data, b"persistent");
     }
