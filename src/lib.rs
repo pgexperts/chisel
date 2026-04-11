@@ -46,11 +46,20 @@ use transaction::TransactionManager;
 /// `cache_size` is a count of pages (not bytes), passed directly to the LRU
 /// `PageCache`. `read_only` still takes an exclusive `flock` — it only
 /// suppresses writes at the application layer.
+///
+/// `superblock_count` (ISSUES.md R4) controls how many superblock slots a
+/// freshly-created database uses. Default 2 (matches the original layout);
+/// valid range is 2..=16. Higher N trades disk space (N × 8 KB) for
+/// resilience against consecutive torn writes — N=3 survives one torn
+/// commit followed by a torn retry, N=4 survives two retries. This
+/// option is ONLY consulted when creating a new database; reopening an
+/// existing file discovers N from the on-disk superblock itself.
 #[derive(Debug, Clone)]
 pub struct Options {
     pub cache_size: usize,
     pub create_if_missing: bool,
     pub read_only: bool,
+    pub superblock_count: u32,
 }
 
 impl Default for Options {
@@ -59,6 +68,7 @@ impl Default for Options {
             cache_size: 1024,
             create_if_missing: true,
             read_only: false,
+            superblock_count: superblock::DEFAULT_SUPERBLOCK_COUNT,
         }
     }
 }
@@ -103,6 +113,18 @@ impl Chisel {
     /// second concurrent `open()` on the same path fails fast with
     /// `LockFailed` rather than racing on the superblock.
     pub fn open(path: &Path, options: Options) -> Result<Chisel> {
+        // R4: validate superblock_count before touching the file.
+        // Only meaningful on the create path, but we check it always
+        // so a malformed Options is caught up front rather than after
+        // the file has been opened.
+        if options.superblock_count < superblock::MIN_SUPERBLOCKS
+            || options.superblock_count > superblock::MAX_SUPERBLOCKS
+        {
+            return Err(ChiselError::InvalidSuperblockCount {
+                value: options.superblock_count,
+            });
+        }
+
         let file_exists = path.exists()
             && std::fs::metadata(path)
                 .map(|m| m.len() > 0)
@@ -116,9 +138,11 @@ impl Chisel {
         let cache = PageCache::new(io, options.cache_size);
 
         let txm = if file_exists {
+            // Existing database: N is discovered from the on-disk
+            // superblock. options.superblock_count is ignored here.
             TransactionManager::open_existing(cache)?
         } else {
-            TransactionManager::create_new(cache)?
+            TransactionManager::create_new(cache, options.superblock_count)?
         };
 
         Ok(Chisel { txm })

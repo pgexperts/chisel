@@ -9,7 +9,7 @@ fn test_begin_allocate_commit_read() {
     let path = file.path().to_owned();
     let io = PageIo::open(&path, false).unwrap();
     let cache = PageCache::new(io, 64);
-    let mut txm = TransactionManager::create_new(cache).unwrap();
+    let mut txm = TransactionManager::create_new(cache, 2).unwrap();
     txm.begin().unwrap();
     let handle = txm.allocate(b"hello world").unwrap();
     txm.commit().unwrap();
@@ -22,7 +22,7 @@ fn test_rollback_discards_changes() {
     let file = NamedTempFile::new().unwrap();
     let io = PageIo::open(file.path(), false).unwrap();
     let cache = PageCache::new(io, 64);
-    let mut txm = TransactionManager::create_new(cache).unwrap();
+    let mut txm = TransactionManager::create_new(cache, 2).unwrap();
     txm.begin().unwrap();
     let handle = txm.allocate(b"doomed").unwrap();
     txm.rollback().unwrap();
@@ -34,7 +34,7 @@ fn test_update_preserves_handle() {
     let file = NamedTempFile::new().unwrap();
     let io = PageIo::open(file.path(), false).unwrap();
     let cache = PageCache::new(io, 64);
-    let mut txm = TransactionManager::create_new(cache).unwrap();
+    let mut txm = TransactionManager::create_new(cache, 2).unwrap();
     txm.begin().unwrap();
     let handle = txm.allocate(b"original").unwrap();
     txm.commit().unwrap();
@@ -50,7 +50,7 @@ fn test_delete() {
     let file = NamedTempFile::new().unwrap();
     let io = PageIo::open(file.path(), false).unwrap();
     let cache = PageCache::new(io, 64);
-    let mut txm = TransactionManager::create_new(cache).unwrap();
+    let mut txm = TransactionManager::create_new(cache, 2).unwrap();
     txm.begin().unwrap();
     let handle = txm.allocate(b"gone soon").unwrap();
     txm.commit().unwrap();
@@ -65,7 +65,7 @@ fn test_savepoint_rollback_to() {
     let file = NamedTempFile::new().unwrap();
     let io = PageIo::open(file.path(), false).unwrap();
     let cache = PageCache::new(io, 64);
-    let mut txm = TransactionManager::create_new(cache).unwrap();
+    let mut txm = TransactionManager::create_new(cache, 2).unwrap();
     txm.begin().unwrap();
     let h1 = txm.allocate(b"kept").unwrap();
     txm.savepoint("alpha").unwrap();
@@ -81,7 +81,7 @@ fn test_savepoint_release() {
     let file = NamedTempFile::new().unwrap();
     let io = PageIo::open(file.path(), false).unwrap();
     let cache = PageCache::new(io, 64);
-    let mut txm = TransactionManager::create_new(cache).unwrap();
+    let mut txm = TransactionManager::create_new(cache, 2).unwrap();
     txm.begin().unwrap();
     let h1 = txm.allocate(b"first").unwrap();
     txm.savepoint("alpha").unwrap();
@@ -97,7 +97,7 @@ fn test_savepoint_rollback_preserves_savepoint() {
     let file = NamedTempFile::new().unwrap();
     let io = PageIo::open(file.path(), false).unwrap();
     let cache = PageCache::new(io, 64);
-    let mut txm = TransactionManager::create_new(cache).unwrap();
+    let mut txm = TransactionManager::create_new(cache, 2).unwrap();
     txm.begin().unwrap();
     txm.savepoint("retry").unwrap();
     let _h1 = txm.allocate(b"attempt 1").unwrap();
@@ -112,7 +112,7 @@ fn test_nested_savepoints() {
     let file = NamedTempFile::new().unwrap();
     let io = PageIo::open(file.path(), false).unwrap();
     let cache = PageCache::new(io, 64);
-    let mut txm = TransactionManager::create_new(cache).unwrap();
+    let mut txm = TransactionManager::create_new(cache, 2).unwrap();
     txm.begin().unwrap();
     let h1 = txm.allocate(b"base").unwrap();
     txm.savepoint("alpha").unwrap();
@@ -134,7 +134,7 @@ fn test_reopen_preserves_data() {
     {
         let io = PageIo::open(&path, false).unwrap();
         let cache = PageCache::new(io, 64);
-        let mut txm = TransactionManager::create_new(cache).unwrap();
+        let mut txm = TransactionManager::create_new(cache, 2).unwrap();
         txm.begin().unwrap();
         handle = txm.allocate(b"persistent").unwrap();
         txm.commit().unwrap();

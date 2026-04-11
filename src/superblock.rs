@@ -20,11 +20,34 @@
 // `select()` will fall back to the previous one. Either way, exactly one
 // consistent snapshot is recoverable — no WAL replay needed.
 //
-// Invariant: the two superblock slots occupy fixed page ids (typically 0 and
-// 1; defined by the caller in page_io). Which one is "current" is determined
-// solely by txn_counter + checksum validity, never by position.
+// Invariant: the superblock slots occupy fixed page ids 0..N (where N is
+// the configurable `superblock_count` — see ISSUES.md R4). Which one is
+// "current" is determined solely by txn_counter + checksum validity,
+// never by position. N=2 is the default (matches the original v1 layout);
+// higher N trades disk space for resilience against consecutive torn
+// writes. N is stored inside each superblock so open-time recovery can
+// discover it from the first valid slot.
 
 use crate::page::{self, MAGIC, PAGE_SIZE};
+
+// Superblock count bounds (ISSUES.md R4). Hardcoded limits keep the
+// probe-at-open-time cost bounded and prevent obviously-broken configs.
+// N=1 is disqualified because it provides no redundancy — a single torn
+// write would brick the database. N > 16 is refused because any realistic
+// workload's sweet spot is N=2-4; beyond that the disk-space cost grows
+// without providing additional resilience worth the complexity.
+pub const MIN_SUPERBLOCKS: u32 = 2;
+pub const MAX_SUPERBLOCKS: u32 = 16;
+pub const DEFAULT_SUPERBLOCK_COUNT: u32 = 2;
+
+// Byte offset of the superblock_count field within the serialized
+// superblock page. Placed AFTER the named-root table (which ends at
+// NAMED_ROOTS_END = 308). A value of 0 in a deserialized superblock is
+// treated as "legacy, implies 2" — this is defensive; no such files
+// exist in practice because R4 shipped alongside v2, but the
+// interpretation protects against any future accidental zero-filling
+// of the field.
+const SUPERBLOCK_COUNT_OFFSET: usize = 308;
 
 // Named-root table (ISSUES.md F2). A small fixed-width table lives inside
 // the superblock itself so that named roots get the same atomic-commit
@@ -117,6 +140,13 @@ pub struct Superblock {
     // in-memory Roots snapshot and the whole thing gets promoted on commit,
     // so named roots survive rollback/savepoint correctly for free.
     pub named_roots: [NamedRoot; NAMED_ROOT_COUNT],
+    // Number of superblock slots in the file at pages 0..N (ISSUES.md
+    // R4). Serialized at byte 308 (right after named_roots). Stored in
+    // each slot so open-time recovery can discover N from the first
+    // valid slot it finds. Valid range is MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS;
+    // a deserialized value of 0 is treated as "legacy" and implies the
+    // default of 2.
+    pub superblock_count: u32,
 }
 
 impl Superblock {
@@ -142,8 +172,13 @@ impl Superblock {
             buf[base + NAMED_ROOT_NAME_LEN..base + NAMED_ROOT_NAME_LEN + 8]
                 .copy_from_slice(&entry.handle.to_le_bytes());
         }
-        // bytes NAMED_ROOTS_END..CHECKSUM_OFFSET are reserved for future
-        // fields and must stay zero so existing checksums remain reproducible.
+        // Superblock count (R4). Written at byte 308, within the v2
+        // reserved region that follows the named-root table.
+        buf[SUPERBLOCK_COUNT_OFFSET..SUPERBLOCK_COUNT_OFFSET + 4]
+            .copy_from_slice(&self.superblock_count.to_le_bytes());
+        // bytes after SUPERBLOCK_COUNT_OFFSET + 4 up to CHECKSUM_OFFSET
+        // are reserved for future fields and must stay zero so existing
+        // checksums remain reproducible.
         page::stamp_checksum(&mut buf);
         buf
     }
@@ -180,6 +215,21 @@ impl Superblock {
                     .unwrap(),
             );
         }
+        // Superblock count (R4). A zero-valued field is interpreted as
+        // "legacy, implies default of 2" — defensive code that's not
+        // actually exercised by any in-the-wild file (R4 shipped with
+        // v2), but means a future zero-fill bug wouldn't immediately
+        // brick open-time recovery.
+        let raw_superblock_count = u32::from_le_bytes(
+            buf[SUPERBLOCK_COUNT_OFFSET..SUPERBLOCK_COUNT_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let superblock_count = if raw_superblock_count == 0 {
+            DEFAULT_SUPERBLOCK_COUNT
+        } else {
+            raw_superblock_count
+        };
         Some(Superblock {
             magic,
             format_version: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
@@ -190,6 +240,7 @@ impl Superblock {
             next_handle: u64::from_le_bytes(buf[40..48].try_into().unwrap()),
             page_size: u32::from_le_bytes(buf[48..52].try_into().unwrap()),
             named_roots,
+            superblock_count,
         })
     }
 
@@ -212,23 +263,28 @@ impl Superblock {
 
     /// Create the initial superblock for a new, empty database.
     ///
-    /// `txn_counter` starts at 1 (not 0) so that any zero-initialized region
-    /// on disk cannot accidentally out-rank a legitimate superblock during
-    /// `select()`. `total_pages = 2` reserves the two superblock slots.
-    /// Both roots are PAGE_ID_NONE — the handle table and freemap are
-    /// created lazily on first write. The named-root table starts empty
-    /// (all slots zeroed; `is_empty()` returns true for every entry).
-    pub fn new_empty() -> Superblock {
+    /// `txn_counter` starts at `superblock_count - 1` so the first
+    /// user commit (which bumps to `superblock_count`) writes slot
+    /// `superblock_count % superblock_count == 0` — the highest-
+    /// counter slot, exactly as the I2 fix requires for N=2. The
+    /// caller (`TransactionManager::create_new`) pairs this with
+    /// additional lower-counter "fallback" slots in positions 1..N.
+    /// `total_pages = superblock_count` reserves all slots. Both
+    /// roots are PAGE_ID_NONE — the handle table and freemap are
+    /// created lazily on first write. The named-root table starts
+    /// empty.
+    pub fn new_empty(superblock_count: u32) -> Superblock {
         Superblock {
             magic: MAGIC,
             format_version: page::FORMAT_VERSION,
-            txn_counter: 1,
+            txn_counter: (superblock_count - 1) as u64,
             root_handle_table_page: page::PAGE_ID_NONE,
             root_freemap_page: page::PAGE_ID_NONE,
-            total_pages: 2,
+            total_pages: superblock_count as u64,
             next_handle: 0,
             page_size: PAGE_SIZE as u32,
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
+            superblock_count,
         }
     }
 }

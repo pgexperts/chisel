@@ -31,6 +31,11 @@ pub enum ChiselError {
     // use and the caller tried to set a new (previously unused) name.
     // See ISSUES.md F2.
     RootNameTableFull,
+    // Options.superblock_count is out of the supported range (ISSUES.md
+    // R4). Only raised at open time when the caller passed a value
+    // < MIN_SUPERBLOCKS (2) or > MAX_SUPERBLOCKS (16). Operational —
+    // the caller fixes their Options and tries again.
+    InvalidSuperblockCount { value: u32 },
 
     // Fatal — database integrity is in question. Close and re-open
     // before attempting further work. The reopen will re-run superblock
@@ -120,6 +125,9 @@ impl fmt::Display for ChiselError {
             ),
             ChiselError::RootNameTableFull => {
                 write!(f, "named-root table is full (all slots are in use)")
+            }
+            ChiselError::InvalidSuperblockCount { value } => {
+                write!(f, "invalid superblock_count {value}; must be in 2..=16")
             }
             ChiselError::IoError(e) => write!(f, "I/O error: {e}"),
             ChiselError::ChecksumMismatch { page_id } => {

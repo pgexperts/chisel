@@ -140,6 +140,7 @@ fn test_reject_unsupported_format_version() {
         next_handle: 0,
         page_size: PAGE_SIZE as u32,
         named_roots: [chisel::superblock::NamedRoot::EMPTY; chisel::superblock::NAMED_ROOT_COUNT],
+        superblock_count: chisel::superblock::DEFAULT_SUPERBLOCK_COUNT,
     };
     let buf_a = sb.serialize();
     sb.txn_counter = 4;
@@ -722,6 +723,178 @@ fn test_freemap_persists_across_reopen() {
         growth < 3,
         "after reopen, an allocation should reuse the freemap-tracked page (growth {growth})"
     );
+}
+
+// --- R4: configurable superblock count ---
+
+#[test]
+fn test_r4_create_with_custom_superblock_count() {
+    // Creating a database with N=4 superblocks should work end-to-end
+    // and the file should be large enough to hold all four slots.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+
+    {
+        let mut db = Chisel::open(
+            &path,
+            Options {
+                superblock_count: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.begin().unwrap();
+        let h = db.allocate(b"r4 payload").unwrap();
+        db.commit().unwrap();
+        assert_eq!(db.read(h).unwrap(), b"r4 payload");
+    }
+
+    // Reopen: N must be discovered from disk, not supplied again.
+    // We pass the default (N=2) to show it's ignored for existing DBs.
+    let db = Chisel::open(&path, Default::default()).unwrap();
+    assert_eq!(db.handles().unwrap().len(), 1);
+}
+
+#[test]
+fn test_r4_invalid_superblock_count_rejected() {
+    // N=1 is disqualified (no redundancy).
+    let file = NamedTempFile::new().unwrap();
+    let result = Chisel::open(
+        file.path(),
+        Options {
+            superblock_count: 1,
+            ..Default::default()
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(ChiselError::InvalidSuperblockCount { value: 1 })
+    ));
+
+    // N=17 exceeds MAX_SUPERBLOCKS (16).
+    let file2 = NamedTempFile::new().unwrap();
+    let result = Chisel::open(
+        file2.path(),
+        Options {
+            superblock_count: 17,
+            ..Default::default()
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(ChiselError::InvalidSuperblockCount { value: 17 })
+    ));
+}
+
+#[test]
+fn test_r4_n3_survives_two_consecutive_torn_writes() {
+    // The motivating use case: N=3 should survive TWO consecutive
+    // torn superblock writes (a torn commit followed by a torn
+    // retry). We simulate this by creating a DB with N=3, doing
+    // several commits so counters spread across all three slots,
+    // then manually zeroing TWO of the slots and verifying the
+    // third still recovers a valid database.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+
+    let handle;
+    {
+        let mut db = Chisel::open(
+            &path,
+            Options {
+                superblock_count: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Do enough commits that each of the 3 slots has been
+        // written at least once, so all three carry real data.
+        db.begin().unwrap();
+        handle = db.allocate(b"survives two tears").unwrap();
+        db.commit().unwrap(); // txn=3 → slot 0
+        db.begin().unwrap();
+        db.allocate(b"txn 2").unwrap();
+        db.commit().unwrap(); // txn=4 → slot 1
+        db.begin().unwrap();
+        db.allocate(b"txn 3").unwrap();
+        db.commit().unwrap(); // txn=5 → slot 2
+    }
+
+    // Zero out slots 0 and 1 (two consecutive torn writes). Slot 2
+    // — which holds the most recent commit — remains intact.
+    {
+        let mut f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&[0u8; PAGE_SIZE]).unwrap();
+        f.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        f.write_all(&[0u8; PAGE_SIZE]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    // Reopen: under N=2 this would be unrecoverable. Under N=3 we
+    // fall back to slot 2 and the database is still openable with
+    // the most recent committed state.
+    let db = Chisel::open(&path, Default::default()).unwrap();
+    assert_eq!(db.read(handle).unwrap(), b"survives two tears");
+    assert_eq!(db.handles().unwrap().len(), 3);
+}
+
+#[test]
+fn test_r4_commits_rotate_through_all_slots() {
+    // With N=3, committing 6 times should write slots in the
+    // sequence 0, 1, 2, 0, 1, 2. We verify indirectly by checking
+    // that the file doesn't grow an extra page on every commit —
+    // all commits reuse the fixed bank of N slots.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+
+    let mut db = Chisel::open(
+        &path,
+        Options {
+            superblock_count: 3,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // First commit: adds handle-table + data + freemap pages.
+    db.begin().unwrap();
+    db.allocate(b"first").unwrap();
+    db.commit().unwrap();
+    let baseline = db.stats().unwrap().total_pages;
+
+    // Do 5 more commits that each update the same handle. Under R1
+    // packing, these all share the cursor page within each txn, so
+    // the file should stay close to baseline.
+    db.begin().unwrap();
+    let h = db.allocate(b"packed").unwrap();
+    db.commit().unwrap();
+    for i in 0..4 {
+        db.begin().unwrap();
+        db.update(h, format!("update {i}").as_bytes()).unwrap();
+        db.commit().unwrap();
+    }
+    let after = db.stats().unwrap().total_pages;
+
+    // The superblock slot bank is fixed at N=3 pages; subsequent
+    // commits rotate through those without allocating new slots.
+    // Any growth is attributable to ht-cow + freemap, NOT to
+    // additional superblock slots.
+    assert!(
+        after - baseline < 20,
+        "5 commits under N=3 shouldn't grow the file significantly (baseline={baseline}, after={after})"
+    );
+}
+
+#[test]
+fn test_r4_default_is_two_slots() {
+    // Default Options creates a 2-slot database, matching the
+    // pre-R4 layout. Verified by the total_pages count after
+    // creation: pages 0 and 1 are superblocks and nothing else
+    // exists until the first user commit adds data.
+    let file = NamedTempFile::new().unwrap();
+    let db = Chisel::open(file.path(), Default::default()).unwrap();
+    assert_eq!(db.stats().unwrap().total_pages, 2);
 }
 
 #[test]

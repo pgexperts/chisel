@@ -232,7 +232,7 @@ Anchor of the freemap bundle. Depends on resolving I9–I11: reclamation needs t
 
 Fix I17 (defrag stats) while you're rewriting the loop.
 
-### R4. Configurable superblock count [roadmap] — **P3** (gated on I2)
+### R4. Configurable superblock count [roadmap] — **P3** (gated on I2) ✅ IMPLEMENTED 2026-04-11
 > Trade commit performance for additional crash durability (3+ superblock copies).
 
 I2 must be fixed first — the "first commit wipes the only valid superblock" bug affects any N ≥ 2.

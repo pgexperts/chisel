@@ -43,7 +43,9 @@ use crate::handle_table::{HandleEntry, HandleFlags, HandleTable};
 use crate::overflow::Overflow;
 use crate::page::{self, PAGE_ID_NONE, PAGE_SIZE};
 use crate::page_cache::PageCache;
-use crate::superblock::{NamedRoot, Superblock, NAMED_ROOT_COUNT, NAMED_ROOT_NAME_LEN};
+use crate::superblock::{
+    NamedRoot, Superblock, MAX_SUPERBLOCKS, NAMED_ROOT_COUNT, NAMED_ROOT_NAME_LEN,
+};
 
 // Largest value stored inline in a data-page slot. Larger values are written to an
 // overflow chain and referenced by a single HandleEntry with HandleFlags::Overflow.
@@ -119,8 +121,16 @@ pub struct TransactionManager {
     current_roots: Roots,
     handle_table: HandleTable,
     // Monotonically increasing. Written into each new superblock; the higher value
-    // wins on recovery. Also used to pick the inactive slot on commit (parity).
+    // wins on recovery. Also used to pick the inactive slot on commit via
+    // `txn_counter % superblock_count`.
     txn_counter: u64,
+    // Number of superblock slots occupying pages 0..superblock_count
+    // (ISSUES.md R4). Set at open time from the winning superblock's
+    // own `superblock_count` field; cached here so commit doesn't have
+    // to re-fetch it. Must equal every slot's self-reported value in a
+    // healthy database; divergence would indicate mid-flight reconfig
+    // or corruption.
+    superblock_count: u32,
     active_txn: bool,
     savepoints: Vec<Savepoint>,
     // Pages whose contents are no longer reachable from the new roots.
@@ -188,44 +198,62 @@ pub struct TransactionManager {
 }
 
 impl TransactionManager {
-    /// Create a new database (initialize superblocks).
+    /// Create a new database with `superblock_count` superblock slots.
     ///
-    /// Writes TWO valid empty-database superblocks at staggered counters:
-    /// slot 0 at txn_counter=1 (the "winner" — select() picks the max) and
-    /// slot 1 at txn_counter=0. Both have identical empty roots. fsync before
-    /// returning so the new database header is durable before any user data
-    /// is written.
+    /// All N slots are initialized as VALID superblocks at staggered
+    /// counters 0..N-1 (slot i gets counter N-1-i). This matters for
+    /// crash safety (ISSUES.md I2 + R4):
     ///
-    /// Why both slots must be valid from the start (see ISSUES.md I2):
-    /// historically slot 1 was left as an all-zero buffer (invalid checksum).
-    /// That seemed fine because select() would simply prefer slot 0 — but the
-    /// very first user commit writes slot 0 (txn_counter=2 has even parity),
-    /// overwriting the ONLY valid superblock on disk. A torn write during
-    /// that first commit then left zero recoverable state and open_existing
-    /// returned CorruptSuperblock forever. By seeding slot 1 with a valid
-    /// empty superblock at counter 0, a torn first commit falls back to an
-    /// empty-but-openable database instead of a bricked file.
+    /// * The I2 fix for N=2: if the first user commit (which writes
+    ///   slot 0 at counter N) is torn, slot 1 at counter N-2 still
+    ///   holds a valid "empty database" superblock so the file stays
+    ///   openable.
+    /// * The R4 generalization for N>=3: multiple staggered fallback
+    ///   slots survive CONSECUTIVE torn writes. For N=3, slots 1 and 2
+    ///   both hold valid empty states at lower counters after slot 0
+    ///   is written; a torn retry of the same commit still has slot 2
+    ///   to fall back to.
     ///
-    /// The zero counter on slot 1 is safe: select() filters on checksum
-    /// validity first, so a legitimately written counter-0 superblock is
-    /// distinguishable from a zeroed disk region (the latter fails XXH3).
-    pub fn create_new(mut cache: PageCache) -> Result<TransactionManager> {
-        let sb_current = Superblock::new_empty();
-        let mut sb_fallback = sb_current.clone();
-        sb_fallback.txn_counter = 0;
-        let buf_a = sb_current.serialize();
-        let buf_b = sb_fallback.serialize();
+    /// An fsync is issued before returning so the whole bank of slots
+    /// is durable before any user data is written. Slot counters with
+    /// the value 0 are SAFE even though zero bits are "the natural
+    /// value of an uninitialized disk region" because `select()`
+    /// filters on XXH3 checksum validity BEFORE comparing counters —
+    /// a legitimate counter-0 slot has a valid checksum; a zeroed
+    /// region doesn't.
+    pub fn create_new(mut cache: PageCache, superblock_count: u32) -> Result<TransactionManager> {
+        // Caller is expected to have validated bounds via Options in
+        // lib.rs, but defend against direct-call misuse too.
+        assert!(
+            (2..=MAX_SUPERBLOCKS).contains(&superblock_count),
+            "superblock_count {superblock_count} out of supported range 2..=16"
+        );
 
-        cache.io_mut().write_page(0, &buf_a)?;
-        cache.io_mut().write_page(1, &buf_b)?;
+        // Write N staggered slots. Slot 0 gets the highest counter
+        // (superblock_count - 1), slot N-1 gets 0. First user commit
+        // bumps to N, which modulo N is 0, so slot 0 is the first to
+        // be overwritten — the behavior the I2 fix established for
+        // N=2 generalizes cleanly to larger N.
+        //
+        // Invariant after this loop: every slot is a valid superblock
+        // referencing the same (empty) roots, at counters 0..N-1.
+        // `select()` at open time will pick slot 0 (highest counter).
+        // After the first user commit, slot 0 holds the newest data
+        // and the rest remain as "rollback fallbacks".
+        let mut sb = Superblock::new_empty(superblock_count);
+        for i in 0..superblock_count {
+            sb.txn_counter = (superblock_count - 1 - i) as u64;
+            let buf = sb.serialize();
+            cache.io_mut().write_page(i as u64, &buf)?;
+        }
         cache.io_mut().fsync()?;
-        cache.set_next_page_id(2);
+        cache.set_next_page_id(superblock_count as u64);
 
         let roots = Roots {
             handle_table_page: PAGE_ID_NONE,
             freemap_page: PAGE_ID_NONE,
             next_handle: 0,
-            total_pages: 2,
+            total_pages: superblock_count as u64,
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
         };
 
@@ -243,7 +271,11 @@ impl TransactionManager {
             committed_roots: roots.clone(),
             current_roots: roots,
             handle_table: HandleTable::new(),
-            txn_counter: sb_current.txn_counter,
+            // Slot 0 was written last in the loop above, at counter
+            // (superblock_count - 1 - 0) = superblock_count - 1. That's
+            // the highest counter and therefore the winner on select().
+            txn_counter: (superblock_count - 1) as u64,
+            superblock_count,
             active_txn: false,
             savepoints: Vec::new(),
             txn_freed_pages: Vec::new(),
@@ -259,16 +291,57 @@ impl TransactionManager {
 
     /// Open an existing database from file.
     ///
-    /// This is the crash recovery path. Both superblock slots are read and
-    /// Superblock::select() picks the one with the highest txn_counter and a
-    /// valid XXH3 checksum. A torn write to the most-recently-targeted slot
-    /// during a prior commit will fail its checksum, and select() will silently
-    /// fall back to the other (older) superblock — which still points at a
-    /// complete, consistent snapshot of committed pages. No replay required.
+    /// This is the crash recovery path. All N superblock slots (where
+    /// N is discovered from disk — see the probe below) are read,
+    /// `Superblock::select()` picks the one with the highest
+    /// txn_counter and a valid XXH3 checksum, and a torn write to the
+    /// most-recently-targeted slot silently falls back to the next
+    /// best survivor. No log replay required.
+    ///
+    /// R4 slot discovery:
+    ///
+    /// The number of superblock slots is NOT a compile-time constant.
+    /// A database created with `superblock_count=4` has 4 slots at
+    /// pages 0..3; a default database has 2 at pages 0..1. To find N
+    /// without any external hint we:
+    ///
+    ///   1. Read the first MAX_SUPERBLOCKS pages of the file (bounded
+    ///      by EOF — a fresh DB has exactly N pages and no more). We
+    ///      deliberately do NOT short-circuit on "this page doesn't
+    ///      look like a superblock": a torn write that hit the magic
+    ///      bytes of an otherwise-valid slot would look like garbage,
+    ///      and short-circuiting would skip past the legitimate
+    ///      successor slots. Reading a few extra pages is cheap.
+    ///   2. Pass all candidates to `Superblock::select`, which uses
+    ///      `deserialize` to filter on XXH3 checksum + MAGIC bytes.
+    ///      Data pages that happen to sit at positions < MAX_SUPERBLOCKS
+    ///      (e.g., in a database where N=2 and there's a data page at
+    ///      page 2) fail the magic check and are harmlessly ignored.
+    ///   3. The winner's `superblock_count` field tells us N, which we
+    ///      cache on the TransactionManager for commit-time slot
+    ///      selection.
+    ///
+    /// If no valid superblock is found in the first MAX_SUPERBLOCKS
+    /// pages, we return `CorruptSuperblock`. This bounds the probe
+    /// cost in the pathological case where every candidate is torn.
     pub fn open_existing(mut cache: PageCache) -> Result<TransactionManager> {
-        let buf_a = cache.io_mut().read_page(0)?;
-        let buf_b = cache.io_mut().read_page(1)?;
-        let sb = Superblock::select(&[buf_a, buf_b]).ok_or(ChiselError::CorruptSuperblock)?;
+        // Step 1: read up to MAX_SUPERBLOCKS pages as candidates.
+        let mut candidates: Vec<[u8; PAGE_SIZE]> = Vec::new();
+        for i in 0..MAX_SUPERBLOCKS as u64 {
+            // If the file is shorter than MAX_SUPERBLOCKS (fresh DB
+            // with small N), read_page returns InvalidPageId (I16).
+            // Stop probing at EOF.
+            match cache.io_mut().read_page(i) {
+                Ok(buf) => candidates.push(buf),
+                Err(ChiselError::InvalidPageId { .. }) => break,
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Step 2 + 3: pick the winner via select(). select() uses
+        // deserialize, which validates checksum and magic — data
+        // pages in the candidate list (if any) are filtered out.
+        let sb = Superblock::select(&candidates).ok_or(ChiselError::CorruptSuperblock)?;
 
         // Format-version gate (see ISSUES.md I15). We validate AFTER select()
         // rather than inside deserialize() because the winning superblock's
@@ -382,6 +455,10 @@ impl TransactionManager {
             current_roots: roots,
             handle_table: ht,
             txn_counter: sb.txn_counter,
+            // R4: discovered from the winning superblock's own
+            // `superblock_count` field. Cached so commit doesn't have
+            // to re-look it up for slot selection.
+            superblock_count: sb.superblock_count,
             active_txn: false,
             savepoints: Vec::new(),
             txn_freed_pages: Vec::new(),
@@ -709,17 +786,21 @@ impl TransactionManager {
             next_handle: self.current_roots.next_handle,
             page_size: PAGE_SIZE as u32,
             named_roots: self.current_roots.named_roots,
+            // R4: every slot records the current N so open-time
+            // recovery can discover it from the winning slot without
+            // external hints.
+            superblock_count: self.superblock_count,
         };
         let buf = sb.serialize();
-        // Step 3: Write to the INACTIVE slot. Parity of the new (post-increment)
-        // txn_counter determines which slot is inactive: even -> slot 0, odd -> 1.
-        // The currently-active slot is never touched, so a torn write here can
-        // only damage the new superblock, never the last known-good one.
-        let inactive = if self.txn_counter.is_multiple_of(2) {
-            0
-        } else {
-            1
-        };
+        // Step 3: Write to the INACTIVE slot. For N superblock slots,
+        // the slot is `txn_counter % N` — a round-robin that always
+        // targets the stalest slot. With N=2 this is the parity
+        // alternation from the original layout; with N>=3 it extends
+        // to true round-robin. The currently-active slot (and every
+        // other non-target slot) is never touched, so a torn write
+        // here can only damage the new superblock, never the N-1
+        // last-known-good ones.
+        let inactive = self.txn_counter % self.superblock_count as u64;
         cache.io_mut().write_page(inactive, &buf)?;
         // Step 4: Durability linearization point. Until this fsync returns the
         // transaction is not crash-safe; after it returns the new state is
@@ -1616,7 +1697,7 @@ mod tests {
         let file = NamedTempFile::new().unwrap();
         let io = PageIo::open(file.path(), false).unwrap();
         let cache = PageCache::new(io, 64);
-        let mut tm = TransactionManager::create_new(cache).unwrap();
+        let mut tm = TransactionManager::create_new(cache, 2).unwrap();
         // Commit once so there's a real baseline to read/write against.
         tm.begin().unwrap();
         tm.commit().unwrap();
