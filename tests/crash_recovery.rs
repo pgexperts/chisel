@@ -1,9 +1,58 @@
-use chisel::page::{self, PAGE_SIZE};
+use chisel::page::{self, PageType, PAGE_SIZE};
 use chisel::superblock::Superblock;
 use chisel::{Chisel, ChiselError, Options};
 use std::fs;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read as _, Seek, SeekFrom, Write};
 use tempfile::NamedTempFile;
+
+/// Scan the file for the first page whose type tag matches `want` and
+/// return its page id. Panics if no such page exists; test helper only.
+///
+/// This is used by the targeted corruption tests below so they can pick
+/// exactly one Overflow or Data page to scribble on, instead of the
+/// blunt "zero everything" approach.
+fn find_page_of_type(path: &std::path::Path, want: PageType) -> u64 {
+    let mut f = fs::File::open(path).unwrap();
+    let len = f.metadata().unwrap().len();
+    let n_pages = len / PAGE_SIZE as u64;
+    // Slots 0..N are superblocks — they do not carry the common type tag,
+    // so we skip them unconditionally. Chisel's DEFAULT_SUPERBLOCK_COUNT
+    // is 2; the caller is responsible for not using this helper on
+    // non-default superblock layouts.
+    for p in 2..n_pages {
+        f.seek(SeekFrom::Start(p * PAGE_SIZE as u64)).unwrap();
+        let mut first = [0u8; 1];
+        f.read_exact(&mut first).unwrap();
+        if first[0] == want as u8 {
+            return p;
+        }
+    }
+    panic!("no page of type {want:?} found in {path:?}");
+}
+
+/// Read a page, mutate its bytes via `mutate`, restamp the checksum so
+/// the page looks checksum-valid to the cache layer, and write it back.
+/// Used to produce "structurally broken but checksum-valid" pages — the
+/// class of corruption that layered validators have to catch.
+fn rewrite_page_with_valid_checksum(
+    path: &std::path::Path,
+    page_id: u64,
+    mutate: impl FnOnce(&mut [u8; PAGE_SIZE]),
+) {
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let mut buf = [0u8; PAGE_SIZE];
+    f.seek(SeekFrom::Start(page_id * PAGE_SIZE as u64)).unwrap();
+    f.read_exact(&mut buf).unwrap();
+    mutate(&mut buf);
+    page::stamp_checksum(&mut buf);
+    f.seek(SeekFrom::Start(page_id * PAGE_SIZE as u64)).unwrap();
+    f.write_all(&buf).unwrap();
+    f.sync_all().unwrap();
+}
 
 #[test]
 fn test_recovery_after_clean_close() {
@@ -111,6 +160,240 @@ fn test_recovery_both_superblocks_corrupt() {
     }
     let result = Chisel::open(&path, Default::default());
     assert!(result.is_err());
+}
+
+#[test]
+fn test_recovery_corrupted_overflow_page_surfaces_fatal_error() {
+    // Targeted: find an Overflow-typed page on disk and zero it so its
+    // checksum fails. The read path must walk the overflow chain and
+    // hit the broken page via `cache.get()`, which validates on load
+    // and raises `ChecksumMismatch` — a fatal error that poisons the
+    // manager.
+    //
+    // This differs from the blunt "zero everything" version by leaving
+    // the handle table intact, so the failure mode is unambiguously the
+    // overflow walker tripping over a bad checksum rather than some
+    // earlier integrity check catching the damage first.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+
+    let handle;
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        // 20 KB forces a multi-page overflow chain (~3 pages at 8 KiB
+        // minus per-page overhead), so at least one page carries the
+        // Overflow type tag.
+        handle = db.allocate(&vec![0xAB; 20_000]).unwrap();
+        db.commit().unwrap();
+    }
+
+    let overflow_page = find_page_of_type(&path, PageType::Overflow);
+    // Zero the page. Checksum goes bad along with the rest, which is
+    // exactly the bit-rot scenario we want to catch.
+    {
+        let mut f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(overflow_page * PAGE_SIZE as u64))
+            .unwrap();
+        f.write_all(&[0u8; PAGE_SIZE]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    let db = Chisel::open(&path, Default::default())
+        .expect("open should still succeed — only an overflow page is damaged");
+    let err = db
+        .read(handle)
+        .expect_err("read of a broken overflow chain must fail");
+    match err {
+        ChiselError::ChecksumMismatch { page_id } => {
+            assert_eq!(page_id, overflow_page, "wrong page id in error");
+        }
+        other => panic!("expected ChecksumMismatch on the overflow page, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_read_of_structurally_broken_data_page_returns_corrupt_page() {
+    // Regression test for the transaction.rs read path upgrade: when
+    // the handle-table entry says a slot is Live but the target data
+    // page is structurally nonsense (wrong page-type tag, inconsistent
+    // slot directory, etc.), the read must surface `CorruptPage`
+    // rather than masquerading as `InvalidHandle`.
+    //
+    // Why this matters: `InvalidHandle` is Operational — callers will
+    // treat it as "oh, my handle is stale, move on". `CorruptPage` is
+    // Fatal and poisons the manager so the caller is forced to stop
+    // and reopen. Misclassifying corruption as a bad handle silently
+    // hides real damage behind a caller-blamed error.
+    //
+    // Construction: stamp the data page's type byte to 0xFF (not a
+    // valid PageType) and refresh the checksum so the cache layer
+    // lets the bytes through. `DataPage::validate_header` then
+    // rejects the page, `DataPage::read` returns None, and the
+    // transaction layer must convert that None into CorruptPage.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+
+    let handle;
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        handle = db.allocate(b"alive but doomed").unwrap();
+        db.commit().unwrap();
+    }
+
+    let data_page = find_page_of_type(&path, PageType::Data);
+    rewrite_page_with_valid_checksum(&path, data_page, |buf| {
+        buf[0] = 0xFF; // not any PageType discriminant
+    });
+
+    let db = Chisel::open(&path, Default::default())
+        .expect("open scans the handle table only, not data pages");
+    let err = db.read(handle).expect_err("read must fail");
+    match err {
+        ChiselError::CorruptPage { page_id } => {
+            assert_eq!(page_id, data_page, "CorruptPage error had wrong page id");
+        }
+        ChiselError::InvalidHandle(_) => panic!(
+            "structurally-broken data page was misclassified as InvalidHandle; \
+             the transaction.rs Live-slot upgrade is missing"
+        ),
+        other => panic!("expected CorruptPage, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_recovery_truncated_file_is_rejected() {
+    // A file shorter than the superblock region cannot possibly hold a
+    // valid database. Open must refuse — the exact error shape depends
+    // on which read fails first (InvalidPageId from the bounds check in
+    // page_io, or CorruptSuperblock if the bytes parse as zeros), so we
+    // accept any error but verify it is NOT success.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        db.allocate(b"x").unwrap();
+        db.commit().unwrap();
+    }
+    // Chop the file down to a single page — slot 1 no longer exists.
+    {
+        let f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(PAGE_SIZE as u64).unwrap();
+    }
+    let result = Chisel::open(&path, Default::default());
+    assert!(
+        result.is_err(),
+        "truncated file was accepted by Chisel::open"
+    );
+}
+
+#[test]
+fn test_recovery_superblock_pointing_past_eof_is_rejected() {
+    // A valid-looking superblock whose `total_pages` exceeds the
+    // physical file length is a crash symptom: the superblock fsync
+    // committed the new metadata but the data-page writes that were
+    // supposed to extend the file never landed. Open must surface
+    // `FileSizeMismatch` rather than trusting the stale metadata and
+    // reading past EOF.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        db.allocate(b"seed").unwrap();
+        db.commit().unwrap();
+    }
+
+    // Write a valid superblock into slot 0 that claims the file is
+    // much longer than it actually is. total_pages is usize-y here;
+    // the real file length is just a handful of pages.
+    let sb = Superblock {
+        magic: page::MAGIC,
+        format_version: page::FORMAT_VERSION,
+        txn_counter: u64::MAX / 2, // ensure this slot wins select()
+        root_handle_table_page: page::PAGE_ID_NONE,
+        root_freemap_page: page::PAGE_ID_NONE,
+        total_pages: 1_000_000,
+        next_handle: 0,
+        page_size: PAGE_SIZE as u32,
+        named_roots: [chisel::superblock::NamedRoot::EMPTY; chisel::superblock::NAMED_ROOT_COUNT],
+        superblock_count: chisel::superblock::DEFAULT_SUPERBLOCK_COUNT,
+    };
+    let buf = sb.serialize();
+    {
+        let mut f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&buf).unwrap();
+        // Also stomp slot 1 so `select()` has no alternative but the
+        // one we just wrote.
+        f.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        f.write_all(&[0u8; PAGE_SIZE]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    match Chisel::open(&path, Default::default()) {
+        Err(ChiselError::FileSizeMismatch { expected, actual }) => {
+            assert_eq!(expected, 1_000_000 * PAGE_SIZE as u64);
+            assert!(actual < expected);
+        }
+        Err(other) => panic!("expected FileSizeMismatch, got {other:?}"),
+        Ok(_) => panic!("expected FileSizeMismatch, open succeeded"),
+    }
+}
+
+#[test]
+fn test_recovery_torn_second_superblock_falls_back_to_previous() {
+    // Models the precise crash window the commit protocol is designed
+    // to survive: data pages for commit N+1 are fully fsync'd (step 1
+    // of the protocol), then the superblock write or its fsync is
+    // interrupted partway through so the inactive slot is left with a
+    // garbage/zeroed payload.
+    //
+    // The old superblock is still intact and points at the post-commit-N
+    // roots. Recovery must pick it via Superblock::select()'s "highest
+    // valid txn_counter wins" rule and expose the post-commit-N state —
+    // the data pages written for commit N+1 are orphaned but harmless.
+    //
+    // With DEFAULT_SUPERBLOCK_COUNT = 2, slot 0 is written by the first
+    // user commit (txn_counter bumps from 1 → 2, even parity) and slot 1
+    // by the second (3, odd parity). We corrupt slot 1 AFTER a second
+    // commit to simulate the torn write.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+
+    let h1;
+    let h2;
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        h1 = db.allocate(b"from commit 1").unwrap();
+        db.commit().unwrap();
+
+        db.begin().unwrap();
+        h2 = db.allocate(b"from commit 2").unwrap();
+        db.commit().unwrap();
+    }
+
+    // Corrupt slot 1 (the most-recent commit) by zeroing it. Slot 0
+    // still carries the post-commit-#1 superblock.
+    {
+        let mut f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        f.write_all(&[0u8; PAGE_SIZE]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    // Recovery should pick slot 0 and expose the state from commit #1.
+    let db = Chisel::open(&path, Default::default()).unwrap();
+    assert_eq!(db.read(h1).unwrap(), b"from commit 1");
+    // h2 was only referenced by the now-lost slot-1 superblock; it must
+    // not resolve against the post-commit-#1 handle table.
+    assert!(
+        db.read(h2).is_err(),
+        "handle from the torn commit should not be visible after recovery"
+    );
 }
 
 #[test]

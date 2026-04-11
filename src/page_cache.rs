@@ -319,6 +319,13 @@ impl PageCache {
         &mut self.io
     }
 
+    /// Immutable view of the underlying `PageIo`. Used only for cheap
+    /// queries like `is_read_only()` that don't need to mutate file
+    /// state — keeps the caller's `&self` borrow intact.
+    pub fn io(&self) -> &PageIo {
+        &self.io
+    }
+
     /// Current value of the next page id counter — i.e. the id that the
     /// next `new_page()` call will return. Used by the transaction layer
     /// as a "watermark": record it before an operation, call the operation

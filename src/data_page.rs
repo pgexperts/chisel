@@ -91,13 +91,57 @@ impl DataPage {
     //
     // Reflects only the central hole between slot dir and data region. Does
     // NOT account for holes left by dead slots — those are reclaimed only by
-    // compact(). saturating_sub defends against a corrupt header where
-    // free_start > free_end; returning 0 forces the caller to fail insert
-    // rather than underflowing.
+    // compact(). Returns 0 if the header is structurally invalid (a corrupt
+    // page with free_start > free_end, or free_end past the checksum region,
+    // etc.) so downstream mutators refuse to operate on it. The more precise
+    // validity check is `validate_header` — callers that care about the
+    // distinction between "full" and "corrupt" should use that.
     pub fn free_space(buf: &[u8; PAGE_SIZE]) -> usize {
+        match Self::validate_header(buf) {
+            Some((free_start, free_end, _)) => free_end - free_start,
+            None => 0,
+        }
+    }
+
+    /// Validate the page header. Returns `(free_start, free_end, slot_count)`
+    /// if every header byte is self-consistent, otherwise None.
+    ///
+    /// Used as the gatekeeper for every mutating or iterating path: a None
+    /// result means the page's bytes are inconsistent with the Data format
+    /// (wrong page-type tag, header pointers out of bounds, slot directory
+    /// overlapping the data region, etc.). The checksum layer above us
+    /// catches bit-flips; this function catches the separate failure mode
+    /// where we're handed a checksum-valid page that was never a valid
+    /// Data page to begin with — for example, one reached via a stale
+    /// handle-table entry pointing at a freemap or overflow page. Without
+    /// this check, indexing the directory or the payload region with
+    /// untrusted u16 values would panic.
+    fn validate_header(buf: &[u8; PAGE_SIZE]) -> Option<(usize, usize, u16)> {
+        if buf[0] != PageType::Data as u8 {
+            return None;
+        }
+        let slot_count = u16::from_le_bytes(buf[2..4].try_into().unwrap());
         let free_start = u16::from_le_bytes(buf[4..6].try_into().unwrap()) as usize;
         let free_end = u16::from_le_bytes(buf[6..8].try_into().unwrap()) as usize;
-        free_end.saturating_sub(free_start)
+        if free_start < DATA_PAGE_HEADER_SIZE {
+            return None;
+        }
+        if free_end > CHECKSUM_OFFSET {
+            return None;
+        }
+        if free_start > free_end {
+            return None;
+        }
+        // Slot directory must fit entirely below free_start: header area
+        // (0..DATA_PAGE_HEADER_SIZE) then `slot_count` entries of 6 bytes
+        // each. If these overflow past free_start, the slot directory and
+        // the free hole would overlap.
+        let dir_end = DATA_PAGE_HEADER_SIZE
+            .checked_add((slot_count as usize).checked_mul(SLOT_ENTRY_SIZE)?)?;
+        if dir_end > free_start {
+            return None;
+        }
+        Some((free_start, free_end, slot_count))
     }
 
     /// Insert a value into the page. Returns the slot index, or None if the page is full.
@@ -115,14 +159,13 @@ impl DataPage {
     // pages for free slots. Intentional, not a bug — this function itself is
     // correct; it's just underutilized.
     pub fn insert(buf: &mut [u8; PAGE_SIZE], value: &[u8]) -> Option<u16> {
+        let (free_start, free_end, slot_count) = Self::validate_header(buf)?;
         let needed = SLOT_ENTRY_SIZE + value.len();
-        if Self::free_space(buf) < needed {
+        if free_end - free_start < needed {
             return None;
         }
-
-        let slot_count = Self::slot_count(buf);
-        let free_start = u16::from_le_bytes(buf[4..6].try_into().unwrap()) as usize;
-        let free_end = u16::from_le_bytes(buf[6..8].try_into().unwrap()) as usize;
+        // slot_count is bounded by validate_header: the full directory
+        // (including the new entry) still fits below free_start.
 
         // Data grows backward from free_end.
         let data_offset = free_end - value.len();
@@ -147,16 +190,23 @@ impl DataPage {
         Some(slot_count) // slot index = old count
     }
 
-    /// Read a value by slot index. Returns None if the slot is dead or out of range.
+    /// Read a value by slot index. Returns None if the slot is dead, out of
+    /// range, or the page header / slot entry is structurally invalid.
     //
     // Zero-copy: returns a slice borrowed from the page buffer. The borrow
     // keeps the buffer immutable for its lifetime, which is enforced by Rust's
     // borrow checker at the call site.
+    //
+    // A None return does NOT distinguish "legitimately dead" from "corrupt
+    // page". Callers that know a slot *should* be live (e.g., the handle
+    // table points at it) should treat a None as CorruptPage; see the
+    // transaction-layer read path for that upgrade.
     pub fn read(buf: &[u8; PAGE_SIZE], slot: u16) -> Option<&[u8]> {
-        if slot >= Self::slot_count(buf) {
+        let (_, _, slot_count) = Self::validate_header(buf)?;
+        if slot >= slot_count {
             return None;
         }
-        let (offset, length, flags) = Self::read_slot_entry(buf, slot);
+        let (offset, length, flags) = Self::read_slot_entry(buf, slot)?;
         if flags != SLOT_FLAG_LIVE {
             return None;
         }
@@ -179,10 +229,15 @@ impl DataPage {
     // Returns false if the slot is dead/out-of-range, or if the relocate path
     // has insufficient free space. The page is left unmodified on failure.
     pub fn update(buf: &mut [u8; PAGE_SIZE], slot: u16, value: &[u8]) -> bool {
-        if slot >= Self::slot_count(buf) {
+        let Some((free_start, free_end, slot_count)) = Self::validate_header(buf) else {
+            return false;
+        };
+        if slot >= slot_count {
             return false;
         }
-        let (old_offset, old_length, flags) = Self::read_slot_entry(buf, slot);
+        let Some((old_offset, old_length, flags)) = Self::read_slot_entry(buf, slot) else {
+            return false;
+        };
         if flags != SLOT_FLAG_LIVE {
             return false;
         }
@@ -192,9 +247,7 @@ impl DataPage {
             Self::write_slot_length(buf, slot, value.len() as u16);
             true
         } else {
-            let free_end = u16::from_le_bytes(buf[6..8].try_into().unwrap()) as usize;
-            let free_start = u16::from_le_bytes(buf[4..6].try_into().unwrap()) as usize;
-            let available = free_end.saturating_sub(free_start);
+            let available = free_end - free_start;
             if available < value.len() {
                 return false;
             }
@@ -216,7 +269,13 @@ impl DataPage {
     // compact(). This is required because external references (the handle
     // table) point at (page, slot) pairs.
     pub fn delete(buf: &mut [u8; PAGE_SIZE], slot: u16) {
-        if slot < Self::slot_count(buf) {
+        // No-op on corrupt header: a tombstone-write into garbage is worse
+        // than leaving the page alone (the transaction layer will surface
+        // the corruption via the next read).
+        let Some((_, _, slot_count)) = Self::validate_header(buf) else {
+            return;
+        };
+        if slot < slot_count {
             Self::write_slot_flags(buf, slot, SLOT_FLAG_DEAD);
         }
     }
@@ -237,11 +296,21 @@ impl DataPage {
     // indices will have changed. Live slots retain their original relative
     // order, but their indices are renumbered starting from 0.
     pub fn compact(buf: &mut [u8; PAGE_SIZE]) -> Vec<(u16, u16)> {
-        let count = Self::slot_count(buf);
+        // Refuse to compact a corrupt page: no mapping is returned, so
+        // callers (defrag) see "nothing changed" and can surface the
+        // underlying corruption through the ordinary read path rather
+        // than scribbling over the buffer here.
+        let Some((_, _, count)) = Self::validate_header(buf) else {
+            return Vec::new();
+        };
         let mut live_entries: Vec<(u16, Vec<u8>)> = Vec::new();
 
         for i in 0..count {
-            let (offset, length, flags) = Self::read_slot_entry(buf, i);
+            let Some((offset, length, flags)) = Self::read_slot_entry(buf, i) else {
+                // A single bad slot entry aborts the whole compact — same
+                // reasoning as the header check above.
+                return Vec::new();
+            };
             if flags == SLOT_FLAG_LIVE {
                 let data = buf[offset..offset + length].to_vec();
                 live_entries.push((i, data));
@@ -272,11 +341,18 @@ impl DataPage {
     // and orphaned data bytes are not included, matching "what would remain
     // after compact()".
     pub fn used_space(buf: &[u8; PAGE_SIZE]) -> usize {
-        let count = Self::slot_count(buf);
+        // Corrupt header ⇒ occupancy is meaningless; returning 0 keeps
+        // defrag's density math defined without pretending the page has
+        // usable free space.
+        let Some((_, _, count)) = Self::validate_header(buf) else {
+            return 0;
+        };
         let mut data_bytes = 0usize;
         let mut live_slots = 0usize;
         for i in 0..count {
-            let (_, length, flags) = Self::read_slot_entry(buf, i);
+            let Some((_, length, flags)) = Self::read_slot_entry(buf, i) else {
+                return 0;
+            };
             if flags == SLOT_FLAG_LIVE {
                 data_bytes += length;
                 live_slots += 1;
@@ -292,10 +368,16 @@ impl DataPage {
     // across the iteration — important for defrag, which rewrites handle
     // table entries.
     pub fn iter_live(buf: &[u8; PAGE_SIZE]) -> Vec<(u16, &[u8])> {
-        let count = Self::slot_count(buf);
+        // Corrupt header ⇒ no slots are reported; see compact/used_space
+        // for the same reasoning.
+        let Some((_, _, count)) = Self::validate_header(buf) else {
+            return Vec::new();
+        };
         let mut result = Vec::new();
         for i in 0..count {
-            let (offset, length, flags) = Self::read_slot_entry(buf, i);
+            let Some((offset, length, flags)) = Self::read_slot_entry(buf, i) else {
+                return Vec::new();
+            };
             if flags == SLOT_FLAG_LIVE {
                 result.push((i, &buf[offset..offset + length]));
             }
@@ -305,18 +387,43 @@ impl DataPage {
 
     // --- Private helpers ---
     //
-    // These compute slot entry byte offsets from a slot index. The base
-    // formula `DATA_PAGE_HEADER_SIZE + slot * SLOT_ENTRY_SIZE` encodes the
-    // invariant that the slot directory is packed immediately after the
-    // fixed header with no gaps. None of these helpers validate bounds; the
-    // callers above must ensure `slot < slot_count(buf)`.
+    // `read_slot_entry` returns Option so every caller is forced to decide
+    // what a structurally-broken slot entry means. The other helpers
+    // (`write_slot_*`) skip validation because the only callers are
+    // `insert`/`update`/`compact` AFTER `validate_header` has confirmed
+    // the directory fits within the page. Whenever a slot index comes
+    // from the on-disk file (not a freshly-produced index), route it
+    // through `read_slot_entry` rather than indexing directly.
 
-    fn read_slot_entry(buf: &[u8; PAGE_SIZE], slot: u16) -> (usize, usize, u16) {
-        let base = DATA_PAGE_HEADER_SIZE + (slot as usize) * SLOT_ENTRY_SIZE;
+    /// Parse a single slot directory entry. Returns None if the slot
+    /// base or the referenced payload range would fall outside the
+    /// page body.
+    ///
+    /// Callers may have already validated `slot < slot_count` via
+    /// `validate_header`, but this function still re-checks the
+    /// physical bounds so it remains safe to call on an untrusted
+    /// slot index in isolation.
+    fn read_slot_entry(buf: &[u8; PAGE_SIZE], slot: u16) -> Option<(usize, usize, u16)> {
+        let base =
+            DATA_PAGE_HEADER_SIZE.checked_add((slot as usize).checked_mul(SLOT_ENTRY_SIZE)?)?;
+        if base.checked_add(SLOT_ENTRY_SIZE)? > CHECKSUM_OFFSET {
+            return None;
+        }
         let offset = u16::from_le_bytes(buf[base..base + 2].try_into().unwrap()) as usize;
         let length = u16::from_le_bytes(buf[base + 2..base + 4].try_into().unwrap()) as usize;
         let flags = u16::from_le_bytes(buf[base + 4..base + 6].try_into().unwrap());
-        (offset, length, flags)
+        // Payload must live entirely within the page body, and must not
+        // overlap the fixed header. A dead slot's bytes are still bounded
+        // by these invariants, so we check even when the caller may
+        // eventually discard the entry.
+        if offset < DATA_PAGE_HEADER_SIZE {
+            return None;
+        }
+        let end = offset.checked_add(length)?;
+        if end > CHECKSUM_OFFSET {
+            return None;
+        }
+        Some((offset, length, flags))
     }
 
     fn write_slot_offset(buf: &mut [u8; PAGE_SIZE], slot: u16, offset: u16) {
@@ -332,5 +439,123 @@ impl DataPage {
     fn write_slot_flags(buf: &mut [u8; PAGE_SIZE], slot: u16, flags: u16) {
         let base = DATA_PAGE_HEADER_SIZE + (slot as usize) * SLOT_ENTRY_SIZE;
         buf[base + 4..base + 6].copy_from_slice(&flags.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod corruption_tests {
+    use super::*;
+
+    // Each of these tests constructs a checksum-VALID page whose header
+    // or slot directory has out-of-band values, then verifies that every
+    // public reader returns a graceful empty/false rather than panicking.
+    // This is the defence-in-depth layer that catches "wrong page type
+    // reached via a stale pointer" — the page-cache checksum layer can't
+    // detect that because the bytes were written correctly for what they
+    // were; they're just not a Data page.
+
+    fn fresh_page() -> [u8; PAGE_SIZE] {
+        let mut buf = [0u8; PAGE_SIZE];
+        DataPage::init_page(&mut buf);
+        buf
+    }
+
+    #[test]
+    fn read_returns_none_on_corrupt_slot_count() {
+        let mut buf = fresh_page();
+        // slot_count = 0xFFFF: far past the directory region.
+        buf[2..4].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        assert!(DataPage::read(&buf, 0).is_none());
+        assert!(DataPage::read(&buf, 1365).is_none());
+        assert!(DataPage::read(&buf, 0xFFFE).is_none());
+    }
+
+    #[test]
+    fn read_returns_none_on_out_of_range_offset_length() {
+        let mut buf = fresh_page();
+        // Construct a directory with one entry whose offset+length
+        // runs past CHECKSUM_OFFSET.
+        buf[2..4].copy_from_slice(&1u16.to_le_bytes());
+        let free_start = (DATA_PAGE_HEADER_SIZE + SLOT_ENTRY_SIZE) as u16;
+        buf[4..6].copy_from_slice(&free_start.to_le_bytes());
+        let base = DATA_PAGE_HEADER_SIZE;
+        // offset = 8000, length = 500 → end = 8500 > CHECKSUM_OFFSET (8184)
+        buf[base..base + 2].copy_from_slice(&8000u16.to_le_bytes());
+        buf[base + 2..base + 4].copy_from_slice(&500u16.to_le_bytes());
+        buf[base + 4..base + 6].copy_from_slice(&SLOT_FLAG_LIVE.to_le_bytes());
+        assert!(DataPage::read(&buf, 0).is_none());
+    }
+
+    #[test]
+    fn read_returns_none_on_offset_below_header() {
+        let mut buf = fresh_page();
+        buf[2..4].copy_from_slice(&1u16.to_le_bytes());
+        buf[4..6]
+            .copy_from_slice(&((DATA_PAGE_HEADER_SIZE + SLOT_ENTRY_SIZE) as u16).to_le_bytes());
+        // offset = 4 sits inside the fixed header.
+        let base = DATA_PAGE_HEADER_SIZE;
+        buf[base..base + 2].copy_from_slice(&4u16.to_le_bytes());
+        buf[base + 2..base + 4].copy_from_slice(&1u16.to_le_bytes());
+        buf[base + 4..base + 6].copy_from_slice(&SLOT_FLAG_LIVE.to_le_bytes());
+        assert!(DataPage::read(&buf, 0).is_none());
+    }
+
+    #[test]
+    fn read_returns_none_on_free_end_past_page_body() {
+        let mut buf = fresh_page();
+        // free_end past CHECKSUM_OFFSET
+        buf[6..8].copy_from_slice(&(CHECKSUM_OFFSET as u16 + 100).to_le_bytes());
+        assert!(DataPage::read(&buf, 0).is_none());
+        assert_eq!(DataPage::free_space(&buf), 0);
+    }
+
+    #[test]
+    fn read_returns_none_on_free_start_less_than_header() {
+        let mut buf = fresh_page();
+        buf[4..6].copy_from_slice(&4u16.to_le_bytes());
+        assert!(DataPage::read(&buf, 0).is_none());
+    }
+
+    #[test]
+    fn read_returns_none_on_wrong_page_type() {
+        let mut buf = fresh_page();
+        buf[0] = 0xFF; // not PageType::Data
+        assert!(DataPage::read(&buf, 0).is_none());
+        assert_eq!(DataPage::used_space(&buf), 0);
+        assert_eq!(DataPage::iter_live(&buf).len(), 0);
+    }
+
+    #[test]
+    fn update_returns_false_on_corrupt_header() {
+        let mut buf = fresh_page();
+        let slot = DataPage::insert(&mut buf, b"hello").unwrap();
+        // Now corrupt: slot_count says 10_000 entries.
+        buf[2..4].copy_from_slice(&10_000u16.to_le_bytes());
+        assert!(!DataPage::update(&mut buf, slot, b"world"));
+    }
+
+    #[test]
+    fn compact_returns_empty_on_corrupt_page() {
+        let mut buf = fresh_page();
+        buf[0] = 0x00;
+        assert!(DataPage::compact(&mut buf).is_empty());
+    }
+
+    #[test]
+    fn insert_refuses_corrupt_header() {
+        let mut buf = fresh_page();
+        buf[4..6].copy_from_slice(&(CHECKSUM_OFFSET as u16 + 1).to_le_bytes());
+        assert!(DataPage::insert(&mut buf, b"x").is_none());
+    }
+
+    #[test]
+    fn iter_live_and_used_space_survive_oversized_slot_count() {
+        let mut buf = fresh_page();
+        DataPage::insert(&mut buf, b"abc").unwrap();
+        // Inflate slot_count so the directory "extends" past the data
+        // region. validate_header must reject this.
+        buf[2..4].copy_from_slice(&2000u16.to_le_bytes());
+        assert_eq!(DataPage::iter_live(&buf).len(), 0);
+        assert_eq!(DataPage::used_space(&buf), 0);
     }
 }

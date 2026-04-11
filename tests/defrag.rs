@@ -1,5 +1,29 @@
-use chisel::Chisel;
+use chisel::{Chisel, ChiselError};
 use tempfile::NamedTempFile;
+
+#[test]
+fn test_defrag_without_active_txn_errors_immediately() {
+    // defrag() mutates through `update`, which requires an active
+    // transaction. Calling defrag on an idle handle must fail
+    // eagerly with `NoActiveTransaction` rather than reading from
+    // the committed snapshot and then failing partway through on
+    // the first update.
+    let file = NamedTempFile::new().unwrap();
+    let mut db = Chisel::open(file.path(), Default::default()).unwrap();
+
+    db.begin().unwrap();
+    for i in 0..4 {
+        db.allocate(&[i as u8; 32]).unwrap();
+    }
+    db.commit().unwrap();
+
+    // NO begin() here: the next call is defrag on an idle handle.
+    let err = db.defrag(Default::default()).unwrap_err();
+    assert!(
+        matches!(err, ChiselError::NoActiveTransaction),
+        "expected NoActiveTransaction, got {err:?}"
+    );
+}
 
 #[test]
 fn test_defrag_reclaims_space_after_deletes() {

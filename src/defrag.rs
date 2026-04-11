@@ -119,6 +119,16 @@ pub struct DefragStats {
 ///   this pass — only data pages are compacted. Handle-table spine
 ///   cleanup would require a separate mechanism.
 pub fn defrag(txm: &mut TransactionManager, options: &DefragOptions) -> Result<DefragStats> {
+    // Defrag mutates through `txm.update`, which requires an active
+    // transaction. Without this check, a caller who forgot to `begin()`
+    // would do some reads (those fall back to committed_roots), start
+    // relocating values, and then hit `NoActiveTransaction` on the
+    // first `update` — leaving the sweep in a half-done state with
+    // confusing stats. Fail fast instead.
+    if !txm.is_active() {
+        return Err(crate::error::ChiselError::NoActiveTransaction);
+    }
+
     let mut stats = DefragStats {
         pages_examined: 0,
         pages_freed: 0,
