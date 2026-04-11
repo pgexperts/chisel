@@ -42,11 +42,13 @@ pub const DEFAULT_SUPERBLOCK_COUNT: u32 = 2;
 
 // Byte offset of the superblock_count field within the serialized
 // superblock page. Placed AFTER the named-root table (which ends at
-// NAMED_ROOTS_END = 308). A value of 0 in a deserialized superblock is
-// treated as "legacy, implies 2" — this is defensive; no such files
-// exist in practice because R4 shipped alongside v2, but the
-// interpretation protects against any future accidental zero-filling
-// of the field.
+// NAMED_ROOTS_END = 308). Deserialization rejects any value outside
+// MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS — a slot with an out-of-range
+// count is treated like a failed checksum: discarded by `select()`,
+// letting the sibling slot take over. A bogus count can't be allowed
+// to reach commit because it's used as the slot-selection modulus
+// (txn_counter % superblock_count); an out-of-range value would
+// direct superblock writes into the data region.
 const SUPERBLOCK_COUNT_OFFSET: usize = 308;
 
 // Named-root table (ISSUES.md F2). A small fixed-width table lives inside
@@ -215,21 +217,21 @@ impl Superblock {
                     .unwrap(),
             );
         }
-        // Superblock count (R4). A zero-valued field is interpreted as
-        // "legacy, implies default of 2" — defensive code that's not
-        // actually exercised by any in-the-wild file (R4 shipped with
-        // v2), but means a future zero-fill bug wouldn't immediately
-        // brick open-time recovery.
-        let raw_superblock_count = u32::from_le_bytes(
+        // Superblock count (R4). Must be within MIN..=MAX; any other
+        // value is treated as a corrupt slot. This is load-bearing:
+        // commit uses `txn_counter % superblock_count` to pick the
+        // next write slot, so an out-of-range count would direct a
+        // superblock write into the data region. Validating here (not
+        // later) means `select()` automatically falls back to the
+        // sibling slot if only one slot has a bad count.
+        let superblock_count = u32::from_le_bytes(
             buf[SUPERBLOCK_COUNT_OFFSET..SUPERBLOCK_COUNT_OFFSET + 4]
                 .try_into()
                 .unwrap(),
         );
-        let superblock_count = if raw_superblock_count == 0 {
-            DEFAULT_SUPERBLOCK_COUNT
-        } else {
-            raw_superblock_count
-        };
+        if !(MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS).contains(&superblock_count) {
+            return None;
+        }
         Some(Superblock {
             magic,
             format_version: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
@@ -286,5 +288,59 @@ impl Superblock {
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
             superblock_count,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A superblock whose count field is outside [MIN, MAX] must be
+    /// rejected by `deserialize`. Otherwise the recovered count would
+    /// feed the `txn_counter % superblock_count` slot calculation in
+    /// commit and could direct a superblock write into the data region.
+    #[test]
+    fn deserialize_rejects_out_of_range_superblock_count() {
+        let mut sb = Superblock::new_empty(DEFAULT_SUPERBLOCK_COUNT);
+        for bogus in [0u32, 1, MAX_SUPERBLOCKS + 1, 1_000_000, u32::MAX] {
+            sb.superblock_count = bogus;
+            // Build with the bad value, then re-stamp the checksum so
+            // the only reason to reject is the count field itself.
+            let mut buf = sb.serialize();
+            buf[SUPERBLOCK_COUNT_OFFSET..SUPERBLOCK_COUNT_OFFSET + 4]
+                .copy_from_slice(&bogus.to_le_bytes());
+            page::stamp_checksum(&mut buf);
+            assert!(
+                Superblock::deserialize(&buf).is_none(),
+                "deserialize accepted out-of-range superblock_count = {bogus}"
+            );
+        }
+    }
+
+    /// All in-range counts must round-trip cleanly.
+    #[test]
+    fn deserialize_accepts_all_valid_superblock_counts() {
+        for n in MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS {
+            let sb = Superblock::new_empty(n);
+            let buf = sb.serialize();
+            let got = Superblock::deserialize(&buf).expect("valid count rejected");
+            assert_eq!(got.superblock_count, n);
+        }
+    }
+
+    /// If one slot has a bogus count but the sibling is valid,
+    /// `select()` must pick the valid sibling rather than returning None.
+    #[test]
+    fn select_falls_back_when_one_slot_has_bad_count() {
+        let good = Superblock::new_empty(DEFAULT_SUPERBLOCK_COUNT);
+        let good_buf = good.serialize();
+
+        let mut bad_buf = good.serialize();
+        bad_buf[SUPERBLOCK_COUNT_OFFSET..SUPERBLOCK_COUNT_OFFSET + 4]
+            .copy_from_slice(&1_000_000u32.to_le_bytes());
+        page::stamp_checksum(&mut bad_buf);
+
+        let picked = Superblock::select(&[bad_buf, good_buf]).expect("no slot picked");
+        assert_eq!(picked.superblock_count, DEFAULT_SUPERBLOCK_COUNT);
     }
 }

@@ -664,6 +664,12 @@ impl TransactionManager {
     }
 
     fn begin_inner(&mut self) -> Result<()> {
+        // Fail fast on read-only mounts so callers don't build up
+        // transaction state only to hit a ReadOnlyMode at the first
+        // write_page call during commit.
+        if self.cache.borrow().io().is_read_only() {
+            return Err(ChiselError::ReadOnlyMode);
+        }
         if self.active_txn {
             return Err(ChiselError::TransactionAlreadyActive);
         }
@@ -1103,9 +1109,18 @@ impl TransactionManager {
         match entry.flags {
             HandleFlags::Live => {
                 let buf = cache.get(entry.page_id)?;
-                DataPage::read(buf, entry.slot_index)
-                    .map(|data| data.to_vec())
-                    .ok_or(ChiselError::InvalidHandle(handle))
+                // The handle-table entry insists this slot is live. If
+                // `DataPage::read` returns None anyway, the data page's
+                // structural state disagrees with the handle table — the
+                // page header, slot directory, or slot entry is damaged.
+                // That's CorruptPage (fatal / poisons the manager), not
+                // InvalidHandle (operational).
+                match DataPage::read(buf, entry.slot_index) {
+                    Some(data) => Ok(data.to_vec()),
+                    None => Err(ChiselError::CorruptPage {
+                        page_id: entry.page_id,
+                    }),
+                }
             }
             HandleFlags::Overflow => Overflow::read(&mut cache, entry.page_id),
             HandleFlags::Deleted => Err(ChiselError::InvalidHandle(handle)),

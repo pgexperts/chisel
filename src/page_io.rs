@@ -27,6 +27,12 @@ use crate::page::PAGE_SIZE;
 
 pub struct PageIo {
     file: File,
+    // Tracked alongside the File so every mutating path can fail-fast
+    // with `ReadOnlyMode` rather than letting the kernel return EBADF
+    // (which would surface as a generic, fatal `IoError`). The distinction
+    // matters: a ReadOnlyMode error is operational — the caller just used
+    // the wrong open mode — while a fatal IoError poisons the manager.
+    read_only: bool,
 }
 
 impl PageIo {
@@ -56,7 +62,14 @@ impl PageIo {
                 .open(path)?
         };
         Self::try_lock(&file)?;
-        Ok(PageIo { file })
+        Ok(PageIo { file, read_only })
+    }
+
+    /// True if this handle was opened read-only. Used by higher layers
+    /// (e.g. `TransactionManager::begin`) to fail fast before touching
+    /// any in-memory transaction state.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Acquire an exclusive advisory lock (flock). Returns LockFailed if
@@ -121,6 +134,9 @@ impl PageIo {
     /// pages with fsync BEFORE writing the superblock, and fsyncing AGAIN
     /// after the superblock. See transaction.rs::commit.
     pub fn write_page(&mut self, page_id: u64, buf: &[u8; PAGE_SIZE]) -> Result<()> {
+        if self.read_only {
+            return Err(ChiselError::ReadOnlyMode);
+        }
         let offset = page_id * PAGE_SIZE as u64;
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(buf)?;
@@ -138,6 +154,9 @@ impl PageIo {
     /// commit — once after writing all data pages, once after writing the
     /// superblock. Reversing or dropping either fsync breaks durability.
     pub fn fsync(&self) -> Result<()> {
+        if self.read_only {
+            return Err(ChiselError::ReadOnlyMode);
+        }
         self.file.sync_all()?;
         Ok(())
     }
@@ -160,7 +179,85 @@ impl PageIo {
     /// id >= n become unreadable immediately. Callers must ensure those
     /// pages are not referenced from any committed root before calling.
     pub fn set_page_count(&mut self, n: u64) -> Result<()> {
+        if self.read_only {
+            return Err(ChiselError::ReadOnlyMode);
+        }
         self.file.set_len(n * PAGE_SIZE as u64)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    // Defense-in-depth regression tests. The upper layer
+    // (`TransactionManager::begin`) fails fast on a read-only handle,
+    // so in normal operation these guards are never reached — but they
+    // exist precisely so a hypothetical new caller that reached for
+    // `PageIo` directly cannot silently scribble on a read-only file.
+    //
+    // Each test exercises exactly one mutating entry point so that a
+    // future refactor which removes one of the three guards will fail
+    // its corresponding test specifically, rather than being masked by
+    // the `begin()` check at the transaction layer.
+
+    /// Create a seeded file (one page of zeros) that the read-only
+    /// opens below can then exercise without tripping the "zero length
+    /// ⇒ create_new" fallback.
+    fn seeded_file() -> NamedTempFile {
+        let f = NamedTempFile::new().unwrap();
+        // Write one page of zeros via a write-capable PageIo, then drop
+        // it to release the flock.
+        {
+            let mut io = PageIo::open(f.path(), false).unwrap();
+            io.write_page(0, &[0u8; PAGE_SIZE]).unwrap();
+            io.fsync().unwrap();
+        }
+        f
+    }
+
+    #[test]
+    fn write_page_on_read_only_returns_read_only_mode() {
+        let f = seeded_file();
+        let mut io = PageIo::open(f.path(), true).unwrap();
+        let err = io.write_page(0, &[0u8; PAGE_SIZE]).unwrap_err();
+        assert!(
+            matches!(err, ChiselError::ReadOnlyMode),
+            "expected ReadOnlyMode, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn fsync_on_read_only_returns_read_only_mode() {
+        let f = seeded_file();
+        let io = PageIo::open(f.path(), true).unwrap();
+        let err = io.fsync().unwrap_err();
+        assert!(
+            matches!(err, ChiselError::ReadOnlyMode),
+            "expected ReadOnlyMode, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn set_page_count_on_read_only_returns_read_only_mode() {
+        let f = seeded_file();
+        let mut io = PageIo::open(f.path(), true).unwrap();
+        let err = io.set_page_count(0).unwrap_err();
+        assert!(
+            matches!(err, ChiselError::ReadOnlyMode),
+            "expected ReadOnlyMode, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_page_on_read_only_succeeds() {
+        // Sanity: the guards are per-mutator, not a blanket refusal.
+        // Opening read-only must still permit reads.
+        let f = seeded_file();
+        let mut io = PageIo::open(f.path(), true).unwrap();
+        let buf = io.read_page(0).unwrap();
+        assert_eq!(buf, [0u8; PAGE_SIZE]);
     }
 }
