@@ -53,6 +53,7 @@ fn test_superblock_roundtrip() {
         next_handle: 50,
         page_size: PAGE_SIZE as u32,
         named_roots: [chisel::superblock::NamedRoot::EMPTY; chisel::superblock::NAMED_ROOT_COUNT],
+        superblock_count: chisel::superblock::DEFAULT_SUPERBLOCK_COUNT,
     };
     let buf = sb.serialize();
     let sb2 = Superblock::deserialize(&buf).unwrap();
@@ -71,6 +72,7 @@ fn test_superblock_checksum_validation() {
         next_handle: 0,
         page_size: PAGE_SIZE as u32,
         named_roots: [chisel::superblock::NamedRoot::EMPTY; chisel::superblock::NAMED_ROOT_COUNT],
+        superblock_count: chisel::superblock::DEFAULT_SUPERBLOCK_COUNT,
     };
     let mut buf = sb.serialize();
     buf[10] ^= 0xFF;
@@ -89,6 +91,7 @@ fn test_superblock_selection() {
         next_handle: 3,
         page_size: PAGE_SIZE as u32,
         named_roots: [chisel::superblock::NamedRoot::EMPTY; chisel::superblock::NAMED_ROOT_COUNT],
+        superblock_count: chisel::superblock::DEFAULT_SUPERBLOCK_COUNT,
     };
     let sb2 = Superblock {
         magic: MAGIC,
@@ -100,6 +103,7 @@ fn test_superblock_selection() {
         next_handle: 5,
         page_size: PAGE_SIZE as u32,
         named_roots: [chisel::superblock::NamedRoot::EMPTY; chisel::superblock::NAMED_ROOT_COUNT],
+        superblock_count: chisel::superblock::DEFAULT_SUPERBLOCK_COUNT,
     };
     let buf1 = sb1.serialize();
     let buf2 = sb2.serialize();
@@ -119,6 +123,7 @@ fn test_superblock_selection_with_one_corrupt() {
         next_handle: 3,
         page_size: PAGE_SIZE as u32,
         named_roots: [chisel::superblock::NamedRoot::EMPTY; chisel::superblock::NAMED_ROOT_COUNT],
+        superblock_count: chisel::superblock::DEFAULT_SUPERBLOCK_COUNT,
     };
     let sb2_buf = [0u8; PAGE_SIZE];
     let buf1 = sb1.serialize();
