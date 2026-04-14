@@ -207,18 +207,28 @@ chisel.ChiselError                    (base, inherits Exception)
 ├── chisel.OperationalError           (database healthy; caller misused it)
 │   ├── InvalidHandleError
 │   ├── NoActiveTransactionError
-│   ├── InvalidSavepointError
+│   ├── TransactionAlreadyActiveError
+│   ├── SavepointNotFoundError
+│   ├── DuplicateSavepointError
 │   ├── ReadOnlyModeError
-│   ├── LockFailedError
 │   ├── FileNotFoundError             (module-qualified; not the builtin)
-│   ├── InvalidSuperblockCountError
-│   └── ValueTooLargeError
+│   ├── InvalidRootNameError
+│   ├── RootNameTableFullError
+│   └── InvalidSuperblockCountError
 └── chisel.FatalError                 (handle is poisoned; drop and reopen)
     ├── IoError                       (wraps OSError as .__cause__)
     ├── ChecksumMismatchError
     ├── CorruptSuperblockError
+    ├── FileSizeMismatchError
+    ├── InvalidMagicError
+    ├── LockFailedError               (Rust is_fatal() classifies this fatal)
+    ├── UnsupportedFormatVersionError
+    ├── CorruptPageError
+    ├── InvalidPageIdError
     └── PoisonedError                 (raised from every call after poisoning)
 ```
+
+The Operational/Fatal split follows `ChiselError::is_fatal()` in `src/error.rs` — that method is authoritative for which variants trigger poisoning, so the Python hierarchy mirrors it exactly.
 
 Every Rust `ChiselError` variant maps 1:1 to a Python exception class. The two-tier split (`OperationalError` vs `FatalError`) encodes Chisel's poison-on-fatal recovery protocol directly: catching `FatalError` is a caller's signal to drop the handle and reopen; catching `OperationalError` is recoverable without reopening.
 
