@@ -14,7 +14,7 @@ def test_operational_hierarchy():
         "SavepointNotFoundError",
         "DuplicateSavepointError",
         "ReadOnlyModeError",
-        "FileNotFoundError",
+        "DatabaseFileNotFoundError",
         "InvalidRootNameError",
         "RootNameTableFullError",
         "InvalidSuperblockCountError",

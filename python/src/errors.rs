@@ -21,7 +21,7 @@ create_exception!(_chisel, TransactionAlreadyActiveError, OperationalError);
 create_exception!(_chisel, SavepointNotFoundError, OperationalError);
 create_exception!(_chisel, DuplicateSavepointError, OperationalError);
 create_exception!(_chisel, ReadOnlyModeError, OperationalError);
-create_exception!(_chisel, FileNotFoundError, OperationalError);
+create_exception!(_chisel, DatabaseFileNotFoundError, OperationalError);
 create_exception!(_chisel, InvalidRootNameError, OperationalError);
 create_exception!(_chisel, RootNameTableFullError, OperationalError);
 create_exception!(_chisel, InvalidSuperblockCountError, OperationalError);
@@ -69,8 +69,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         py.get_type_bound::<ReadOnlyModeError>(),
     )?;
     m.add(
-        "FileNotFoundError",
-        py.get_type_bound::<FileNotFoundError>(),
+        "DatabaseFileNotFoundError",
+        py.get_type_bound::<DatabaseFileNotFoundError>(),
     )?;
     m.add(
         "InvalidRootNameError",
@@ -133,7 +133,7 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
         RustChiselError::SavepointNotFound(_) => SavepointNotFoundError::new_err(msg),
         RustChiselError::DuplicateSavepoint(_) => DuplicateSavepointError::new_err(msg),
         RustChiselError::ReadOnlyMode => ReadOnlyModeError::new_err(msg),
-        RustChiselError::FileNotFound => FileNotFoundError::new_err(msg),
+        RustChiselError::FileNotFound => DatabaseFileNotFoundError::new_err(msg),
         RustChiselError::InvalidRootName => InvalidRootNameError::new_err(msg),
         RustChiselError::RootNameTableFull => RootNameTableFullError::new_err(msg),
         RustChiselError::InvalidSuperblockCount { .. } => InvalidSuperblockCountError::new_err(msg),
