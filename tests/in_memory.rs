@@ -4,6 +4,8 @@
 // integration suite; these tests cover only what is specific to memory mode:
 // the open constructors, option validation, and isolation between instances.
 
+mod common;
+
 use chisel::{Chisel, Options};
 
 #[test]
@@ -75,3 +77,13 @@ fn dropping_in_memory_db_releases_backing() {
         db.commit().unwrap();
     }
 }
+
+fn sanity_body(b: &common::Backing) {
+    let mut db = common::open_chisel(b);
+    db.begin().unwrap();
+    let h = db.allocate(b"ok").unwrap();
+    db.commit().unwrap();
+    assert_eq!(db.read(h).unwrap(), b"ok".to_vec());
+}
+
+dual_backing_test!(harness_sanity, sanity_body);
