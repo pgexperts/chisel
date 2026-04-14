@@ -343,10 +343,11 @@ mod read_only_tests {
 mod memory_backing_tests {
     use super::*;
 
-    // These tests exercise the Memory variant through the PageIo surface.
-    // They use the (Task 3) constructor `PageIo::open_in_memory`, written
-    // against its final signature so that implementing Task 3 flips these
-    // from failing-to-compile to passing.
+    // Tests for the Memory variant of Backing, exercised through the public
+    // PageIo surface. The File variant has its own coverage in the wider
+    // test suite (integration tests open a NamedTempFile); these focus on
+    // semantics specific to the in-memory backing — POSIX-parity sparse
+    // writes, fsync as a no-op, and shrink/grow via set_page_count.
 
     #[test]
     fn memory_starts_with_zero_pages() {
@@ -402,8 +403,24 @@ mod memory_backing_tests {
 
     #[test]
     fn memory_fsync_is_noop() {
-        let io = PageIo::open_in_memory().unwrap();
+        // fsync on a memory backing must return Ok(()) and leave every
+        // observable property unchanged: page count, page contents, and
+        // the result of subsequent reads. A wrong implementation that
+        // accidentally mutates state would fail here.
+        let mut io = PageIo::open_in_memory().unwrap();
+        let mut marker = [0u8; PAGE_SIZE];
+        marker[0] = 0xA5;
+        marker[PAGE_SIZE - 1] = 0x5A;
+        io.write_page(0, &marker).unwrap();
+        io.write_page(1, &[0u8; PAGE_SIZE]).unwrap();
+
+        let before_count = io.page_count().unwrap();
         io.fsync().unwrap();
+        let after_count = io.page_count().unwrap();
+
+        assert_eq!(before_count, after_count);
+        assert_eq!(io.read_page(0).unwrap(), marker);
+        assert_eq!(io.read_page(1).unwrap(), [0u8; PAGE_SIZE]);
     }
 
     #[test]
