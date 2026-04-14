@@ -170,12 +170,14 @@ def test_operational_hierarchy():
     for cls_name in [
         "InvalidHandleError",
         "NoActiveTransactionError",
-        "InvalidSavepointError",
+        "TransactionAlreadyActiveError",
+        "SavepointNotFoundError",
+        "DuplicateSavepointError",
         "ReadOnlyModeError",
-        "LockFailedError",
         "FileNotFoundError",
+        "InvalidRootNameError",
+        "RootNameTableFullError",
         "InvalidSuperblockCountError",
-        "ValueTooLargeError",
     ]:
         cls = getattr(chisel, cls_name)
         assert issubclass(cls, chisel.OperationalError)
@@ -187,6 +189,12 @@ def test_fatal_hierarchy():
         "IoError",
         "ChecksumMismatchError",
         "CorruptSuperblockError",
+        "FileSizeMismatchError",
+        "InvalidMagicError",
+        "LockFailedError",
+        "UnsupportedFormatVersionError",
+        "CorruptPageError",
+        "InvalidPageIdError",
         "PoisonedError",
     ]:
         cls = getattr(chisel, cls_name)
@@ -243,35 +251,52 @@ create_exception!(_chisel, FatalError, ChiselError);
 // Operational
 create_exception!(_chisel, InvalidHandleError, OperationalError);
 create_exception!(_chisel, NoActiveTransactionError, OperationalError);
-create_exception!(_chisel, InvalidSavepointError, OperationalError);
+create_exception!(_chisel, TransactionAlreadyActiveError, OperationalError);
+create_exception!(_chisel, SavepointNotFoundError, OperationalError);
+create_exception!(_chisel, DuplicateSavepointError, OperationalError);
 create_exception!(_chisel, ReadOnlyModeError, OperationalError);
-create_exception!(_chisel, LockFailedError, OperationalError);
 create_exception!(_chisel, FileNotFoundError, OperationalError);
+create_exception!(_chisel, InvalidRootNameError, OperationalError);
+create_exception!(_chisel, RootNameTableFullError, OperationalError);
 create_exception!(_chisel, InvalidSuperblockCountError, OperationalError);
-create_exception!(_chisel, ValueTooLargeError, OperationalError);
 
-// Fatal
+// Fatal — matches ChiselError::is_fatal() in src/error.rs exactly.
 create_exception!(_chisel, IoError, FatalError);
 create_exception!(_chisel, ChecksumMismatchError, FatalError);
 create_exception!(_chisel, CorruptSuperblockError, FatalError);
+create_exception!(_chisel, FileSizeMismatchError, FatalError);
+create_exception!(_chisel, InvalidMagicError, FatalError);
+create_exception!(_chisel, LockFailedError, FatalError);
+create_exception!(_chisel, UnsupportedFormatVersionError, FatalError);
+create_exception!(_chisel, CorruptPageError, FatalError);
+create_exception!(_chisel, InvalidPageIdError, FatalError);
 create_exception!(_chisel, PoisonedError, FatalError);
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("ChiselError", m.py().get_type_bound::<ChiselError>())?;
-    m.add("OperationalError", m.py().get_type_bound::<OperationalError>())?;
-    m.add("FatalError", m.py().get_type_bound::<FatalError>())?;
-    m.add("InvalidHandleError", m.py().get_type_bound::<InvalidHandleError>())?;
-    m.add("NoActiveTransactionError", m.py().get_type_bound::<NoActiveTransactionError>())?;
-    m.add("InvalidSavepointError", m.py().get_type_bound::<InvalidSavepointError>())?;
-    m.add("ReadOnlyModeError", m.py().get_type_bound::<ReadOnlyModeError>())?;
-    m.add("LockFailedError", m.py().get_type_bound::<LockFailedError>())?;
-    m.add("FileNotFoundError", m.py().get_type_bound::<FileNotFoundError>())?;
-    m.add("InvalidSuperblockCountError", m.py().get_type_bound::<InvalidSuperblockCountError>())?;
-    m.add("ValueTooLargeError", m.py().get_type_bound::<ValueTooLargeError>())?;
-    m.add("IoError", m.py().get_type_bound::<IoError>())?;
-    m.add("ChecksumMismatchError", m.py().get_type_bound::<ChecksumMismatchError>())?;
-    m.add("CorruptSuperblockError", m.py().get_type_bound::<CorruptSuperblockError>())?;
-    m.add("PoisonedError", m.py().get_type_bound::<PoisonedError>())?;
+    let py = m.py();
+    m.add("ChiselError", py.get_type_bound::<ChiselError>())?;
+    m.add("OperationalError", py.get_type_bound::<OperationalError>())?;
+    m.add("FatalError", py.get_type_bound::<FatalError>())?;
+    m.add("InvalidHandleError", py.get_type_bound::<InvalidHandleError>())?;
+    m.add("NoActiveTransactionError", py.get_type_bound::<NoActiveTransactionError>())?;
+    m.add("TransactionAlreadyActiveError", py.get_type_bound::<TransactionAlreadyActiveError>())?;
+    m.add("SavepointNotFoundError", py.get_type_bound::<SavepointNotFoundError>())?;
+    m.add("DuplicateSavepointError", py.get_type_bound::<DuplicateSavepointError>())?;
+    m.add("ReadOnlyModeError", py.get_type_bound::<ReadOnlyModeError>())?;
+    m.add("FileNotFoundError", py.get_type_bound::<FileNotFoundError>())?;
+    m.add("InvalidRootNameError", py.get_type_bound::<InvalidRootNameError>())?;
+    m.add("RootNameTableFullError", py.get_type_bound::<RootNameTableFullError>())?;
+    m.add("InvalidSuperblockCountError", py.get_type_bound::<InvalidSuperblockCountError>())?;
+    m.add("IoError", py.get_type_bound::<IoError>())?;
+    m.add("ChecksumMismatchError", py.get_type_bound::<ChecksumMismatchError>())?;
+    m.add("CorruptSuperblockError", py.get_type_bound::<CorruptSuperblockError>())?;
+    m.add("FileSizeMismatchError", py.get_type_bound::<FileSizeMismatchError>())?;
+    m.add("InvalidMagicError", py.get_type_bound::<InvalidMagicError>())?;
+    m.add("LockFailedError", py.get_type_bound::<LockFailedError>())?;
+    m.add("UnsupportedFormatVersionError", py.get_type_bound::<UnsupportedFormatVersionError>())?;
+    m.add("CorruptPageError", py.get_type_bound::<CorruptPageError>())?;
+    m.add("InvalidPageIdError", py.get_type_bound::<InvalidPageIdError>())?;
+    m.add("PoisonedError", py.get_type_bound::<PoisonedError>())?;
     Ok(())
 }
 
@@ -279,34 +304,38 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // variant explicitly so adding a new Rust variant is a compile error here,
 // not a silent fallthrough to a generic ChiselError.
 pub fn to_py_err(err: ChiselError) -> PyErr {
+    // Display impl on ChiselError already produces a human-readable message;
+    // use it for the exception's argument so callers see the same text Rust
+    // callers would see via println!("{err}").
+    let msg = err.to_string();
     match err {
-        ChiselError::InvalidHandle => InvalidHandleError::new_err("invalid handle"),
-        ChiselError::NoActiveTransaction => NoActiveTransactionError::new_err("no active transaction"),
-        ChiselError::InvalidSavepoint { ref name } => {
-            InvalidSavepointError::new_err(format!("invalid savepoint: {name}"))
-        }
-        ChiselError::ReadOnlyMode => ReadOnlyModeError::new_err("database opened read-only"),
-        ChiselError::LockFailed => LockFailedError::new_err("could not acquire file lock"),
-        ChiselError::FileNotFound => FileNotFoundError::new_err("database file not found"),
-        ChiselError::InvalidSuperblockCount { value } => {
-            InvalidSuperblockCountError::new_err(format!("invalid superblock_count: {value}"))
-        }
-        ChiselError::ValueTooLarge { size } => {
-            ValueTooLargeError::new_err(format!("value too large: {size} bytes"))
-        }
-        ChiselError::IoError(ref e) => IoError::new_err(format!("I/O error: {e}")),
-        ChiselError::ChecksumMismatch { page_id } => {
-            ChecksumMismatchError::new_err(format!("checksum mismatch on page {page_id}"))
-        }
-        ChiselError::CorruptSuperblock => CorruptSuperblockError::new_err("corrupt superblock"),
-        ChiselError::Poisoned => PoisonedError::new_err(
-            "database handle is poisoned by a prior fatal error; drop and reopen"
-        ),
+        // Operational
+        ChiselError::InvalidHandle(_) => InvalidHandleError::new_err(msg),
+        ChiselError::NoActiveTransaction => NoActiveTransactionError::new_err(msg),
+        ChiselError::TransactionAlreadyActive => TransactionAlreadyActiveError::new_err(msg),
+        ChiselError::SavepointNotFound(_) => SavepointNotFoundError::new_err(msg),
+        ChiselError::DuplicateSavepoint(_) => DuplicateSavepointError::new_err(msg),
+        ChiselError::ReadOnlyMode => ReadOnlyModeError::new_err(msg),
+        ChiselError::FileNotFound => FileNotFoundError::new_err(msg),
+        ChiselError::InvalidRootName => InvalidRootNameError::new_err(msg),
+        ChiselError::RootNameTableFull => RootNameTableFullError::new_err(msg),
+        ChiselError::InvalidSuperblockCount { .. } => InvalidSuperblockCountError::new_err(msg),
+        // Fatal
+        ChiselError::IoError(_) => IoError::new_err(msg),
+        ChiselError::ChecksumMismatch { .. } => ChecksumMismatchError::new_err(msg),
+        ChiselError::CorruptSuperblock => CorruptSuperblockError::new_err(msg),
+        ChiselError::FileSizeMismatch { .. } => FileSizeMismatchError::new_err(msg),
+        ChiselError::InvalidMagic => InvalidMagicError::new_err(msg),
+        ChiselError::LockFailed => LockFailedError::new_err(msg),
+        ChiselError::UnsupportedFormatVersion { .. } => UnsupportedFormatVersionError::new_err(msg),
+        ChiselError::CorruptPage { .. } => CorruptPageError::new_err(msg),
+        ChiselError::InvalidPageId { .. } => InvalidPageIdError::new_err(msg),
+        ChiselError::Poisoned => PoisonedError::new_err(msg),
     }
 }
 ```
 
-Note: check the exact variant names in `chisel::error::ChiselError` and adjust the match arms if any names differ. Every Rust variant must be handled explicitly.
+The match is exhaustive — adding a new variant to `ChiselError` will produce a compile error here, forcing the binding to be updated rather than silently routing to a generic error.
 
 - [ ] **Step 4: Wire errors into `python/src/lib.rs`**
 
@@ -334,25 +363,37 @@ from chisel._chisel import (
     FatalError,
     InvalidHandleError,
     NoActiveTransactionError,
-    InvalidSavepointError,
+    TransactionAlreadyActiveError,
+    SavepointNotFoundError,
+    DuplicateSavepointError,
     ReadOnlyModeError,
-    LockFailedError,
     FileNotFoundError,
+    InvalidRootNameError,
+    RootNameTableFullError,
     InvalidSuperblockCountError,
-    ValueTooLargeError,
     IoError,
     ChecksumMismatchError,
     CorruptSuperblockError,
+    FileSizeMismatchError,
+    InvalidMagicError,
+    LockFailedError,
+    UnsupportedFormatVersionError,
+    CorruptPageError,
+    InvalidPageIdError,
     PoisonedError,
 )
 
 __all__ = [
     "__version__",
     "ChiselError", "OperationalError", "FatalError",
-    "InvalidHandleError", "NoActiveTransactionError", "InvalidSavepointError",
-    "ReadOnlyModeError", "LockFailedError", "FileNotFoundError",
-    "InvalidSuperblockCountError", "ValueTooLargeError",
+    "InvalidHandleError", "NoActiveTransactionError",
+    "TransactionAlreadyActiveError", "SavepointNotFoundError",
+    "DuplicateSavepointError", "ReadOnlyModeError", "FileNotFoundError",
+    "InvalidRootNameError", "RootNameTableFullError",
+    "InvalidSuperblockCountError",
     "IoError", "ChecksumMismatchError", "CorruptSuperblockError",
+    "FileSizeMismatchError", "InvalidMagicError", "LockFailedError",
+    "UnsupportedFormatVersionError", "CorruptPageError", "InvalidPageIdError",
     "PoisonedError",
 ]
 ```
