@@ -8,6 +8,8 @@ use chisel::page_io::PageIo;
 use chisel::superblock::Superblock;
 use chisel::Chisel;
 use tempfile::NamedTempFile;
+mod common;
+use common::{open_chisel, Backing};
 
 // --- Page checksum tests ---
 
@@ -480,11 +482,8 @@ fn test_handle_table_delete() {
 
 // --- Chisel public API tests ---
 
-#[test]
-fn test_chisel_public_api_roundtrip() {
-    let file = NamedTempFile::new().unwrap();
-    let path = file.path().to_owned();
-    let mut db = Chisel::open(&path, Default::default()).unwrap();
+fn test_chisel_public_api_roundtrip_body(b: &Backing) {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     let h1 = db.allocate(b"value one").unwrap();
     let h2 = db.allocate(b"value two").unwrap();
@@ -499,6 +498,11 @@ fn test_chisel_public_api_roundtrip() {
     assert!(db.read(h2).is_err());
     db.close().unwrap();
 }
+
+dual_backing_test!(
+    test_chisel_public_api_roundtrip,
+    test_chisel_public_api_roundtrip_body
+);
 
 #[test]
 fn test_chisel_reopen() {
@@ -519,10 +523,8 @@ fn test_chisel_reopen() {
     }
 }
 
-#[test]
-fn test_chisel_stats() {
-    let file = NamedTempFile::new().unwrap();
-    let mut db = Chisel::open(file.path(), Default::default()).unwrap();
+fn test_chisel_stats_body(b: &Backing) {
+    let mut db = open_chisel(b);
     let stats = db.stats().unwrap();
     assert_eq!(stats.handle_count, 0);
     db.begin().unwrap();
@@ -532,3 +534,5 @@ fn test_chisel_stats() {
     let stats = db.stats().unwrap();
     assert_eq!(stats.handle_count, 2);
 }
+
+dual_backing_test!(test_chisel_stats, test_chisel_stats_body);
