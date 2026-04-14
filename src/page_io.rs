@@ -1,4 +1,5 @@
-// page_io.rs — Raw page-level file I/O with exclusive flock.
+// page_io.rs — Raw page I/O with two backings: file (durable) and memory
+// (ephemeral).
 //
 // Architecture layer 2 (per CLAUDE.md): the ONLY module in the engine that
 // touches the filesystem directly. Every other layer (page_cache, freemap,
@@ -6,13 +7,17 @@
 // keeps platform-specific syscalls (flock, fsync, set_len) confined to one
 // place.
 //
-// Invariants:
+// Two backings, one interface:
+// - `Backing::File` — the durable path. Owns a `File` handle for its entire
+//   lifetime; the advisory flock is tied to that fd and released on drop.
+//   Two fsyncs per commit; shadow paging guarantees crash consistency.
+// - `Backing::Memory` — the ephemeral path. Pages live in a `Vec`; fsync is
+//   a no-op; no flock is taken. Used for benchmark parity with SQLite
+//   `:memory:` — see the in-memory-mode spec for the design rationale.
+//
+// Invariants common to both backings:
 // - All reads and writes are page-aligned: offset = page_id * PAGE_SIZE.
 //   Callers pass logical page IDs; this module never sees byte offsets.
-// - The struct owns the `File` handle for its entire lifetime. The advisory
-//   lock is tied to that file descriptor, so `flock` is released implicitly
-//   when `PageIo` (and therefore `File`) is dropped. There is no explicit
-//   unlock path — correctness relies on Rust's drop semantics.
 // - Platform: macOS and Linux only. `libc::flock` is a BSD/Linux syscall;
 //   Windows is not supported.
 // - On-disk format is little-endian (see page.rs); this module is
@@ -31,6 +36,11 @@ use crate::page::PAGE_SIZE;
 // and effectively free once the variant is hot. See the in-memory-mode spec.
 enum Backing {
     File { file: File },
+    // Memory-backed database for benchmarking against SQLite :memory:.
+    // `pages.len() * PAGE_SIZE` is the on-disk "file size" equivalent;
+    // allocating a new page is a `Vec::push` of a zero-filled array.
+    // No fsync, no flock, no recovery — see the in-memory-mode spec.
+    Memory { pages: Vec<[u8; PAGE_SIZE]> },
 }
 
 pub struct PageIo {
@@ -73,6 +83,21 @@ impl PageIo {
         Ok(PageIo {
             backing: Backing::File { file },
             read_only,
+        })
+    }
+
+    /// Open a fresh memory-backed database. Non-durable by design: dropping
+    /// the returned `PageIo` discards all pages. Used for benchmark parity
+    /// with SQLite `:memory:`; not intended for durable workloads.
+    ///
+    /// No `flock` is taken — a memory-backed database is single-client by
+    /// virtue of being owned by a single `PageIo` value. Never fallible in
+    /// the current implementation, but the `Result` return keeps the API
+    /// symmetric with `open` and leaves room for future fallible init.
+    pub fn open_in_memory() -> Result<PageIo> {
+        Ok(PageIo {
+            backing: Backing::Memory { pages: Vec::new() },
+            read_only: false,
         })
     }
 
@@ -133,6 +158,7 @@ impl PageIo {
                 file.read_exact(&mut buf)?;
                 Ok(buf)
             }
+            Backing::Memory { pages } => Ok(pages[page_id as usize]),
         }
     }
 
@@ -159,6 +185,17 @@ impl PageIo {
                 file.write_all(buf)?;
                 Ok(())
             }
+            Backing::Memory { pages } => {
+                // Match POSIX: writing past end extends, intermediate pages
+                // are zero-filled. Shadow paging and PageCache::new_page
+                // rely on this growth shape.
+                let idx = page_id as usize;
+                if idx >= pages.len() {
+                    pages.resize(idx + 1, [0u8; PAGE_SIZE]);
+                }
+                pages[idx] = *buf;
+                Ok(())
+            }
         }
     }
 
@@ -181,6 +218,10 @@ impl PageIo {
                 file.sync_all()?;
                 Ok(())
             }
+            // No durable storage to flush. The commit protocol still calls
+            // fsync twice per commit; that overhead (two method calls and
+            // two matches) is preserved for benchmark fidelity.
+            Backing::Memory { .. } => Ok(()),
         }
     }
 
@@ -197,6 +238,7 @@ impl PageIo {
                 let len = file.seek(SeekFrom::End(0))?;
                 Ok(len / PAGE_SIZE as u64)
             }
+            Backing::Memory { pages } => Ok(pages.len() as u64),
         }
     }
 
@@ -212,6 +254,10 @@ impl PageIo {
         match &mut self.backing {
             Backing::File { file } => {
                 file.set_len(n * PAGE_SIZE as u64)?;
+                Ok(())
+            }
+            Backing::Memory { pages } => {
+                pages.resize(n as usize, [0u8; PAGE_SIZE]);
                 Ok(())
             }
         }
@@ -290,5 +336,90 @@ mod read_only_tests {
         let mut io = PageIo::open(f.path(), true).unwrap();
         let buf = io.read_page(0).unwrap();
         assert_eq!(buf, [0u8; PAGE_SIZE]);
+    }
+}
+
+#[cfg(test)]
+mod memory_backing_tests {
+    use super::*;
+
+    // These tests exercise the Memory variant through the PageIo surface.
+    // They use the (Task 3) constructor `PageIo::open_in_memory`, written
+    // against its final signature so that implementing Task 3 flips these
+    // from failing-to-compile to passing.
+
+    #[test]
+    fn memory_starts_with_zero_pages() {
+        let mut io = PageIo::open_in_memory().unwrap();
+        assert_eq!(io.page_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn memory_write_then_read_roundtrip() {
+        let mut io = PageIo::open_in_memory().unwrap();
+        let mut buf = [0u8; PAGE_SIZE];
+        buf[0] = 0x42;
+        buf[PAGE_SIZE - 1] = 0xFF;
+        io.write_page(0, &buf).unwrap();
+        let read = io.read_page(0).unwrap();
+        assert_eq!(read, buf);
+    }
+
+    #[test]
+    fn memory_write_extends_page_count() {
+        let mut io = PageIo::open_in_memory().unwrap();
+        io.write_page(0, &[0u8; PAGE_SIZE]).unwrap();
+        io.write_page(1, &[0u8; PAGE_SIZE]).unwrap();
+        io.write_page(2, &[0u8; PAGE_SIZE]).unwrap();
+        assert_eq!(io.page_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn memory_write_beyond_end_grows_with_zero_fill() {
+        // Writing to page 5 on an empty backing extends pages 0..=5.
+        // Pages 0..=4 must be zero-filled; page 5 carries the written bytes.
+        let mut io = PageIo::open_in_memory().unwrap();
+        let mut buf = [0u8; PAGE_SIZE];
+        buf[42] = 0xAB;
+        io.write_page(5, &buf).unwrap();
+        assert_eq!(io.page_count().unwrap(), 6);
+        for p in 0..5 {
+            assert_eq!(io.read_page(p).unwrap(), [0u8; PAGE_SIZE]);
+        }
+        assert_eq!(io.read_page(5).unwrap(), buf);
+    }
+
+    #[test]
+    fn memory_read_out_of_range_is_invalid_page_id() {
+        let mut io = PageIo::open_in_memory().unwrap();
+        io.write_page(0, &[0u8; PAGE_SIZE]).unwrap();
+        let err = io.read_page(1).unwrap_err();
+        assert!(
+            matches!(err, ChiselError::InvalidPageId { page_id: 1 }),
+            "expected InvalidPageId {{ 1 }}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn memory_fsync_is_noop() {
+        let io = PageIo::open_in_memory().unwrap();
+        io.fsync().unwrap();
+    }
+
+    #[test]
+    fn memory_set_page_count_shrinks_and_grows() {
+        let mut io = PageIo::open_in_memory().unwrap();
+        io.write_page(0, &[1u8; PAGE_SIZE]).unwrap();
+        io.write_page(1, &[2u8; PAGE_SIZE]).unwrap();
+        io.write_page(2, &[3u8; PAGE_SIZE]).unwrap();
+        io.set_page_count(1).unwrap();
+        assert_eq!(io.page_count().unwrap(), 1);
+        assert_eq!(io.read_page(0).unwrap(), [1u8; PAGE_SIZE]);
+        io.set_page_count(4).unwrap();
+        assert_eq!(io.page_count().unwrap(), 4);
+        // Pages 1..=3 are freshly zero-filled after re-growth.
+        for p in 1..4 {
+            assert_eq!(io.read_page(p).unwrap(), [0u8; PAGE_SIZE]);
+        }
     }
 }
