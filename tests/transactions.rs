@@ -3,129 +3,128 @@ use chisel::page_io::PageIo;
 use chisel::transaction::TransactionManager;
 use tempfile::NamedTempFile;
 
-#[test]
-fn test_begin_allocate_commit_read() {
-    let file = NamedTempFile::new().unwrap();
-    let path = file.path().to_owned();
-    let io = PageIo::open(&path, false).unwrap();
-    let cache = PageCache::new(io, 64);
-    let mut txm = TransactionManager::create_new(cache, 2).unwrap();
-    txm.begin().unwrap();
-    let handle = txm.allocate(b"hello world").unwrap();
-    txm.commit().unwrap();
-    let data = txm.read(handle).unwrap();
+mod common;
+use common::{open_chisel, Backing};
+
+fn test_begin_allocate_commit_read_body(b: &Backing) {
+    let mut db = open_chisel(b);
+    db.begin().unwrap();
+    let handle = db.allocate(b"hello world").unwrap();
+    db.commit().unwrap();
+    let data = db.read(handle).unwrap();
     assert_eq!(data, b"hello world");
 }
 
-#[test]
-fn test_rollback_discards_changes() {
-    let file = NamedTempFile::new().unwrap();
-    let io = PageIo::open(file.path(), false).unwrap();
-    let cache = PageCache::new(io, 64);
-    let mut txm = TransactionManager::create_new(cache, 2).unwrap();
-    txm.begin().unwrap();
-    let handle = txm.allocate(b"doomed").unwrap();
-    txm.rollback().unwrap();
-    assert!(txm.read(handle).is_err());
+dual_backing_test!(
+    test_begin_allocate_commit_read,
+    test_begin_allocate_commit_read_body
+);
+
+fn test_rollback_discards_changes_body(b: &Backing) {
+    let mut db = open_chisel(b);
+    db.begin().unwrap();
+    let handle = db.allocate(b"doomed").unwrap();
+    db.rollback().unwrap();
+    assert!(db.read(handle).is_err());
 }
 
-#[test]
-fn test_update_preserves_handle() {
-    let file = NamedTempFile::new().unwrap();
-    let io = PageIo::open(file.path(), false).unwrap();
-    let cache = PageCache::new(io, 64);
-    let mut txm = TransactionManager::create_new(cache, 2).unwrap();
-    txm.begin().unwrap();
-    let handle = txm.allocate(b"original").unwrap();
-    txm.commit().unwrap();
-    txm.begin().unwrap();
-    txm.update(handle, b"updated value").unwrap();
-    txm.commit().unwrap();
-    let data = txm.read(handle).unwrap();
+dual_backing_test!(
+    test_rollback_discards_changes,
+    test_rollback_discards_changes_body
+);
+
+fn test_update_preserves_handle_body(b: &Backing) {
+    let mut db = open_chisel(b);
+    db.begin().unwrap();
+    let handle = db.allocate(b"original").unwrap();
+    db.commit().unwrap();
+    db.begin().unwrap();
+    db.update(handle, b"updated value").unwrap();
+    db.commit().unwrap();
+    let data = db.read(handle).unwrap();
     assert_eq!(data, b"updated value");
 }
 
-#[test]
-fn test_delete() {
-    let file = NamedTempFile::new().unwrap();
-    let io = PageIo::open(file.path(), false).unwrap();
-    let cache = PageCache::new(io, 64);
-    let mut txm = TransactionManager::create_new(cache, 2).unwrap();
-    txm.begin().unwrap();
-    let handle = txm.allocate(b"gone soon").unwrap();
-    txm.commit().unwrap();
-    txm.begin().unwrap();
-    txm.delete(handle).unwrap();
-    txm.commit().unwrap();
-    assert!(txm.read(handle).is_err());
+dual_backing_test!(
+    test_update_preserves_handle,
+    test_update_preserves_handle_body
+);
+
+fn test_delete_body(b: &Backing) {
+    let mut db = open_chisel(b);
+    db.begin().unwrap();
+    let handle = db.allocate(b"gone soon").unwrap();
+    db.commit().unwrap();
+    db.begin().unwrap();
+    db.delete(handle).unwrap();
+    db.commit().unwrap();
+    assert!(db.read(handle).is_err());
 }
 
-#[test]
-fn test_savepoint_rollback_to() {
-    let file = NamedTempFile::new().unwrap();
-    let io = PageIo::open(file.path(), false).unwrap();
-    let cache = PageCache::new(io, 64);
-    let mut txm = TransactionManager::create_new(cache, 2).unwrap();
-    txm.begin().unwrap();
-    let h1 = txm.allocate(b"kept").unwrap();
-    txm.savepoint("alpha").unwrap();
-    let h2 = txm.allocate(b"discarded").unwrap();
-    txm.rollback_to("alpha").unwrap();
-    txm.commit().unwrap();
-    assert_eq!(txm.read(h1).unwrap(), b"kept");
-    assert!(txm.read(h2).is_err());
+dual_backing_test!(test_delete, test_delete_body);
+
+fn test_savepoint_rollback_to_body(b: &Backing) {
+    let mut db = open_chisel(b);
+    db.begin().unwrap();
+    let h1 = db.allocate(b"kept").unwrap();
+    db.savepoint("alpha").unwrap();
+    let h2 = db.allocate(b"discarded").unwrap();
+    db.rollback_to("alpha").unwrap();
+    db.commit().unwrap();
+    assert_eq!(db.read(h1).unwrap(), b"kept");
+    assert!(db.read(h2).is_err());
 }
 
-#[test]
-fn test_savepoint_release() {
-    let file = NamedTempFile::new().unwrap();
-    let io = PageIo::open(file.path(), false).unwrap();
-    let cache = PageCache::new(io, 64);
-    let mut txm = TransactionManager::create_new(cache, 2).unwrap();
-    txm.begin().unwrap();
-    let h1 = txm.allocate(b"first").unwrap();
-    txm.savepoint("alpha").unwrap();
-    let h2 = txm.allocate(b"second").unwrap();
-    txm.release("alpha").unwrap();
-    txm.commit().unwrap();
-    assert_eq!(txm.read(h1).unwrap(), b"first");
-    assert_eq!(txm.read(h2).unwrap(), b"second");
+dual_backing_test!(test_savepoint_rollback_to, test_savepoint_rollback_to_body);
+
+fn test_savepoint_release_body(b: &Backing) {
+    let mut db = open_chisel(b);
+    db.begin().unwrap();
+    let h1 = db.allocate(b"first").unwrap();
+    db.savepoint("alpha").unwrap();
+    let h2 = db.allocate(b"second").unwrap();
+    db.release("alpha").unwrap();
+    db.commit().unwrap();
+    assert_eq!(db.read(h1).unwrap(), b"first");
+    assert_eq!(db.read(h2).unwrap(), b"second");
 }
 
-#[test]
-fn test_savepoint_rollback_preserves_savepoint() {
-    let file = NamedTempFile::new().unwrap();
-    let io = PageIo::open(file.path(), false).unwrap();
-    let cache = PageCache::new(io, 64);
-    let mut txm = TransactionManager::create_new(cache, 2).unwrap();
-    txm.begin().unwrap();
-    txm.savepoint("retry").unwrap();
-    let _h1 = txm.allocate(b"attempt 1").unwrap();
-    txm.rollback_to("retry").unwrap();
-    let h2 = txm.allocate(b"attempt 2").unwrap();
-    txm.commit().unwrap();
-    assert_eq!(txm.read(h2).unwrap(), b"attempt 2");
+dual_backing_test!(test_savepoint_release, test_savepoint_release_body);
+
+fn test_savepoint_rollback_preserves_savepoint_body(b: &Backing) {
+    let mut db = open_chisel(b);
+    db.begin().unwrap();
+    db.savepoint("retry").unwrap();
+    let _h1 = db.allocate(b"attempt 1").unwrap();
+    db.rollback_to("retry").unwrap();
+    let h2 = db.allocate(b"attempt 2").unwrap();
+    db.commit().unwrap();
+    assert_eq!(db.read(h2).unwrap(), b"attempt 2");
 }
 
-#[test]
-fn test_nested_savepoints() {
-    let file = NamedTempFile::new().unwrap();
-    let io = PageIo::open(file.path(), false).unwrap();
-    let cache = PageCache::new(io, 64);
-    let mut txm = TransactionManager::create_new(cache, 2).unwrap();
-    txm.begin().unwrap();
-    let h1 = txm.allocate(b"base").unwrap();
-    txm.savepoint("alpha").unwrap();
-    let h2 = txm.allocate(b"in alpha").unwrap();
-    txm.savepoint("beta").unwrap();
-    let h3 = txm.allocate(b"in beta").unwrap();
-    txm.rollback_to("alpha").unwrap();
-    txm.commit().unwrap();
-    assert_eq!(txm.read(h1).unwrap(), b"base");
-    assert!(txm.read(h2).is_err());
-    assert!(txm.read(h3).is_err());
+dual_backing_test!(
+    test_savepoint_rollback_preserves_savepoint,
+    test_savepoint_rollback_preserves_savepoint_body
+);
+
+fn test_nested_savepoints_body(b: &Backing) {
+    let mut db = open_chisel(b);
+    db.begin().unwrap();
+    let h1 = db.allocate(b"base").unwrap();
+    db.savepoint("alpha").unwrap();
+    let h2 = db.allocate(b"in alpha").unwrap();
+    db.savepoint("beta").unwrap();
+    let h3 = db.allocate(b"in beta").unwrap();
+    db.rollback_to("alpha").unwrap();
+    db.commit().unwrap();
+    assert_eq!(db.read(h1).unwrap(), b"base");
+    assert!(db.read(h2).is_err());
+    assert!(db.read(h3).is_err());
 }
 
+dual_backing_test!(test_nested_savepoints, test_nested_savepoints_body);
+
+// Kept file-only: reopens the same path to verify on-disk persistence.
 #[test]
 fn test_reopen_preserves_data() {
     let file = NamedTempFile::new().unwrap();
