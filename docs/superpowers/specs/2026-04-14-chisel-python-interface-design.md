@@ -211,7 +211,7 @@ chisel.ChiselError                    (base, inherits Exception)
 │   ├── SavepointNotFoundError
 │   ├── DuplicateSavepointError
 │   ├── ReadOnlyModeError
-│   ├── FileNotFoundError             (module-qualified; not the builtin)
+│   ├── DatabaseFileNotFoundError     (named to avoid shadowing builtins.FileNotFoundError)
 │   ├── InvalidRootNameError
 │   ├── RootNameTableFullError
 │   └── InvalidSuperblockCountError
