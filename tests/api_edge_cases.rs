@@ -17,93 +17,125 @@
 
 use chisel::{Chisel, ChiselError, Options};
 use tempfile::NamedTempFile;
-
-fn open_fresh() -> (NamedTempFile, Chisel) {
-    let file = NamedTempFile::new().unwrap();
-    let db = Chisel::open(file.path(), Options::default()).unwrap();
-    (file, db)
-}
+mod common;
+use common::{open_chisel, Backing};
 
 // --- NoActiveTransaction on every mutating call ---
 
-#[test]
-fn test_allocate_without_begin_errors() {
-    let (_f, mut db) = open_fresh();
+fn test_allocate_without_begin_errors_body(b: &Backing) {
+    let mut db = open_chisel(b);
     let err = db.allocate(b"x").unwrap_err();
     assert!(matches!(err, ChiselError::NoActiveTransaction));
 }
 
-#[test]
-fn test_update_without_begin_errors() {
-    let (_f, mut db) = open_fresh();
+dual_backing_test!(
+    test_allocate_without_begin_errors,
+    test_allocate_without_begin_errors_body
+);
+
+fn test_update_without_begin_errors_body(b: &Backing) {
+    let mut db = open_chisel(b);
     let err = db.update(0, b"x").unwrap_err();
     assert!(matches!(err, ChiselError::NoActiveTransaction));
 }
 
-#[test]
-fn test_delete_without_begin_errors() {
-    let (_f, mut db) = open_fresh();
+dual_backing_test!(
+    test_update_without_begin_errors,
+    test_update_without_begin_errors_body
+);
+
+fn test_delete_without_begin_errors_body(b: &Backing) {
+    let mut db = open_chisel(b);
     let err = db.delete(0).unwrap_err();
     assert!(matches!(err, ChiselError::NoActiveTransaction));
 }
 
-#[test]
-fn test_delete_many_without_begin_errors() {
-    let (_f, mut db) = open_fresh();
+dual_backing_test!(
+    test_delete_without_begin_errors,
+    test_delete_without_begin_errors_body
+);
+
+fn test_delete_many_without_begin_errors_body(b: &Backing) {
+    let mut db = open_chisel(b);
     let err = db.delete_many(&[0, 1, 2]).unwrap_err();
     assert!(matches!(err, ChiselError::NoActiveTransaction));
 }
 
-#[test]
-fn test_commit_without_begin_errors() {
-    let (_f, mut db) = open_fresh();
+dual_backing_test!(
+    test_delete_many_without_begin_errors,
+    test_delete_many_without_begin_errors_body
+);
+
+fn test_commit_without_begin_errors_body(b: &Backing) {
+    let mut db = open_chisel(b);
     let err = db.commit().unwrap_err();
     assert!(matches!(err, ChiselError::NoActiveTransaction));
 }
 
-#[test]
-fn test_rollback_without_begin_errors() {
-    let (_f, mut db) = open_fresh();
+dual_backing_test!(
+    test_commit_without_begin_errors,
+    test_commit_without_begin_errors_body
+);
+
+fn test_rollback_without_begin_errors_body(b: &Backing) {
+    let mut db = open_chisel(b);
     let err = db.rollback().unwrap_err();
     assert!(matches!(err, ChiselError::NoActiveTransaction));
 }
 
-#[test]
-fn test_savepoint_without_begin_errors() {
-    let (_f, mut db) = open_fresh();
+dual_backing_test!(
+    test_rollback_without_begin_errors,
+    test_rollback_without_begin_errors_body
+);
+
+fn test_savepoint_without_begin_errors_body(b: &Backing) {
+    let mut db = open_chisel(b);
     let err = db.savepoint("sp").unwrap_err();
     assert!(matches!(err, ChiselError::NoActiveTransaction));
 }
 
-#[test]
-fn test_set_root_name_without_begin_errors() {
-    let (_f, mut db) = open_fresh();
+dual_backing_test!(
+    test_savepoint_without_begin_errors,
+    test_savepoint_without_begin_errors_body
+);
+
+fn test_set_root_name_without_begin_errors_body(b: &Backing) {
+    let mut db = open_chisel(b);
     let err = db.set_root_name("meta", 0).unwrap_err();
     assert!(matches!(err, ChiselError::NoActiveTransaction));
 }
 
-#[test]
-fn test_clear_root_name_without_begin_errors() {
-    let (_f, mut db) = open_fresh();
+dual_backing_test!(
+    test_set_root_name_without_begin_errors,
+    test_set_root_name_without_begin_errors_body
+);
+
+fn test_clear_root_name_without_begin_errors_body(b: &Backing) {
+    let mut db = open_chisel(b);
     let err = db.clear_root_name("meta").unwrap_err();
     assert!(matches!(err, ChiselError::NoActiveTransaction));
 }
 
+dual_backing_test!(
+    test_clear_root_name_without_begin_errors,
+    test_clear_root_name_without_begin_errors_body
+);
+
 // --- Nested begin ---
 
-#[test]
-fn test_begin_twice_errors() {
-    let (_f, mut db) = open_fresh();
+fn test_begin_twice_errors_body(b: &Backing) {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     let err = db.begin().unwrap_err();
     assert!(matches!(err, ChiselError::TransactionAlreadyActive));
 }
 
+dual_backing_test!(test_begin_twice_errors, test_begin_twice_errors_body);
+
 // --- Invalid handle on mutations ---
 
-#[test]
-fn test_update_invalid_handle_errors() {
-    let (_f, mut db) = open_fresh();
+fn test_update_invalid_handle_errors_body(b: &Backing) {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     let err = db.update(999_999, b"nope").unwrap_err();
     assert!(matches!(err, ChiselError::InvalidHandle(999_999)));
@@ -112,9 +144,13 @@ fn test_update_invalid_handle_errors() {
     db.rollback().unwrap();
 }
 
-#[test]
-fn test_delete_invalid_handle_errors() {
-    let (_f, mut db) = open_fresh();
+dual_backing_test!(
+    test_update_invalid_handle_errors,
+    test_update_invalid_handle_errors_body
+);
+
+fn test_delete_invalid_handle_errors_body(b: &Backing) {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     let err = db.delete(42).unwrap_err();
     assert!(matches!(err, ChiselError::InvalidHandle(42)));
@@ -122,19 +158,27 @@ fn test_delete_invalid_handle_errors() {
     db.rollback().unwrap();
 }
 
-#[test]
-fn test_read_invalid_handle_on_empty_db_errors() {
-    let (_f, db) = open_fresh();
+dual_backing_test!(
+    test_delete_invalid_handle_errors,
+    test_delete_invalid_handle_errors_body
+);
+
+fn test_read_invalid_handle_on_empty_db_errors_body(b: &Backing) {
+    let db = open_chisel(b);
     let err = db.read(0).unwrap_err();
     assert!(matches!(err, ChiselError::InvalidHandle(0)));
     assert!(!db.is_poisoned());
 }
 
+dual_backing_test!(
+    test_read_invalid_handle_on_empty_db_errors,
+    test_read_invalid_handle_on_empty_db_errors_body
+);
+
 // --- Empty value roundtrip ---
 
-#[test]
-fn test_allocate_empty_value_roundtrip() {
-    let (_f, mut db) = open_fresh();
+fn test_allocate_empty_value_roundtrip_body(b: &Backing) {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     let h = db.allocate(b"").unwrap();
     db.commit().unwrap();
@@ -142,9 +186,13 @@ fn test_allocate_empty_value_roundtrip() {
     assert!(got.is_empty());
 }
 
-#[test]
-fn test_update_to_empty_value() {
-    let (_f, mut db) = open_fresh();
+dual_backing_test!(
+    test_allocate_empty_value_roundtrip,
+    test_allocate_empty_value_roundtrip_body
+);
+
+fn test_update_to_empty_value_body(b: &Backing) {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     let h = db.allocate(b"not empty").unwrap();
     db.update(h, b"").unwrap();
@@ -152,11 +200,12 @@ fn test_update_to_empty_value() {
     assert!(db.read(h).unwrap().is_empty());
 }
 
+dual_backing_test!(test_update_to_empty_value, test_update_to_empty_value_body);
+
 // --- Inline / overflow boundary. MAX_INLINE_VALUE = 8162. ---
 
-#[test]
-fn test_value_at_inline_max_boundary() {
-    let (_f, mut db) = open_fresh();
+fn test_value_at_inline_max_boundary_body(b: &Backing) {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     let v = vec![0x5Au8; 8162];
     let h = db.allocate(&v).unwrap();
@@ -164,9 +213,13 @@ fn test_value_at_inline_max_boundary() {
     assert_eq!(db.read(h).unwrap(), v);
 }
 
-#[test]
-fn test_value_one_byte_over_inline_goes_overflow() {
-    let (_f, mut db) = open_fresh();
+dual_backing_test!(
+    test_value_at_inline_max_boundary,
+    test_value_at_inline_max_boundary_body
+);
+
+fn test_value_one_byte_over_inline_goes_overflow_body(b: &Backing) {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     let v = vec![0x5Au8; 8163];
     let h = db.allocate(&v).unwrap();
@@ -175,12 +228,16 @@ fn test_value_one_byte_over_inline_goes_overflow() {
     assert_eq!(db.read(h).unwrap(), v);
 }
 
-#[test]
-fn test_handle_stable_across_inline_overflow_transition() {
+dual_backing_test!(
+    test_value_one_byte_over_inline_goes_overflow,
+    test_value_one_byte_over_inline_goes_overflow_body
+);
+
+fn test_handle_stable_across_inline_overflow_transition_body(b: &Backing) {
     // Allocate a small inline value, update it to a large overflow value,
     // then update it back to a small inline value. The handle u64 MUST
     // survive both transitions and yield the current value on read.
-    let (_f, mut db) = open_fresh();
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     let h = db.allocate(b"small").unwrap();
     db.commit().unwrap();
@@ -197,11 +254,15 @@ fn test_handle_stable_across_inline_overflow_transition() {
     assert_eq!(db.read(h).unwrap(), b"small again");
 }
 
+dual_backing_test!(
+    test_handle_stable_across_inline_overflow_transition,
+    test_handle_stable_across_inline_overflow_transition_body
+);
+
 // --- delete_many ---
 
-#[test]
-fn test_delete_many_empty_slice_is_noop() {
-    let (_f, mut db) = open_fresh();
+fn test_delete_many_empty_slice_is_noop_body(b: &Backing) {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     let h = db.allocate(b"still here").unwrap();
     db.delete_many(&[]).unwrap();
@@ -209,12 +270,16 @@ fn test_delete_many_empty_slice_is_noop() {
     assert_eq!(db.read(h).unwrap(), b"still here");
 }
 
-#[test]
-fn test_delete_many_bad_handle_mid_batch_stops_at_first_error() {
+dual_backing_test!(
+    test_delete_many_empty_slice_is_noop,
+    test_delete_many_empty_slice_is_noop_body
+);
+
+fn test_delete_many_bad_handle_mid_batch_stops_at_first_error_body(b: &Backing) {
     // Documented semantics (transaction.rs::delete_many): on first error the
     // loop returns; handles deleted before the failure remain deleted in the
     // current txn. Caller decides commit vs rollback.
-    let (_f, mut db) = open_fresh();
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     let h1 = db.allocate(b"a").unwrap();
     let h2 = db.allocate(b"b").unwrap();
@@ -233,42 +298,63 @@ fn test_delete_many_bad_handle_mid_batch_stops_at_first_error() {
     assert_eq!(db.read(h3).unwrap(), b"c");
 }
 
+dual_backing_test!(
+    test_delete_many_bad_handle_mid_batch_stops_at_first_error,
+    test_delete_many_bad_handle_mid_batch_stops_at_first_error_body
+);
+
 // --- Savepoint error cases ---
 
-#[test]
-fn test_duplicate_savepoint_rejected() {
-    let (_f, mut db) = open_fresh();
+fn test_duplicate_savepoint_rejected_body(b: &Backing) {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     db.savepoint("sp").unwrap();
     let err = db.savepoint("sp").unwrap_err();
     assert!(matches!(err, ChiselError::DuplicateSavepoint(ref n) if n == "sp"));
 }
 
-#[test]
-fn test_rollback_to_missing_savepoint_errors() {
-    let (_f, mut db) = open_fresh();
+dual_backing_test!(
+    test_duplicate_savepoint_rejected,
+    test_duplicate_savepoint_rejected_body
+);
+
+fn test_rollback_to_missing_savepoint_errors_body(b: &Backing) {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     let err = db.rollback_to("nope").unwrap_err();
     assert!(matches!(err, ChiselError::SavepointNotFound(ref n) if n == "nope"));
 }
 
-#[test]
-fn test_release_missing_savepoint_errors() {
-    let (_f, mut db) = open_fresh();
+dual_backing_test!(
+    test_rollback_to_missing_savepoint_errors,
+    test_rollback_to_missing_savepoint_errors_body
+);
+
+fn test_release_missing_savepoint_errors_body(b: &Backing) {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     let err = db.release("nope").unwrap_err();
     assert!(matches!(err, ChiselError::SavepointNotFound(ref n) if n == "nope"));
 }
 
-#[test]
-fn test_rollback_to_released_savepoint_errors() {
-    let (_f, mut db) = open_fresh();
+dual_backing_test!(
+    test_release_missing_savepoint_errors,
+    test_release_missing_savepoint_errors_body
+);
+
+fn test_rollback_to_released_savepoint_errors_body(b: &Backing) {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     db.savepoint("sp").unwrap();
     db.release("sp").unwrap();
     let err = db.rollback_to("sp").unwrap_err();
     assert!(matches!(err, ChiselError::SavepointNotFound(ref n) if n == "sp"));
 }
+
+dual_backing_test!(
+    test_rollback_to_released_savepoint_errors,
+    test_rollback_to_released_savepoint_errors_body
+);
 
 // --- Poison model ---
 //
@@ -280,12 +366,18 @@ fn test_rollback_to_released_savepoint_errors() {
 // durable data after a reopen (which is the other half of the poison
 // recovery contract).
 
-#[test]
-fn test_fresh_handle_is_not_poisoned() {
-    let (_f, db) = open_fresh();
+fn test_fresh_handle_is_not_poisoned_body(b: &Backing) {
+    let db = open_chisel(b);
     assert!(!db.is_poisoned());
 }
 
+dual_backing_test!(
+    test_fresh_handle_is_not_poisoned,
+    test_fresh_handle_is_not_poisoned_body
+);
+
+// Left file-only: reopens the same path after drop, which requires a persistent
+// on-disk file. In-memory backing has no path identity across instances.
 #[test]
 fn test_reopen_after_drop_observes_only_committed_data() {
     let file = NamedTempFile::new().unwrap();
@@ -309,9 +401,8 @@ fn test_reopen_after_drop_observes_only_committed_data() {
 
 // --- stats() consistency ---
 
-#[test]
-fn test_stats_empty_db_has_zero_handles() {
-    let (_f, db) = open_fresh();
+fn test_stats_empty_db_has_zero_handles_body(b: &Backing) {
+    let db = open_chisel(b);
     let s = db.stats().unwrap();
     assert_eq!(s.handle_count, 0);
     // File size is always a whole number of pages.
@@ -322,9 +413,13 @@ fn test_stats_empty_db_has_zero_handles() {
     );
 }
 
-#[test]
-fn test_stats_handle_count_matches_handles_len() {
-    let (_f, mut db) = open_fresh();
+dual_backing_test!(
+    test_stats_empty_db_has_zero_handles,
+    test_stats_empty_db_has_zero_handles_body
+);
+
+fn test_stats_handle_count_matches_handles_len_body(b: &Backing) {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     for i in 0..25u32 {
         db.allocate(&i.to_le_bytes()).unwrap();
@@ -336,9 +431,13 @@ fn test_stats_handle_count_matches_handles_len() {
     assert_eq!(s.handle_count, 25);
 }
 
-#[test]
-fn test_stats_is_idempotent_without_mutation() {
-    let (_f, mut db) = open_fresh();
+dual_backing_test!(
+    test_stats_handle_count_matches_handles_len,
+    test_stats_handle_count_matches_handles_len_body
+);
+
+fn test_stats_is_idempotent_without_mutation_body(b: &Backing) {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     db.allocate(b"x").unwrap();
     db.allocate(b"y").unwrap();
@@ -349,3 +448,8 @@ fn test_stats_is_idempotent_without_mutation() {
     assert_eq!(s1.total_pages, s2.total_pages);
     assert_eq!(s1.file_size_bytes, s2.file_size_bytes);
 }
+
+dual_backing_test!(
+    test_stats_is_idempotent_without_mutation,
+    test_stats_is_idempotent_without_mutation_body
+);
