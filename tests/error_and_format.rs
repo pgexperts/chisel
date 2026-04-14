@@ -13,6 +13,13 @@
 //   * encode_root_name validation via the public set_root_name path
 //     (covers empty, too-long, embedded NUL, and a happy-path max-length
 //     name).
+//
+// Named-root tests that exercise the public API through a live Chisel
+// handle run under dual_backing_test! (file + memory). Tests relying on
+// reopen/persistence remain file-only.
+
+mod common;
+use common::{open_chisel, Backing};
 
 use chisel::page::{
     self, compute_checksum, stamp_checksum, verify_checksum, PageType, CHECKSUM_OFFSET,
@@ -205,58 +212,80 @@ fn test_page_layout_constants_are_self_consistent() {
 }
 
 // --- Named-root validation via the public API ---
+//
+// open_with_txn_body opens a DB from the given backing, begins a
+// transaction, and returns the handle. Used by all named-root tests that
+// only need a live transaction and do not reopen the database.
 
-fn open_with_txn() -> (tempfile::NamedTempFile, Chisel) {
-    let file = NamedTempFile::new().unwrap();
-    let mut db = Chisel::open(file.path(), Options::default()).unwrap();
+fn open_with_txn_body(b: &Backing) -> Chisel {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
-    (file, db)
+    db
 }
 
-#[test]
-fn test_named_root_empty_name_rejected() {
-    let (_f, mut db) = open_with_txn();
+fn test_named_root_empty_name_rejected_body(b: &Backing) {
+    let mut db = open_with_txn_body(b);
     let err = db.set_root_name("", 0).unwrap_err();
     assert!(matches!(err, ChiselError::InvalidRootName));
 }
 
-#[test]
-fn test_named_root_too_long_rejected() {
-    let (_f, mut db) = open_with_txn();
+dual_backing_test!(
+    test_named_root_empty_name_rejected,
+    test_named_root_empty_name_rejected_body
+);
+
+fn test_named_root_too_long_rejected_body(b: &Backing) {
+    let mut db = open_with_txn_body(b);
     let long = "x".repeat(NAMED_ROOT_NAME_LEN + 1);
     let err = db.set_root_name(&long, 0).unwrap_err();
     assert!(matches!(err, ChiselError::InvalidRootName));
 }
 
-#[test]
-fn test_named_root_max_length_accepted() {
+dual_backing_test!(
+    test_named_root_too_long_rejected,
+    test_named_root_too_long_rejected_body
+);
+
+fn test_named_root_max_length_accepted_body(b: &Backing) {
     // Exactly NAMED_ROOT_NAME_LEN bytes is the inclusive upper bound.
-    let (_f, mut db) = open_with_txn();
+    let mut db = open_with_txn_body(b);
     let name = "x".repeat(NAMED_ROOT_NAME_LEN);
     db.set_root_name(&name, 7).unwrap();
     assert_eq!(db.get_root_name(&name).unwrap(), Some(7));
 }
 
-#[test]
-fn test_named_root_embedded_nul_rejected() {
-    let (_f, mut db) = open_with_txn();
+dual_backing_test!(
+    test_named_root_max_length_accepted,
+    test_named_root_max_length_accepted_body
+);
+
+fn test_named_root_embedded_nul_rejected_body(b: &Backing) {
+    let mut db = open_with_txn_body(b);
     let err = db.set_root_name("bad\0name", 0).unwrap_err();
     assert!(matches!(err, ChiselError::InvalidRootName));
 }
 
-#[test]
-fn test_named_root_overwrite_reuses_slot() {
-    let (_f, mut db) = open_with_txn();
+dual_backing_test!(
+    test_named_root_embedded_nul_rejected,
+    test_named_root_embedded_nul_rejected_body
+);
+
+fn test_named_root_overwrite_reuses_slot_body(b: &Backing) {
+    let mut db = open_with_txn_body(b);
     db.set_root_name("meta", 1).unwrap();
     db.set_root_name("meta", 42).unwrap();
     assert_eq!(db.get_root_name("meta").unwrap(), Some(42));
 }
 
-#[test]
-fn test_named_root_table_full() {
+dual_backing_test!(
+    test_named_root_overwrite_reuses_slot,
+    test_named_root_overwrite_reuses_slot_body
+);
+
+fn test_named_root_table_full_body(b: &Backing) {
     // There are NAMED_ROOT_COUNT slots; filling them all + 1 must return
     // RootNameTableFull.
-    let (_f, mut db) = open_with_txn();
+    let mut db = open_with_txn_body(b);
     for i in 0..chisel::superblock::NAMED_ROOT_COUNT {
         db.set_root_name(&format!("n{i}"), i as u64).unwrap();
     }
@@ -264,9 +293,10 @@ fn test_named_root_table_full() {
     assert!(matches!(err, ChiselError::RootNameTableFull));
 }
 
-#[test]
-fn test_named_root_clear_then_reuse_slot() {
-    let (_f, mut db) = open_with_txn();
+dual_backing_test!(test_named_root_table_full, test_named_root_table_full_body);
+
+fn test_named_root_clear_then_reuse_slot_body(b: &Backing) {
+    let mut db = open_with_txn_body(b);
     for i in 0..chisel::superblock::NAMED_ROOT_COUNT {
         db.set_root_name(&format!("n{i}"), i as u64).unwrap();
     }
@@ -277,17 +307,24 @@ fn test_named_root_clear_then_reuse_slot() {
     assert_eq!(db.get_root_name("n0").unwrap(), None);
 }
 
-#[test]
-fn test_named_root_clear_missing_name_is_noop() {
-    let (_f, mut db) = open_with_txn();
+dual_backing_test!(
+    test_named_root_clear_then_reuse_slot,
+    test_named_root_clear_then_reuse_slot_body
+);
+
+fn test_named_root_clear_missing_name_is_noop_body(b: &Backing) {
+    let mut db = open_with_txn_body(b);
     db.clear_root_name("never_set").unwrap();
     assert_eq!(db.get_root_name("never_set").unwrap(), None);
 }
 
-#[test]
-fn test_named_root_rollback_reverts_set() {
-    let file = NamedTempFile::new().unwrap();
-    let mut db = Chisel::open(file.path(), Options::default()).unwrap();
+dual_backing_test!(
+    test_named_root_clear_missing_name_is_noop,
+    test_named_root_clear_missing_name_is_noop_body
+);
+
+fn test_named_root_rollback_reverts_set_body(b: &Backing) {
+    let mut db = open_chisel(b);
     db.begin().unwrap();
     db.set_root_name("meta", 5).unwrap();
     db.rollback().unwrap();
@@ -295,6 +332,13 @@ fn test_named_root_rollback_reverts_set() {
     assert_eq!(db.get_root_name("meta").unwrap(), None);
 }
 
+dual_backing_test!(
+    test_named_root_rollback_reverts_set,
+    test_named_root_rollback_reverts_set_body
+);
+
+// FILE-ONLY: reopens the same on-disk path after drop to test persistence;
+// memory mode has no persistent backing to reopen.
 #[test]
 fn test_named_root_survives_commit_and_reopen() {
     let file = NamedTempFile::new().unwrap();
