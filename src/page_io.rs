@@ -25,9 +25,17 @@ use std::path::Path;
 use crate::error::{ChiselError, Result};
 use crate::page::PAGE_SIZE;
 
+// Why an enum rather than a trait object: benchmark integrity. A `dyn PageIo`
+// adds a vtable call per page read/write — exactly the cost we want excluded
+// when comparing Chisel to SQLite `:memory:`. An enum branch is predictable
+// and effectively free once the variant is hot. See the in-memory-mode spec.
+enum Backing {
+    File { file: File },
+}
+
 pub struct PageIo {
-    file: File,
-    // Tracked alongside the File so every mutating path can fail-fast
+    backing: Backing,
+    // Tracked alongside the backing so every mutating path can fail-fast
     // with `ReadOnlyMode` rather than letting the kernel return EBADF
     // (which would surface as a generic, fatal `IoError`). The distinction
     // matters: a ReadOnlyMode error is operational — the caller just used
@@ -62,7 +70,10 @@ impl PageIo {
                 .open(path)?
         };
         Self::try_lock(&file)?;
-        Ok(PageIo { file, read_only })
+        Ok(PageIo {
+            backing: Backing::File { file },
+            read_only,
+        })
     }
 
     /// True if this handle was opened read-only. Used by higher layers
@@ -114,11 +125,15 @@ impl PageIo {
         if page_id >= page_count {
             return Err(ChiselError::InvalidPageId { page_id });
         }
-        let offset = page_id * PAGE_SIZE as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut buf = [0u8; PAGE_SIZE];
-        self.file.read_exact(&mut buf)?;
-        Ok(buf)
+        match &mut self.backing {
+            Backing::File { file } => {
+                let offset = page_id * PAGE_SIZE as u64;
+                file.seek(SeekFrom::Start(offset))?;
+                let mut buf = [0u8; PAGE_SIZE];
+                file.read_exact(&mut buf)?;
+                Ok(buf)
+            }
+        }
     }
 
     /// Write a single page by page ID.
@@ -137,10 +152,14 @@ impl PageIo {
         if self.read_only {
             return Err(ChiselError::ReadOnlyMode);
         }
-        let offset = page_id * PAGE_SIZE as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(buf)?;
-        Ok(())
+        match &mut self.backing {
+            Backing::File { file } => {
+                let offset = page_id * PAGE_SIZE as u64;
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(buf)?;
+                Ok(())
+            }
+        }
     }
 
     /// Flush all writes to durable storage.
@@ -157,8 +176,12 @@ impl PageIo {
         if self.read_only {
             return Err(ChiselError::ReadOnlyMode);
         }
-        self.file.sync_all()?;
-        Ok(())
+        match &self.backing {
+            Backing::File { file } => {
+                file.sync_all()?;
+                Ok(())
+            }
+        }
     }
 
     /// Return the number of whole pages in the file.
@@ -169,8 +192,12 @@ impl PageIo {
     /// not a multiple of PAGE_SIZE) is silently floored — such a file is
     /// corrupt, but detecting it is the superblock layer's job.
     pub fn page_count(&mut self) -> Result<u64> {
-        let len = self.file.seek(SeekFrom::End(0))?;
-        Ok(len / PAGE_SIZE as u64)
+        match &mut self.backing {
+            Backing::File { file } => {
+                let len = file.seek(SeekFrom::End(0))?;
+                Ok(len / PAGE_SIZE as u64)
+            }
+        }
     }
 
     /// Truncate (or extend) the file to exactly `n` pages.
@@ -182,8 +209,12 @@ impl PageIo {
         if self.read_only {
             return Err(ChiselError::ReadOnlyMode);
         }
-        self.file.set_len(n * PAGE_SIZE as u64)?;
-        Ok(())
+        match &mut self.backing {
+            Backing::File { file } => {
+                file.set_len(n * PAGE_SIZE as u64)?;
+                Ok(())
+            }
+        }
     }
 }
 
