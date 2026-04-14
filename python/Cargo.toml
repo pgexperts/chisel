@@ -1,0 +1,12 @@
+[package]
+name = "chisel-py"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_chisel"
+crate-type = ["cdylib"]
+
+[dependencies]
+chisel = { path = ".." }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }
