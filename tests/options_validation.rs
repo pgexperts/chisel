@@ -10,6 +10,13 @@
 //     it with FileNotFound, and create_if_missing=true creates a fresh DB.
 //   * Reopening an existing database ignores options.superblock_count —
 //     the value is discovered from the on-disk superblock.
+//
+// Dual-backing coverage: the three superblock_count rejection tests are
+// validated against both file-backed and memory-backed constructors using
+// the negative-path dual-open pattern (explicit double-assert). All other
+// tests remain file-only for reasons noted inline.
+
+mod common;
 
 use chisel::superblock::{DEFAULT_SUPERBLOCK_COUNT, MAX_SUPERBLOCKS};
 use chisel::{Chisel, ChiselError, Options, Result};
@@ -35,37 +42,69 @@ fn opts(superblock_count: u32) -> Options {
 }
 
 // --- superblock_count validation ---
+//
+// These three tests use the negative-path dual-open pattern: the invalid
+// Options are rejected before any I/O, so the same validation path fires
+// for both constructors. dual_backing_test! is not used here because it
+// calls .unwrap() on the open result, which would panic on the expected Err.
 
 #[test]
 fn test_superblock_count_zero_rejected() {
+    let bad = opts(0);
+
+    // File-backed: rejection happens before the file is opened.
     let f = NamedTempFile::new().unwrap();
-    let err = expect_err(Chisel::open(f.path(), opts(0)));
     assert!(matches!(
-        err,
+        expect_err(Chisel::open(f.path(), bad.clone())),
+        ChiselError::InvalidSuperblockCount { value: 0 }
+    ));
+
+    // Memory-backed: same validation path.
+    assert!(matches!(
+        expect_err(Chisel::open_in_memory_with_options(bad)),
         ChiselError::InvalidSuperblockCount { value: 0 }
     ));
 }
 
 #[test]
 fn test_superblock_count_one_rejected() {
+    let bad = opts(1);
+
+    // File-backed: rejection happens before the file is opened.
     let f = NamedTempFile::new().unwrap();
-    let err = expect_err(Chisel::open(f.path(), opts(1)));
     assert!(matches!(
-        err,
+        expect_err(Chisel::open(f.path(), bad.clone())),
+        ChiselError::InvalidSuperblockCount { value: 1 }
+    ));
+
+    // Memory-backed: same validation path.
+    assert!(matches!(
+        expect_err(Chisel::open_in_memory_with_options(bad)),
         ChiselError::InvalidSuperblockCount { value: 1 }
     ));
 }
 
 #[test]
 fn test_superblock_count_seventeen_rejected() {
+    let bad = opts(17);
+
+    // File-backed: rejection happens before the file is opened.
     let f = NamedTempFile::new().unwrap();
-    let err = expect_err(Chisel::open(f.path(), opts(17)));
     assert!(matches!(
-        err,
+        expect_err(Chisel::open(f.path(), bad.clone())),
+        ChiselError::InvalidSuperblockCount { value: 17 }
+    ));
+
+    // Memory-backed: same validation path.
+    assert!(matches!(
+        expect_err(Chisel::open_in_memory_with_options(bad)),
         ChiselError::InvalidSuperblockCount { value: 17 }
     ));
 }
 
+// FILE-ONLY: creates a DB, drops it, then reopens the same path to verify
+// the on-disk superblock_count survives a round-trip. Memory mode has no
+// persistent backing to reopen.
 #[test]
 fn test_superblock_count_min_valid() {
     // The minimum valid value.
@@ -83,6 +122,7 @@ fn test_superblock_count_min_valid() {
     assert_eq!(db.read(h).unwrap(), b"hello");
 }
 
+// FILE-ONLY: persistence test (drop + reopen).
 #[test]
 fn test_superblock_count_max_valid_roundtrip() {
     let dir = TempDir::new().unwrap();
@@ -100,6 +140,7 @@ fn test_superblock_count_max_valid_roundtrip() {
     assert!(stats.total_pages >= MAX_SUPERBLOCKS as u64);
 }
 
+// FILE-ONLY: persistence test (drop + reopen).
 #[test]
 fn test_superblock_count_mid_valid_roundtrip() {
     let dir = TempDir::new().unwrap();
@@ -115,6 +156,8 @@ fn test_superblock_count_mid_valid_roundtrip() {
 
 // --- Reopen ignores superblock_count option ---
 
+// FILE-ONLY: explicitly tests that a reopen of an on-disk file uses the
+// superblock_count recorded in the file, not the Options value.
 #[test]
 fn test_reopen_discovers_superblock_count_from_disk() {
     // Create with N=4, then reopen passing a DIFFERENT valid N (3). The
@@ -140,6 +183,8 @@ fn test_reopen_discovers_superblock_count_from_disk() {
 
 // --- create_if_missing semantics ---
 
+// FILE-ONLY: create_if_missing is a file-system concept with no analogue
+// in memory mode.
 #[test]
 fn test_create_if_missing_false_on_missing_file_errors() {
     // A path that does not exist.
@@ -155,6 +200,8 @@ fn test_create_if_missing_false_on_missing_file_errors() {
     assert!(matches!(err, ChiselError::FileNotFound));
 }
 
+// FILE-ONLY: reads std::fs::metadata to verify the file is zero-length;
+// the zero-length-as-missing behavior is inherently file-system specific.
 #[test]
 fn test_create_if_missing_false_on_zero_length_file_errors() {
     // A zero-length file is treated as "not yet a database" by
@@ -173,6 +220,8 @@ fn test_create_if_missing_false_on_zero_length_file_errors() {
     assert!(matches!(err, ChiselError::FileNotFound));
 }
 
+// FILE-ONLY: validates "touch + open" recovery story — the zero-length
+// file is a file-system artifact that has no meaning in memory mode.
 #[test]
 fn test_zero_length_file_is_initialized_as_fresh_db() {
     // Counterpart to the previous test: the default (create_if_missing=true)
@@ -189,6 +238,8 @@ fn test_zero_length_file_is_initialized_as_fresh_db() {
 
 // --- ReadOnly mode ---
 
+// FILE-ONLY: read_only requires reopening an already-created on-disk file;
+// memory mode has no persistent backing and no equivalent open mode.
 #[test]
 fn test_read_only_open_rejects_begin() {
     // A database opened with `read_only: true` must surface
@@ -226,6 +277,7 @@ fn test_read_only_open_rejects_begin() {
 
 // --- LockFailed ---
 
+// FILE-ONLY: flock is a file-system concept; memory mode has no lock.
 #[test]
 fn test_second_open_on_same_file_fails_with_lock_error() {
     // flock is exclusive non-blocking; the second open returns LockFailed
