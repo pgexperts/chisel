@@ -148,6 +148,45 @@ impl Chisel {
         Ok(Chisel { txm })
     }
 
+    /// Open a non-durable, memory-backed Chisel database. Intended for
+    /// benchmark comparisons against SQLite `:memory:` and for tests that
+    /// do not need filesystem persistence. All data is lost when the
+    /// returned `Chisel` is dropped.
+    ///
+    /// Uses default `Options`. For a tuned cache size or superblock count,
+    /// use `open_in_memory_with_options`.
+    pub fn open_in_memory() -> Result<Chisel> {
+        Self::open_in_memory_with_options(Options::default())
+    }
+
+    /// Open a memory-backed Chisel database with explicit options.
+    ///
+    /// `options.read_only` must be `false`: a fresh memory database must
+    /// be writable for the initial superblock bootstrap, and there is no
+    /// prior file to reopen read-only. `options.create_if_missing` is
+    /// ignored — memory mode always creates a fresh database. All other
+    /// options (cache_size, superblock_count) flow through normally.
+    pub fn open_in_memory_with_options(options: Options) -> Result<Chisel> {
+        if options.read_only {
+            // Fail fast rather than bootstrapping and then blocking the
+            // superblock write with ReadOnlyMode: the caller almost
+            // certainly passed `read_only: true` by mistake.
+            return Err(ChiselError::ReadOnlyMode);
+        }
+        if options.superblock_count < superblock::MIN_SUPERBLOCKS
+            || options.superblock_count > superblock::MAX_SUPERBLOCKS
+        {
+            return Err(ChiselError::InvalidSuperblockCount {
+                value: options.superblock_count,
+            });
+        }
+
+        let io = PageIo::open_in_memory()?;
+        let cache = PageCache::new(io, options.cache_size);
+        let txm = TransactionManager::create_new(cache, options.superblock_count)?;
+        Ok(Chisel { txm })
+    }
+
     /// Explicit close. Exists for API symmetry and so callers can observe a
     /// `Result` at teardown; functionally identical to letting the value
     /// drop, since release of the flock and file descriptor happens in
