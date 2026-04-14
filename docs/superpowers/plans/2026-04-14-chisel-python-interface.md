@@ -174,7 +174,7 @@ def test_operational_hierarchy():
         "SavepointNotFoundError",
         "DuplicateSavepointError",
         "ReadOnlyModeError",
-        "FileNotFoundError",
+        "DatabaseFileNotFoundError",
         "InvalidRootNameError",
         "RootNameTableFullError",
         "InvalidSuperblockCountError",
@@ -255,7 +255,7 @@ create_exception!(_chisel, TransactionAlreadyActiveError, OperationalError);
 create_exception!(_chisel, SavepointNotFoundError, OperationalError);
 create_exception!(_chisel, DuplicateSavepointError, OperationalError);
 create_exception!(_chisel, ReadOnlyModeError, OperationalError);
-create_exception!(_chisel, FileNotFoundError, OperationalError);
+create_exception!(_chisel, DatabaseFileNotFoundError, OperationalError);
 create_exception!(_chisel, InvalidRootNameError, OperationalError);
 create_exception!(_chisel, RootNameTableFullError, OperationalError);
 create_exception!(_chisel, InvalidSuperblockCountError, OperationalError);
@@ -283,7 +283,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("SavepointNotFoundError", py.get_type_bound::<SavepointNotFoundError>())?;
     m.add("DuplicateSavepointError", py.get_type_bound::<DuplicateSavepointError>())?;
     m.add("ReadOnlyModeError", py.get_type_bound::<ReadOnlyModeError>())?;
-    m.add("FileNotFoundError", py.get_type_bound::<FileNotFoundError>())?;
+    m.add("DatabaseFileNotFoundError", py.get_type_bound::<DatabaseFileNotFoundError>())?;
     m.add("InvalidRootNameError", py.get_type_bound::<InvalidRootNameError>())?;
     m.add("RootNameTableFullError", py.get_type_bound::<RootNameTableFullError>())?;
     m.add("InvalidSuperblockCountError", py.get_type_bound::<InvalidSuperblockCountError>())?;
@@ -316,7 +316,7 @@ pub fn to_py_err(err: ChiselError) -> PyErr {
         ChiselError::SavepointNotFound(_) => SavepointNotFoundError::new_err(msg),
         ChiselError::DuplicateSavepoint(_) => DuplicateSavepointError::new_err(msg),
         ChiselError::ReadOnlyMode => ReadOnlyModeError::new_err(msg),
-        ChiselError::FileNotFound => FileNotFoundError::new_err(msg),
+        ChiselError::FileNotFound => DatabaseFileNotFoundError::new_err(msg),
         ChiselError::InvalidRootName => InvalidRootNameError::new_err(msg),
         ChiselError::RootNameTableFull => RootNameTableFullError::new_err(msg),
         ChiselError::InvalidSuperblockCount { .. } => InvalidSuperblockCountError::new_err(msg),
@@ -367,7 +367,7 @@ from chisel._chisel import (
     SavepointNotFoundError,
     DuplicateSavepointError,
     ReadOnlyModeError,
-    FileNotFoundError,
+    DatabaseFileNotFoundError,
     InvalidRootNameError,
     RootNameTableFullError,
     InvalidSuperblockCountError,
@@ -388,7 +388,7 @@ __all__ = [
     "ChiselError", "OperationalError", "FatalError",
     "InvalidHandleError", "NoActiveTransactionError",
     "TransactionAlreadyActiveError", "SavepointNotFoundError",
-    "DuplicateSavepointError", "ReadOnlyModeError", "FileNotFoundError",
+    "DuplicateSavepointError", "ReadOnlyModeError", "DatabaseFileNotFoundError",
     "InvalidRootNameError", "RootNameTableFullError",
     "InvalidSuperblockCountError",
     "IoError", "ChecksumMismatchError", "CorruptSuperblockError",
@@ -451,7 +451,7 @@ def test_open_context_manager(tmp_db):
 
 
 def test_open_rejects_missing_when_create_false(tmp_db):
-    with pytest.raises(chisel.FileNotFoundError):
+    with pytest.raises(chisel.DatabaseFileNotFoundError):
         chisel.open(str(tmp_db), create_if_missing=False)
 
 
@@ -1768,7 +1768,7 @@ class NoActiveTransactionError(OperationalError): ...
 class InvalidSavepointError(OperationalError): ...
 class ReadOnlyModeError(OperationalError): ...
 class LockFailedError(OperationalError): ...
-class FileNotFoundError(OperationalError): ...
+class DatabaseFileNotFoundError(OperationalError): ...
 class InvalidSuperblockCountError(OperationalError): ...
 class ValueTooLargeError(OperationalError): ...
 
