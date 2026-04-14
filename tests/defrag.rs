@@ -1,15 +1,15 @@
-use chisel::{Chisel, ChiselError};
-use tempfile::NamedTempFile;
+use chisel::ChiselError;
 
-#[test]
-fn test_defrag_without_active_txn_errors_immediately() {
+mod common;
+use common::{open_chisel, Backing};
+
+fn test_defrag_without_active_txn_errors_immediately_body(b: &Backing) {
     // defrag() mutates through `update`, which requires an active
     // transaction. Calling defrag on an idle handle must fail
     // eagerly with `NoActiveTransaction` rather than reading from
     // the committed snapshot and then failing partway through on
     // the first update.
-    let file = NamedTempFile::new().unwrap();
-    let mut db = Chisel::open(file.path(), Default::default()).unwrap();
+    let mut db = open_chisel(b);
 
     db.begin().unwrap();
     for i in 0..4 {
@@ -25,10 +25,13 @@ fn test_defrag_without_active_txn_errors_immediately() {
     );
 }
 
-#[test]
-fn test_defrag_reclaims_space_after_deletes() {
-    let file = NamedTempFile::new().unwrap();
-    let mut db = Chisel::open(file.path(), Default::default()).unwrap();
+dual_backing_test!(
+    test_defrag_without_active_txn_errors_immediately,
+    test_defrag_without_active_txn_errors_immediately_body
+);
+
+fn test_defrag_reclaims_space_after_deletes_body(b: &Backing) {
+    let mut db = open_chisel(b);
 
     db.begin().unwrap();
     let mut handles = Vec::new();
@@ -53,10 +56,13 @@ fn test_defrag_reclaims_space_after_deletes() {
     assert!(result.pages_freed > 0);
 }
 
-#[test]
-fn test_defrag_preserves_all_data() {
-    let file = NamedTempFile::new().unwrap();
-    let mut db = Chisel::open(file.path(), Default::default()).unwrap();
+dual_backing_test!(
+    test_defrag_reclaims_space_after_deletes,
+    test_defrag_reclaims_space_after_deletes_body
+);
+
+fn test_defrag_preserves_all_data_body(b: &Backing) {
+    let mut db = open_chisel(b);
 
     db.begin().unwrap();
     let h1 = db.allocate(b"alpha").unwrap();
@@ -73,13 +79,16 @@ fn test_defrag_preserves_all_data() {
     assert_eq!(db.read(h3).unwrap(), b"gamma");
 }
 
-#[test]
-fn test_defrag_skips_dense_pages() {
+dual_backing_test!(
+    test_defrag_preserves_all_data,
+    test_defrag_preserves_all_data_body
+);
+
+fn test_defrag_skips_dense_pages_body(b: &Backing) {
     // R3: a database whose data pages are all dense should have
     // nothing to do during defrag. `values_moved` should be zero
     // because the sweep identifies no sparse pages.
-    let file = NamedTempFile::new().unwrap();
-    let mut db = Chisel::open(file.path(), Default::default()).unwrap();
+    let mut db = open_chisel(b);
 
     // Pack many values in one transaction — they all go into a
     // fresh dense cursor page.
@@ -101,13 +110,16 @@ fn test_defrag_skips_dense_pages() {
     assert_eq!(result.pages_examined, 0);
 }
 
-#[test]
-fn test_defrag_stats_are_page_accurate() {
+dual_backing_test!(
+    test_defrag_skips_dense_pages,
+    test_defrag_skips_dense_pages_body
+);
+
+fn test_defrag_stats_are_page_accurate_body(b: &Backing) {
     // I17: `pages_examined` should count unique sparse pages touched,
     // not values moved. `pages_freed` should count pages that were
     // present at the start of the sweep and are gone at the end.
-    let file = NamedTempFile::new().unwrap();
-    let mut db = Chisel::open(file.path(), Default::default()).unwrap();
+    let mut db = open_chisel(b);
 
     // Seed enough values to spread across multiple data pages.
     // 200-byte values pack ~39 per 8 KB page, so 100 values land
@@ -150,14 +162,17 @@ fn test_defrag_stats_are_page_accurate() {
     }
 }
 
-#[test]
-fn test_defrag_respects_max_pages() {
+dual_backing_test!(
+    test_defrag_stats_are_page_accurate,
+    test_defrag_stats_are_page_accurate_body
+);
+
+fn test_defrag_respects_max_pages_body(b: &Backing) {
     // `max_pages` caps how much work defrag does in one call so
     // large databases can be incrementally compacted. With a cap of
     // 2, defrag should relocate at most 2 values.
     use chisel::defrag::DefragOptions;
-    let file = NamedTempFile::new().unwrap();
-    let mut db = Chisel::open(file.path(), Default::default()).unwrap();
+    let mut db = open_chisel(b);
 
     db.begin().unwrap();
     let handles: Vec<u64> = (0..50)
@@ -190,3 +205,8 @@ fn test_defrag_respects_max_pages() {
         assert_eq!(db.read(h).unwrap(), [i as u8; 200]);
     }
 }
+
+dual_backing_test!(
+    test_defrag_respects_max_pages,
+    test_defrag_respects_max_pages_body
+);
