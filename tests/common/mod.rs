@@ -42,9 +42,12 @@ pub fn open_chisel_with(b: &Backing, opts: Options) -> Chisel {
     }
 }
 
+// Requires `mod common;` at the root of the invoking test binary —
+// the expansion references `$crate::common::Backing`, and `$crate`
+// resolves to the test binary's own root crate.
 #[macro_export]
 macro_rules! dual_backing_test {
-    ($name:ident, $body:path) => {
+    ($name:ident, $body:ident) => {
         paste::paste! {
             #[test]
             fn [<$name _file>]() {
