@@ -1,3 +1,40 @@
-from chisel._chisel import __version__
+from chisel._chisel import (
+    __version__,
+    ChiselError,
+    OperationalError,
+    FatalError,
+    InvalidHandleError,
+    NoActiveTransactionError,
+    TransactionAlreadyActiveError,
+    SavepointNotFoundError,
+    DuplicateSavepointError,
+    ReadOnlyModeError,
+    FileNotFoundError,
+    InvalidRootNameError,
+    RootNameTableFullError,
+    InvalidSuperblockCountError,
+    IoError,
+    ChecksumMismatchError,
+    CorruptSuperblockError,
+    FileSizeMismatchError,
+    InvalidMagicError,
+    LockFailedError,
+    UnsupportedFormatVersionError,
+    CorruptPageError,
+    InvalidPageIdError,
+    PoisonedError,
+)
 
-__all__ = ["__version__"]
+__all__ = [
+    "__version__",
+    "ChiselError", "OperationalError", "FatalError",
+    "InvalidHandleError", "NoActiveTransactionError",
+    "TransactionAlreadyActiveError", "SavepointNotFoundError",
+    "DuplicateSavepointError", "ReadOnlyModeError", "FileNotFoundError",
+    "InvalidRootNameError", "RootNameTableFullError",
+    "InvalidSuperblockCountError",
+    "IoError", "ChecksumMismatchError", "CorruptSuperblockError",
+    "FileSizeMismatchError", "InvalidMagicError", "LockFailedError",
+    "UnsupportedFormatVersionError", "CorruptPageError", "InvalidPageIdError",
+    "PoisonedError",
+]
