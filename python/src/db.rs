@@ -241,6 +241,18 @@ impl PyChisel {
         self.with_inner_mut_io(py, |c| c.clear_root_name(name))
     }
 
+    pub(crate) fn savepoint_internal(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        self.with_inner_mut_io(py, |c| c.savepoint(name))
+    }
+
+    pub(crate) fn release_internal(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        self.with_inner_mut_io(py, |c| c.release(name))
+    }
+
+    pub(crate) fn rollback_to_internal(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        self.with_inner_mut_io(py, |c| c.rollback_to(name))
+    }
+
     // These two helpers are the ONLY place the closed/poisoned
     // distinction collapses to PoisonedError — callers above never see
     // a bare None. We intentionally do NOT release the GIL around the
