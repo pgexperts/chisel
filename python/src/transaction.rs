@@ -92,4 +92,16 @@ impl PyTransaction {
     fn clear_root_name(&self, py: Python<'_>, name: &str) -> PyResult<()> {
         self.db.bind(py).borrow().clear_root_name_internal(py, name)
     }
+
+    fn savepoint(
+        &self,
+        py: Python<'_>,
+        name: &str,
+    ) -> PyResult<Py<crate::savepoint::PySavepoint>> {
+        self.db.bind(py).borrow().savepoint_internal(py, name)?;
+        Py::new(
+            py,
+            crate::savepoint::PySavepoint::new(self.db.clone_ref(py), name.to_string()),
+        )
+    }
 }
