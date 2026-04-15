@@ -72,13 +72,25 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Create virtualenv
+        working-directory: python
+        run: python -m venv .venv
+
       - name: Install maturin and test deps
-        run: pip install maturin pytest hypothesis
+        working-directory: python
+        run: |
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install maturin pytest hypothesis
 
       - name: Build and install
         working-directory: python
-        run: maturin develop --release
+        run: |
+          . .venv/bin/activate
+          maturin develop --release
 
       - name: Run tests
         working-directory: python
-        run: pytest -v
+        run: |
+          . .venv/bin/activate
+          pytest -v
