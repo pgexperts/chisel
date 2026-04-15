@@ -169,6 +169,51 @@ impl PyChisel {
     fn clear_root_name(&self, py: Python<'_>, name: &str) -> PyResult<()> {
         self.clear_root_name_internal(py, name)
     }
+
+    // stats() is read-only on the engine side (`&self`), so the usual
+    // immutable borrow path is sufficient. We materialize a
+    // `chisel.Stats` dataclass rather than a pyclass so users get the
+    // standard dataclass ergonomics (repr, eq, frozen).
+    fn stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let s = self.with_inner_io(py, |c| c.stats())?;
+        let module = py.import_bound("chisel")?;
+        let cls = module.getattr("Stats")?;
+        let kwargs = pyo3::types::PyDict::new_bound(py);
+        kwargs.set_item("handle_count", s.handle_count)?;
+        kwargs.set_item("total_pages", s.total_pages)?;
+        kwargs.set_item("file_size_bytes", s.file_size_bytes)?;
+        Ok(cls.call((), Some(&kwargs))?.unbind())
+    }
+
+    // defrag() runs inside the caller's active transaction — see
+    // src/defrag.rs "Transactionality" note. If no transaction is
+    // active, the engine surfaces NoActiveTransactionError, which
+    // propagates unchanged. We accept either a `chisel.DefragOptions`
+    // dataclass or None (defaults).
+    #[pyo3(signature = (options=None))]
+    fn defrag(&self, py: Python<'_>, options: Option<&Bound<'_, PyAny>>) -> PyResult<PyObject> {
+        let rust_opts = match options {
+            None => chisel::defrag::DefragOptions::default(),
+            Some(obj) => {
+                let sparse_threshold: f64 = obj.getattr("sparse_threshold")?.extract()?;
+                let max_pages: usize = obj.getattr("max_pages")?.extract()?;
+                chisel::defrag::DefragOptions {
+                    sparse_threshold,
+                    max_pages,
+                }
+            }
+        };
+
+        let stats = self.with_inner_mut_io(py, |c| c.defrag(rust_opts.clone()))?;
+
+        let module = py.import_bound("chisel")?;
+        let cls = module.getattr("DefragStats")?;
+        let kwargs = pyo3::types::PyDict::new_bound(py);
+        kwargs.set_item("pages_examined", stats.pages_examined)?;
+        kwargs.set_item("pages_freed", stats.pages_freed)?;
+        kwargs.set_item("values_moved", stats.values_moved)?;
+        Ok(cls.call((), Some(&kwargs))?.unbind())
+    }
 }
 
 // Internal helpers — NOT exposed to Python. PyTransaction reaches into
