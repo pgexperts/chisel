@@ -1630,33 +1630,26 @@ def test_db_can_be_moved_between_threads(tmp_db):
     db.close()
 
 
-def test_commit_releases_gil(tmp_db):
-    # While a commit is in flight, another Python thread should be able
-    # to make progress. This test is flaky by nature — we assert only
-    # that the sibling thread did *some* work, not a timing threshold.
+def test_sequential_access_across_threads(tmp_db):
+    # Verify a Chisel can be handed from one thread to another and that
+    # the second thread's commits are visible to the first. This is the
+    # supported threading pattern — migration, not concurrency.
     db = chisel.open(str(tmp_db))
-    sibling_iters = []
-    stop = threading.Event()
+    handles = []
 
-    def sibling():
-        n = 0
-        while not stop.is_set():
-            n += 1
-        sibling_iters.append(n)
-
-    t = threading.Thread(target=sibling)
-    t.start()
-
-    # Do a batch of commits
-    for _ in range(20):
+    def writer():
         with db.transaction() as tx:
-            tx.allocate(b"x" * 1024)
+            for i in range(5):
+                handles.append(tx.allocate(bytes([i])))
 
-    stop.set()
+    t = threading.Thread(target=writer)
+    t.start()
     t.join()
-    db.close()
 
-    assert sibling_iters[0] > 0
+    assert len(handles) == 5
+    for i, h in enumerate(handles):
+        assert db.read(h) == bytes([i])
+    db.close()
 ```
 
 - [ ] **Step 2: Run**
@@ -1670,7 +1663,7 @@ Expected: pass.
 
 ```bash
 git add python/tests/test_threading.py
-git commit -m "Test thread migration and GIL release on commit"
+git commit -m "Test thread migration (sequential access across threads)"
 ```
 
 ---
