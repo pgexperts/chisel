@@ -1,5 +1,7 @@
 from chisel._chisel import (
     __version__,
+    Chisel,
+    open,
     ChiselError,
     OperationalError,
     FatalError,
@@ -27,6 +29,7 @@ from chisel._chisel import (
 
 __all__ = [
     "__version__",
+    "Chisel", "open",
     "ChiselError", "OperationalError", "FatalError",
     "InvalidHandleError", "NoActiveTransactionError",
     "TransactionAlreadyActiveError", "SavepointNotFoundError",
