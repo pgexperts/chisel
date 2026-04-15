@@ -50,3 +50,35 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt -- --check
+
+  python:
+    needs: [test, clippy, fmt]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install maturin and test deps
+        run: pip install maturin pytest hypothesis
+
+      - name: Build and install
+        working-directory: python
+        run: maturin develop --release
+
+      - name: Run tests
+        working-directory: python
+        run: pytest -v
