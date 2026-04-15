@@ -1,0 +1,62 @@
+name: Build wheels
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  wheels:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.19
+        env:
+          CIBW_BUILD: "cp311-* cp312-* cp313-*"
+          CIBW_ARCHS_LINUX: "x86_64 aarch64"
+          CIBW_ARCHS_MACOS: "x86_64 arm64"
+          CIBW_SKIP: "*-musllinux_* *-win_*"
+          CIBW_BEFORE_BUILD: "pip install maturin"
+          CIBW_BUILD_FRONTEND: "build"
+          CIBW_TEST_REQUIRES: "pytest hypothesis"
+          CIBW_TEST_COMMAND: "pytest {package}/tests"
+        with:
+          package-dir: python
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build sdist
+        working-directory: python
+        run: maturin sdist -o ../dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
