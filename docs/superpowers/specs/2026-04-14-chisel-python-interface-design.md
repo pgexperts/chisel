@@ -248,14 +248,9 @@ Documentation will state this plainly: "A `Chisel` instance is not safe for conc
 
 ### 5.2 GIL Release
 
-Methods that can block on I/O release the GIL via `py.allow_threads(...)`:
+The binding does NOT release the GIL during engine calls. The original intent was to wrap `commit()`, `read()`, and the CRUD methods in `py.allow_threads(...)`, but the engine's poison flag is implemented as an internal `Cell<bool>`, which makes `&Chisel` non-`Sync` (and therefore non-`Ungil`). PyO3's `allow_threads` requires the closure to be `Ungil`, so this does not compile.
 
-- `commit()` — performs two fsyncs.
-- `read()` — may miss the cache and hit disk.
-- `allocate()`, `update()`, `delete()`, `delete_many()` — may hit disk on cache eviction.
-- `defrag()` — can do substantial I/O.
-
-This costs nothing when no other Python threads exist and is a clear win in embedded-app contexts where a web server or task queue has other threads doing Python work during a Chisel commit.
+Given Chisel's deliberate single-client design (one `Chisel` per process at the filesystem level; no cross-thread sharing in the public contract), this restriction costs nothing in practice: an embedded Python application that holds the GIL during a Chisel commit has no sibling thread that could make independent storage progress anyway. If a future engine change removes the `Cell<bool>` in favor of a `Sync`-compatible atomic, GIL-releasing wrappers can be added non-breakingly.
 
 ## 6. Testing Strategy
 
