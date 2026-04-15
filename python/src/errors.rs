@@ -121,7 +121,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // — adding a new variant to ChiselError produces a compile error here, which
 // is intended: the binding must be updated rather than silently routing to a
 // generic error.
-#[allow(dead_code)]
 pub fn to_py_err(err: RustChiselError) -> PyErr {
     // The Display impl on ChiselError already yields human-readable text.
     let msg = err.to_string();
