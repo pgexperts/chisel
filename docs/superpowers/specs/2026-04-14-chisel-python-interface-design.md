@@ -50,9 +50,9 @@ The `python/` crate path-depends on the parent Chisel crate. Wheel builds theref
 
 ### 2.3 Distribution
 
-- **Wheels**: CPython 3.10, 3.11, 3.12, 3.13 × {macOS x86_64, macOS arm64, Linux x86_64 manylinux, Linux aarch64 manylinux}. Built in CI with `cibuildwheel`.
+- **Wheels**: CPython 3.11, 3.12, 3.13 × {macOS x86_64, macOS arm64, Linux x86_64 manylinux, Linux aarch64 manylinux}. Built in CI with `cibuildwheel` using `abi3-py311`.
 - **sdist**: published alongside wheels. On Windows, the build script raises a clear error pointing at the `flock` dependency.
-- **Python version floor**: 3.10. Justification: `match` statements and `X | Y` union syntax clean up the binding code; 3.9 is near end-of-life by release time.
+- **Python version floor**: 3.11. Originally 3.10; raised during Task 4 implementation because pyo3 0.22's safe `PyBuffer` API is gated behind `Py_3_11` when `abi3` limited-API is active. Keeping 3.10 would require either dropping `abi3` (per-version wheels) or using raw FFI for the buffer protocol. The buffer protocol is central to the value API, so bumping the floor is the clean choice; 3.10 is near end-of-life.
 - **Versioning**: Python package version matches the Rust crate version exactly.
 
 ### 2.4 CI Integration
@@ -288,7 +288,7 @@ Explicit coverage required:
 
 ### 6.3 CI
 
-Linux x86_64 and macOS arm64 on Python 3.10 (floor) and 3.13 (ceiling) for PRs; full matrix on main.
+Linux x86_64 and macOS arm64 on Python 3.11 (floor) and 3.13 (ceiling) for PRs; full matrix on main.
 
 ## 7. Out of Scope (Explicit Deferrals)
 

@@ -6,7 +6,7 @@
 
 **Architecture:** New `python/` directory inside the Chisel repo. A PyO3 `cdylib` crate path-deps on the parent Chisel crate. A thin pure-Python package (`chisel/`) re-exports the native module, bundles dataclasses for structured returns, and ships hand-written type stubs. Wheels are built with `maturin` / `cibuildwheel` and tested with `pytest`.
 
-**Tech Stack:** Rust (PyO3 0.22+, chisel path dep), Python 3.10+, maturin, pytest, hypothesis, cibuildwheel, GitHub Actions.
+**Tech Stack:** Rust (PyO3 0.22+, chisel path dep), Python 3.11+, maturin, pytest, hypothesis, cibuildwheel, GitHub Actions.
 
 ---
 
@@ -70,12 +70,12 @@ name = "chisel"
 version = "0.1.0"
 description = "Python binding for the Chisel transactional storage engine"
 readme = "../README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Christophe Pettus" }]
 classifiers = [
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
@@ -1918,7 +1918,7 @@ Add this job (adjust name/keys to match the existing file's conventions):
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python-version: ["3.10", "3.13"]
+        python-version: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -1939,7 +1939,7 @@ Add this job (adjust name/keys to match the existing file's conventions):
 
 ```bash
 git add .github/workflows/ci.yml
-git commit -m "Add Python binding to CI matrix (Linux + macOS × 3.10, 3.13)"
+git commit -m "Add Python binding to CI matrix (Linux + macOS × 3.11, 3.13)"
 ```
 
 ---
@@ -2035,7 +2035,7 @@ Python binding for the [Chisel](..) transactional storage engine.
 pip install chisel
 ```
 
-Wheels are provided for CPython 3.10–3.13 on Linux (x86_64, aarch64) and
+Wheels are provided for CPython 3.11–3.13 on Linux (x86_64, aarch64) and
 macOS (x86_64, arm64). Windows is not supported.
 
 ## Quick start
