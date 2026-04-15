@@ -9,4 +9,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 chisel = { path = ".." }
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }
