@@ -55,7 +55,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 chisel = { path = ".." }
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }
 ```
 
 - [ ] **Step 2: Create `python/pyproject.toml`**
@@ -75,7 +75,6 @@ license = { text = "MIT" }
 authors = [{ name = "Christophe Pettus" }]
 classifiers = [
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
