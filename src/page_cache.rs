@@ -38,6 +38,20 @@ use crate::error::{ChiselError, Result};
 use crate::page::{self, PAGE_SIZE};
 use crate::page_io::PageIo;
 
+// Hard-ceiling multiplier on `max_pages` (ISSUES.md I19). The cache's
+// soft limit — `max_pages` — is the working-set target; dirty pages
+// pin themselves against eviction, so a single transaction can
+// legitimately push the cache over the soft limit. But unbounded
+// growth is an OOM hazard; this multiplier caps how far over the soft
+// limit the cache may grow with every entry dirty before `maybe_evict`
+// surfaces `ChiselError::CacheFull` and forces the caller to commit
+// or roll back. 8× is a defensive default: generous enough that
+// normal write-heavy workloads never see it, small enough that a
+// pathological or runaway transaction trips the brake within seconds
+// rather than megabytes of memory. Not currently configurable; expose
+// via `Options` if a real workload needs to tune it.
+const HARD_CEILING_MULTIPLIER: usize = 8;
+
 struct CacheEntry {
     buf: Box<[u8; PAGE_SIZE]>,
     // `dirty` means "modified since last flush, must be written on commit".
@@ -373,6 +387,17 @@ impl PageCache {
     /// transaction — the dirty-discard would lose committed-but-unflushed
     /// work.
     pub fn claim_page(&mut self, page_id: u64) -> Result<()> {
+        // ISSUES.md I20: enforce the "freemap never returns an already-dirty
+        // id" invariant in debug builds. The only legitimate caller is
+        // `allocate_data_page` via the freemap, which — post-I18 — keeps the
+        // at-risk id sets out of the in-commit free pool. A violation here
+        // would silently drop the caller's pending writes on `page_id`; an
+        // assertion surfaces the bug at its source rather than hours later
+        // as mysterious data loss.
+        debug_assert!(
+            !self.is_dirty(page_id),
+            "claim_page called on a dirty page (page_id={page_id}); freemap returned an id with pending writes from the current transaction"
+        );
         // Remove any pre-existing entry so a stale cached copy from a
         // prior reader doesn't leak into the new transaction's view.
         self.entries.remove(&page_id);
@@ -455,9 +480,19 @@ impl PageCache {
     /// losing it to eviction would lose the transaction's work.
     ///
     /// Termination: if every cached page is dirty we break out of the
-    /// loop and deliberately exceed `max_pages`. This is a soft limit, not
-    /// a hard one. Write-heavy transactions can grow the cache arbitrarily
-    /// between flushes; this is intentional.
+    /// loop and deliberately exceed `max_pages`. This is a SOFT limit
+    /// on the working-set size, not a hard cap on memory. Write-heavy
+    /// transactions can legitimately push the cache well past
+    /// `max_pages` between flushes.
+    ///
+    /// Hard ceiling (ISSUES.md I19): after the eviction loop settles,
+    /// if we are still above `max_pages * HARD_CEILING_MULTIPLIER`,
+    /// we raise `ChiselError::CacheFull`. This caps runaway growth in
+    /// pathological workloads (a long transaction that allocates
+    /// pages in a loop without committing) while preserving the
+    /// soft-limit semantics for normal use. The caller recovers by
+    /// committing (flushes → pages become evictable) or rolling back
+    /// (discards all dirty pages).
     ///
     /// The `is_none_or(|e| e.dirty)` is awkward: it returns true if the
     /// entry is missing OR dirty, so `!` flips to "entry exists AND is
@@ -477,9 +512,121 @@ impl PageCache {
                     self.entries.remove(&id);
                     self.lru.retain(|&lid| lid != id);
                 }
-                None => break, // All pages are dirty; can't evict.
+                None => break, // All pages are dirty; fall through to the hard-ceiling check.
             }
         }
+        let hard_ceiling = self.max_pages.saturating_mul(HARD_CEILING_MULTIPLIER);
+        if self.entries.len() > hard_ceiling {
+            return Err(ChiselError::CacheFull {
+                limit: hard_ceiling,
+            });
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::page_io::PageIo;
+    use tempfile::NamedTempFile;
+
+    fn fresh_cache(max_pages: usize) -> PageCache {
+        let file = NamedTempFile::new().unwrap();
+        let io = PageIo::open(file.path(), false).unwrap();
+        // Leak the tempfile so the PageIo's file handle outlives this
+        // function; tests drop the cache at end of scope, which closes
+        // the fd and releases the flock cleanly.
+        std::mem::forget(file);
+        PageCache::new(io, max_pages)
+    }
+
+    // Regression test for ISSUES.md I19. The cache is a SOFT limit by
+    // design: when every cached entry is dirty, `maybe_evict` is forced
+    // to break out of its eviction loop and let the cache grow past
+    // `max_pages`. Pre-I19 there was no upper bound at all, so a
+    // long-running transaction that allocated many `new_page()`s
+    // without flushing could exhaust memory silently. I19 adds a hard
+    // ceiling — currently `max_pages * HARD_CEILING_MULTIPLIER` — that
+    // trips `ChiselError::CacheFull` once exceeded, forcing the caller
+    // to commit (which flushes, enabling eviction) or roll back. This
+    // is an OPERATIONAL error, not fatal: the cache state is internally
+    // consistent and the caller can recover by splitting their work
+    // into smaller transactions.
+    #[test]
+    fn cache_full_fires_when_all_pages_dirty_past_hard_ceiling() {
+        let max_pages = 4;
+        let mut cache = fresh_cache(max_pages);
+        let hard_ceiling = max_pages * HARD_CEILING_MULTIPLIER;
+
+        // Allocate up to the ceiling. Every `new_page()` produces a
+        // DIRTY entry, so the LRU eviction loop can never evict.
+        for _ in 0..hard_ceiling {
+            cache
+                .new_page()
+                .expect("allocations up to the ceiling must succeed");
+        }
+        assert_eq!(cache.entries.len(), hard_ceiling);
+
+        // The next new_page must trip CacheFull.
+        let err = cache.new_page().unwrap_err();
+        assert!(
+            matches!(err, ChiselError::CacheFull { limit } if limit == hard_ceiling),
+            "expected CacheFull {{ limit: {hard_ceiling} }}, got {err:?}"
+        );
+    }
+
+    // Flushing the cache clears dirty flags, which means the eviction
+    // loop can actually evict again, which means subsequent allocations
+    // succeed. Covers the intended "commit to recover from CacheFull"
+    // recovery path.
+    #[test]
+    fn cache_full_is_recoverable_via_flush() {
+        let max_pages = 4;
+        let mut cache = fresh_cache(max_pages);
+        let hard_ceiling = max_pages * HARD_CEILING_MULTIPLIER;
+
+        for _ in 0..hard_ceiling {
+            cache.new_page().unwrap();
+        }
+        assert!(matches!(
+            cache.new_page(),
+            Err(ChiselError::CacheFull { .. })
+        ));
+
+        // Flush clears every dirty flag. The next maybe_evict can then
+        // reclaim capacity by evicting clean pages from the LRU tail.
+        cache.flush().unwrap();
+        // After flush, the cache is still at hard_ceiling entries but
+        // all clean; the next new_page evicts one and succeeds.
+        cache
+            .new_page()
+            .expect("post-flush allocation should succeed");
+        assert!(cache.entries.len() <= hard_ceiling);
+    }
+
+    // Regression test for ISSUES.md I20. claim_page previously silently
+    // dropped any prior dirty writes on the claimed id: it unconditionally
+    // removed the existing cache entry and inserted a fresh zeroed one.
+    // The only legitimate caller is `allocate_data_page` via the freemap,
+    // which must never return an id already dirty in the current txn —
+    // but the invariant was unenforced. I20 adds a debug_assert so the
+    // rule is checked in debug builds; a violation fires immediately
+    // rather than surfacing hours later as silent data loss.
+    //
+    // Gated on debug_assertions because debug_assert! is a no-op in
+    // release builds; running this test under `cargo test --release`
+    // would (correctly) not panic.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "claim_page called on a dirty page")]
+    fn claim_page_asserts_on_dirty_page() {
+        let mut cache = fresh_cache(64);
+
+        // new_page produces a fresh dirty entry. claim_page'ing that
+        // same id is exactly the forbidden path the I20 assert guards.
+        let id = cache.new_page().unwrap();
+        assert!(cache.is_dirty(id));
+        let _ = cache.claim_page(id);
     }
 }

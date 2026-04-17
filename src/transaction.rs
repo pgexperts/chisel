@@ -1774,7 +1774,13 @@ mod tests {
     fn fresh_manager() -> TransactionManager {
         let file = NamedTempFile::new().unwrap();
         let io = PageIo::open(file.path(), false).unwrap();
-        let cache = PageCache::new(io, 64);
+        // Match Options::default()'s cache_size of 1024 so tests that
+        // intentionally allocate many pages in a single transaction
+        // (e.g. the I3+I7 handle-table-growth test allocates 510+) stay
+        // well under the I19 hard ceiling of `cache_size *
+        // HARD_CEILING_MULTIPLIER`. Tiny test caches were fine before
+        // I19 because the cache had no upper bound.
+        let cache = PageCache::new(io, 1024);
         let mut tm = TransactionManager::create_new(cache, 2).unwrap();
         // Commit once so there's a real baseline to read/write against.
         tm.begin().unwrap();

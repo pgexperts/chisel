@@ -33,7 +33,7 @@ Dependencies and batching drive this more than raw priority. Earlier items unblo
 10. **R1** — pack multiple values per data page. Biggest space/perf win; best done on top of a working freemap.
 11. **R3 + I17** — selective defrag (and fix the stat accuracy while rewriting the loop).
 12. **I13 + I14** — overflow hardening pass.
-13. **Page-cache hardening: I19 + I20** — add bounds/asserts on `maybe_evict` and `claim_page`. Batch with any future PageCache refactor.
+13. **Page-cache hardening: I19 + I20** — add bounds/asserts on `maybe_evict` and `claim_page`. ✅ FIXED 2026-04-17.
 14. **Python binding cleanup: I21–I25** — ergonomics and dead-code audit; batch as one PR once the Rust-side dust has settled.
 15. **P3 cleanup sweep** — I5, I8, I16, C1–C3, and the "invariants to verify" section.
 
@@ -200,21 +200,19 @@ Error-quality only. Add a bounds check on any PR touching `page_io.rs`.
 
 ## Page-cache hardening
 
-### I19. `PageCache::maybe_evict` grows unboundedly when every page is dirty [comment-pass 2026-04-17] — **P2**
-**Where:** `page_cache.rs:446–463`
+### I19. `PageCache::maybe_evict` grows unboundedly when every page is dirty [comment-pass 2026-04-17] — **P2** ✅ FIXED 2026-04-17
+**Where:** `page_cache.rs` `maybe_evict`
 
-When every cached entry is dirty the eviction loop `break`s and the cache silently grows past `max_pages`. The code comments this as a deliberate soft-limit (dirty pages may not be evicted without losing writes), but there is no upper bound and no warning. A long-running transaction that calls `new_page()` many times without intervening flushes can exhaust memory.
+When every cached entry was dirty, the eviction loop broke out and the cache silently grew past `max_pages` without bound. A long-running transaction allocating many `new_page()`s without intervening flushes could exhaust memory.
 
-**Fix candidates:**
-- Add a hard ceiling (e.g., `max_pages * K`) that returns `ChiselError::CacheFull` rather than continuing to grow.
-- Or, log / `debug_assert!` on an all-dirty eviction so runaway growth shows up in tests.
+**Fix:** added a `HARD_CEILING_MULTIPLIER` constant (currently 8×) and a check at the end of `maybe_evict` that returns the new operational `ChiselError::CacheFull { limit }` once `entries.len()` exceeds `max_pages * HARD_CEILING_MULTIPLIER`. The soft-limit semantics for `max_pages` are unchanged — write-heavy transactions can still grow past it — but runaway growth now trips a recoverable error. Caller recovery is to commit (which flushes, freeing the dirty pin) or roll back. The Python binding gets a parallel `CacheFullError` in the OperationalError tier. Tests `cache_full_fires_when_all_pages_dirty_past_hard_ceiling` and `cache_full_is_recoverable_via_flush` in `page_cache.rs` cover trigger and recovery; `fresh_manager`'s test cache size in `transaction.rs` was bumped from 64 to 1024 so existing high-allocation tests stay well under the new ceiling.
 
-### I20. `PageCache::claim_page` silently discards dirty writes on re-insertion [comment-pass 2026-04-17] — **P3**
-**Where:** `page_cache.rs:354–367`
+### I20. `PageCache::claim_page` silently discards dirty writes on re-insertion [comment-pass 2026-04-17] — **P3** ✅ FIXED 2026-04-17
+**Where:** `page_cache.rs` `claim_page`
 
-If the freemap ever hands back an id that the current transaction has already dirtied, `claim_page` will replace the cached entry and lose the pending writes. The only current caller is `allocate_data_page` via the freemap, which is not supposed to return an already-dirty id; the invariant is just not enforced.
+If the freemap ever handed back an id the current transaction had already dirtied, `claim_page` would silently replace the cached entry and lose the pending writes. The only legitimate caller is `allocate_data_page` via the freemap, which post-I18 is well-behaved — the invariant just wasn't enforced.
 
-**Fix:** add `debug_assert!(!self.is_dirty(page_id))` to `claim_page`. Trivial; batch with any future freemap or cache change (see I19 and I18).
+**Fix:** added `debug_assert!(!self.is_dirty(page_id), …)` at the top of `claim_page` so a violation surfaces immediately in debug builds rather than as silent data loss hours later. Release builds are unchanged. Test `claim_page_asserts_on_dirty_page` covers the assertion (gated on `cfg(debug_assertions)`).
 
 ---
 
