@@ -50,3 +50,36 @@ def test_savepoint_exposes_name(mem_db):
         sp = tx.savepoint("mark")
         assert sp.name == "mark"
         sp.release()
+
+
+def test_savepoint_second_release_raises(mem_db):
+    # I22: a second explicit release() must raise AlreadyFinishedError
+    # rather than silently succeeding. The silent no-op masked
+    # "called release() on the wrong savepoint" bugs.
+    with mem_db.transaction() as tx:
+        sp = tx.savepoint("once")
+        sp.release()
+        with pytest.raises(chisel.AlreadyFinishedError):
+            sp.release()
+
+
+def test_savepoint_second_rollback_to_raises(mem_db):
+    # I22: same idempotency-as-error rule as release().
+    with mem_db.transaction() as tx:
+        tx.allocate(b"before")
+        sp = tx.savepoint("once")
+        tx.allocate(b"after")
+        sp.rollback_to()
+        with pytest.raises(chisel.AlreadyFinishedError):
+            sp.rollback_to()
+
+
+def test_savepoint_explicit_then_with_exit_is_silent(mem_db):
+    # The __exit__ path stays idempotent — the guard short-circuits
+    # without raising, matching normal context-manager semantics. A
+    # user who called release() inside the `with` block should not
+    # see AlreadyFinishedError bubble out of the block exit.
+    with mem_db.transaction() as tx:
+        with tx.savepoint("ok") as sp:
+            sp.release()  # explicit finish
+        # __exit__ here should NOT raise AlreadyFinishedError

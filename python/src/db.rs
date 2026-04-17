@@ -1,18 +1,32 @@
 // db.rs — PyChisel wraps chisel::Chisel and provides the top-level
 // `open()` constructor. The engine is held in a RefCell<Option<Chisel>>
-// so that close() can deterministically drop it; subsequent calls see
-// None and (for is_poisoned) report true — a closed handle is,
-// semantically, a handle that can never produce new results, which is
-// indistinguishable from poisoned from the caller's perspective.
+// so that close() can deterministically drop it; subsequent mutating
+// or reading calls raise `ClosedError` (ISSUES.md I25, distinct from
+// `PoisonedError` so the user can tell "I closed this" from "Rust-side
+// corruption"). The `is_poisoned` getter treats closed as poisoned
+// because from a "can this handle still do work?" perspective the two
+// are equivalent — the distinct exception class lets code that DOES
+// care about the cause tell them apart.
 //
 // Why RefCell (and not Mutex): Chisel is explicitly a single-client
 // embedded engine (see MEMORY: project_chisel_single_client_design),
-// and the Python GIL already serializes access to this object from
-// Python code. RefCell gives us `&self` pymethods with interior
-// mutability at near-zero cost; the only failure mode (a double
-// borrow_mut panic) would indicate a reentrancy bug — e.g. a Rust
-// callback that re-entered Python and called back into the same
-// PyChisel during a mutable borrow. No such path exists today.
+// and the Python GIL already serializes CROSS-THREAD access to this
+// object from Python code. RefCell gives us `&self` pymethods with
+// interior mutability at near-zero cost.
+//
+// What the GIL does NOT protect against (ISSUES.md I21): a
+// SAME-THREAD re-entry — e.g., some future engine API that takes a
+// Python callback, dispatches into Python while holding a borrow_mut
+// on `inner`, and then the callback turns around and calls another
+// PyChisel method on the same thread. The GIL is held throughout
+// (same thread, no yield), but the second borrow_mut hits an already-
+// borrowed RefCell and panics. No such callback API exists in this
+// binding today — every public method takes Python values and returns
+// them; no engine callback escapes back into Python code. If/when a
+// callback API is introduced, either (a) convert `inner` to
+// `Option<Chisel>` behind a `try_borrow_mut` wrapper that raises an
+// explicit reentrancy error, or (b) reshape the engine call so the
+// mutable borrow is released before the Python callback fires.
 //
 // Lifetime pinning: PyTransaction and PySavepoint each hold a
 // `Py<PyChisel>` (a strong Python reference), so the Rust-side
@@ -20,7 +34,10 @@
 // savepoint object is still live on the Python side. Conversely,
 // `close()` only clears the `Option` — if a transaction is still
 // holding the `Py<PyChisel>`, the PyChisel itself survives until
-// GC'd, but further calls through it see `None` and raise PoisonedError.
+// GC'd, but further calls through it see `None` and raise ClosedError.
+// Calling `close()` inside `with db.transaction()` therefore causes
+// the __exit__'s commit/rollback to surface ClosedError on the way
+// out, which is intentionally distinguishable from PoisonedError.
 
 use pyo3::prelude::*;
 use pyo3::types::PyString;
@@ -353,14 +370,15 @@ impl PyChisel {
     }
 
     // These two helpers are the ONLY place the closed/poisoned
-    // distinction collapses to PoisonedError — callers above never see
-    // a bare None. We intentionally do NOT release the GIL around the
-    // engine call: Chisel owns `Cell<bool>` internally so `&Chisel`
+    // distinction collapses to its typed errors — callers above never
+    // see a bare None. We intentionally do NOT release the GIL around
+    // the engine call: Chisel owns `Cell<bool>` internally so `&Chisel`
     // is not `Sync`, and the single-client embedded design means
     // there is no concurrent Python work to overlap with anyway (see
-    // MEMORY: project_chisel_single_client_design). Python's GIL also
-    // prevents concurrent re-entry into the RefCell; a borrow_mut
-    // panic here would mean a genuine reentrancy bug.
+    // MEMORY: project_chisel_single_client_design). The GIL prevents
+    // CROSS-THREAD re-entry into the RefCell, but not same-thread
+    // re-entry through a hypothetical future callback API — see the
+    // module-level I21 note at the top of this file.
     //
     // Consequence: long-running engine calls (e.g. a large commit's
     // fsync, a big defrag) will block ALL other Python threads in this
@@ -380,9 +398,7 @@ impl PyChisel {
         f: impl FnOnce(&Chisel) -> chisel::Result<R>,
     ) -> PyResult<R> {
         let guard = self.inner.borrow();
-        let c = guard
-            .as_ref()
-            .ok_or_else(|| to_py_err(chisel::ChiselError::Poisoned))?;
+        let c = guard.as_ref().ok_or_else(closed_err)?;
         f(c).map_err(to_py_err)
     }
 
@@ -392,11 +408,18 @@ impl PyChisel {
         f: impl FnOnce(&mut Chisel) -> chisel::Result<R>,
     ) -> PyResult<R> {
         let mut guard = self.inner.borrow_mut();
-        let c = guard
-            .as_mut()
-            .ok_or_else(|| to_py_err(chisel::ChiselError::Poisoned))?;
+        let c = guard.as_mut().ok_or_else(closed_err)?;
         f(c).map_err(to_py_err)
     }
+}
+
+// Small helper so the ClosedError construction is not duplicated
+// between the two `with_inner_*` helpers. Message matches the
+// exception class description in errors.rs — the user-visible
+// distinction between "closed" and "poisoned" is the class name,
+// not the text.
+fn closed_err() -> PyErr {
+    crate::errors::ClosedError::new_err("database handle has been closed")
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

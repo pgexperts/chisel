@@ -42,3 +42,40 @@ def test_nested_transactions_raise(mem_db):
 def test_mutators_outside_transaction_raise(mem_db):
     with pytest.raises(chisel.NoActiveTransactionError):
         mem_db.allocate(b"orphan")
+
+
+def test_tx_explicit_commit(mem_db):
+    # I24: explicit commit() on PyTransaction drives the engine and
+    # sets the `finished` guard so __exit__ becomes a silent no-op.
+    tx = mem_db.transaction()
+    h = tx.allocate(b"explicit")
+    tx.commit()
+    assert mem_db.read(h) == b"explicit"
+
+
+def test_tx_explicit_rollback(mem_db):
+    # I24: explicit rollback() matches commit()'s shape.
+    tx = mem_db.transaction()
+    tx.allocate(b"discarded")
+    tx.rollback()
+    assert mem_db.handles() == []
+
+
+def test_tx_second_commit_raises(mem_db):
+    # I24: mirrors PySavepoint's idempotency-as-error policy — a second
+    # explicit drive raises AlreadyFinishedError.
+    tx = mem_db.transaction()
+    tx.allocate(b"once")
+    tx.commit()
+    with pytest.raises(chisel.AlreadyFinishedError):
+        tx.commit()
+
+
+def test_tx_commit_then_with_exit_is_silent(mem_db):
+    # Like savepoints: explicit commit inside a `with` block must not
+    # make __exit__ raise on its way out. The `finished` guard short-
+    # circuits __exit__ silently.
+    with mem_db.transaction() as tx:
+        tx.allocate(b"keep")
+        tx.commit()
+        # __exit__ here should NOT raise AlreadyFinishedError
