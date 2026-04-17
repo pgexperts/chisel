@@ -19,7 +19,9 @@ Priority legend:
 
 ## Suggested fix order
 
-Dependencies and batching drive this more than raw priority. Earlier items unblock later ones.
+> **Status note (2026-04-17):** every item below has landed. The order is preserved here as historical context — a reader looking at this file for "what's open?" should conclude: nothing from the 2026-04-10 or 2026-04-17 review passes is still actionable. The individual entries in later sections carry the definitive status.
+
+Dependencies and batching drove this more than raw priority. Earlier items unblocked later ones.
 
 1. **I2** — first commit wipes the only valid superblock. One-day fix, unblocks every other durability guarantee.
 2. **I15** — superblock `format_version` validation. One-hour fix, do while I2 is in review.
@@ -37,7 +39,7 @@ Dependencies and batching drive this more than raw priority. Earlier items unblo
 14. **Python binding cleanup: I21–I25** — ergonomics and dead-code audit. ✅ RESOLVED 2026-04-17 (I23 was a false alarm; the other four landed as one PR).
 15. **P3 cleanup sweep** — I5, I8, I16, C1–C3, and the "invariants to verify" section.
 
-R4 (configurable superblock count) and R5 (Python bindings) sit outside this order — R4 is gated on I2, R5 is gated on F3.
+R4 (configurable superblock count) and R5 (Python bindings) sat outside this order — R4 was gated on I2, R5 on F3. Both have shipped.
 
 ---
 
@@ -301,10 +303,10 @@ Fix I17 (defrag stats) while you're rewriting the loop.
 
 I2 must be fixed first — the "first commit wipes the only valid superblock" bug affects any N ≥ 2.
 
-### R5. Python bindings [roadmap] — **P3** (gated on F3)
+### R5. Python bindings [roadmap] — **P3** (gated on F3) ✅ SHIPPED 2026-04-17 (across the python-binding commit series; see `python/` subcrate and the I21–I25 follow-up batch)
 > PyO3-based wrapper exposing the full Chisel API to Python, including context managers for transactions and savepoints.
 
-Blocked on F3 — PyO3 wants `&self` methods too, so fixing once helps both clients. Don't ship bindings until the API shape is settled.
+Formally gated on F3 (so `&self` reads flow through without wrapping); the binding then landed incrementally as a separate PyO3 subcrate under `python/` with its own `Cargo.toml` / `pyproject.toml` / `maturin develop` workflow, and was further polished by the I21–I25 binding-cleanup batch (explicit `PyTransaction.commit()` / `.rollback()`, `AlreadyFinishedError` on double-drive, `ClosedError` distinct from `PoisonedError`, and RefCell reentrancy docs).
 
 ---
 
