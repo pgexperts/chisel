@@ -75,11 +75,15 @@ impl Default for Options {
 
 /// A live handle to an open Chisel database.
 ///
-/// Owns (transitively) the exclusive file lock, the page cache, and the
-/// current in-memory view of the superblock roots. Dropping a `Chisel`
-/// releases the page cache and closes the underlying file, which in turn
-/// releases the `flock` (the lock is tied to the file descriptor, so drop
-/// order is what matters — not an explicit unlock call).
+/// Owns (transitively) the page cache and the current in-memory view of
+/// the superblock roots. For file-backed databases it also owns the
+/// exclusive `flock`; memory-backed databases (opened via
+/// `open_in_memory[_with_options]`) have no lock because the `Vec`-backed
+/// `PageIo` is itself the database and cannot be opened twice by
+/// construction. Dropping a `Chisel` releases the page cache and closes
+/// the underlying file, which in turn releases the `flock` on the file
+/// path (the lock is tied to the file descriptor, so drop order is what
+/// matters — not an explicit unlock call).
 ///
 /// IMPORTANT: dropping without calling `commit()` on an in-flight transaction
 /// discards that transaction. Shadow paging guarantees the on-disk state is
@@ -243,6 +247,12 @@ impl Chisel {
     /// they are never reused within a database's lifetime and are stable
     /// across updates, defrag, and reopens. Physical location may change;
     /// the handle will not.
+    ///
+    /// Values up to `transaction::MAX_INLINE_VALUE` are packed into a slot
+    /// on a data page (R1 packing — multiple values share a page); larger
+    /// values are written to an overflow chain in `overflow.rs`. The
+    /// caller cannot tell which path was taken except by consulting
+    /// stats; all reads go through the same `read()` entry point.
     pub fn allocate(&mut self, value: &[u8]) -> Result<u64> {
         self.txm.allocate(value)
     }

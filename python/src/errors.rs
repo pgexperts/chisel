@@ -4,6 +4,40 @@
 // src/error.rs exactly, so `except chisel.FatalError` in Python
 // captures the same set of "drop-and-reopen" conditions that would
 // poison the Rust TransactionManager.
+//
+// Invariant: every ChiselError variant maps to exactly one concrete
+// exception class. The match in `to_py_err` is exhaustive, so adding a
+// new ChiselError variant produces a compile error here rather than a
+// silent fallback. That is the ONLY safety mechanism keeping the
+// Python exception surface in sync with the Rust error enum — there is
+// no test that enumerates variants.
+//
+// Class hierarchy (matches both the .pyi stubs and __init__.py re-exports):
+//
+//   Exception
+//     ChiselError                        (base for all binding errors)
+//       OperationalError                 (database intact; user or transient)
+//         InvalidHandleError
+//         NoActiveTransactionError
+//         TransactionAlreadyActiveError
+//         SavepointNotFoundError
+//         DuplicateSavepointError
+//         ReadOnlyModeError
+//         DatabaseFileNotFoundError
+//         InvalidRootNameError
+//         RootNameTableFullError
+//         InvalidSuperblockCountError
+//       FatalError                       (drop-and-reopen recovery only)
+//         IoError
+//         ChecksumMismatchError
+//         CorruptSuperblockError
+//         FileSizeMismatchError
+//         InvalidMagicError
+//         LockFailedError
+//         UnsupportedFormatVersionError
+//         CorruptPageError
+//         InvalidPageIdError
+//         PoisonedError
 
 use chisel::ChiselError as RustChiselError;
 use pyo3::create_exception;
@@ -38,6 +72,10 @@ create_exception!(_chisel, CorruptPageError, FatalError);
 create_exception!(_chisel, InvalidPageIdError, FatalError);
 create_exception!(_chisel, PoisonedError, FatalError);
 
+// Manually register each exception class on the module. `create_exception!`
+// creates the type but does NOT attach it to the module; `m.add` does
+// that. Order within each tier does not matter — Python's `isinstance`
+// cares only about the parent chain, which was set at class creation.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
     m.add("ChiselError", py.get_type_bound::<ChiselError>())?;
@@ -121,8 +159,15 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // — adding a new variant to ChiselError produces a compile error here, which
 // is intended: the binding must be updated rather than silently routing to a
 // generic error.
+//
+// Called from every engine-facing site in db.rs (via with_inner_io /
+// with_inner_mut_io) and from db::open when the initial open/create
+// fails. The GIL is always held at call sites.
 pub fn to_py_err(err: RustChiselError) -> PyErr {
     // The Display impl on ChiselError already yields human-readable text.
+    // We do NOT attach the Rust error as __cause__ — the string is the
+    // only cross-boundary contract, and round-tripping back into Rust
+    // from Python isn't supported.
     let msg = err.to_string();
     match err {
         // Operational

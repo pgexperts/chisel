@@ -6,11 +6,14 @@
 // see raw file I/O.
 //
 // Key invariants:
-// - Every page loaded from disk has its checksum verified in `load_page`
-//   BEFORE it enters the cache. Once a page is in `entries`, callers may
-//   assume its bytes were valid at load time. Bytes mutated in-cache will
-//   not have a valid checksum until the relevant page-type module rewrites
-//   one before flush.
+// - Checksums are verified on COLD reads only (in `load_page`, before the
+//   entry enters `entries`). Cache hits via `get`/`get_mut` do NOT
+//   re-validate — the bytes are trusted between load and eviction. Once a
+//   page is in `entries`, callers may assume its bytes were valid at load
+//   time. Bytes mutated in-cache will not have a valid checksum until the
+//   relevant page-type module rewrites one before flush. This trust chain
+//   relies on the exclusive flock in `PageIo::open` preventing any other
+//   process from scribbling on the file behind our back.
 // - Dirty pages are NEVER evicted. `maybe_evict` walks the LRU tail and
 //   skips any dirty entry. This is the cache's contribution to shadow
 //   paging: once a transaction has touched a page, the in-memory version
@@ -83,9 +86,13 @@ impl PageCache {
     ///
     /// On a miss, `load_page` validates the checksum before the bytes enter
     /// the cache. Callers of `get` therefore never see unvalidated data.
-    /// Subsequent hits skip re-verification, which is safe as long as the
-    /// in-memory buffer is not shared with any external process (enforced
-    /// by the exclusive flock in `PageIo::open`).
+    /// Subsequent hits skip re-verification — checksums are validated on
+    /// COLD reads (cache misses) only, not on every call to `get`. This is
+    /// safe as long as the in-memory buffer is not shared with any external
+    /// process (enforced by the exclusive flock in `PageIo::open`) and as
+    /// long as no module mutates a cached buffer without going through
+    /// `get_mut`, which marks it dirty (and therefore eligible for a fresh
+    /// checksum stamp at flush time by the page-type module).
     pub fn get(&mut self, page_id: u64) -> Result<&[u8; PAGE_SIZE]> {
         if !self.entries.contains_key(&page_id) {
             self.load_page(page_id)?;
@@ -295,26 +302,31 @@ impl PageCache {
 
     /// Expose the PageIo for direct superblock I/O.
     ///
-    /// Superblocks live at fixed page IDs (0 and 1) and must bypass the
-    /// page cache entirely. Both ends of the superblock lifecycle use
-    /// this accessor directly:
+    /// Superblocks live at fixed page IDs `0..N` (where N is the
+    /// configurable `superblock_count`, 2..=16 — see ISSUES.md R4)
+    /// and must bypass the page cache entirely. Both ends of the
+    /// superblock lifecycle use this accessor directly:
     ///
     ///   * `TransactionManager::commit_inner` writes the new superblock
-    ///     to its inactive slot via `io_mut().write_page(inactive, ...)`.
-    ///   * `TransactionManager::open_existing` reads both slots via
-    ///     `io_mut().read_page(0)` and `read_page(1)` before letting
-    ///     `Superblock::select` pick the winner.
+    ///     to its inactive slot via `io_mut().write_page(inactive, ...)`
+    ///     where `inactive = txn_counter % superblock_count`.
+    ///   * `TransactionManager::open_existing` reads up to
+    ///     MAX_SUPERBLOCKS candidate slots via `io_mut().read_page(i)`
+    ///     before letting `Superblock::select` pick the winner.
     ///
-    /// Caching superblocks would break the dual-superblock alternation
-    /// protocol: `commit_inner` writes the inactive slot and expects
-    /// the file (not a cache entry) to reflect the change immediately
-    /// for the subsequent fsync. A cached superblock buffer could also
-    /// hand a reader a stale copy across the alternation boundary,
-    /// defeating the whole "highest valid counter wins" selection rule.
+    /// Caching superblocks would break the N-way alternation protocol:
+    /// `commit_inner` writes the inactive slot and expects the file
+    /// (not a cache entry) to reflect the change immediately for the
+    /// subsequent fsync. A cached superblock buffer could also hand a
+    /// reader a stale copy across the rotation boundary, defeating
+    /// the whole "highest valid counter wins" selection rule.
     ///
-    /// The caller-side discipline is "never call cache.get(0) or
-    /// cache.get(1)"; this is a transaction-layer convention, not
-    /// enforced by the cache itself.
+    /// The caller-side discipline is "never call cache.get(id) for
+    /// id < superblock_count"; this is a transaction-layer convention,
+    /// not enforced by the cache itself. Note that the cache cannot
+    /// enforce it on its own because it does not know the value of
+    /// `superblock_count` (that field lives on TransactionManager,
+    /// not on PageCache).
     pub fn io_mut(&mut self) -> &mut PageIo {
         &mut self.io
     }
@@ -351,6 +363,15 @@ impl PageCache {
     /// (the old entry is dropped). Does NOT extend the file — the id
     /// must already exist within the current file size, and the caller
     /// must have acquired it via the freemap before invoking this.
+    ///
+    /// Warning: if a prior cache entry for `page_id` was dirty, its
+    /// pending writes are silently discarded. That is intentional for
+    /// the freemap-reuse path (the only legitimate caller) because the
+    /// page has just been re-allocated and its pre-existing content is
+    /// by definition garbage. But it means this method MUST NOT be
+    /// called on a page that has live writes belonging to the current
+    /// transaction — the dirty-discard would lose committed-but-unflushed
+    /// work.
     pub fn claim_page(&mut self, page_id: u64) -> Result<()> {
         // Remove any pre-existing entry so a stale cached copy from a
         // prior reader doesn't leak into the new transaction's view.

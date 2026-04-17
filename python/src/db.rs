@@ -4,6 +4,23 @@
 // None and (for is_poisoned) report true — a closed handle is,
 // semantically, a handle that can never produce new results, which is
 // indistinguishable from poisoned from the caller's perspective.
+//
+// Why RefCell (and not Mutex): Chisel is explicitly a single-client
+// embedded engine (see MEMORY: project_chisel_single_client_design),
+// and the Python GIL already serializes access to this object from
+// Python code. RefCell gives us `&self` pymethods with interior
+// mutability at near-zero cost; the only failure mode (a double
+// borrow_mut panic) would indicate a reentrancy bug — e.g. a Rust
+// callback that re-entered Python and called back into the same
+// PyChisel during a mutable borrow. No such path exists today.
+//
+// Lifetime pinning: PyTransaction and PySavepoint each hold a
+// `Py<PyChisel>` (a strong Python reference), so the Rust-side
+// `Chisel` engine cannot be dropped while any transaction or
+// savepoint object is still live on the Python side. Conversely,
+// `close()` only clears the `Option` — if a transaction is still
+// holding the `Py<PyChisel>`, the PyChisel itself survives until
+// GC'd, but further calls through it see `None` and raise PoisonedError.
 
 use pyo3::prelude::*;
 use pyo3::types::PyString;
@@ -22,6 +39,14 @@ pub struct PyChisel {
     inner: RefCell<Option<Chisel>>,
 }
 
+// Keyword-only args after `path` (note the `*`) so users can't
+// positionally supply cache_size by accident; the defaults mirror
+// `chisel::Options::default()` so `open(None)` and `open("f.db")`
+// behave the same as the Rust API with default options.
+//
+// Defaults MUST stay in sync with chisel::Options::default() — both
+// sides hard-code them rather than sharing a constant because the Rust
+// side's constants are not exposed through the PyO3 signature syntax.
 #[pyfunction]
 #[pyo3(signature = (
     path = None,
@@ -41,6 +66,11 @@ pub fn open(
 ) -> PyResult<PyChisel> {
     // Coerce path to PathBuf under the GIL first. Accept str fast-path
     // and fall back to os.fspath() for any os.PathLike (pathlib.Path, etc).
+    //
+    // Path None is the in-memory-mode sentinel (matches the stubs'
+    // `path: ... | None`); any non-None value must either be a str or
+    // implement os.PathLike. We do this extraction before releasing the
+    // GIL so a bad argument raises a Python TypeError synchronously.
     let path_buf: Option<PathBuf> = match path {
         None => None,
         Some(obj) => {
@@ -83,10 +113,19 @@ impl PyChisel {
     fn close(&self) -> PyResult<()> {
         // Drop the engine; this releases the flock and closes the file.
         // Safe to call repeatedly — second call is a no-op.
+        //
+        // Note: this runs Drop on the inner Chisel while the GIL is
+        // held. That is intentional — if a Drop impl ever needs to
+        // report an error (currently none do), it must go through the
+        // Chisel::close method. An in-flight transaction is silently
+        // discarded by shadow paging; the last committed state remains
+        // durable on disk.
         let _ = self.inner.borrow_mut().take();
         Ok(())
     }
 
+    // Context manager support: `with chisel.open(...) as db:` closes on
+    // exit. __exit__ returns False so exceptions are never suppressed.
     fn __enter__<'py>(slf: PyRef<'py, Self>) -> PyRef<'py, Self> {
         slf
     }
@@ -122,6 +161,12 @@ impl PyChisel {
     // If begin() fails (e.g., TransactionAlreadyActive), the exception
     // propagates before PyTransaction is constructed — callers never
     // see a half-alive transaction object.
+    //
+    // The `slf: Py<Self>` (rather than `&self`) is the PyO3 idiom for
+    // "I need to store a Python-side reference to my own object."
+    // PyTransaction holds that Py<PyChisel>, which keeps the PyChisel
+    // alive for the lifetime of the transaction object regardless of
+    // whether the user still holds a reference to the db.
     fn transaction(
         slf: Py<Self>,
         py: Python<'_>,
@@ -190,6 +235,10 @@ impl PyChisel {
     // active, the engine surfaces NoActiveTransactionError, which
     // propagates unchanged. We accept either a `chisel.DefragOptions`
     // dataclass or None (defaults).
+    //
+    // Duck-typed on attribute names rather than checking the exact
+    // class, so a user-defined options-shaped object will also work
+    // — the dataclass is just the nice ergonomic default.
     #[pyo3(signature = (options=None))]
     fn defrag(&self, py: Python<'_>, options: Option<&Bound<'_, PyAny>>) -> PyResult<PyObject> {
         let rust_opts = match options {
@@ -220,6 +269,11 @@ impl PyChisel {
 // these pub(crate) methods to share the same engine-access code path as
 // the direct PyChisel pymethods. The with_inner_io / with_inner_mut_io
 // wrappers are the ONE place the closed/poisoned check lives.
+//
+// Rationale: every method that mutates or reads the engine must go
+// through one of these two helpers, so there is exactly one site where
+// "closed" collapses into PoisonedError. Bypassing them would create a
+// path where `self.inner.borrow().as_ref().unwrap()` panics a closed db.
 impl PyChisel {
     pub(crate) fn commit_internal(&self, py: Python<'_>) -> PyResult<()> {
         self.with_inner_mut_io(py, |c| c.commit())
@@ -307,6 +361,19 @@ impl PyChisel {
     // MEMORY: project_chisel_single_client_design). Python's GIL also
     // prevents concurrent re-entry into the RefCell; a borrow_mut
     // panic here would mean a genuine reentrancy bug.
+    //
+    // Consequence: long-running engine calls (e.g. a large commit's
+    // fsync, a big defrag) will block ALL other Python threads in this
+    // process. `open()` itself does release the GIL around the initial
+    // filesystem setup — see the `allow_threads` there — but per-op
+    // calls do not. If future work wants to overlap Python work with
+    // Chisel I/O, the fix is (a) make Chisel's interior state Sync-
+    // safe, or (b) move the GIL release into the engine layer.
+    //
+    // The `_py: Python<'_>` parameter on both helpers is an unused
+    // token; it exists to make the GIL-held precondition explicit at
+    // the call sites and to leave room for a future `allow_threads`
+    // insertion without changing every caller signature.
     fn with_inner_io<R>(
         &self,
         _py: Python<'_>,

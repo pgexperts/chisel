@@ -7,6 +7,22 @@
 //              constructed; __enter__ is just a hand-off.
 //   __exit__:  commits on clean exit, rolls back on exception. Never
 //              suppresses (returns Ok(false)).
+//
+// Design note: PyTransaction is a stateless wrapper around the active
+// transaction on the PyChisel. The underlying chisel::Chisel tracks
+// "transaction is active" itself, so this object stores no transaction
+// identity — only a db reference and a `finished` guard. That means a
+// user who both calls `tx.commit()` manually AND then exits the `with`
+// block will not hit "no active transaction" twice: the `finished`
+// flag short-circuits the __exit__ path. (However, this binding does
+// not expose an explicit commit()/rollback() method on PyTransaction;
+// only the context-manager __exit__ drives the transaction lifecycle.)
+//
+// Ordering invariant: because only one chisel transaction is active
+// at a time, nesting `with db.transaction()` inside another
+// `db.transaction()` will fail at begin() with TransactionAlreadyActive.
+// That is correct behaviour — Chisel has savepoints for nesting, not
+// nested transactions.
 
 use pyo3::prelude::*;
 use std::cell::Cell;
@@ -15,7 +31,16 @@ use crate::db::PyChisel;
 
 #[pyclass(name = "Transaction", module = "chisel._chisel")]
 pub struct PyTransaction {
+    // Owning a `Py<PyChisel>` pins the PyChisel on the Python heap for
+    // at least as long as this transaction object is live. Combined
+    // with PyChisel's `RefCell<Option<Chisel>>`, this prevents the
+    // engine from being dropped mid-transaction — though the user CAN
+    // still call `db.close()`, which nulls out the Option and turns
+    // subsequent transaction calls into PoisonedError.
     db: Py<PyChisel>,
+    // Cell<bool>: __exit__ takes `&self`, so we need interior
+    // mutability to set the one-shot guard. Cell (not RefCell) because
+    // bool is Copy and there is no borrow to juggle.
     finished: Cell<bool>,
 }
 
@@ -34,6 +59,18 @@ impl PyTransaction {
         slf
     }
 
+    // Commit-on-success / rollback-on-exception. Only the *type* of the
+    // raised exception is checked; we don't care about value or traceback.
+    // A `finished` short-circuit prevents double-commit if the user
+    // somehow re-entered __exit__, and reserves space for a future
+    // explicit `.commit()` / `.rollback()` API on PyTransaction without
+    // changing this logic.
+    //
+    // Returns Ok(false) unconditionally: we must NEVER suppress the
+    // original Python exception. If the rollback itself fails (for
+    // example because the engine is now poisoned), the caller gets the
+    // rollback error instead of the original — matching standard
+    // context-manager semantics for secondary errors on cleanup.
     fn __exit__(
         &self,
         py: Python<'_>,
@@ -93,6 +130,11 @@ impl PyTransaction {
         self.db.bind(py).borrow().clear_root_name_internal(py, name)
     }
 
+    // PySavepoint takes its OWN Py<PyChisel> (via clone_ref, which
+    // bumps the Python refcount), so the savepoint object outlives
+    // this PyTransaction reference-wise. That is harmless: both
+    // objects route through PyChisel, and the engine rejects
+    // savepoint ops outside an active transaction.
     fn savepoint(
         &self,
         py: Python<'_>,

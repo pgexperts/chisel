@@ -28,10 +28,21 @@
 //   - The superblock on disk still points at committed_roots; current_roots lives
 //     only in memory. A crash mid-transaction discards all dirty pages from cache
 //     and the on-disk superblock still references the prior committed snapshot.
-//   - NOTE: new_page() DOES extend the underlying file immediately (see page_cache
-//     and the v1 simplification in CLAUDE.md about the freemap not being wired up).
-//     Those extended-but-uncommitted pages are harmless after a crash because
-//     nothing in the committed superblock references them.
+//   - NOTE: `new_page()` (file extension) extends the underlying file immediately;
+//     `allocate_data_page` prefers reuse from `current_freemap` but also calls
+//     through to `new_page()` when the freemap is empty. Either way, any pages
+//     extended-but-uncommitted before a crash are harmless because nothing in the
+//     committed superblock references them, and the rollback path
+//     (`cache.truncate(committed_roots.total_pages)` — I3) actively shrinks the
+//     file on a clean rollback so they don't accumulate at all.
+//
+// In-memory mode: `TransactionManager::create_new` and `open_existing` are
+// backend-agnostic — whether the underlying PageIo is backed by a file (with
+// flock) or by a Vec<u8> (no flock, no durability) is invisible here. The
+// in-memory entry points live in `lib.rs` and just hand this module a
+// memory-backed PageIo. Every transactional invariant in this file (commit
+// ordering, poison on fatal error, watermark rollback) applies equally to the
+// in-memory backend.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -631,8 +642,28 @@ impl TransactionManager {
         }
 
         // Step 4: allocate a page for the new freemap. May come from the
-        // freemap itself (including the just-freed old_freemap_page id)
-        // or extend the file.
+        // freemap itself or extend the file.
+        //
+        // SUSPECTED BUG (flagged during 2026-04-17 commenting pass; not
+        // previously memorialized): steps 1 and 3 have just merged BOTH
+        // `txn_freed_pages` and `old_freemap_page` into
+        // `current_freemap`. These ids are still referenced by the
+        // currently-committed on-disk superblock — the very invariant
+        // that `allocate_data_page`'s doc comment warns about
+        // ("committed pages must stay readable via `committed_roots`
+        // until commit swaps the superblock"). Allocating from
+        // `current_freemap` right here is therefore allowed to return
+        // an id whose on-disk bytes are a LIVE page under the last
+        // durably-committed superblock. `claim_page` zeros the cache
+        // entry and the forthcoming `cache.flush()` writes the new
+        // content out, overwriting that still-live page. A crash
+        // between `flush()` and the superblock fsync leaves the
+        // previously-committed superblock pointing at a page whose
+        // bytes no longer match what it committed to — breaking the
+        // core shadow-paging invariant. Safer designs: delay the
+        // `old_freemap_page` / `txn_freed_pages` merges until AFTER
+        // the new freemap page is chosen, or make this single
+        // allocation path force file-extension (bypass the freemap).
         let new_freemap_page = self.allocate_data_page()?;
 
         // Step 5: serialize current_freemap into that page. The in-memory
@@ -706,19 +737,25 @@ impl TransactionManager {
     ///
     /// 2. Compute the new superblock in memory.
     ///    Bump txn_counter first so (a) the new superblock outranks the old one
-    ///    via Superblock::select()'s max_by_key, and (b) parity of the counter
-    ///    selects which slot to overwrite (step 3). total_pages is queried from
-    ///    the file AFTER flush() so any new_page() allocations are reflected.
+    ///    via Superblock::select()'s max_by_key, and (b) `txn_counter %
+    ///    superblock_count` selects which slot to overwrite (step 3). For N=2
+    ///    this is the original parity alternation; for N>=3 (R4) it is true
+    ///    round-robin across all N slots. total_pages is queried from the file
+    ///    AFTER flush() so any new_page() allocations are reflected.
     ///
     /// 3. Write the new superblock to the INACTIVE slot.
-    ///    Slots 0 and 1 alternate based on txn_counter parity. The previously
-    ///    active slot is untouched and still contains a valid superblock with
-    ///    txn_counter - 1. WHY: if we crash during this write, the target slot
-    ///    may be torn (bad checksum) but the OTHER slot still holds the last
-    ///    committed state. Recovery picks the surviving older superblock and
-    ///    the transaction is simply lost — never half-applied. Overwriting the
-    ///    active slot in place would be catastrophic: a torn write there could
-    ///    destroy the only valid superblock on disk.
+    ///    The target is `txn_counter % superblock_count`, which always
+    ///    points at the stalest slot. The N-1 other slots (including the
+    ///    previously-active one, at counter txn_counter-1) are untouched
+    ///    and still hold valid superblocks at strictly smaller counters.
+    ///    WHY: if we crash during this write, the target slot may be torn
+    ///    (bad checksum) but every other slot still holds the last
+    ///    committed state (or earlier ones). Recovery picks the highest
+    ///    surviving valid counter and the transaction is simply lost —
+    ///    never half-applied. Overwriting an active slot in place would
+    ///    be catastrophic: a torn write there could destroy a valid
+    ///    superblock. Higher N buys survival of CONSECUTIVE torn writes
+    ///    to the same target slot on retry (see `create_new` docstring).
     ///
     /// 4. fsync the superblock write.
     ///    This is the LINEARIZATION POINT of the commit. Before this fsync the
@@ -733,8 +770,15 @@ impl TransactionManager {
     ///
     /// 5. Update in-memory committed_roots and clear txn state.
     ///    Only after the superblock fsync succeeds do we promote current_roots
-    ///    to committed_roots. If any step above fails, active_txn stays true
-    ///    and committed_roots is unchanged; the caller can retry or rollback.
+    ///    to committed_roots. If ANY step in the protocol fails the manager is
+    ///    poisoned (see the I1 block below) — active_txn / committed_roots are
+    ///    left untouched but no public API will accept further calls; the only
+    ///    legal recovery is close + reopen, which picks the last-durable
+    ///    superblock via `Superblock::select`. Retry-in-place is forbidden
+    ///    because a half-committed state (dirty flags already cleared in the
+    ///    cache, txn_counter possibly bumped, target slot possibly torn on
+    ///    disk) cannot be safely continued, and Linux fsyncgate semantics make
+    ///    re-calling fsync() after a failed fsync unsafe regardless.
     pub fn commit(&mut self) -> Result<()> {
         self.check_alive()?;
         // Special poison policy for commit: we refuse BOTH operational and
@@ -935,9 +979,13 @@ impl TransactionManager {
     /// and pops any savepoints layered on top. The named savepoint itself
     /// remains on the stack and can be rolled back to again or released.
     ///
-    /// NOTE: `freed_pages` from savepoints layered on top are dropped here,
-    /// which is correct — those "frees" never became durable. Like commit(),
-    /// freed pages are never actually returned to a freemap in v1.
+    /// NOTE: `freed_pages` from savepoints layered on top (and from
+    /// `self.txn_freed_pages`) are dropped here, which is correct —
+    /// those frees never became durable, and the roots/page contents
+    /// those frees described have been rewound along with the cache
+    /// truncate. Post-R2, `commit()` DOES return freed pages to the
+    /// freemap; this rollback path simply discards the unfinished
+    /// accounting.
     pub fn rollback_to(&mut self, name: &str) -> Result<()> {
         self.check_alive()?;
         let result = self.rollback_to_inner(name);
@@ -1130,15 +1178,20 @@ impl TransactionManager {
     /// Update an existing handle to point at a new value.
     ///
     /// Allocates a new slot/overflow chain for the new value and rewrites
-    /// the HandleEntry via COW. The OLD location (inline data page or
-    /// overflow chain) is collected into `txn_freed_pages` so commit can
-    /// return its pages to the freemap (ISSUES.md I9).
+    /// the HandleEntry via COW. The OLD location is retired differently
+    /// depending on its kind:
     ///
-    /// COUPLING (load-bearing, see R1): the "free the old data page"
-    /// step assumes every data page has at most one live slot — which
-    /// is true today because `insert_into_data_page` allocates a fresh
-    /// page per value. When R1 lands (multiple values per page), this
-    /// path must free a SLOT within the page, not the whole page.
+    ///   * Inline (Live): goes through `release_data_slot`, which
+    ///     decrements the per-page live-slot count (R1). Only when the
+    ///     count reaches zero does the entire page land in
+    ///     `txn_freed_pages`. Otherwise the slot becomes a tombstone,
+    ///     reclaimable only via defrag (R3).
+    ///   * Overflow: the whole chain is deleted and every page in the
+    ///     chain is pushed onto `txn_freed_pages`.
+    ///
+    /// The earlier "assumes one live slot per page / must change when R1
+    /// lands" caveat is OBSOLETE — R1 has landed and the slot-level
+    /// accounting below implements exactly the post-R1 contract.
     pub fn update(&mut self, handle: u64, value: &[u8]) -> Result<()> {
         self.check_alive()?;
         let result = self.update_inner(handle, value);
@@ -1219,11 +1272,12 @@ impl TransactionManager {
 
     /// Delete a handle.
     ///
-    /// Collects the old location into `txn_freed_pages` (whole data page
-    /// for inline, whole overflow chain for overflow), then asks the
-    /// handle table to remove the mapping via COW. The same R1 coupling
-    /// documented on `update` applies here — freeing the whole page is
-    /// only sound because each data page currently holds one value.
+    /// Retires the old location (inline slot via `release_data_slot`
+    /// with its R1 slot-level accounting; overflow chain by deleting
+    /// every page in the chain into `txn_freed_pages`) and then asks
+    /// the handle table to remove the mapping via COW. The earlier
+    /// "whole-page free assumes one value per page" caveat referenced
+    /// by `update`'s docstring is obsolete post-R1.
     pub fn delete(&mut self, handle: u64) -> Result<()> {
         self.check_alive()?;
         let result = self.delete_inner(handle);
@@ -1582,7 +1636,6 @@ impl TransactionManager {
 
     // --- Private helpers ---
 
-    /// Lazily create a handle table root on first insert. A fresh database has
     /// Release one slot from a data page (ISSUES.md R1). Decrements
     /// `current_live_slots[page_id]`; if the count reaches zero, the
     /// whole page becomes unreferenced and is pushed to
@@ -1593,6 +1646,14 @@ impl TransactionManager {
     /// If the page is somehow not tracked in `current_live_slots` (a
     /// bug; open-time scan should catch every live data page), this is
     /// a no-op — we prefer leaking to a spurious free.
+    ///
+    /// NOTE: a stray orphaned line "Lazily create a handle table root
+    /// on first insert. A fresh database has" previously sat at the
+    /// top of this doc block (an interleaved remnant of
+    /// `ensure_handle_table`'s docstring); removed 2026-04-17 during
+    /// the commenting pass. The counterpart ("root_handle_table_page
+    /// == PAGE_ID_NONE; we don't materialize...") still sits above
+    /// `ensure_handle_table` below — both belong together.
     fn release_data_slot(&mut self, page_id: u64) {
         let Some(count) = self.current_live_slots.get_mut(&page_id) else {
             return;
@@ -1613,11 +1674,12 @@ impl TransactionManager {
         }
     }
 
-    /// root_handle_table_page == PAGE_ID_NONE; we don't materialize the root
-    /// until there is a handle to put in it, so empty databases never pay for
-    /// a handle-table page. No per-page rollback bookkeeping — the
-    /// watermark rollback mechanism (I3) handles any page allocated here
-    /// automatically.
+    /// Lazily create a handle table root on first insert. A fresh
+    /// database has `root_handle_table_page == PAGE_ID_NONE`; we don't
+    /// materialize the root until there is a handle to put in it, so
+    /// empty databases never pay for a handle-table page. No per-page
+    /// rollback bookkeeping — the watermark rollback mechanism (I3)
+    /// handles any page allocated here automatically.
     fn ensure_handle_table(&mut self) -> Result<()> {
         if self.current_roots.handle_table_page == PAGE_ID_NONE {
             let root = {
@@ -1631,27 +1693,30 @@ impl TransactionManager {
 
     /// Place a value in a data page and return (page_id, slot_index).
     ///
-    /// v1 SIMPLIFICATION (see CLAUDE.md): this unconditionally allocates a
-    /// fresh page per insert rather than searching existing pages with free
-    /// space. Combined with update() not reclaiming the old slot, every
-    /// allocate/update cycle costs at least one new 8KB page. Correctness is
-    /// preserved; space efficiency is terrible until the freemap is wired up.
+    /// Post-R1 packing model: the transaction maintains an "insert
+    /// cursor" — a data page allocated earlier in THIS transaction
+    /// that still has space — and packs successive small-value inserts
+    /// into it until it fills. When the cursor is absent/full, a new
+    /// page is allocated (via `allocate_data_page`, which prefers
+    /// freemap reuse over file extension — R2) and becomes the new
+    /// cursor. Packing is disabled while savepoints are active: the
+    /// cursor is force-cleared by `savepoint()` and is NOT set when a
+    /// new page is allocated inside a savepoint scope, so each insert
+    /// under a savepoint gets its own page (the pre-R1 behavior). This
+    /// keeps the per-savepoint snapshot cheap to restore.
     ///
-    /// Checksum is stamped eagerly so the page is valid if it later gets
-    /// evicted and reloaded mid-transaction. Without this, a dirty page
-    /// evicted by LRU pressure would fail checksum verification on reload.
-    ///
-    /// R1: tries to pack the value into the current insert cursor page
-    /// (a data page allocated earlier in this transaction that still
-    /// has space). Falls back to allocating a new page if the cursor
-    /// is full, unset, or packing is disabled (active savepoints).
-    /// R2: new-page allocations go through `allocate_data_page`, which
-    /// prefers freemap reuse over file extension.
+    /// Checksum is stamped eagerly after any mutation so the page is
+    /// valid if it later gets evicted and reloaded mid-transaction.
+    /// Without this, a dirty page evicted by LRU pressure would fail
+    /// checksum verification on reload.
     ///
     /// Live-slot bookkeeping: every successful insert increments
-    /// `current_live_slots[page_id]`, which delete/update consult to
-    /// decide when a page is fully empty and can be freed back to the
-    /// freemap on commit. No on-disk slot-count tracking is needed.
+    /// `current_live_slots[page_id]`. `delete`/`update` consult this
+    /// map (via `release_data_slot`) to decide when a page is fully
+    /// empty and can be freed back to the freemap on commit. The map
+    /// is kept purely in memory — storing a slot count ON the data
+    /// page would force a COW (and a handle-table rewrite for every
+    /// entry pointing into it) on every delete.
     fn insert_into_data_page(&mut self, value: &[u8]) -> Result<(u64, u16)> {
         // Packing path: try to reuse the current cursor page if it
         // has room. The cursor only exists when savepoints are empty
