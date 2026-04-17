@@ -11,12 +11,15 @@
 // Design note: PyTransaction is a stateless wrapper around the active
 // transaction on the PyChisel. The underlying chisel::Chisel tracks
 // "transaction is active" itself, so this object stores no transaction
-// identity — only a db reference and a `finished` guard. That means a
-// user who both calls `tx.commit()` manually AND then exits the `with`
-// block will not hit "no active transaction" twice: the `finished`
-// flag short-circuits the __exit__ path. (However, this binding does
-// not expose an explicit commit()/rollback() method on PyTransaction;
-// only the context-manager __exit__ drives the transaction lifecycle.)
+// identity — only a db reference and a `finished` guard.
+//
+// Explicit commit() / rollback() (ISSUES.md I24) mirror the PySavepoint
+// shape: they drive the engine and set `finished`, so a subsequent
+// __exit__ short-circuits silently without a second engine call. A
+// second explicit call (after another commit, rollback, or __exit__
+// has already run) raises AlreadyFinishedError — matches the explicit-
+// versus-__exit__ asymmetry on PySavepoint: context-manager exits are
+// idempotent, explicit calls aren't.
 //
 // Ordering invariant: because only one chisel transaction is active
 // at a time, nesting `with db.transaction()` inside another
@@ -91,6 +94,29 @@ impl PyTransaction {
         Ok(false)
     }
 
+    // Explicit commit() — drives the engine and sets `finished` so a
+    // subsequent __exit__ short-circuits without a second engine call.
+    // Raises AlreadyFinishedError if called a second time (after
+    // another commit, a rollback, or a __exit__ has already run).
+    fn commit(&self, py: Python<'_>) -> PyResult<()> {
+        if self.finished.get() {
+            return Err(already_finished_err());
+        }
+        self.finished.set(true);
+        self.db.bind(py).borrow().commit_internal(py)
+    }
+
+    // Explicit rollback() — same `finished` semantics as commit(). Useful
+    // when a user wants to abort a transaction manually without raising
+    // an exception through the enclosing `with` block.
+    fn rollback(&self, py: Python<'_>) -> PyResult<()> {
+        if self.finished.get() {
+            return Err(already_finished_err());
+        }
+        self.finished.set(true);
+        self.db.bind(py).borrow().rollback_internal(py)
+    }
+
     fn allocate(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<u64> {
         self.db.bind(py).borrow().allocate_internal(py, value)
     }
@@ -146,4 +172,12 @@ impl PyTransaction {
             crate::savepoint::PySavepoint::new(self.db.clone_ref(py), name.to_string()),
         )
     }
+}
+
+// Message phrased generically so the same text works whether the prior
+// finish was a commit, a rollback, or a __exit__.
+fn already_finished_err() -> PyErr {
+    crate::errors::AlreadyFinishedError::new_err(
+        "transaction already finished (committed or rolled back)",
+    )
 }

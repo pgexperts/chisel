@@ -77,27 +77,29 @@ impl PySavepoint {
         Ok(false)
     }
 
-    // Explicit release(): idempotent. A second call (or a call after
-    // __exit__ ran) is a no-op rather than raising SavepointNotFound,
-    // because the user's intent ("make sure this savepoint is gone")
-    // is already satisfied.
+    // Explicit release(): raises AlreadyFinishedError on a second
+    // call (including after __exit__ has run, or after an earlier
+    // rollback_to). Pre-I22 this was a silent no-op; that masked
+    // "called release() on the wrong sp object" bugs. The __exit__
+    // path itself stays idempotent (guard short-circuits without
+    // raising), so normal context-manager usage is unaffected.
     fn release(&self, py: Python<'_>) -> PyResult<()> {
         if self.finished.get() {
-            return Ok(());
+            return Err(already_finished_err());
         }
         self.finished.set(true);
         self.db.bind(py).borrow().release_internal(py, &self.name)
     }
 
-    // Explicit rollback_to(): same idempotency rationale as release().
-    // Note that after rollback_to, the savepoint mark itself is also
-    // gone on the engine side — the engine pops the stack down to and
-    // including this savepoint. So a subsequent rollback_to() on the
-    // same object would fail at the engine layer with SavepointNotFound;
-    // the `finished` guard here converts that into a silent no-op.
+    // Explicit rollback_to(): same idempotency-as-error policy as
+    // release(). The engine pops the savepoint stack down to AND
+    // including this savepoint, so the mark itself is gone after
+    // one successful call — a second call would fail at the engine
+    // layer with SavepointNotFound regardless. The guard here turns
+    // that into a cleaner, more specific AlreadyFinishedError.
     fn rollback_to(&self, py: Python<'_>) -> PyResult<()> {
         if self.finished.get() {
-            return Ok(());
+            return Err(already_finished_err());
         }
         self.finished.set(true);
         self.db
@@ -105,4 +107,13 @@ impl PySavepoint {
             .borrow()
             .rollback_to_internal(py, &self.name)
     }
+}
+
+// Used by both explicit release() and explicit rollback_to(). Phrased
+// generically ("savepoint already finished") so the same message works
+// whether the prior finish was a release, a rollback_to, or a __exit__.
+fn already_finished_err() -> PyErr {
+    crate::errors::AlreadyFinishedError::new_err(
+        "savepoint already finished (released or rolled back)",
+    )
 }

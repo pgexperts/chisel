@@ -34,7 +34,7 @@ Dependencies and batching drive this more than raw priority. Earlier items unblo
 11. **R3 + I17** — selective defrag (and fix the stat accuracy while rewriting the loop).
 12. **I13 + I14** — overflow hardening pass.
 13. **Page-cache hardening: I19 + I20** — add bounds/asserts on `maybe_evict` and `claim_page`. ✅ FIXED 2026-04-17.
-14. **Python binding cleanup: I21–I25** — ergonomics and dead-code audit; batch as one PR once the Rust-side dust has settled.
+14. **Python binding cleanup: I21–I25** — ergonomics and dead-code audit. ✅ RESOLVED 2026-04-17 (I23 was a false alarm; the other four landed as one PR).
 15. **P3 cleanup sweep** — I5, I8, I16, C1–C3, and the "invariants to verify" section.
 
 R4 (configurable superblock count) and R5 (Python bindings) sit outside this order — R4 is gated on I2, R5 is gated on F3.
@@ -220,42 +220,30 @@ If the freemap ever handed back an id the current transaction had already dirtie
 
 These are all from the 2026-04-17 pass over the `python/src/` subcrate. Python-side API surface items; none block the Rust core, but they should be settled before R5 ships broadly.
 
-### I21. `PyChisel` latent `RefCell` re-entry hazard [comment-pass 2026-04-17] — **P3**
-**Where:** `python/src/db.rs:108–118` (and every `with_inner_mut_io` caller)
+### I21. `PyChisel` latent `RefCell` re-entry hazard [comment-pass 2026-04-17] — **P3** ✅ DOCUMENTED 2026-04-17
+**Where:** `python/src/db.rs`
 
-Pyclass methods take `&self` and internally `borrow_mut()` through `with_inner_mut_io`. The existing comment claims "Python's GIL prevents concurrent re-entry" — true for **cross-thread** callers, but **not** for same-thread Rust→Python→PyChisel callbacks. No such path exists today (Chisel has no Python-side callbacks in its Rust API), but any future engine callback that dispatches into Python would deadlock on `borrow_mut`.
+The existing comment said "Python's GIL prevents concurrent re-entry" — true cross-thread, but not for a hypothetical future same-thread Rust→Python→PyChisel callback. No such callback path exists today, so this was a documentation fix only: the comments at the top of `db.rs` and above `with_inner_io` / `with_inner_mut_io` now distinguish cross-thread from same-thread re-entry and spell out what a future callback API would need to do (use `try_borrow_mut` with an explicit reentrancy error, or reshape the engine call so the mutable borrow is released before the callback fires).
 
-**Fix:** document the constraint explicitly, and if/when a callback API is introduced, convert to `try_borrow_mut` with an explicit reentrancy error — or use a different interior-mutability story. Revisit when R5's public surface expands.
+### I22. `PySavepoint::rollback_to()` is silently idempotent [comment-pass 2026-04-17] — **P3** ✅ FIXED 2026-04-17
+**Where:** `python/src/savepoint.rs`
 
-### I22. `PySavepoint::rollback_to()` is silently idempotent [comment-pass 2026-04-17] — **P3**
-**Where:** `python/src/savepoint.rs:66–83`
+An explicit second `release()` or `rollback_to()` on a finished savepoint now raises the new `AlreadyFinishedError` (operational tier) rather than silently succeeding. The `__exit__` path intentionally stays idempotent — the `finished` guard short-circuits without raising so normal `with sp:` usage is unaffected whether the user also called an explicit method inside the block. Regression tests: `test_savepoint_second_release_raises`, `test_savepoint_second_rollback_to_raises`, `test_savepoint_explicit_then_with_exit_is_silent`.
 
-Calling `rollback_to()` twice on the same savepoint (without an intervening savepoint re-creation) succeeds silently the second time because of the `finished` guard. A user who writes `sp.rollback_to()` in an `if` branch and then exits the `with` block also silently succeeds. Arguably correct, but it masks a "called `rollback_to` on the wrong savepoint object" bug.
-
-**Fix candidates:**
-- Raise `AlreadyFinishedError` on the second call, matching the transaction API's usual idempotency-as-error stance.
-- Or document the idempotency explicitly and leave it.
-
-### I23. `DuplicateSavepointError` may be dead code [comment-pass 2026-04-17] — **P3**
+### I23. `DuplicateSavepointError` may be dead code [comment-pass 2026-04-17] — **P3** ✅ RESOLVED 2026-04-17 (not actually dead; issue entry was incorrect)
 **Where:** `python/src/errors.rs`
 
-`DuplicateSavepointError` is declared in the Python exception tree, but no `ChiselError::DuplicateSavepoint` variant appears to exist in `src/error.rs` — only `SavepointNotFound(_)` is matched in `to_py_err`. Either the Rust-side variant is missing a raise path, or the Python-side exception is reachable only by name and should be removed.
+The comment-pass entry claimed `ChiselError::DuplicateSavepoint` did not exist in `src/error.rs` and that only `SavepointNotFound(_)` was matched in `to_py_err`. Both assertions were wrong. `ChiselError::DuplicateSavepoint(String)` is declared in `src/error.rs`, is raised by `TransactionManager::savepoint()` when a name is reused (exercised by the existing `operational_error_does_not_poison` unit test at `src/transaction.rs`), and is routed in `python/src/errors.rs::to_py_err` to the Python-side `DuplicateSavepointError` class. No code change needed; this entry is preserved for audit-trail value.
 
-**Fix:** audit `src/error.rs` for a duplicate-savepoint case; either wire it through or drop the Python class. Batch with I21.
-
-### I24. `PyTransaction` has no explicit `.commit()` / `.rollback()` methods [comment-pass 2026-04-17] — **P3**
+### I24. `PyTransaction` has no explicit `.commit()` / `.rollback()` methods [comment-pass 2026-04-17] — **P3** ✅ FIXED 2026-04-17
 **Where:** `python/src/transaction.rs`, `python/chisel/chisel.pyi`
 
-The `finished: Cell<bool>` guard inside `PyTransaction` is structured as if `.commit()` / `.rollback()` were exposed explicitly (the guard short-circuits the second call), but they are not. The `.pyi` stubs do not list them either. Users are limited to the `with db.transaction():` context-manager form.
+Explicit `.commit()` and `.rollback()` methods are now exposed on `PyTransaction`, mirroring the shape of `PySavepoint.release()` / `.rollback_to()`: both drive the engine and set the `finished` guard so a subsequent `__exit__` short-circuits silently; a second explicit drive raises `AlreadyFinishedError`. `.pyi` stubs updated accordingly. Regression tests: `test_tx_explicit_commit`, `test_tx_explicit_rollback`, `test_tx_second_commit_raises`, `test_tx_commit_then_with_exit_is_silent`.
 
-**Decision needed:** either expose explicit `.commit()` / `.rollback()` and keep the guard (matches savepoint shape), or remove the guard machinery as unused. Consistent with savepoint API is probably preferable.
-
-### I25. `db.close()` silently cancels live `PyTransaction` / `PySavepoint` objects [comment-pass 2026-04-17] — **P3**
+### I25. `db.close()` silently cancels live `PyTransaction` / `PySavepoint` objects [comment-pass 2026-04-17] — **P3** ✅ FIXED 2026-04-17
 **Where:** `python/src/db.rs close()` + `with_inner_mut_io` contract
 
-After `db.close()` clears `inner`, any subsequent call through a still-live `PyTransaction` or `PySavepoint` returns `PoisonedError` (because `with_inner_mut_io` sees `None`). Calling `db.close()` inside a `with db.transaction():` block therefore cancels the transaction, and the `with`-exit commit then raises `PoisonedError` while attempting to commit.
-
-This is arguably graceful, but surprising enough to deserve docs. Possibly upgrade to a dedicated `ClosedError` so the user can tell "closed underneath me" from "Rust-side poison."
+After `db.close()` clears `inner`, any subsequent call through a still-live `PyTransaction` or `PySavepoint` (including an automatic `__exit__` commit on the enclosing `with` block) now raises the new `ClosedError` (operational tier) instead of `PoisonedError`. The `is_poisoned` getter still reports `True` for a closed handle — it answers the "can this handle still do work?" question — but the distinct exception class lets callers tell "I closed this" apart from "Rust-side corruption". Regression tests: `test_close_then_call_raises_closed`, `test_closed_error_is_not_poisoned_error`, `test_close_inside_transaction_surfaces_as_closed`.
 
 ---
 
