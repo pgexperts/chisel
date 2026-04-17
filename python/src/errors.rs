@@ -27,6 +27,7 @@
 //         InvalidRootNameError
 //         RootNameTableFullError
 //         InvalidSuperblockCountError
+//         CacheFullError
 //       FatalError                       (drop-and-reopen recovery only)
 //         IoError
 //         ChecksumMismatchError
@@ -59,6 +60,7 @@ create_exception!(_chisel, DatabaseFileNotFoundError, OperationalError);
 create_exception!(_chisel, InvalidRootNameError, OperationalError);
 create_exception!(_chisel, RootNameTableFullError, OperationalError);
 create_exception!(_chisel, InvalidSuperblockCountError, OperationalError);
+create_exception!(_chisel, CacheFullError, OperationalError);
 
 // Fatal — matches ChiselError::is_fatal() in src/error.rs exactly.
 create_exception!(_chisel, IoError, FatalError);
@@ -122,6 +124,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "InvalidSuperblockCountError",
         py.get_type_bound::<InvalidSuperblockCountError>(),
     )?;
+    m.add("CacheFullError", py.get_type_bound::<CacheFullError>())?;
 
     m.add("IoError", py.get_type_bound::<IoError>())?;
     m.add(
@@ -181,6 +184,7 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
         RustChiselError::InvalidRootName => InvalidRootNameError::new_err(msg),
         RustChiselError::RootNameTableFull => RootNameTableFullError::new_err(msg),
         RustChiselError::InvalidSuperblockCount { .. } => InvalidSuperblockCountError::new_err(msg),
+        RustChiselError::CacheFull { .. } => CacheFullError::new_err(msg),
         // Fatal
         RustChiselError::IoError(_) => IoError::new_err(msg),
         RustChiselError::ChecksumMismatch { .. } => ChecksumMismatchError::new_err(msg),

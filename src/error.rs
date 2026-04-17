@@ -36,6 +36,13 @@ pub enum ChiselError {
     // < MIN_SUPERBLOCKS (2) or > MAX_SUPERBLOCKS (16). Operational —
     // the caller fixes their Options and tries again.
     InvalidSuperblockCount { value: u32 },
+    // The page cache has grown past its hard ceiling
+    // (`max_pages * HARD_CEILING_MULTIPLIER`) with every cached entry
+    // dirty, so there is no clean page available for eviction.
+    // Operational: the DB on disk is still fine. Recovery is to commit
+    // (which flushes dirty pages and clears the backlog) or roll back
+    // (which discards the in-flight work entirely). See ISSUES.md I19.
+    CacheFull { limit: usize },
 
     // Fatal — database integrity is in question. Close and re-open
     // before attempting further work. The reopen will re-run superblock
@@ -129,6 +136,10 @@ impl fmt::Display for ChiselError {
             ChiselError::InvalidSuperblockCount { value } => {
                 write!(f, "invalid superblock_count {value}; must be in 2..=16")
             }
+            ChiselError::CacheFull { limit } => write!(
+                f,
+                "page cache full: {limit} dirty pages held; commit or roll back to free cache"
+            ),
             ChiselError::IoError(e) => write!(f, "I/O error: {e}"),
             ChiselError::ChecksumMismatch { page_id } => {
                 write!(f, "checksum mismatch on page {page_id}")
