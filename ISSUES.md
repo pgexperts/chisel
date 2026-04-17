@@ -25,7 +25,7 @@ Dependencies and batching drive this more than raw priority. Earlier items unblo
 2. **I15** — superblock `format_version` validation. One-hour fix, do while I2 is in review.
 3. **I6** — `find_leaf` sentinel returns the root as the leaf. Latent corruption; needs a test that forces a sparse handle range.
 4. **I1** — commit error handling. Design decided (poison model — see I1 below); implement after I2/I6 so the recovery path is clean.
-5. **I18** — `persist_freemap` can reuse pages still referenced by the last-durable superblock. Violates shadow-paging invariant; needs a crash-injection test and a fix that either excludes in-flight freemap consolidation ids from allocation or defers the merge until after the superblock fsync.
+5. **I18** — `persist_freemap` can reuse pages still referenced by the last-durable superblock. ✅ FIXED 2026-04-17.
 6. **F3** — `read()` → `&self`. Do before F2 and I12 pile more API on top; also unblocks R5 (Python bindings).
 7. **F2 + I7** — named roots and handle-table rollback tracking. Both touch the handle table / superblock boundary; one coherent PR.
 8. **I3 + I4** — rollback file-extension cleanup and `next_page_id` seeding audit.
@@ -94,20 +94,16 @@ Audit as part of I3 cleanup: confirm `TransactionManager::open` always resets `n
 
 No error or debug_assert if discarded entries are dirty. Safe as long as all callers are post-commit, but there is no runtime guard. Add a `debug_assert!(!entry.dirty)` on any future handle-table PR.
 
-### I18. `persist_freemap` can reuse pages the last-durable superblock still references [comment-pass 2026-04-17] — **P0**
-**Where:** `transaction.rs:634–662` `persist_freemap`
+### I18. `persist_freemap` can reuse pages the last-durable superblock still references [comment-pass 2026-04-17] — **P0** ✅ FIXED 2026-04-17
+**Where:** `transaction.rs` `persist_freemap`
 
-During commit, `persist_freemap` merges `txn_freed_pages` and `old_freemap_page` into `current_freemap` (steps 1 and 3) **before** calling `allocate_data_page` (step 4) to pick a page for the new freemap snapshot. `allocate_data_page` may reuse from `current_freemap`; `allocate_first` returns the lowest free id, which is very likely `old_freemap_page`. The subsequent `claim_page` + `cache.flush()` then overwrites the bytes of a page that the **currently-committed** on-disk superblock still references. A crash in the window between that flush and the superblock fsync leaves the last-durable superblock pointing at overwritten bytes.
+During commit, `persist_freemap` merged `txn_freed_pages` and `old_freemap_page` into `current_freemap` **before** calling `allocate_data_page` to pick a page for the new freemap snapshot. `FreeMap::allocate_first` returns the lowest free id, which was very likely `old_freemap_page` itself or one of the ids just merged from `txn_freed_pages`. The subsequent `claim_page` + `cache.flush()` then overwrote the bytes of a page that the **currently-committed** on-disk superblock still referenced. A crash in the window between that flush and the superblock fsync would leave the last-durable superblock pointing at overwritten bytes.
 
-This directly violates the shadow-paging invariant spelled out in `allocate_data_page`'s own doc comment ("pages reused by the freemap must not be referenced by the currently-committed superblock"). A comment flagging the hazard was added inline during the 2026-04-17 pass.
+This directly violated the shadow-paging invariant spelled out in `allocate_data_page`'s own doc comment ("pages reused by the freemap must not be referenced by the currently-committed superblock").
 
-**Severity:** potentially serious — defeats the "old state untouched until swap" guarantee that the whole durability story depends on.
+**Fix (landed 2026-04-17):** restructured `persist_freemap` to allocate the new freemap page BEFORE merging `txn_freed_pages` or `old_freemap_page` into `current_freemap`. At the moment of allocation, `current_freemap` still reflects only committed-state frees minus this transaction's allocations, so `FreeMap::allocate_first` can only return a page that was already free in the committed state or a freshly-extended page — both safe. The merges happen AFTER the allocation; the resulting freemap still serializes to disk with those ids marked free, so future transactions can reclaim them.
 
-**Fix candidates:**
-- Defer the merge of `old_freemap_page` and `txn_freed_pages` until after the superblock fsync, keeping the committed snapshot's pages off-limits for the duration of the commit.
-- Or, pass `allocate_data_page` an "exclusion set" containing `old_freemap_page` and anything in `txn_freed_pages` that the last-durable superblock still references.
-
-**Test:** crash-injection regression between the `persist_freemap`-triggered `cache.flush()` and the superblock fsync; after reopen, verify the last-durable tree is intact.
+**Regression test:** `persist_freemap_does_not_reuse_committed_live_pages` in `src/transaction.rs`. It seeds a committed freemap page via overflow-delete (R1 slot-packing otherwise keeps multi-slot data pages live), then runs a second commit whose deletes populate `txn_freed_pages`, and asserts the new `committed_roots.freemap_page` is not in the at-risk set (old freemap page ∪ frozen `txn_freed_pages`). The test is framed as a direct invariant check rather than a crash-injection harness because the at-risk set is observable purely in post-commit internal state.
 
 ---
 
