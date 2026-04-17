@@ -607,76 +607,74 @@ impl TransactionManager {
         self.cache.borrow_mut().new_page()
     }
 
-    // Persist the freemap at commit time (ISSUES.md R2 / I11).
+    // Persist the freemap at commit time (ISSUES.md R2 / I11 / I18).
     //
     // Called once at the very start of `commit_inner`, BEFORE cache.flush().
-    // Steps:
-    //   1. Merge `txn_freed_pages` into `current_freemap`. These pages
-    //      become reusable for future transactions (not this one).
-    //   2. If nothing changed relative to `committed_freemap`, return
-    //      early — no new freemap page needs to be written.
-    //   3. Mark the OLD freemap page (if any) as free. This lets the
-    //      next commit reclaim it. Without this step, each commit would
-    //      permanently leak one page.
-    //   4. Allocate a new page for the freemap (via
-    //      `allocate_data_page`, which may reuse or extend).
-    //   5. Serialize the updated `current_freemap` into that page's
-    //      cache buffer.
-    //   6. Point `current_roots.freemap_page` at the new page, so the
-    //      new superblock will pick it up.
+    //
+    // STEP ORDER IS LOAD-BEARING (ISSUES.md I18). The at-risk set during
+    // commit is the union of `committed_roots.freemap_page` and every id
+    // in `txn_freed_pages` — both are still referenced by the currently-
+    // committed on-disk superblock. If any of those ids were visible to
+    // `allocate_data_page` when it picks the page for the new freemap
+    // snapshot, the subsequent `cache.flush()` would overwrite a page
+    // whose bytes the last-durable superblock still depends on. A crash
+    // in the window between that flush and the superblock fsync would
+    // then leave recovery pointing at bytes that no longer match what
+    // was committed — shadow-paging invariant broken.
+    //
+    // We close that window by ALLOCATING FIRST and MERGING LAST:
+    //   1. Early-exit if nothing in the freemap has changed.
+    //   2. Allocate a page for the new freemap snapshot. At this point
+    //      `current_freemap` still excludes both `old_freemap_page` and
+    //      `txn_freed_pages`, so `FreeMap::allocate_first` can only
+    //      return (a) a page that was already free in `committed_freemap`
+    //      (safe: not referenced by the committed superblock) or
+    //      (b) a freshly-extended page beyond `total_pages` (also safe).
+    //   3. NOW merge `txn_freed_pages` and `old_freemap_page` into
+    //      `current_freemap`. These frees land on disk as part of the
+    //      new freemap snapshot (so future transactions can reclaim
+    //      them) but they are never visible to THIS commit's
+    //      allocator — the window is already closed.
+    //   4. Serialize the resulting freemap into the allocated page and
+    //      point `current_roots.freemap_page` at it.
     fn persist_freemap(&mut self) -> Result<()> {
-        // Step 1: merge transaction frees.
-        for &id in &self.txn_freed_pages {
-            FreeMap::mark_free(&mut self.current_freemap, id);
-        }
-
-        // Step 2: skip if the freemap is unchanged.
-        if self.current_freemap == self.committed_freemap {
+        // Step 1: early-exit if this transaction produced neither a
+        // free nor an allocation-from-freemap. An all-extend
+        // transaction leaves `current_freemap == committed_freemap`
+        // and `txn_freed_pages` empty; the committed freemap snapshot
+        // is still valid as-is.
+        if self.txn_freed_pages.is_empty() && self.current_freemap == self.committed_freemap {
             return Ok(());
         }
 
-        // Step 3: reclaim the old freemap page itself.
+        // Step 2: allocate the new freemap page BEFORE merging any of
+        // the at-risk ids into `current_freemap`. See the I18 note in
+        // this method's header for why ordering matters.
+        let new_freemap_page = self.allocate_data_page()?;
+
+        // Step 3: merge the transaction's frees and the old freemap
+        // page id. After this, `current_freemap` reflects the full
+        // post-commit view that goes onto disk, but the allocation
+        // above has already chosen a safe id.
+        for &id in &self.txn_freed_pages {
+            FreeMap::mark_free(&mut self.current_freemap, id);
+        }
         let old_freemap_page = self.committed_roots.freemap_page;
         if old_freemap_page != PAGE_ID_NONE {
             FreeMap::mark_free(&mut self.current_freemap, old_freemap_page);
         }
 
-        // Step 4: allocate a page for the new freemap. May come from the
-        // freemap itself or extend the file.
-        //
-        // SUSPECTED BUG (flagged during 2026-04-17 commenting pass; not
-        // previously memorialized): steps 1 and 3 have just merged BOTH
-        // `txn_freed_pages` and `old_freemap_page` into
-        // `current_freemap`. These ids are still referenced by the
-        // currently-committed on-disk superblock — the very invariant
-        // that `allocate_data_page`'s doc comment warns about
-        // ("committed pages must stay readable via `committed_roots`
-        // until commit swaps the superblock"). Allocating from
-        // `current_freemap` right here is therefore allowed to return
-        // an id whose on-disk bytes are a LIVE page under the last
-        // durably-committed superblock. `claim_page` zeros the cache
-        // entry and the forthcoming `cache.flush()` writes the new
-        // content out, overwriting that still-live page. A crash
-        // between `flush()` and the superblock fsync leaves the
-        // previously-committed superblock pointing at a page whose
-        // bytes no longer match what it committed to — breaking the
-        // core shadow-paging invariant. Safer designs: delay the
-        // `old_freemap_page` / `txn_freed_pages` merges until AFTER
-        // the new freemap page is chosen, or make this single
-        // allocation path force file-extension (bypass the freemap).
-        let new_freemap_page = self.allocate_data_page()?;
-
-        // Step 5: serialize current_freemap into that page. The in-memory
-        // buffer already carries the FreeMap page-type tag (byte 0 = 0x04)
-        // and the bitmap body; a direct copy is the correct on-disk format.
+        // Step 4: serialize current_freemap into the new page and
+        // update the roots so the new superblock picks it up. The
+        // in-memory buffer already carries the FreeMap page-type
+        // tag (byte 0 = 0x04) and the bitmap body; a direct copy is
+        // the correct on-disk format.
         {
             let mut cache = self.cache.borrow_mut();
             let buf = cache.get_mut(new_freemap_page)?;
             *buf = *self.current_freemap;
             page::stamp_checksum(buf);
         }
-
-        // Step 6: update the roots so the new superblock points here.
         self.current_roots.freemap_page = new_freemap_page;
         Ok(())
     }
@@ -1928,5 +1926,92 @@ mod tests {
         // InvalidHandle from read — operational.
         assert!(matches!(tm.read(999), Err(ChiselError::InvalidHandle(_))));
         assert!(!tm.is_poisoned());
+    }
+
+    // Regression test for ISSUES.md I18. Inside commit_inner's
+    // persist_freemap step, the new-freemap-page allocation must never
+    // return an id that is still referenced by the currently-committed
+    // on-disk superblock. The two sources of such at-risk ids are:
+    //
+    //   (1) `committed_roots.freemap_page` itself — the current
+    //       on-disk freemap page; overwriting it mid-commit destroys
+    //       the committed freemap snapshot.
+    //   (2) Any id in `txn_freed_pages` — pages that held handle
+    //       values reachable through the committed handle table;
+    //       overwriting any of them mid-commit destroys a
+    //       committed value.
+    //
+    // A crash in the window between `cache.flush()` and the superblock
+    // fsync would then leave the last-durable superblock pointing at
+    // a page whose bytes no longer match what it committed to —
+    // breaking the core shadow-paging invariant. The fix defers the
+    // merge of both at-risk sets into `current_freemap` until AFTER
+    // the new-freemap-page allocate has run, so `FreeMap::allocate_first`
+    // cannot return any of them during the vulnerable window.
+    #[test]
+    fn persist_freemap_does_not_reuse_committed_live_pages() {
+        let mut tm = fresh_manager();
+
+        // Commit 1: seed a non-trivial committed state. We need
+        // persist_freemap to actually materialize a freemap page,
+        // not take the early-exit path. That requires `txn_freed_pages`
+        // to be non-empty at commit, which means freeing at least one
+        // WHOLE data page — R1 slot packing keeps multi-slot data
+        // pages live even after individual deletes. The simplest way
+        // to guarantee whole-page frees is to use overflow-sized
+        // values (> MAX_INLINE_VALUE): each gets its own overflow
+        // chain, and delete releases every page in the chain into
+        // txn_freed_pages via Overflow::delete.
+        let big: Vec<u8> = vec![0xAB; MAX_INLINE_VALUE + 32];
+        tm.begin().unwrap();
+        let h_throwaway = tm.allocate(&big).unwrap();
+        let h_live_a = tm.allocate(&big).unwrap();
+        let h_live_b = tm.allocate(&big).unwrap();
+        let h_live_c = tm.allocate(&big).unwrap();
+        tm.delete(h_throwaway).unwrap();
+        tm.commit().unwrap();
+
+        let committed_freemap_page = tm.committed_roots.freemap_page;
+        assert_ne!(
+            committed_freemap_page, PAGE_ID_NONE,
+            "test precondition: commit 1 should have established a freemap page"
+        );
+
+        // Commit 2: delete two more handles. release_data_slot pushes
+        // their data pages into `txn_freed_pages`; those pages are
+        // still referenced by commit 1's (currently-on-disk)
+        // superblock at the moment commit_inner runs persist_freemap.
+        tm.begin().unwrap();
+        tm.delete(h_live_a).unwrap();
+        tm.delete(h_live_b).unwrap();
+
+        let frozen_txn_freed: Vec<u64> = tm.txn_freed_pages.clone();
+        assert!(
+            !frozen_txn_freed.is_empty(),
+            "test precondition: deletes should have populated txn_freed_pages"
+        );
+
+        tm.commit().unwrap();
+
+        // The at-risk set: anything that was still live under the
+        // prior committed superblock at the moment persist_freemap
+        // started allocating.
+        let mut still_live_pre_commit = frozen_txn_freed.clone();
+        still_live_pre_commit.push(committed_freemap_page);
+
+        let new_freemap_page = tm.committed_roots.freemap_page;
+        assert!(
+            !still_live_pre_commit.contains(&new_freemap_page),
+            "I18: persist_freemap allocated the new freemap page at an id \
+             that was still referenced by the last-durable superblock. \
+             new_freemap_page={new_freemap_page}, \
+             committed_freemap_page was {committed_freemap_page}, \
+             txn_freed_pages at commit time = {frozen_txn_freed:?}"
+        );
+
+        // Sanity: the un-deleted handle still reads back correctly
+        // (rules out a subtler corruption that survived the invariant
+        // check but poisoned the data plane).
+        assert_eq!(tm.read(h_live_c).unwrap(), big);
     }
 }
