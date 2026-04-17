@@ -3,8 +3,11 @@
 //
 // Shadow-paging commit protocol (see transaction.rs for the orchestration):
 //   1. Write all new/COW'd data pages; fsync the data file.
-//   2. Write the new superblock to the *other* of the two superblock slots
-//      (slots alternate — if txn N used slot 0, txn N+1 uses slot 1).
+//   2. Write the new superblock to slot `new_txn_counter % superblock_count`.
+//      With the default N=2 this alternates slot 0/1; with N>2 (ISSUES.md
+//      R4) it rotates through all N slots. The "previous" slot is always
+//      left untouched, so a crash between (1) and (3) cannot destroy the
+//      last-known-good superblock.
 //   3. fsync again.
 // If we crash between (1) and (2), the old superblock is still current and
 // the new data pages are orphaned garbage. They are NOT actively cleaned up
@@ -246,16 +249,25 @@ impl Superblock {
         })
     }
 
-    /// Select the active superblock from the pair of slot buffers.
+    /// Select the active superblock from a list of candidate slot buffers.
     ///
-    /// Correctness of crash recovery rides on this: we deserialize both
-    /// slots, discard any whose checksum/magic fail, and pick the survivor
-    /// with the highest `txn_counter`. Because the commit protocol fsyncs
-    /// data pages *before* writing the new superblock, the highest-counter
-    /// valid superblock is guaranteed to reference a fully-durable page set.
+    /// Correctness of crash recovery rides on this: we deserialize every
+    /// candidate, discard any whose checksum/magic/count-range validation
+    /// fails, and pick the survivor with the highest `txn_counter`.
+    /// Because the commit protocol fsyncs data pages *before* writing the
+    /// new superblock, the highest-counter valid superblock is guaranteed
+    /// to reference a fully-durable page set.
     ///
-    /// Returns None only when *every* slot is corrupt — the caller should
-    /// treat that as `CorruptSuperblock` (fatal).
+    /// The caller (`TransactionManager::open_existing`) passes up to
+    /// MAX_SUPERBLOCKS candidate pages without first trying to determine
+    /// N: non-superblock pages (data / overflow / freemap / handle-table)
+    /// that happen to land in the probed range will fail the MAGIC check
+    /// inside `deserialize` and be filtered out harmlessly. This is why
+    /// the open path reads blindly up to MAX_SUPERBLOCKS rather than
+    /// trying to look up N first.
+    ///
+    /// Returns None only when *every* candidate is corrupt — the caller
+    /// should treat that as `CorruptSuperblock` (fatal).
     pub fn select(buffers: &[[u8; PAGE_SIZE]]) -> Option<Superblock> {
         buffers
             .iter()
@@ -270,11 +282,17 @@ impl Superblock {
     /// `superblock_count % superblock_count == 0` — the highest-
     /// counter slot, exactly as the I2 fix requires for N=2. The
     /// caller (`TransactionManager::create_new`) pairs this with
-    /// additional lower-counter "fallback" slots in positions 1..N.
-    /// `total_pages = superblock_count` reserves all slots. Both
-    /// roots are PAGE_ID_NONE — the handle table and freemap are
-    /// created lazily on first write. The named-root table starts
-    /// empty.
+    /// additional lower-counter "fallback" slots in positions 1..N
+    /// (counters superblock_count-2, superblock_count-3, ..., 0) so
+    /// that every slot on disk holds a valid-empty-database
+    /// superblock from the moment the file exists; this means a
+    /// torn write on the FIRST commit can still fall back to one of
+    /// the pre-seeded siblings rather than to garbage.
+    ///
+    /// `total_pages = superblock_count` reserves the N slots and
+    /// nothing else. Both root pointers are PAGE_ID_NONE — the handle
+    /// table and freemap are created lazily on first write. The named-
+    /// root table starts empty.
     pub fn new_empty(superblock_count: u32) -> Superblock {
         Superblock {
             magic: MAGIC,

@@ -5,6 +5,7 @@ rough category. Each entry carries a priority tag; see legend below.
 
 Sources:
 - **[comment-pass]** — found during the 2026-04-10 commenting pass (read-only review, no tests run)
+- **[comment-pass 2026-04-17]** — found during the 2026-04-17 re-commenting pass (also read-only; covered changed `src/` files and the new `python/src/` subcrate)
 - **[roadmap]** — from the README roadmap
 - **[client]** — requested by the primary Chisel client
 
@@ -24,14 +25,17 @@ Dependencies and batching drive this more than raw priority. Earlier items unblo
 2. **I15** — superblock `format_version` validation. One-hour fix, do while I2 is in review.
 3. **I6** — `find_leaf` sentinel returns the root as the leaf. Latent corruption; needs a test that forces a sparse handle range.
 4. **I1** — commit error handling. Design decided (poison model — see I1 below); implement after I2/I6 so the recovery path is clean.
-5. **F3** — `read()` → `&self`. Do before F2 and I12 pile more API on top; also unblocks R5 (Python bindings).
-6. **F2 + I7** — named roots and handle-table rollback tracking. Both touch the handle table / superblock boundary; one coherent PR.
-7. **I3 + I4** — rollback file-extension cleanup and `next_page_id` seeding audit.
-8. **Freemap bundle: R2 + I9 + I10 + I11 + I12 (F1)** — wire the freemap, plug the leaks, expose bulk delete. One coherent effort; reclamation has to be consistent.
-9. **R1** — pack multiple values per data page. Biggest space/perf win; best done on top of a working freemap.
-10. **R3 + I17** — selective defrag (and fix the stat accuracy while rewriting the loop).
-11. **I13 + I14** — overflow hardening pass.
-12. **P3 cleanup sweep** — I5, I8, I16, C1–C3, and the "invariants to verify" section.
+5. **I18** — `persist_freemap` can reuse pages still referenced by the last-durable superblock. Violates shadow-paging invariant; needs a crash-injection test and a fix that either excludes in-flight freemap consolidation ids from allocation or defers the merge until after the superblock fsync.
+6. **F3** — `read()` → `&self`. Do before F2 and I12 pile more API on top; also unblocks R5 (Python bindings).
+7. **F2 + I7** — named roots and handle-table rollback tracking. Both touch the handle table / superblock boundary; one coherent PR.
+8. **I3 + I4** — rollback file-extension cleanup and `next_page_id` seeding audit.
+9. **Freemap bundle: R2 + I9 + I10 + I11 + I12 (F1)** — wire the freemap, plug the leaks, expose bulk delete. One coherent effort; reclamation has to be consistent.
+10. **R1** — pack multiple values per data page. Biggest space/perf win; best done on top of a working freemap.
+11. **R3 + I17** — selective defrag (and fix the stat accuracy while rewriting the loop).
+12. **I13 + I14** — overflow hardening pass.
+13. **Page-cache hardening: I19 + I20** — add bounds/asserts on `maybe_evict` and `claim_page`. Batch with any future PageCache refactor.
+14. **Python binding cleanup: I21–I25** — ergonomics and dead-code audit; batch as one PR once the Rust-side dust has settled.
+15. **P3 cleanup sweep** — I5, I8, I16, C1–C3, and the "invariants to verify" section.
 
 R4 (configurable superblock count) and R5 (Python bindings) sit outside this order — R4 is gated on I2, R5 is gated on F3.
 
@@ -89,6 +93,21 @@ Audit as part of I3 cleanup: confirm `TransactionManager::open` always resets `n
 **Where:** `page_cache.rs` `truncate()`
 
 No error or debug_assert if discarded entries are dirty. Safe as long as all callers are post-commit, but there is no runtime guard. Add a `debug_assert!(!entry.dirty)` on any future handle-table PR.
+
+### I18. `persist_freemap` can reuse pages the last-durable superblock still references [comment-pass 2026-04-17] — **P0**
+**Where:** `transaction.rs:634–662` `persist_freemap`
+
+During commit, `persist_freemap` merges `txn_freed_pages` and `old_freemap_page` into `current_freemap` (steps 1 and 3) **before** calling `allocate_data_page` (step 4) to pick a page for the new freemap snapshot. `allocate_data_page` may reuse from `current_freemap`; `allocate_first` returns the lowest free id, which is very likely `old_freemap_page`. The subsequent `claim_page` + `cache.flush()` then overwrites the bytes of a page that the **currently-committed** on-disk superblock still references. A crash in the window between that flush and the superblock fsync leaves the last-durable superblock pointing at overwritten bytes.
+
+This directly violates the shadow-paging invariant spelled out in `allocate_data_page`'s own doc comment ("pages reused by the freemap must not be referenced by the currently-committed superblock"). A comment flagging the hazard was added inline during the 2026-04-17 pass.
+
+**Severity:** potentially serious — defeats the "old state untouched until swap" guarantee that the whole durability story depends on.
+
+**Fix candidates:**
+- Defer the merge of `old_freemap_page` and `txn_freed_pages` until after the superblock fsync, keeping the committed snapshot's pages off-limits for the duration of the commit.
+- Or, pass `allocate_data_page` an "exclusion set" containing `old_freemap_page` and anything in `txn_freed_pages` that the last-durable superblock still references.
+
+**Test:** crash-injection regression between the `persist_freemap`-triggered `cache.flush()` and the superblock fsync; after reopen, verify the last-durable tree is intact.
 
 ---
 
@@ -180,6 +199,69 @@ Error-quality only. Add a bounds check on any PR touching `page_io.rs`.
 **Where:** `defrag.rs:59-60`
 
 `stats.pages_examined` and `stats.pages_freed` are populated from a per-value counter, not actual page counts. Fix while doing R3.
+
+---
+
+## Page-cache hardening
+
+### I19. `PageCache::maybe_evict` grows unboundedly when every page is dirty [comment-pass 2026-04-17] — **P2**
+**Where:** `page_cache.rs:446–463`
+
+When every cached entry is dirty the eviction loop `break`s and the cache silently grows past `max_pages`. The code comments this as a deliberate soft-limit (dirty pages may not be evicted without losing writes), but there is no upper bound and no warning. A long-running transaction that calls `new_page()` many times without intervening flushes can exhaust memory.
+
+**Fix candidates:**
+- Add a hard ceiling (e.g., `max_pages * K`) that returns `ChiselError::CacheFull` rather than continuing to grow.
+- Or, log / `debug_assert!` on an all-dirty eviction so runaway growth shows up in tests.
+
+### I20. `PageCache::claim_page` silently discards dirty writes on re-insertion [comment-pass 2026-04-17] — **P3**
+**Where:** `page_cache.rs:354–367`
+
+If the freemap ever hands back an id that the current transaction has already dirtied, `claim_page` will replace the cached entry and lose the pending writes. The only current caller is `allocate_data_page` via the freemap, which is not supposed to return an already-dirty id; the invariant is just not enforced.
+
+**Fix:** add `debug_assert!(!self.is_dirty(page_id))` to `claim_page`. Trivial; batch with any future freemap or cache change (see I19 and I18).
+
+---
+
+## Python binding
+
+These are all from the 2026-04-17 pass over the `python/src/` subcrate. Python-side API surface items; none block the Rust core, but they should be settled before R5 ships broadly.
+
+### I21. `PyChisel` latent `RefCell` re-entry hazard [comment-pass 2026-04-17] — **P3**
+**Where:** `python/src/db.rs:108–118` (and every `with_inner_mut_io` caller)
+
+Pyclass methods take `&self` and internally `borrow_mut()` through `with_inner_mut_io`. The existing comment claims "Python's GIL prevents concurrent re-entry" — true for **cross-thread** callers, but **not** for same-thread Rust→Python→PyChisel callbacks. No such path exists today (Chisel has no Python-side callbacks in its Rust API), but any future engine callback that dispatches into Python would deadlock on `borrow_mut`.
+
+**Fix:** document the constraint explicitly, and if/when a callback API is introduced, convert to `try_borrow_mut` with an explicit reentrancy error — or use a different interior-mutability story. Revisit when R5's public surface expands.
+
+### I22. `PySavepoint::rollback_to()` is silently idempotent [comment-pass 2026-04-17] — **P3**
+**Where:** `python/src/savepoint.rs:66–83`
+
+Calling `rollback_to()` twice on the same savepoint (without an intervening savepoint re-creation) succeeds silently the second time because of the `finished` guard. A user who writes `sp.rollback_to()` in an `if` branch and then exits the `with` block also silently succeeds. Arguably correct, but it masks a "called `rollback_to` on the wrong savepoint object" bug.
+
+**Fix candidates:**
+- Raise `AlreadyFinishedError` on the second call, matching the transaction API's usual idempotency-as-error stance.
+- Or document the idempotency explicitly and leave it.
+
+### I23. `DuplicateSavepointError` may be dead code [comment-pass 2026-04-17] — **P3**
+**Where:** `python/src/errors.rs`
+
+`DuplicateSavepointError` is declared in the Python exception tree, but no `ChiselError::DuplicateSavepoint` variant appears to exist in `src/error.rs` — only `SavepointNotFound(_)` is matched in `to_py_err`. Either the Rust-side variant is missing a raise path, or the Python-side exception is reachable only by name and should be removed.
+
+**Fix:** audit `src/error.rs` for a duplicate-savepoint case; either wire it through or drop the Python class. Batch with I21.
+
+### I24. `PyTransaction` has no explicit `.commit()` / `.rollback()` methods [comment-pass 2026-04-17] — **P3**
+**Where:** `python/src/transaction.rs`, `python/chisel/chisel.pyi`
+
+The `finished: Cell<bool>` guard inside `PyTransaction` is structured as if `.commit()` / `.rollback()` were exposed explicitly (the guard short-circuits the second call), but they are not. The `.pyi` stubs do not list them either. Users are limited to the `with db.transaction():` context-manager form.
+
+**Decision needed:** either expose explicit `.commit()` / `.rollback()` and keep the guard (matches savepoint shape), or remove the guard machinery as unused. Consistent with savepoint API is probably preferable.
+
+### I25. `db.close()` silently cancels live `PyTransaction` / `PySavepoint` objects [comment-pass 2026-04-17] — **P3**
+**Where:** `python/src/db.rs close()` + `with_inner_mut_io` contract
+
+After `db.close()` clears `inner`, any subsequent call through a still-live `PyTransaction` or `PySavepoint` returns `PoisonedError` (because `with_inner_mut_io` sees `None`). Calling `db.close()` inside a `with db.transaction():` block therefore cancels the transaction, and the `with`-exit commit then raises `PoisonedError` while attempting to commit.
+
+This is arguably graceful, but surprising enough to deserve docs. Possibly upgrade to a dedicated `ClosedError` so the user can tell "closed underneath me" from "Rust-side poison."
 
 ---
 

@@ -143,8 +143,17 @@ impl PageIo {
     /// `InvalidPageId` variant rather than the old generic
     /// `UnexpectedEof` wrapped as `IoError`, so upstream debugging can
     /// distinguish "caller asked for a page that doesn't exist" from
-    /// "genuine disk I/O failure". The bounds check is cheap (one
-    /// stat-less comparison against a cached length).
+    /// "genuine disk I/O failure".
+    ///
+    /// Cost note: `page_count()` performs a `seek(End(0))` on the File
+    /// backing, so every read pays one extra lseek syscall. `PageCache`
+    /// absorbs that cost on cache hits (cache only calls `read_page` on
+    /// a miss), so the per-operation overhead is bounded by the miss rate.
+    /// Cached page_count would be strictly faster but would need
+    /// invalidation on every `write_page` past EOF and every
+    /// `set_page_count` — not worth the coupling for the v1 design.
+    /// `&mut self` is required on this method precisely because of the
+    /// seek.
     pub fn read_page(&mut self, page_id: u64) -> Result<[u8; PAGE_SIZE]> {
         let page_count = self.page_count()?;
         if page_id >= page_count {
@@ -208,7 +217,16 @@ impl PageIo {
     ///
     /// Ordering invariant: the transaction manager calls this twice per
     /// commit — once after writing all data pages, once after writing the
-    /// superblock. Reversing or dropping either fsync breaks durability.
+    /// new superblock into its inactive slot (slot index =
+    /// `txn_counter % superblock_count`). Reversing or dropping either
+    /// fsync breaks durability: a superblock that reaches the platter
+    /// before its referenced data pages can point into garbage, and the
+    /// crash-recovery path has no WAL to replay.
+    ///
+    /// Fsyncgate note (see I1 in ISSUES.md): a FAILED fsync cannot be
+    /// safely retried on Linux — the dirty pages may have already been
+    /// discarded from the kernel cache. The transaction manager treats
+    /// any Err from this function as poison-worthy.
     pub fn fsync(&self) -> Result<()> {
         if self.read_only {
             return Err(ChiselError::ReadOnlyMode);

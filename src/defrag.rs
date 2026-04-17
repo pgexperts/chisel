@@ -50,16 +50,20 @@ use crate::transaction::TransactionManager;
 
 /// Knobs for a defrag pass.
 ///
-/// `sparse_threshold`: intended fill fraction below which a page is
-/// considered worth compacting (e.g. 0.25 = pages less than 25% full).
-/// Currently unused — see the v1 simplification note at the top of the
-/// file. Kept in the struct so future versions can honor it without an
-/// API break.
+/// `sparse_threshold`: fill-density fraction (live_slots / stored_slots)
+/// below which a page is treated as sparse and its values are relocated
+/// (e.g. 0.25 = pages less than 25% dense are compacted). Consumed by
+/// `TransactionManager::sparse_data_pages` during step 2 of the sweep.
+/// Dense pages above the threshold are left alone — per R3, the cost of
+/// re-packing a mostly-full page exceeds the benefit. Values <= 0
+/// disable the sweep entirely (the sparse set comes back empty).
 ///
 /// `max_pages`: soft cap on work per call, so a very large database can
 /// be defragged incrementally across several transactions. `0` means no
-/// limit. The implementation counts values processed, not pages touched,
-/// which is another v1 approximation.
+/// limit. DESPITE THE NAME, the cap counts values relocated, not pages
+/// touched — the field name is a carry-over from pre-R3 defrag and is
+/// preserved for API stability. Breaking the loop early leaves the
+/// transaction in a valid state; the caller chooses commit vs rollback.
 #[derive(Debug, Clone)]
 pub struct DefragOptions {
     pub sparse_threshold: f64,
