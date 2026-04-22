@@ -408,6 +408,21 @@ impl HandleTable {
         page_id: u64,
         handle: u64,
     ) -> Result<Option<(u64, usize)>> {
+        // I26: any handle outside the tree's reach is definitionally
+        // absent — same answer as a zero child pointer mid-descent.
+        // Without this guard the descent loop below would compute a
+        // `child_idx >= PTRS_PER_INTERIOR` and read `buf[CHECKSUM_OFFSET..]`
+        // (treating the page's checksum as a child pointer) or panic on
+        // an out-of-bounds slice for very large handles. `insert`
+        // pre-grows via `while handle >= capacity { grow() }` so it
+        // cannot hit this path — only the lookup side (read / update /
+        // delete) needs the guard. At depth 0 `handle % ENTRIES_PER_LEAF`
+        // is already total, so the check is only needed when we actually
+        // descend.
+        if self.depth > 0 && handle >= self.capacity() {
+            return Ok(None);
+        }
+
         if self.depth == 0 {
             let index = (handle % ENTRIES_PER_LEAF as u64) as usize;
             return Ok(Some((page_id, index)));
@@ -587,6 +602,65 @@ mod tests {
         assert_eq!(
             result, None,
             "sparse handle must report absent, not a bogus entry"
+        );
+    }
+
+    // Regression test for ISSUES.md I26. `find_leaf` did not bounds-check
+    // `child_idx` against `PTRS_PER_INTERIOR`: any `handle >= capacity()`
+    // walked the offset calculation past the last valid child pointer. At
+    // the first-overflow boundary (`child_idx == PTRS_PER_INTERIOR`, i.e.
+    // handle == ENTRIES_PER_LEAF * PTRS_PER_INTERIOR at depth 1) the code
+    // read `buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 8]` — the XXH3 checksum
+    // bytes of the interior page — and treated that nonzero u64 as a
+    // child page id. Descent then called `cache.get(checksum_as_id)`,
+    // which failed fatally and poisoned the manager. At larger `child_idx`
+    // the slice op panicked with out-of-bounds access. The contract
+    // (from lookup's callers read()/update()/delete()) says an unknown
+    // handle must surface as InvalidHandle, not as a poison or a crash.
+    //
+    // Post-fix: the capacity guard at the top of `find_leaf` short-circuits
+    // to Ok(None), so any handle beyond the tree's current reach is
+    // reported as definitionally absent — same answer as a zero child
+    // pointer encountered mid-descent.
+    #[test]
+    fn lookup_handle_beyond_capacity_returns_none() {
+        let mut cache = make_cache();
+        let mut ht = HandleTable::new();
+        let root0 = ht.create_root(&mut cache).unwrap();
+
+        let entry = HandleEntry {
+            page_id: 42,
+            slot_index: 7,
+            flags: HandleFlags::Live,
+        };
+        // Grow to depth=1: handle 0 fits in the initial leaf; the second
+        // insert at ENTRIES_PER_LEAF forces `grow()`.
+        let root1 = ht.insert(&mut cache, root0, 0, &entry).unwrap();
+        let root2 = ht
+            .insert(&mut cache, root1, ENTRIES_PER_LEAF as u64, &entry)
+            .unwrap();
+        assert_eq!(ht.depth(), 1);
+
+        // Capacity at depth=1 is ENTRIES_PER_LEAF * PTRS_PER_INTERIOR
+        // (= 520_710). The FIRST out-of-range handle makes child_idx
+        // exactly PTRS_PER_INTERIOR, whose offset lands on CHECKSUM_OFFSET
+        // — the classic pre-fix failure site that read the checksum as
+        // a page id and poisoned the cache via `get()` on a bogus id.
+        let first_over = (ENTRIES_PER_LEAF as u64) * (PTRS_PER_INTERIOR as u64);
+        assert_eq!(
+            ht.lookup(&mut cache, root2, first_over).unwrap(),
+            None,
+            "handle at exact capacity must be reported absent, not trigger a fatal cache.get"
+        );
+
+        // A much larger handle would, pre-fix, panic on the slice op
+        // because child_idx * CHILD_PTR_SIZE overflows PAGE_SIZE. The
+        // capacity guard must cover this path too — not just the neat
+        // first-overflow boundary.
+        assert_eq!(
+            ht.lookup(&mut cache, root2, u64::MAX).unwrap(),
+            None,
+            "u64::MAX handle must not panic nor read past the page"
         );
     }
 }

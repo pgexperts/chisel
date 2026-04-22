@@ -6,6 +6,7 @@ rough category. Each entry carries a priority tag; see legend below.
 Sources:
 - **[comment-pass]** — found during the 2026-04-10 commenting pass (read-only review, no tests run)
 - **[comment-pass 2026-04-17]** — found during the 2026-04-17 re-commenting pass (also read-only; covered changed `src/` files and the new `python/src/` subcrate)
+- **[comment-pass 2026-04-22]** — found during the 2026-04-22 third review pass (read-only; five-agent parallel audit over `src/` and `python/src/`)
 - **[roadmap]** — from the README roadmap
 - **[client]** — requested by the primary Chisel client
 
@@ -20,6 +21,8 @@ Priority legend:
 ## Suggested fix order
 
 > **Status note (2026-04-17):** every item below has landed. The order is preserved here as historical context — a reader looking at this file for "what's open?" should conclude: nothing from the 2026-04-10 or 2026-04-17 review passes is still actionable. The individual entries in later sections carry the definitive status.
+>
+> **Status note (2026-04-22):** a fresh third review pass re-opened the file with new items I26 (P1, handle-table bounds), I27 (P2, savepoint freed-pages leak on commit), I28 (P2, `CacheFull` poisons during commit), and a doc-sweep bundle (C4). These are NOT in the suggested fix order above — see each entry in its own section below. The 2026-04-22 pass specifically looked for invariant mismatches across module boundaries, which is where the remaining bugs now live.
 
 Dependencies and batching drove this more than raw priority. Earlier items unblocked later ones.
 
@@ -107,6 +110,23 @@ This directly violated the shadow-paging invariant spelled out in `allocate_data
 
 **Regression test:** `persist_freemap_does_not_reuse_committed_live_pages` in `src/transaction.rs`. It seeds a committed freemap page via overflow-delete (R1 slot-packing otherwise keeps multi-slot data pages live), then runs a second commit whose deletes populate `txn_freed_pages`, and asserts the new `committed_roots.freemap_page` is not in the at-risk set (old freemap page ∪ frozen `txn_freed_pages`). The test is framed as a direct invariant check rather than a crash-injection harness because the at-risk set is observable purely in post-commit internal state.
 
+### I27. `commit()` silently drops `savepoints[*].freed_pages` when savepoints are still active [comment-pass 2026-04-22] — **P2**
+**Where:** `transaction.rs` `commit_inner` (the `self.savepoints.clear()` at the end of commit) vs `release_inner` (which DOES merge freed pages back via `merged_freed.extend_from_slice(&sp.freed_pages)`)
+
+`release()` and `commit()` are asymmetric about what happens to a savepoint's `freed_pages`. When a savepoint is released, its `freed_pages` are merged back into the enclosing transaction's `txn_freed_pages`, so commit can return those ids to the freemap. When `commit()` runs with savepoints still on the stack, `commit_inner` simply calls `self.savepoints.clear()` — the per-savepoint `freed_pages` lists are dropped on the floor. `persist_freemap` only iterates `self.txn_freed_pages`, so any page freed in a scope enclosed by an unreleased savepoint is permanently orphaned from the freemap.
+
+**Leak workflow:** `begin → delete(h1) → delete(h2) → savepoint("s") → <more work> → commit`. The pages backing h1 and h2 were moved from `txn_freed_pages` into the savepoint's `freed_pages` by `savepoint_inner`, the savepoint was never released, commit clears the stack, those ids never reach the freemap. Nothing corrupts — the superblock is consistent, the pages are unreachable — but the freemap no longer knows they are reusable. Defrag is the only thing that can reclaim them.
+
+**Why prior passes missed it:** the 2026-04-10 pass predated R2 (freemap wiring) — leaks were known and batched into the freemap bundle. The 2026-04-17 pass focused on the I18 `persist_freemap` restructure and the page-cache hardening; savepoint semantics weren't in scope. The bug has been latent since R2 landed and will trip any workload that commits with a savepoint still active.
+
+**Fix direction:** Two coherent options.
+1. In `commit_inner`, before calling `persist_freemap`, merge all savepoints' `freed_pages` into `self.txn_freed_pages` — same pattern as `release_inner` lines 1042–1054, applied across the full stack. Matches the implicit "commit flattens everything" model.
+2. Reject `commit()` when savepoints are active — return a new `SavepointsStillActive` operational error that forces the caller to `release()` or `rollback_to()` first. More explicit; breaks existing callers that rely on implicit flatten-on-commit.
+
+(1) is the lower-risk fix and preserves existing behaviour.
+
+**Regression test (not yet written):** Begin a transaction, free some pages, take a savepoint, commit without releasing, reopen, assert the freed pages are in the freemap. Directly observable in internal state (the committed `Roots::freemap_page` contents) without crash injection.
+
 ---
 
 ## Handle table
@@ -133,6 +153,19 @@ Batch with F2 — same area of code.
 **Where:** `handle_table.rs`
 
 The "zero child pointer is unambiguous" invariant only holds because page 0 is superblock A and never a handle-table node. True today but not enforced. Add an `assert!` when next touching `handle_table.rs`.
+
+### I26. `find_leaf` does not bounds-check `child_idx` against `PTRS_PER_INTERIOR` [comment-pass 2026-04-22] — **P1** ✅ FIXED 2026-04-22
+**Where:** `handle_table.rs` `find_leaf` (the descent loop around line 419)
+
+For any `handle >= HandleTable::capacity()`, the descent loop computes `child_idx = remaining / child_span` without bounding the result to `< PTRS_PER_INTERIOR (= 1021)`. The resulting byte offset `DATA_PAGE_HEADER_SIZE + child_idx * CHILD_PTR_SIZE` walks off the valid child-pointer region. At the first-overflow boundary (`child_idx == 1021`, reachable with `handle == 520_710` at depth 1) it reads `buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 8]` — the XXH3 checksum bytes of the interior page — and treats that nonzero u64 as a child page id. The descent then calls `cache.get(checksum_as_id)`, which will almost always fail with `InvalidPageId` or `ChecksumMismatch`, both of which the TransactionManager classifies fatal and poisons on. At `child_idx >= 1022` the slice op panics outright with out-of-bounds access.
+
+`lookup` is the only external call site (reached from `read()`, `update()`, `delete()`, `delete_many()`, and `handles()`), and it does not pre-validate the handle. A caller who supplies a u64 larger than the current tree capacity triggers the bug externally — an operational mistake whose expected response is `InvalidHandle` gets escalated to an engine-poisoning fatal error or a process crash.
+
+**Same failure shape as the historical I6**: `find_leaf` reporting wrong information for a handle that does not exist in the tree. `insert` is unaffected because it pre-grows via `while handle >= capacity { grow() }`.
+
+**Fix (landed 2026-04-22):** added a capacity guard at the top of `find_leaf`, scoped to `self.depth > 0`. At depth 0 the existing `handle % ENTRIES_PER_LEAF` is already total (wraps cleanly for any u64) and the descent loop never runs, so the guard only matters on the descent path where the out-of-bounds `child_idx` actually arises. Scoping it this way avoids silently changing depth-0 semantics for callers that happen to pass large handles.
+
+**Regression test:** `lookup_handle_beyond_capacity_returns_none` in `src/handle_table.rs`. Grows the tree to depth 1 and asserts both the first-overflow boundary (`handle == ENTRIES_PER_LEAF * PTRS_PER_INTERIOR`, the historical reads-checksum-as-child case — which without the fix returned `Err(InvalidPageId { page_id: <xxhash of interior page> })`) and `handle == u64::MAX` (the would-panic case) both return `Ok(None)`.
 
 ---
 
@@ -216,6 +249,23 @@ If the freemap ever handed back an id the current transaction had already dirtie
 
 **Fix:** added `debug_assert!(!self.is_dirty(page_id), …)` at the top of `claim_page` so a violation surfaces immediately in debug builds rather than as silent data loss hours later. Release builds are unchanged. Test `claim_page_asserts_on_dirty_page` covers the assertion (gated on `cfg(debug_assertions)`).
 
+### I28. `CacheFull` raised during commit's `persist_freemap` poisons the manager [comment-pass 2026-04-22] — **P2**
+**Where:** `page_cache.rs` `maybe_evict` (the hard-ceiling check added in I19) × `transaction.rs` `commit()` / `poison_on_fatal`
+
+I19 introduced `ChiselError::CacheFull` as an **operational** error: documented as "caller recovers by committing (flushes → pages become evictable) or rolling back (discards all dirty pages)", and correctly classified `is_fatal() == false`. But `commit_inner` runs `persist_freemap` → `allocate_data_page` → `claim_page` / `new_page` → `maybe_evict` **before** `cache.flush()` drains dirty pages. If `maybe_evict` fires `CacheFull` at that point, the error propagates out of `commit_inner` and `commit()`'s `poison_on_fatal` wrapper poisons the TransactionManager regardless of `is_fatal()`.
+
+The resulting behaviour violates the operational contract in a particularly painful way: the recovery advice is "commit to flush," and commit is precisely what failed. A caller encountering `CacheFull` during commit has no legal action other than `close()` + reopen, which is the poison-model recovery — `CacheFull` was effectively reclassified fatal by the commit wrapper without anyone noticing.
+
+In practice the window is narrow: the transaction has to be at the hard ceiling with every page dirty at the moment `persist_freemap` allocates. But the semantic mismatch is real, and any user who hits it gets an inexplicable downgrade from "operational" to "must-reopen."
+
+**Fix direction:** Two coherent options.
+1. **Drain the cache before `persist_freemap`.** Commit's job is to flush the dirty pages to disk anyway; moving the flush earlier removes the dirty pins `maybe_evict` couldn't work around, so `CacheFull` cannot arise in the commit path. No contract change, no caller-visible behaviour difference beyond the bug going away.
+2. **Explicitly classify `CacheFull` as poisoning in the commit context.** Update the I19 docs and the Python `CacheFullError` class description to match: "operational outside commit, fatal inside commit." Honest about the actual semantics but more caveats for callers to remember.
+
+(1) is cleaner — no invariant changes.
+
+**Regression test (not yet written):** Construct a cache near the hard ceiling with many dirty pages, call `commit()`, assert the result is `Ok(())` (or at worst `Err(CacheFull)` without poisoning) rather than a poisoned manager. Verifiable via `is_poisoned()` post-commit.
+
 ---
 
 ## Python binding
@@ -259,6 +309,23 @@ The doc comment claims a fallback to `allocate_first`, but the implementation ju
 
 ### C3. `page_cache.rs` original header — "dirty pages are never evicted" — **P3** (annotate under I1) ✅ RESOLVED 2026-04-10
 Annotated in `PageCache::flush()` as part of I1: documented the "durability window" between dirty-flag clearing and the trailing fsync, explained that the I1 poison model is what makes the window benign, and flagged what would need to change if the poison model is ever weakened.
+
+### C4. Documentation sweep [comment-pass 2026-04-22] — **P3** (batch)
+
+The 2026-04-22 pass surfaced a cluster of small doc / sharp-edge items that don't warrant individual entries. Batch into one cleanup PR when convenient.
+
+- **`superblock.rs:152–153`** — field comment on `superblock_count` says "a deserialized value of 0 is treated as 'legacy' and implies the default of 2", but `deserialize` at line 235 rejects any value outside `MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS` (i.e., 0 is rejected, not back-filled). Code is correct (rejecting 0 is the only safe behaviour — a zero modulus would direct a superblock write into the data region). Comment is misleading and could seduce a future developer into adding a bogus legacy-compat branch. Delete the sentence.
+- **`superblock.rs:271` (`select()`)** — tie-break is silent: `max_by_key` returns the first maximum in iteration order (lowest slot index). Undocumented. Add one line explaining the policy.
+- **`error.rs:147` (`CorruptSuperblock` Display)** — message is "no valid superblock found", which doesn't distinguish "all slots fail XXH3" from "all slots had out-of-range `superblock_count`" (both emit the same variant). Consider either threading a reason through or enriching the Display to name the failure mode.
+- **`stats.rs:18–19` (`file_size_bytes` comment)** — says "may exceed `total_pages * PAGE_SIZE` briefly during a commit in progress", which implies a concurrent observer. Chisel is single-writer; there's no such observer. Reword to describe the real cause: "may exceed `total_pages * PAGE_SIZE` if a crashed commit left orphan pages in the file tail."
+- **`page_cache.rs:29–33` (header)** — claims the cache "may transiently hold `max_pages + 1` entries", but under the I19 hard-ceiling design it can legitimately grow further while dirty pages pin out eviction. Tighten to "may grow by one per allocation when eviction is blocked, up to `max_pages * HARD_CEILING_MULTIPLIER`."
+- **`page_cache.rs` — `max_pages == 0` sharp edge** — `new(io, 0)` trips `CacheFull { limit: 0 }` on the first allocation because `0 * 8 = 0`. Not exploitable (callers don't pass 0), but worth an `assert!(max_pages >= 1)` or a `max_pages.max(1)` clamp in `PageCache::new`.
+- **`freemap.rs` — stale "NOT WIRED IN" note** — a header comment still flags the freemap as unwired. R2 wired it in 2026-04-10. Delete.
+- **`transaction.rs:1117–1131` (`read`)** — two consecutive `///` doc paragraphs both start with "Read a value by handle." Merge into one.
+- **`python/chisel/__init__.py:64` (`DefragOptions.max_pages` docstring)** — says "cap on pages examined in one pass"; the actual cap counts values relocated, not pages touched. `defrag.rs:63–66` acknowledges the legacy name internally but the Python-facing docstring propagates the confusion. Update to "cap on values relocated in one pass (0 = no limit); the name is a legacy carry-over."
+- **`python/src/transaction.rs:1–28` (file header)** — the Design note section describes the explicit `commit()` / `rollback()` added in I24, but the very first "Semantics:" block above it lists only `__enter__` / `__exit__`. Add one sentence to the semantics block noting the explicit methods and their `finished`-guard contract.
+
+Also one discussion item, not a fix: **`LockFailed` classification** is currently under `FatalError` in the Python error hierarchy. `LockFailed` can only fire at `open()` before a TransactionManager exists, so it cannot poison anything — but the database file itself is intact, which puts it closer to the "operational" tier conceptually. Either re-parent to `OperationalError` (alongside `DatabaseFileNotFoundError`) or document why it sits under `FatalError` despite the file being undamaged. Design call, not a bug.
 
 ---
 
