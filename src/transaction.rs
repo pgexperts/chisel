@@ -1164,7 +1164,6 @@ impl TransactionManager {
     /// MVCC / snapshot isolation for concurrent readers because the writer is
     /// single-threaded; this branch is purely about making the active writer
     /// see its own pending mutations.
-    /// Read a value by handle.
     ///
     /// F3: takes `&self`. Internally, the page cache is wrapped in a
     /// RefCell so that the mutation required by LRU bookkeeping / page

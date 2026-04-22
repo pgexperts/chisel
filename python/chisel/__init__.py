@@ -61,8 +61,10 @@ class DefragOptions:
 
     sparse_threshold: fraction in [0, 1]. A data page is considered sparse
         when live-slot-count <= threshold * max_observed. Default 0.25.
-    max_pages: cap on pages examined in one pass; 0 means no limit.
-        Default 0.
+    max_pages: cap on VALUES relocated in one pass; 0 means no limit.
+        The name is a legacy carry-over from an earlier defrag design
+        that counted pages; the current implementation caps value moves,
+        which is the useful knob for bounding pass cost. Default 0.
     """
     sparse_threshold: float = 0.25
     max_pages: int = 0

@@ -149,8 +149,10 @@ pub struct Superblock {
     // R4). Serialized at byte 308 (right after named_roots). Stored in
     // each slot so open-time recovery can discover N from the first
     // valid slot it finds. Valid range is MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS;
-    // a deserialized value of 0 is treated as "legacy" and implies the
-    // default of 2.
+    // any value outside that range (including 0) is rejected by
+    // `deserialize` and the slot is treated as corrupt — a zero value
+    // would be catastrophic because the commit path uses
+    // `txn_counter % superblock_count` to pick the write slot.
     pub superblock_count: u32,
 }
 
@@ -268,6 +270,14 @@ impl Superblock {
     ///
     /// Returns None only when *every* candidate is corrupt — the caller
     /// should treat that as `CorruptSuperblock` (fatal).
+    ///
+    /// Tie-break policy: on a `txn_counter` tie, `max_by_key` returns the
+    /// FIRST maximum in iteration order — i.e. the slot with the lowest
+    /// page id. Ties should not arise in normal operation (every
+    /// successful commit bumps the counter), but they can appear during
+    /// the `create_new` seeding window before the first user commit and
+    /// in hand-crafted corruption-repair scenarios. Lowest-slot-wins is
+    /// deterministic and matches the slot-0-is-primary intuition.
     pub fn select(buffers: &[[u8; PAGE_SIZE]]) -> Option<Superblock> {
         buffers
             .iter()

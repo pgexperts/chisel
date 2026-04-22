@@ -26,11 +26,16 @@
 //   does NOT rewind it (see the note in `discard`); orphaned page IDs are
 //   acceptable because they are reclaimed by the freemap after commit or
 //   simply re-truncated.
-// - The cache is a SOFT limit. `load_page` evicts before insertion, but
-//   `new_page` evicts after insertion, so the map may transiently hold
-//   `max_pages + 1` entries. If every page in the cache is dirty, the
-//   cache can legitimately exceed `max_pages` indefinitely until `flush`
-//   clears the dirty bits.
+// - The cache is a SOFT limit with a HARD ceiling. `load_page` evicts
+//   before insertion; `new_page` evicts after insertion, so a single
+//   allocation can transiently push the map to `max_pages + 1`. When
+//   every page in the cache is dirty, `maybe_evict` cannot evict anyone
+//   and the cache legitimately grows past `max_pages` — but only up to
+//   `max_pages * HARD_CEILING_MULTIPLIER` (default 8×), after which it
+//   returns `ChiselError::CacheFull` rather than exhaust memory. See
+//   I19 for the design. Recovery from `CacheFull` is to commit or roll
+//   back the transaction; commit itself pre-drains the cache (I28) so
+//   `CacheFull` cannot arise on the commit path.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -85,7 +90,15 @@ impl PageCache {
     /// `unwrap_or(0)` on page_count failure is a tradeoff: we'd rather
     /// construct a usable cache and surface the underlying I/O error on
     /// the next real operation than fail the constructor.
+    ///
+    /// `max_pages` is clamped to at least 1. A value of 0 would set the
+    /// hard ceiling (`max_pages * HARD_CEILING_MULTIPLIER`) to 0 too,
+    /// tripping `CacheFull` on the first allocation regardless of
+    /// workload. Callers should never pass 0 in practice — `Options`
+    /// defaults to 1024 — but the clamp turns a confusing constructor-
+    /// time mistake into correct (if inefficient) behaviour.
     pub fn new(mut io: PageIo, max_pages: usize) -> PageCache {
+        let max_pages = max_pages.max(1);
         let next_page_id = io.page_count().unwrap_or(0);
         PageCache {
             io,

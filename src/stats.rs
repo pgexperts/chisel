@@ -15,6 +15,11 @@ pub struct Stats {
     /// Total allocated pages in the file, matching Superblock.total_pages.
     pub total_pages: u64,
     /// Raw size of the database file on disk. May exceed
-    /// `total_pages * PAGE_SIZE` briefly during a commit in progress.
+    /// `total_pages * PAGE_SIZE` when a previous crash left orphan
+    /// pages in the file tail — the last-durable superblock's
+    /// `total_pages` is authoritative, anything beyond it is dead
+    /// weight that the next allocation will overwrite (see I4).
+    /// Chisel is single-writer, so there is no concurrent commit
+    /// that could cause a transient divergence.
     pub file_size_bytes: u64,
 }

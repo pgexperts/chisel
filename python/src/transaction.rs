@@ -3,10 +3,15 @@
 // PyChisel via Py<PyChisel> so the transaction cannot outlive the db.
 //
 // Semantics:
-//   __enter__: db.transaction() already called begin() when this was
-//              constructed; __enter__ is just a hand-off.
-//   __exit__:  commits on clean exit, rolls back on exception. Never
-//              suppresses (returns Ok(false)).
+//   __enter__:  db.transaction() already called begin() when this was
+//               constructed; __enter__ is just a hand-off.
+//   __exit__:   commits on clean exit, rolls back on exception. Never
+//               suppresses (returns Ok(false)).
+//   .commit(),
+//   .rollback(): explicit drive (ISSUES.md I24). Both set the
+//               `finished` guard before the engine call, so a
+//               subsequent __exit__ short-circuits silently; a second
+//               explicit call raises AlreadyFinishedError.
 //
 // Design note: PyTransaction is a stateless wrapper around the active
 // transaction on the PyChisel. The underlying chisel::Chisel tracks
