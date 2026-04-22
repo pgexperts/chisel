@@ -272,7 +272,9 @@ The Python API mirrors the Rust one but adds context managers for transactions a
 
 ## Design documents
 
-Deeper architectural notes live in [`docs/superpowers/specs/`](docs/superpowers/specs/):
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — living architecture overview: layer model, commit protocol, recovery, full on-disk format byte-by-byte, and cross-cutting concepts. Start here if you're reading the codebase for the first time.
+
+Deeper notes frozen at decision time in [`docs/superpowers/specs/`](docs/superpowers/specs/):
 
 - [`2026-04-09-chisel-storage-engine-design.md`](docs/superpowers/specs/2026-04-09-chisel-storage-engine-design.md) — shadow paging, handle table, page layouts.
 - [`2026-04-13-chisel-in-memory-mode-design.md`](docs/superpowers/specs/2026-04-13-chisel-in-memory-mode-design.md) — the `Vec<u8>`-backed `PageIo`.
