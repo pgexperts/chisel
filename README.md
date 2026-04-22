@@ -229,7 +229,11 @@ The poison model is mandatory because Linux `fsync` semantics (post-2018 "fsyncg
 
 ### How it's encoded
 
-Each superblock carries a packed `format_version` u32: upper 16 bits = MAJOR, lower 16 bits = MINOR. The open-time gate compares MAJOR only — a 1.3 binary opens a 1.7 file cleanly, but a 1.3 binary rejects a 2.0 file. Minor bumps are reserved for additive changes within the superblock's reserved region, so older binaries can safely *read* newer-minor files.
+Versioning is two-tiered.
+
+**File level** — each superblock carries a packed `format_version` u32: upper 16 bits = MAJOR, lower 16 bits = MINOR. The open-time gate compares MAJOR only. A 1.3 binary opens a 1.7 file cleanly, but a 1.3 binary rejects a 2.0 file. Minor bumps within a major are reserved for additive changes, so older binaries can safely *read* newer-minor files.
+
+**Page level** — each non-superblock page carries a one-byte `page_format_version` in its header, letting individual page layouts evolve within a major without a file-wide format bump. The post-1.0 upgrade story is lazy migration: on read, the page-type module dispatches on its page's declared version; on write, it always produces the current version; cold pages stay in the old layout until an opt-in `db.upgrade()` sweep rewrites them. An additional 8 bytes are reserved in every non-superblock page header for future common-header fields.
 
 Write safety across minors is a narrower guarantee: a binary at MINOR = *m* opening a file at MINOR = *m' > m* cannot safely commit without risking overwriting fields it doesn't know about. Starting with the first minor bump after 1.0, the open path will refuse writes in that direction (read-only on the newer-minor file); until then the check is a no-op because no minor variants exist. The post-1.0 cross-minor read-compatibility guarantee is absolute; write-compatibility requires binary MINOR ≥ file MINOR.
 

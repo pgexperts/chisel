@@ -6,17 +6,18 @@
 //
 // Physical layout of a data page:
 //   byte  0       : PageType tag (0x02 = Data)
-//   byte  1       : reserved / padding (zeroed by init_page; no reader looks at it)
+//   byte  1       : page format version (per-page versioning, I31;
+//                   `page::PAGE_FORMAT_VERSION_CURRENT` today)
 //   bytes 2..4    : slot_count (u16 LE) — number of slot dir entries (live + dead)
 //   bytes 4..6    : free_start (u16 LE) — end of the slot directory, grows forward
 //   bytes 6..8    : free_end   (u16 LE) — start of packed data region, grows backward
-//   bytes 8..16   : reserved for a future per-page txn_counter (u64 LE) that
-//                   would record "the transaction that last wrote this page".
-//                   Currently ALLOCATED IN THE LAYOUT BUT NOT WRITTEN by any
-//                   module — init_page zeroes these bytes and compact()
-//                   faithfully preserves whatever's there across a rebuild.
-//                   The layout slot exists so the field can be added without
-//                   an on-disk format bump; no live code reads or writes it.
+//   bytes 8..16   : RESERVED for future common-header fields (I31 reserved
+//                   region, 64 bits; universally zero across all page types
+//                   today). A future common field added here bumps the
+//                   affected page type's per-page version, not the
+//                   superblock's MAJOR. No live code reads or writes these
+//                   bytes; init_page zeroes them and compact() preserves
+//                   whatever's there across a rebuild.
 //   bytes 16..free_start : slot directory (6 bytes per entry)
 //   bytes free_start..free_end : free hole (shrinks as slots and data are added)
 //   bytes free_end..CHECKSUM_OFFSET : packed value data (grows backward)
@@ -46,7 +47,7 @@
 // init_page() does not preserve prior contents; compact() rebuilds the page
 // but preserves bytes 8..16 (txn_counter).
 
-use crate::page::{PageType, CHECKSUM_OFFSET, DATA_PAGE_HEADER_SIZE, PAGE_SIZE};
+use crate::page::{self, PageType, CHECKSUM_OFFSET, DATA_PAGE_HEADER_SIZE, PAGE_SIZE};
 
 // Slot directory entry size — must match the layout documented above.
 // Changing this is an on-disk format break.
@@ -69,6 +70,11 @@ impl DataPage {
     pub fn init_page(buf: &mut [u8; PAGE_SIZE]) {
         buf.fill(0);
         buf[0] = PageType::Data as u8;
+        // I31: per-page version byte at position 1 for Data pages.
+        // Written explicitly (even though buf.fill(0) already set it) so
+        // the layout intent is visible and future `CURRENT` bumps flow
+        // through here automatically.
+        buf[1] = page::PAGE_FORMAT_VERSION_CURRENT;
         // slot_count = 0 (bytes 2..4 already zero)
         // free_start = DATA_PAGE_HEADER_SIZE (end of header = start of slot dir area)
         let free_start = DATA_PAGE_HEADER_SIZE as u16;
@@ -286,10 +292,12 @@ impl DataPage {
     // Strategy: copy all live values out to a temporary Vec, re-init the page,
     // and re-insert. This is simple but O(n) allocations and a full copy.
     //
-    // The txn_counter (bytes 8..16) is preserved across the re-init because
-    // init_page() zeroes the buffer — losing it would break any code tracking
-    // "last modified by which transaction". Other header fields are
-    // regenerated correctly by the reinsert loop.
+    // Bytes 8..16 (the I31 common-header reserved region) are preserved
+    // across the re-init because init_page() zeroes the buffer. Today
+    // those bytes are always zero and the preservation is a no-op; the
+    // moment any future common-header field lives in that region we'll
+    // depend on this save/restore to keep compact non-destructive.
+    // Other header fields are regenerated correctly by the reinsert loop.
     //
     // Returned mapping must be consumed by the caller (transaction layer) to
     // rewrite any handle-table entries that reference this page, since slot

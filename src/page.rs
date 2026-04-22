@@ -1,6 +1,6 @@
 // page.rs — Foundation layer (layer 1). Defines the on-disk page format:
-// page size, type tags, header sizes, magic/version constants, and the
-// checksum primitives every other page module relies on.
+// page size, type tags, header sizes, magic/format-version constants, and
+// the checksum primitives every other page module relies on.
 //
 // Invariant: every page on disk is exactly PAGE_SIZE bytes and ends with an
 // 8-byte little-endian XXH3 checksum computed over bytes 0..CHECKSUM_OFFSET.
@@ -9,6 +9,14 @@
 // writes. A mismatch at load time is fatal (ChecksumMismatch).
 // On-disk format is little-endian by convention (we assume LE hosts and
 // explicitly use to_le_bytes/from_le_bytes for portability if that changes).
+//
+// Versioning is two-tiered. At the FILE level, the superblock carries a
+// packed MAJOR/MINOR `format_version` (I29); the open-time gate rejects
+// a file whose MAJOR doesn't match the binary's. At the PAGE level, each
+// non-superblock page carries a one-byte `page_format_version` (I31)
+// that lets individual page layouts evolve within a MAJOR without a
+// file-wide bump — the foundation for lazy per-page upgrade. See the
+// PAGE_FORMAT_VERSION_CURRENT block below for the storage convention.
 
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -30,6 +38,47 @@ pub const COMMON_HEADER_SIZE: usize = 12;
 // subtracting that header and the trailing checksum.
 pub const DATA_PAGE_HEADER_SIZE: usize = 16;
 pub const PAGE_BODY_SIZE: usize = PAGE_SIZE - DATA_PAGE_HEADER_SIZE - CHECKSUM_SIZE; // 8168
+
+// Per-page format version (ISSUES.md I31). Each non-superblock page
+// carries a one-byte version that lets future binaries read older
+// page layouts without a MAJOR-format bump — the basis for lazy
+// per-page upgrade. Version 0 is reserved for "the layout as of the
+// I31 commit" (byte values pre-this-change happen to be zero already,
+// which is why introducing this byte does not require breaking
+// existing files).
+//
+// Storage offset is per-type, dispatched via `page_format_version`:
+//   - Data, Overflow, FreeMap: byte 1 (was unused / padding)
+//   - HandleTable:             byte 2 (byte 1 holds FLAG_LEAF/INTERIOR)
+//
+// Bytes 8..16 of every non-superblock page are RESERVED for future
+// common-header fields (64 bits of headroom). Today they are
+// universally zero. Adding a field there in the future will bump
+// the relevant page type's per-page version, not the superblock's
+// MAJOR.
+pub const PAGE_FORMAT_VERSION_CURRENT: u8 = 0;
+pub const COMMON_RESERVED_OFFSET: usize = 8;
+pub const COMMON_RESERVED_LEN: usize = 8;
+
+/// Read the per-page format version from a page buffer. Dispatches on
+/// the PageType byte because HandleTable pages keep their FLAG byte at
+/// position 1, so their version byte sits at position 2 instead.
+///
+/// Superblock pages are NOT covered — the superblock carries its own
+/// packed MAJOR/MINOR in `format_version` (see I29). The `PageType`
+/// enum has no `Superblock` variant precisely because superblocks do
+/// not participate in the common-header scheme; pages 0..N in the file
+/// are superblocks by convention and the reader already knows to skip
+/// them before looking at PageType. Feeding a superblock buffer to
+/// this function would read the superblock's own magic byte and
+/// return an arbitrary-looking value — don't.
+pub fn page_format_version(buf: &[u8; PAGE_SIZE]) -> u8 {
+    if buf[0] == PageType::HandleTable as u8 {
+        buf[2]
+    } else {
+        buf[1]
+    }
+}
 
 // "CHSL" in ASCII, stored little-endian so it appears as C-H-S-L when you
 // hexdump the first 4 bytes of the file. Used to reject non-Chisel files
@@ -130,4 +179,80 @@ pub fn verify_checksum(buf: &[u8; PAGE_SIZE]) -> bool {
     let stored = u64::from_le_bytes(buf[CHECKSUM_OFFSET..].try_into().unwrap());
     let computed = compute_checksum(buf);
     stored == computed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // I31: the per-page version byte lives at position 1 for Data,
+    // Overflow, and FreeMap pages, and at position 2 for HandleTable
+    // pages (because byte 1 there holds FLAG_LEAF / FLAG_INTERIOR).
+    // This test pins the dispatch: flipping a version byte at the right
+    // offset for each page-type-byte-0 value must surface through
+    // `page_format_version`, while flipping the OTHER position must not.
+    #[test]
+    fn page_format_version_dispatches_by_page_type() {
+        let mut buf = [0u8; PAGE_SIZE];
+
+        // Data page: version at byte 1.
+        buf[0] = PageType::Data as u8;
+        buf[1] = 7;
+        buf[2] = 0;
+        assert_eq!(page_format_version(&buf), 7);
+        // Byte 2 is type-specific for Data (slot_count high byte) —
+        // must not leak into the version result.
+        buf[2] = 99;
+        assert_eq!(page_format_version(&buf), 7);
+
+        // Overflow: version at byte 1.
+        let mut buf = [0u8; PAGE_SIZE];
+        buf[0] = PageType::Overflow as u8;
+        buf[1] = 3;
+        buf[2] = 99;
+        assert_eq!(page_format_version(&buf), 3);
+
+        // FreeMap: version at byte 1.
+        let mut buf = [0u8; PAGE_SIZE];
+        buf[0] = PageType::FreeMap as u8;
+        buf[1] = 5;
+        buf[2] = 99;
+        assert_eq!(page_format_version(&buf), 5);
+
+        // HandleTable: version at byte 2 (byte 1 is FLAG_*).
+        let mut buf = [0u8; PAGE_SIZE];
+        buf[0] = PageType::HandleTable as u8;
+        buf[1] = 0x01; // FLAG_LEAF — must be ignored by version reader
+        buf[2] = 4;
+        assert_eq!(page_format_version(&buf), 4);
+        // Flipping the FLAG byte must not change the reported version.
+        buf[1] = 0x02; // FLAG_INTERIOR
+        assert_eq!(page_format_version(&buf), 4);
+    }
+
+    // A freshly-constructed page of any type — that is, one that has
+    // passed through its module's init_page / create_root — must report
+    // `PAGE_FORMAT_VERSION_CURRENT` here. Today that is 0, so a pre-I31
+    // page (which had all header bytes at zero by accident) also reports
+    // 0; the test still pins the invariant for future CURRENT bumps.
+    //
+    // Lives here rather than in each page-type test module because the
+    // intent is the cross-cutting convention, not any one type's init.
+    #[test]
+    fn fresh_pages_report_current_version() {
+        // Data
+        let mut buf = [0u8; PAGE_SIZE];
+        crate::data_page::DataPage::init_page(&mut buf);
+        assert_eq!(page_format_version(&buf), PAGE_FORMAT_VERSION_CURRENT);
+
+        // FreeMap
+        let mut buf = [0u8; PAGE_SIZE];
+        crate::freemap::FreeMap::init_page(&mut buf);
+        assert_eq!(page_format_version(&buf), PAGE_FORMAT_VERSION_CURRENT);
+
+        // Overflow and HandleTable init through their cache-aware paths,
+        // not a free-standing helper, so exercising them here would pull
+        // PageCache into a pure-byte test. They are covered end-to-end
+        // by the existing integration tests instead.
+    }
 }

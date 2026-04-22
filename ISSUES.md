@@ -22,7 +22,7 @@ Priority legend:
 
 > **Status note (2026-04-17):** every item below has landed. The order is preserved here as historical context — a reader looking at this file for "what's open?" should conclude: nothing from the 2026-04-10 or 2026-04-17 review passes is still actionable. The individual entries in later sections carry the definitive status.
 >
-> **Status note (2026-04-22):** a fresh third review pass re-opened the file with new items I26 (P1, handle-table bounds), I27 (P2, savepoint freed-pages leak on commit), I28 (P2, `CacheFull` poisons during commit), and a doc-sweep bundle (C4), all resolved the same day. I29 also landed later that day: a pre-1.0 infrastructure change splitting `format_version` into packed MAJOR / MINOR so the README's "sacred within a major version" promise is enforceable at the bytes level. These are NOT in the suggested fix order above — see each entry in its own section below. The 2026-04-22 pass specifically looked for invariant mismatches across module boundaries, which is where the remaining bugs now live.
+> **Status note (2026-04-22):** a fresh third review pass re-opened the file with new items I26 (P1, handle-table bounds), I27 (P2, savepoint freed-pages leak on commit), I28 (P2, `CacheFull` poisons during commit), and a doc-sweep bundle (C4), all resolved the same day. Two pre-1.0 infrastructure items also landed that day: I29 (split `format_version` into packed MAJOR / MINOR so the README's "sacred within a major version" promise is enforceable at the bytes level) and I31 (per-page format-version byte + 64-bit reserved common-header region, the foundation for lazy per-page upgrade). These are NOT in the suggested fix order above — see each entry in its own section below. The 2026-04-22 pass specifically looked for invariant mismatches across module boundaries, which is where the remaining bugs now live.
 
 Dependencies and batching drove this more than raw priority. Earlier items unblocked later ones.
 
@@ -143,6 +143,26 @@ This directly violated the shadow-paging invariant spelled out in `allocate_data
 **Pre-1.0 compatibility note:** any file written by a prior development build carries `format_version = 1` or `format_version = 2` in the flat scheme. Under the packed interpretation those decode as MAJOR = 0, MINOR = 1 or 2. MAJOR = 0 ≠ current MAJOR = 1 → rejected with `UnsupportedFormatVersion`. This is the documented pre-1.0 break; there are no production DBs to migrate, and release notes call it out. MAJOR = 0 is implicitly reserved forever as "pre-1.0 development" and will never be written by a released binary.
 
 **Regression test:** `format_version_gate_is_major_only` in `src/transaction.rs`. Creates a fresh database, closes, patches both superblock slots to (a) the current major with a bumped minor — asserts open succeeds (pre-fix this rejected with `UnsupportedFormatVersion`); then patches to a bumped major — asserts open fails with `UnsupportedFormatVersion`. Exercises both halves of the MAJOR-only check.
+
+### I31. Per-page format version byte + reserved common-header space [infrastructure 2026-04-22] — **P1** (pre-1.0 foundation) ✅ PHASE 1 LANDED 2026-04-22
+**Where:** `page.rs` `page_format_version` / `PAGE_FORMAT_VERSION_CURRENT` / `COMMON_RESERVED_*`; every non-superblock page-type module's `init_page` (data_page, overflow, freemap, handle_table)
+
+**Motivation:** the upgrade plan for post-1.0 format evolution calls for **lazy per-page migration** — reads dispatch on each page's declared format version; writes always produce the current format; pages get migrated as the application happens to touch them. A later task (the "eager upgrader", see below) sweeps remaining cold pages. Both depend on having a per-page format version to dispatch on. Pre-I31 there was no such byte.
+
+**Scheme:**
+- Each non-superblock page carries a one-byte `page_format_version`. `PAGE_FORMAT_VERSION_CURRENT = 0` is "the layout as of the I31 commit."
+- Storage offset is per-type, dispatched via `page::page_format_version(buf)`:
+  - `Data`, `Overflow`, `FreeMap`: byte 1 (was "reserved / padding" today, already zero on every existing page).
+  - `HandleTable`: byte 2 (byte 1 holds `FLAG_LEAF` / `FLAG_INTERIOR`; the flag is forensic-only, no runtime code reads it, moving it would have cost a gratuitous format break).
+- Bytes 8..16 of every non-superblock page are RESERVED for future common-header fields (8 bytes / 64 bits, `COMMON_RESERVED_OFFSET` / `COMMON_RESERVED_LEN`). Universally zero today; a future common field added there will bump the affected page type's per-page version, not the superblock's MAJOR. This generalizes and extends the existing data_page "reserved for future per-page txn_counter" slot.
+
+**Why per-type dispatch rather than uniform byte 1:** moving `FLAG_LEAF`/`FLAG_INTERIOR` would not have been a behavior change (no code reads them) but WOULD have made every existing handle-table page on disk differ from a freshly-initialized one at byte 1 vs byte 2, which would have required a MAJOR bump to avoid silent reinterpretation. The per-type dispatch costs one `if` in the reader and avoids any break — pre-I31 files Just Work (byte 1 or 2 was already zero = "version 0" = current).
+
+**Phase 1 (landed 2026-04-22):** byte allocation only. `page_format_version` exists and is testable; every page-type `init_page` writes `PAGE_FORMAT_VERSION_CURRENT` explicitly (even though `buf.fill(0)` already zeroed it) so future CURRENT bumps flow through a single authoritative site per type. No dispatch code yet — there are no non-zero versions in use.
+
+**Phase 2 (deferred — the "eager upgrader"):** when a realistic format change requires it, the read path in the affected page-type module grows a version switch (`match page_format_version(buf) { 0 => read_v0(buf), 1 => read_v1(buf), _ => Err(Unsupported) }`), writes always produce the latest version, and an opt-in `db.upgrade(on_progress)` method rewrites every cold page. `on_progress: FnMut(UpgradeProgress)` lets the caller surface progress to logs / TUI / IPC. A later phase 3 would wrap this in an async worker thread for fully-unattended upgrade — but per the design discussion, that's polish on top of the synchronous scanner, not a separate architecture.
+
+**Regression tests:** `page_format_version_dispatches_by_page_type` (pure unit test pinning the per-type offset) and `fresh_pages_report_current_version` (asserts Data/FreeMap `init_page` output reports `PAGE_FORMAT_VERSION_CURRENT` through the `page_format_version` reader; Overflow and HandleTable init through their cache-aware paths and are covered end-to-end by existing integration tests). Both in `src/page.rs`'s test module.
 
 ---
 

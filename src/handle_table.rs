@@ -63,7 +63,15 @@ const PTRS_PER_INTERIOR: usize = (CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE) / CHI
 
 // Page flags byte (buf[1]): distinguishes leaf from interior. Stored in the
 // page header so `open_existing` can walk the tree to recover depth without
-// needing the depth to be persisted separately in the superblock.
+// needing the depth to be persisted separately in the superblock. Currently
+// forensic-only — no live code reads it (the depth walk uses child-pointer
+// presence); kept because a hex-dump reader can tell leaf from interior at
+// a glance.
+//
+// NOTE on per-page version byte (I31): handle-table pages keep the flag at
+// byte 1 and put the I31 per-page format version at byte 2. Every other
+// page type puts its version at byte 1; `page::page_format_version`
+// dispatches on PageType to read from the right offset.
 const FLAG_LEAF: u8 = 0x01;
 const FLAG_INTERIOR: u8 = 0x02;
 
@@ -149,6 +157,7 @@ impl HandleTable {
         buf.fill(0); // Zero-fill: every slot reads as Deleted (see HandleFlags::from_u8).
         buf[0] = PageType::HandleTable as u8;
         buf[1] = FLAG_LEAF;
+        buf[2] = page::PAGE_FORMAT_VERSION_CURRENT; // I31
         page::stamp_checksum(buf);
         self.depth = 0;
         Ok(page_id)
@@ -281,6 +290,7 @@ impl HandleTable {
         buf.fill(0);
         buf[0] = PageType::HandleTable as u8;
         buf[1] = FLAG_INTERIOR;
+        buf[2] = page::PAGE_FORMAT_VERSION_CURRENT; // I31
         buf[DATA_PAGE_HEADER_SIZE..DATA_PAGE_HEADER_SIZE + 8]
             .copy_from_slice(&old_root.to_le_bytes());
         page::stamp_checksum(buf);
@@ -353,6 +363,7 @@ impl HandleTable {
                     buf.fill(0);
                     buf[0] = PageType::HandleTable as u8;
                     buf[1] = FLAG_LEAF;
+                    buf[2] = page::PAGE_FORMAT_VERSION_CURRENT; // I31
                     page::stamp_checksum(buf);
                     leaf
                 } else {
@@ -362,6 +373,7 @@ impl HandleTable {
                     buf.fill(0);
                     buf[0] = PageType::HandleTable as u8;
                     buf[1] = FLAG_INTERIOR;
+                    buf[2] = page::PAGE_FORMAT_VERSION_CURRENT; // I31
                     page::stamp_checksum(buf);
                     interior
                 }

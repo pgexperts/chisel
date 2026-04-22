@@ -233,7 +233,7 @@ Useful for:
 
 ### How it's encoded
 
-Each superblock carries a packed `format_version` u32 — upper 16 bits = MAJOR, lower 16 bits = MINOR. The open-time gate compares MAJOR only: a 1.3 binary opens a 1.7 file cleanly, a 1.3 binary rejects a 2.0 file.
+Versioning is two-tiered. **File level**: each superblock carries a packed `format_version` u32 — upper 16 bits = MAJOR, lower 16 bits = MINOR. The open-time gate compares MAJOR only: a 1.3 binary opens a 1.7 file cleanly, a 1.3 binary rejects a 2.0 file. **Page level**: each non-superblock page carries a one-byte format version in its header, letting individual page layouts evolve within a major without a file-wide bump — the basis for lazy per-page upgrade on future versions.
 
 Cross-minor *read* compatibility is absolute within a major. *Write* compatibility is narrower: starting with the first post-1.0 minor bump, a binary at MINOR = *m* opening a file at MINOR = *m' > m* will be restricted to read-only to avoid clobbering fields the binary doesn't know about. Until 1.1 ships this check is a no-op because no minor variants exist.
 

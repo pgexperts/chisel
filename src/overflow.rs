@@ -9,15 +9,18 @@
 //
 // Physical layout of an overflow page:
 //   byte  0        : PageType tag (0x03 = Overflow)
-//   bytes 1..16    : reserved / zeroed. The layout is padded out to
-//                    DATA_PAGE_HEADER_SIZE (= 16, from page.rs) so data
-//                    pages and overflow pages share the same 16-byte
-//                    header footprint — useful for any future page-agnostic
-//                    header inspection and for keeping byte offsets aligned
-//                    with the data-page layout. This is NOT the same as
-//                    COMMON_HEADER_SIZE (= 12); the overflow and data pages
-//                    share the bigger number, the common header is only
-//                    the shared prefix.
+//   byte  1        : page format version (I31;
+//                    page::PAGE_FORMAT_VERSION_CURRENT today)
+//   bytes 2..8     : reserved / zeroed for type-specific use.
+//   bytes 8..16    : RESERVED for future common-header fields (I31; 64
+//                    bits of headroom shared with data_page / freemap /
+//                    handle_table). Universally zero today.
+//
+//   The layout is padded out to DATA_PAGE_HEADER_SIZE (= 16, from page.rs)
+//   so data pages and overflow pages share the same 16-byte header
+//   footprint. This is NOT the same as COMMON_HEADER_SIZE (= 12); the
+//   overflow and data pages share the bigger number, the common header
+//   is only the shared prefix.
 //   bytes 16..24   : total_length (u64 LE) — full value size, REPEATED on every
 //                    page in the chain so any page can answer "how big is this
 //                    value?" without walking to the end
@@ -105,6 +108,10 @@ impl Overflow {
             let buf = cache.get_mut(page_id)?;
             buf.fill(0);
             buf[0] = PageType::Overflow as u8;
+            // I31: per-page version at byte 1. Explicit for the same
+            // reason as data_page::init_page — intent visible, future
+            // CURRENT bumps flow through here automatically.
+            buf[1] = page::PAGE_FORMAT_VERSION_CURRENT;
             buf[16..24].copy_from_slice(&total_length.to_le_bytes());
             buf[24..32].copy_from_slice(&next_page.to_le_bytes());
             buf[OVERFLOW_HEADER_END..OVERFLOW_HEADER_END + chunk.len()].copy_from_slice(chunk);
