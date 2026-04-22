@@ -399,23 +399,29 @@ fn test_recovery_torn_second_superblock_falls_back_to_previous() {
 #[test]
 fn test_reject_unsupported_format_version() {
     // Regression test for ISSUES.md I15: a superblock with a valid checksum
-    // but a future format_version must be refused with a distinct error,
-    // not silently accepted.
+    // but a MAJOR-incompatible format_version must be refused with a
+    // distinct error, not silently accepted. Post-I29 the gate is
+    // major-only (`format_major(sb.format_version) != FORMAT_MAJOR_VERSION`),
+    // so we forge a future MAJOR rather than a flat "+99" — the old +99
+    // would now be a same-major MINOR bump and (correctly) succeed.
     let file = NamedTempFile::new().unwrap();
     let path = file.path().to_owned();
 
-    // Create a fresh database (initializes both superblock slots at v1).
+    // Create a fresh database (initializes both superblock slots at the
+    // current MAJOR.MINOR).
     {
         let _db = Chisel::open(&path, Default::default()).unwrap();
     }
 
-    // Overwrite BOTH slots with valid superblocks at a future format_version.
-    // We must overwrite both — if we leave one at v1, select() would pick
-    // whichever had the higher counter. Using identical counters here and
-    // overwriting both guarantees the v-future slot wins.
+    // Overwrite BOTH slots with valid superblocks at a future MAJOR.
+    // We must overwrite both — if we leave one at the current major,
+    // select() would pick whichever had the higher counter. Using
+    // identical-shape superblocks with controlled counters here
+    // guarantees the future-major slot wins.
+    let future_major = page::pack_format_version(page::FORMAT_MAJOR_VERSION.wrapping_add(1), 0);
     let mut sb = Superblock {
         magic: page::MAGIC,
-        format_version: page::FORMAT_VERSION + 99,
+        format_version: future_major,
         txn_counter: 5,
         root_handle_table_page: page::PAGE_ID_NONE,
         root_freemap_page: page::PAGE_ID_NONE,
@@ -439,7 +445,7 @@ fn test_reject_unsupported_format_version() {
 
     match Chisel::open(&path, Default::default()) {
         Err(ChiselError::UnsupportedFormatVersion { found, expected }) => {
-            assert_eq!(found, page::FORMAT_VERSION + 99);
+            assert_eq!(found, future_major);
             assert_eq!(expected, page::FORMAT_VERSION);
         }
         Err(other) => panic!("expected UnsupportedFormatVersion, got error {:?}", other),
