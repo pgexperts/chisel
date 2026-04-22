@@ -110,7 +110,7 @@ This directly violated the shadow-paging invariant spelled out in `allocate_data
 
 **Regression test:** `persist_freemap_does_not_reuse_committed_live_pages` in `src/transaction.rs`. It seeds a committed freemap page via overflow-delete (R1 slot-packing otherwise keeps multi-slot data pages live), then runs a second commit whose deletes populate `txn_freed_pages`, and asserts the new `committed_roots.freemap_page` is not in the at-risk set (old freemap page ∪ frozen `txn_freed_pages`). The test is framed as a direct invariant check rather than a crash-injection harness because the at-risk set is observable purely in post-commit internal state.
 
-### I27. `commit()` silently drops `savepoints[*].freed_pages` when savepoints are still active [comment-pass 2026-04-22] — **P2**
+### I27. `commit()` silently drops `savepoints[*].freed_pages` when savepoints are still active [comment-pass 2026-04-22] — **P2** ✅ FIXED 2026-04-22
 **Where:** `transaction.rs` `commit_inner` (the `self.savepoints.clear()` at the end of commit) vs `release_inner` (which DOES merge freed pages back via `merged_freed.extend_from_slice(&sp.freed_pages)`)
 
 `release()` and `commit()` are asymmetric about what happens to a savepoint's `freed_pages`. When a savepoint is released, its `freed_pages` are merged back into the enclosing transaction's `txn_freed_pages`, so commit can return those ids to the freemap. When `commit()` runs with savepoints still on the stack, `commit_inner` simply calls `self.savepoints.clear()` — the per-savepoint `freed_pages` lists are dropped on the floor. `persist_freemap` only iterates `self.txn_freed_pages`, so any page freed in a scope enclosed by an unreleased savepoint is permanently orphaned from the freemap.
@@ -119,13 +119,9 @@ This directly violated the shadow-paging invariant spelled out in `allocate_data
 
 **Why prior passes missed it:** the 2026-04-10 pass predated R2 (freemap wiring) — leaks were known and batched into the freemap bundle. The 2026-04-17 pass focused on the I18 `persist_freemap` restructure and the page-cache hardening; savepoint semantics weren't in scope. The bug has been latent since R2 landed and will trip any workload that commits with a savepoint still active.
 
-**Fix direction:** Two coherent options.
-1. In `commit_inner`, before calling `persist_freemap`, merge all savepoints' `freed_pages` into `self.txn_freed_pages` — same pattern as `release_inner` lines 1042–1054, applied across the full stack. Matches the implicit "commit flattens everything" model.
-2. Reject `commit()` when savepoints are active — return a new `SavepointsStillActive` operational error that forces the caller to `release()` or `rollback_to()` first. More explicit; breaks existing callers that rely on implicit flatten-on-commit.
+**Fix (landed 2026-04-22):** chose option (1) — at the top of `commit_inner`, before `persist_freemap`, iterate every active savepoint and `append` its `freed_pages` onto `self.txn_freed_pages`. This matches `release_inner`'s merge pattern but applied across the full stack. The existing `savepoints.clear()` at step 5 still runs afterwards; we drain rather than iterate-by-reference so the savepoints don't hold stale `freed_pages` if step 5 ever changes. No new error variant, no caller-visible behaviour change beyond the leak going away.
 
-(1) is the lower-risk fix and preserves existing behaviour.
-
-**Regression test (not yet written):** Begin a transaction, free some pages, take a savepoint, commit without releasing, reopen, assert the freed pages are in the freemap. Directly observable in internal state (the committed `Roots::freemap_page` contents) without crash injection.
+**Regression test:** `commit_with_active_savepoint_returns_freed_pages_to_freemap` in `src/transaction.rs`. Seeds two overflow-sized handles, opens a transaction, deletes both (populating `txn_freed_pages`), takes a savepoint (which empties `txn_freed_pages` into `savepoint.freed_pages`), commits WITHOUT release, and asserts `FreeMap::is_free(&committed_freemap, id)` holds for every previously-captured id. Pre-fix, none of the ids were marked free — they were permanently leaked.
 
 ---
 
@@ -249,7 +245,7 @@ If the freemap ever handed back an id the current transaction had already dirtie
 
 **Fix:** added `debug_assert!(!self.is_dirty(page_id), …)` at the top of `claim_page` so a violation surfaces immediately in debug builds rather than as silent data loss hours later. Release builds are unchanged. Test `claim_page_asserts_on_dirty_page` covers the assertion (gated on `cfg(debug_assertions)`).
 
-### I28. `CacheFull` raised during commit's `persist_freemap` poisons the manager [comment-pass 2026-04-22] — **P2**
+### I28. `CacheFull` raised during commit's `persist_freemap` poisons the manager [comment-pass 2026-04-22] — **P2** ✅ FIXED 2026-04-22
 **Where:** `page_cache.rs` `maybe_evict` (the hard-ceiling check added in I19) × `transaction.rs` `commit()` / `poison_on_fatal`
 
 I19 introduced `ChiselError::CacheFull` as an **operational** error: documented as "caller recovers by committing (flushes → pages become evictable) or rolling back (discards all dirty pages)", and correctly classified `is_fatal() == false`. But `commit_inner` runs `persist_freemap` → `allocate_data_page` → `claim_page` / `new_page` → `maybe_evict` **before** `cache.flush()` drains dirty pages. If `maybe_evict` fires `CacheFull` at that point, the error propagates out of `commit_inner` and `commit()`'s `poison_on_fatal` wrapper poisons the TransactionManager regardless of `is_fatal()`.
@@ -258,13 +254,11 @@ The resulting behaviour violates the operational contract in a particularly pain
 
 In practice the window is narrow: the transaction has to be at the hard ceiling with every page dirty at the moment `persist_freemap` allocates. But the semantic mismatch is real, and any user who hits it gets an inexplicable downgrade from "operational" to "must-reopen."
 
-**Fix direction:** Two coherent options.
-1. **Drain the cache before `persist_freemap`.** Commit's job is to flush the dirty pages to disk anyway; moving the flush earlier removes the dirty pins `maybe_evict` couldn't work around, so `CacheFull` cannot arise in the commit path. No contract change, no caller-visible behaviour difference beyond the bug going away.
-2. **Explicitly classify `CacheFull` as poisoning in the commit context.** Update the I19 docs and the Python `CacheFullError` class description to match: "operational outside commit, fatal inside commit." Honest about the actual semantics but more caveats for callers to remember.
+**Fix (landed 2026-04-22):** chose option (1) — added `self.cache.borrow_mut().flush()?;` at the top of `commit_inner`, before `persist_freemap`. The drain clears every dirty pin so `persist_freemap`'s own `allocate_data_page` can evict clean pages rather than trip the hard ceiling. `CacheFull` can no longer surface on the commit path. Cost: one extra fsync per commit (2 → 3 total). Consistent with the project's "durability over performance" posture and cheaper than the alternative ("reclassify `CacheFull` as fatal during commit"), which would require caveats throughout the docs and the Python error hierarchy.
 
-(1) is cleaner — no invariant changes.
+**Ordering safety:** the pre-drain does not weaken the shadow-paging invariant. Shadow paging requires "data-page writes durable BEFORE superblock write durable" — step 1's existing flush (now operating on just the one freemap page persist_freemap materializes) still runs between persist_freemap and the superblock write. The pre-drain only shifts user-dirty page writes earlier within the same pre-superblock window; both are part of the same durable write set the superblock linearizes.
 
-**Regression test (not yet written):** Construct a cache near the hard ceiling with many dirty pages, call `commit()`, assert the result is `Ok(())` (or at worst `Err(CacheFull)` without poisoning) rather than a poisoned manager. Verifiable via `is_poisoned()` post-commit.
+**Regression test:** `commit_does_not_poison_when_cache_is_past_hard_ceiling` in `src/transaction.rs`. Constructs a `TransactionManager` with `max_pages=4` (hard ceiling 32), saturates the cache via an allocate-until-`CacheFull` loop in a transaction that also has a non-empty `txn_freed_pages` (so `persist_freemap` does not take its early-exit), then calls `commit()` and asserts both `Ok(())` and `!is_poisoned()`. Pre-fix commit returned `Err(CacheFull { limit: 32 })` and poisoned the manager; post-fix both assertions hold.
 
 ---
 
