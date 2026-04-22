@@ -801,6 +801,48 @@ impl TransactionManager {
     }
 
     fn commit_inner(&mut self) -> Result<()> {
+        // I27: flatten every still-active savepoint's `freed_pages`
+        // back into `txn_freed_pages` before persist_freemap consumes
+        // it. savepoint_inner moves `txn_freed_pages` INTO the
+        // savepoint record (via std::mem::take), so any frees that
+        // happened before a still-unreleased savepoint otherwise get
+        // dropped on the floor when step 5 calls `savepoints.clear()`
+        // — a permanent freemap leak for the "commit with savepoint
+        // active" pattern. Mirrors `release_inner`'s merge but applied
+        // across the full stack. We take the lists out of the
+        // savepoints (rather than iterating by reference) so the
+        // savepoints hold no stale `freed_pages` if we ever change
+        // step 5 to drain instead of clear; current code is equivalent
+        // either way.
+        for sp in self.savepoints.iter_mut() {
+            self.txn_freed_pages.append(&mut sp.freed_pages);
+        }
+
+        // I28: drain the page cache BEFORE persist_freemap runs. Without
+        // this, `persist_freemap`'s own `allocate_data_page` can trip
+        // `maybe_evict`'s hard-ceiling check (every existing entry dirty,
+        // nothing evictable) and return `ChiselError::CacheFull`. That
+        // error is operational-by-design (I19 docs: "caller recovers by
+        // committing or rolling back"), but commit's poison wrapper fires
+        // on any error once the protocol has started — demoting an
+        // operational signal to fatal for a caller who has no legal
+        // action left (commit is precisely what failed). Pre-draining
+        // clears every dirty pin so the ceiling is reachable via normal
+        // eviction when persist_freemap itself allocates. Cost: one
+        // extra fsync on every commit. That is consistent with the
+        // project's explicit "durability over performance" posture —
+        // the alternative reclassifies CacheFull as fatal inside commit,
+        // which is both more surprising and harder to document cleanly.
+        //
+        // Ordering note: this flush is safe to do before persist_freemap.
+        // The shadow-paging invariant requires "new-freemap-page durable
+        // before superblock" (step 1's flush does that). The pre-drain
+        // only affects user-dirty pages, which are already part of the
+        // transaction's durable write set — just flushed earlier. The
+        // subsequent step 1 flush handles the one new freemap page
+        // persist_freemap adds.
+        self.cache.borrow_mut().flush()?;
+
         // Step 0 (ISSUES.md R2 / I11): persist the freemap. This merges
         // `txn_freed_pages` into `current_freemap`, reclaims the old
         // freemap page id, allocates a new page for the updated freemap,
@@ -2019,5 +2061,156 @@ mod tests {
         // (rules out a subtler corruption that survived the invariant
         // check but poisoned the data plane).
         assert_eq!(tm.read(h_live_c).unwrap(), big);
+    }
+
+    // Regression test for ISSUES.md I27. `savepoint_inner` moves
+    // `txn_freed_pages` into the savepoint record via `std::mem::take`.
+    // If commit runs with savepoints still on the stack, the pre-fix
+    // `commit_inner` just called `self.savepoints.clear()` at step 5
+    // and those `freed_pages` lists were dropped — never reaching the
+    // freemap. `persist_freemap` iterates only `self.txn_freed_pages`.
+    // The post-fix merge in commit_inner flattens every active
+    // savepoint's `freed_pages` back into `txn_freed_pages` before
+    // `persist_freemap` runs, so every page freed anywhere in the
+    // transaction reaches the committed freemap.
+    //
+    // Observable via `FreeMap::is_free(&committed_freemap, id)` — the
+    // freemap's public predicate avoids any reliance on subsequent
+    // allocator reuse (which depends on `savepoints.is_empty()` too and
+    // would muddy the test).
+    #[test]
+    fn commit_with_active_savepoint_returns_freed_pages_to_freemap() {
+        let mut tm = fresh_manager();
+
+        // Seed: enough overflow-sized handles that deleting them
+        // produces genuine page frees (R1 slot-packing would otherwise
+        // keep multi-slot data pages live).
+        let big: Vec<u8> = vec![0xCD; MAX_INLINE_VALUE + 32];
+        tm.begin().unwrap();
+        let h_a = tm.allocate(&big).unwrap();
+        let h_b = tm.allocate(&big).unwrap();
+        let h_keepalive = tm.allocate(&big).unwrap();
+        tm.commit().unwrap();
+
+        // The leak pattern: delete first, THEN open a savepoint. The
+        // savepoint captures the accumulated `txn_freed_pages`, leaving
+        // the outer `txn_freed_pages` empty for the rest of the txn.
+        tm.begin().unwrap();
+        tm.delete(h_a).unwrap();
+        tm.delete(h_b).unwrap();
+        let frozen_txn_freed: Vec<u64> = tm.txn_freed_pages.clone();
+        assert!(
+            !frozen_txn_freed.is_empty(),
+            "test precondition: overflow-sized deletes should free at least one page"
+        );
+
+        tm.savepoint("s").unwrap();
+        assert!(
+            tm.txn_freed_pages.is_empty(),
+            "savepoint_inner should have moved txn_freed_pages into the savepoint"
+        );
+
+        // Commit WITHOUT releasing the savepoint. Pre-fix this silently
+        // drops savepoint.freed_pages on `savepoints.clear()`; post-fix
+        // commit_inner merges them into txn_freed_pages first.
+        tm.commit().unwrap();
+
+        for id in &frozen_txn_freed {
+            assert!(
+                FreeMap::is_free(&tm.committed_freemap, *id),
+                "I27: freed page {id} should be marked free in committed_freemap \
+                 after commit-with-active-savepoint; frozen_txn_freed={frozen_txn_freed:?}"
+            );
+        }
+
+        // Sanity: the surviving handle still reads back (rules out a
+        // wider corruption that happens to also trip the is_free check).
+        assert_eq!(tm.read(h_keepalive).unwrap(), big);
+    }
+
+    // Regression test for ISSUES.md I28. I19 introduced `CacheFull` as
+    // an **operational** error (documented as "commit or rollback to
+    // recover"), but `commit_inner` runs `persist_freemap` BEFORE
+    // `cache.flush()` — and `persist_freemap` itself calls
+    // `allocate_data_page`, which may trip `maybe_evict`'s hard-ceiling
+    // check when every existing cache entry is dirty. Pre-fix the
+    // resulting `CacheFull` propagated out of commit_inner and
+    // commit()'s poison wrapper poisoned the manager unconditionally.
+    // The recovery advice ("commit to flush") became impossible to
+    // follow because commit itself failed.
+    //
+    // Post-fix: commit drains the cache BEFORE persist_freemap, so the
+    // ceiling is always reachable via eviction when persist_freemap
+    // itself allocates. CacheFull cannot arise on the commit path.
+    //
+    // Setup note: we deliberately use a small `max_pages` so the hard
+    // ceiling (max_pages * HARD_CEILING_MULTIPLIER = 8) is cheap to
+    // saturate. `fresh_manager`'s default of 1024 exists to keep
+    // existing tests well under the ceiling; this test is the opposite
+    // — it *needs* to cross the ceiling.
+    #[test]
+    fn commit_does_not_poison_when_cache_is_past_hard_ceiling() {
+        let file = NamedTempFile::new().unwrap();
+        let io = PageIo::open(file.path(), false).unwrap();
+        std::mem::forget(file);
+        // max_pages=4 → hard ceiling = 32. Big enough for baseline
+        // operations (handle-table root + superblocks + freemap) to
+        // coexist, small enough that a few dozen big allocations
+        // saturate it.
+        let cache = PageCache::new(io, 4);
+        let mut tm = TransactionManager::create_new(cache, 2).unwrap();
+        tm.begin().unwrap();
+        tm.commit().unwrap();
+
+        // Seed one handle so the victim transaction can produce a
+        // non-empty `txn_freed_pages` via delete. Without any frees AND
+        // with `current_freemap == committed_freemap`, `persist_freemap`
+        // takes its early-exit path and never allocates — which would
+        // mean it also cannot trip CacheFull, and the test would fail
+        // to reproduce the bug.
+        let big: Vec<u8> = vec![0x99; MAX_INLINE_VALUE + 32];
+        tm.begin().unwrap();
+        let victim = tm.allocate(&big).unwrap();
+        tm.commit().unwrap();
+
+        // Victim transaction: delete to populate txn_freed_pages, then
+        // allocate until the cache saturates past the hard ceiling.
+        // CacheFull from an allocate() is operational — we catch it and
+        // proceed to commit, which is what we actually want to stress.
+        tm.begin().unwrap();
+        tm.delete(victim).unwrap();
+        let mut saturated = false;
+        for _ in 0..200 {
+            match tm.allocate(&big) {
+                Ok(_) => continue,
+                Err(ChiselError::CacheFull { .. }) => {
+                    saturated = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected error during cache-fill setup: {e:?}"),
+            }
+        }
+        assert!(
+            saturated,
+            "test precondition: cache did not reach CacheFull in 200 allocations"
+        );
+        assert!(
+            !tm.is_poisoned(),
+            "precondition: CacheFull from allocate() is operational and must not poison"
+        );
+
+        // The actual I28 check. Pre-fix, `persist_freemap`'s internal
+        // `allocate_data_page` trips the hard ceiling and propagates
+        // CacheFull out of commit_inner; commit()'s poison wrapper
+        // then sets the poison flag. Post-fix commit drains first.
+        let result = tm.commit();
+        assert!(
+            result.is_ok(),
+            "I28: commit over a saturated cache should succeed; got {result:?}"
+        );
+        assert!(
+            !tm.is_poisoned(),
+            "I28: CacheFull during commit must not poison — it's operational by design"
+        );
     }
 }
