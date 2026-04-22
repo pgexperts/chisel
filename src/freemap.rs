@@ -18,7 +18,11 @@
 //
 // On-disk layout of a freemap page:
 //   byte 0        : PageType tag (0x04 = FreeMap)
-//   bytes 1..16   : reserved (common/data-page header region; zeroed)
+//   byte 1        : page format version (I31; PAGE_FORMAT_VERSION_CURRENT today)
+//   bytes 2..8    : reserved / zeroed (type-specific region, unused)
+//   bytes 8..16   : RESERVED for future common-header fields (I31 common
+//                   reserved region, 64 bits, universally zero across all
+//                   non-superblock page types)
 //   bytes 16..8184: bitmap body (PAGE_BODY_SIZE bytes = 8168 bytes = 65344 bits)
 //   bytes 8184..8192: XXH3 checksum (stamped by caller after mutation)
 //
@@ -69,6 +73,10 @@ impl FreeMap {
     pub fn init_page(buf: &mut [u8; PAGE_SIZE]) {
         buf.fill(0);
         buf[0] = PageType::FreeMap as u8;
+        // I31: per-page version byte at position 1 (same offset as
+        // data_page and overflow). Written explicitly even though
+        // buf.fill(0) already zeroed it.
+        buf[1] = crate::page::PAGE_FORMAT_VERSION_CURRENT;
     }
 
     /// Check if a page is marked free in the bitmap.
