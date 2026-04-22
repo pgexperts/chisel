@@ -55,6 +55,14 @@ pub enum ChiselError {
     // response regardless of which fatal variant fired.
     IoError(io::Error),
     ChecksumMismatch { page_id: u64 },
+    // Raised when `Superblock::select` finds no usable slot. "Usable"
+    // means `deserialize` returned Some, which in turn requires a valid
+    // XXH3 checksum, correct magic, AND a `superblock_count` inside
+    // `MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS`. A slot that passes checksum
+    // but has an out-of-range `superblock_count` counts as corrupt for
+    // this purpose — the Display message is generic, so operators
+    // diagnosing a bad file should look at the raw slot bytes if a
+    // more specific cause is needed.
     CorruptSuperblock,
     FileSizeMismatch { expected: u64, actual: u64 },
     InvalidMagic,

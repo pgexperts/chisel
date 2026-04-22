@@ -4,11 +4,17 @@
 // FreeMap page. Each bit represents one page in the database file.
 //   1 = free (available for reuse), 0 = in use.
 //
-// NOTE (v1 simplification, per CLAUDE.md): this module is BUILT BUT NOT WIRED IN.
-// `PageCache::new_page()` currently always extends the file rather than consulting
-// the freemap, so freed pages are never actually reused. The bitmap logic here is
-// correct and ready; the allocator just doesn't call it yet. Do not assume calls
-// to mark_free/mark_used occur during normal transactional writes.
+// The freemap is wired into the data-page allocator (ISSUES.md R2):
+// `TransactionManager::allocate_data_page` prefers
+// `FreeMap::allocate_first` and falls back to extending the file only
+// when the freemap has no free id to hand out. Reclamation happens
+// during commit via `persist_freemap`, which merges `txn_freed_pages`
+// into `current_freemap` BEFORE writing the new freemap snapshot
+// (I18 ordering) so `allocate_data_page` cannot reuse a page the
+// last-durable superblock still references. Overflow and handle-table
+// pages still extend directly — they go through `PageCache::new_page`
+// not through `allocate_data_page` — but their frees do feed the
+// freemap on commit.
 //
 // On-disk layout of a freemap page:
 //   byte 0        : PageType tag (0x04 = FreeMap)
