@@ -1,27 +1,38 @@
 # Chisel
 
-A transactional, crash-durable key-value storage engine written in Rust.
+A transactional, crash-durable key-value storage engine written in Rust. Chisel uses **shadow paging** (copy-on-write) to guarantee that the database file is always in a consistent state. There is no write-ahead log and no recovery procedure — after a crash, you just open the file and it's correct.
 
-Chisel uses **shadow paging** (copy-on-write) to guarantee that the database file is always in a consistent state. There is no write-ahead log and no recovery procedure — after a crash, you just open the file and it's correct.
+Chisel is designed for single-writer embedded use: one process holds the file via `flock`, all mutations go through `&mut self`, and the API is synchronous. A PyO3 binding ships alongside the Rust crate; see [`python/README.md`](python/README.md).
+
+## Status
+
+Pre-1.0. Current release: `0.1.0`. The API is stable-by-intent but subject to revision until 1.0 ships. The on-disk format is likewise pre-stable; see [On-disk format compatibility](#on-disk-format-compatibility) for the 1.0-and-onward promise.
 
 ## Features
 
-- **Crash durability** — dual superblocks with alternating writes ensure committed data survives any single crash. Every page is checksummed (XXH3) for torn-write and bit-rot detection.
-- **Transactions** — full begin/commit/rollback with two-phase commit (fsync data, then fsync superblock).
-- **Savepoints** — PostgreSQL-style named savepoints with `rollback_to` (preserves the savepoint for retry) and `release` (merges work into the parent transaction).
-- **Handles** — store a value, get back a `u64` handle. Read, update, or delete by handle. Handles are stable across updates and defragmentation.
-- **Small value packing** — slotted data pages pack multiple values per 8KB page. Values over ~8KB transparently overflow into chained pages.
-- **Single-user** — exclusive file locking via `flock`. Designed for embedded use where one process owns the file.
-- **Defragmentation** — explicit `defrag()` consolidates sparse pages and can shrink the file.
+- **Crash durability** — N configurable superblocks (2–16) with round-robin writes ensure committed data survives crashes. Every page carries an XXH3 checksum for torn-write and bit-rot detection.
+- **Transactions** — begin / commit / rollback with two-phase durability (fsync data pages, then fsync superblock).
+- **Savepoints** — PostgreSQL-style named savepoints with `rollback_to` (savepoint preserved for retry) and `release` (merges into the enclosing scope).
+- **Handles** — store a value, get back a `u64` handle. Read, update, or delete by handle. Handles are stable across updates, defrag, and reopens.
+- **Value packing** — slotted data pages pack multiple small values per 8 KB page; values over ~8 KB transparently overflow into chained pages.
+- **Named roots** — a small fixed table in the superblock mapping string names to handles. Survives commit / rollback transactionally.
+- **Defragmentation** — explicit `defrag()` consolidates sparse pages and returns a count-based stats record.
+- **In-memory mode** — same engine, `Vec<u8>`-backed I/O, no file and no lock. For tests, benchmarks, and ephemeral work.
+- **Poison model** — any fatal error (I/O failure, checksum mismatch, commit-protocol failure) poisons the handle; recovery is drop-and-reopen. Mirrors `std::sync::Mutex` poisoning.
+- **Single-writer** — exclusive `flock` at the filesystem level; `&mut self` on every mutating method.
 
-## Quick Start
+## Install
 
 Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-chisel = { path = "path/to/chisel" }
+chisel = "0.1"
 ```
+
+(While Chisel is pre-1.0 and not yet on crates.io, use a path or git dependency: `chisel = { path = "path/to/chisel" }`.)
+
+## Quick Start
 
 ```rust
 use chisel::{Chisel, Options};
@@ -36,78 +47,226 @@ fn main() -> chisel::Result<()> {
     db.commit()?;
 
     // Reads work inside or outside a transaction.
-    let data = db.read(handle)?;
-    assert_eq!(data, b"hello world");
+    assert_eq!(db.read(handle)?, b"hello world");
 
     // Updates preserve the handle.
     db.begin()?;
     db.update(handle, b"updated value")?;
     db.commit()?;
 
-    // Savepoints let you partially roll back.
+    // Savepoints let you partially roll back within a transaction.
     db.begin()?;
-    let h1 = db.allocate(b"keep this")?;
+    let keep = db.allocate(b"keep this")?;
     db.savepoint("before_experiment")?;
-    let h2 = db.allocate(b"maybe discard")?;
-    db.rollback_to("before_experiment")?;  // h2 is gone, h1 is kept
+    let _discard = db.allocate(b"maybe discard")?;
+    db.rollback_to("before_experiment")?;  // discard is gone; keep stays
     db.commit()?;
 
     db.close()
 }
 ```
 
-## API
+## Concepts
 
-| Method | Description |
-|--------|-------------|
-| `Chisel::open(path, options)` | Open or create a database |
+### Handles
+
+A handle is a stable `u64` returned by `allocate()`. It maps through a radix-tree **handle table** rooted in the superblock to a `(page, slot)` location in a slotted data page. This indirection means values can move internally — during `update()` to a larger value, or during `defrag()` — without changing the handle. Deleted handles are retired and never reused within a database's lifetime.
+
+### Transactions
+
+All mutations require an active transaction. `begin()` opens one, `commit()` makes it durable, `rollback()` discards it. Only one transaction is active at a time — Chisel has savepoints, not nested transactions.
+
+```rust
+db.begin()?;
+let h1 = db.allocate(b"a")?;
+let h2 = db.allocate(b"b")?;
+db.commit()?;  // both h1 and h2 become durable atomically
+```
+
+Rollback is effectively free: pages written during the transaction were never linked from a superblock, so they are simply abandoned. There is no undo log to replay.
+
+### Savepoints
+
+Savepoints are named marks within a transaction.
+
+- `rollback_to(name)` undoes changes back to the savepoint but keeps the savepoint on the stack so you can try again.
+- `release(name)` flattens the savepoint into the enclosing scope; any savepoints layered on top of it are also released.
+- `rollback()` (full rollback) and `commit()` both clear the entire savepoint stack.
+
+```rust
+db.begin()?;
+let keep = db.allocate(b"keep")?;
+db.savepoint("experiment")?;
+let _ = db.allocate(b"maybe discard")?;
+db.rollback_to("experiment")?;  // discards the _ handle; keep remains; sp still open
+db.release("experiment")?;
+db.commit()?;
+```
+
+### Named roots
+
+A small fixed-size table in the superblock mapping short string names to handles, intended for long-lived entry points such as a meta-B-tree root. Changes are transactional: `set_root_name` takes effect on commit and reverts on rollback.
+
+```rust
+db.begin()?;
+let meta = db.allocate(b"meta-root-payload")?;
+db.set_root_name("meta", meta)?;
+db.commit()?;
+
+// Later, possibly after reopen:
+let meta = db.get_root_name("meta")?.expect("meta root should be set");
+```
+
+Names are bounded in length and must be valid UTF-8 without embedded NUL; the table has a small fixed capacity. See `TransactionManager::set_root_name` for exact limits.
+
+### Defragmentation
+
+`defrag()` consolidates sparse data pages: it re-inserts values from pages whose live-slot count falls below a threshold so those pages become fully free and can be reclaimed. It runs inside an active transaction so it composes with other work and commits atomically.
+
+```rust
+use chisel::defrag::DefragOptions;
+
+db.begin()?;
+let stats = db.defrag(DefragOptions {
+    sparse_threshold: 0.25,
+    max_pages: 0,  // 0 = no cap on values relocated
+})?;
+db.commit()?;
+```
+
+### In-memory mode
+
+`Chisel::open_in_memory()` creates a memory-backed database using a `Vec<u8>`-backed `PageIo`. Same code path, same guarantees except durability — no filesystem, no `flock`, and all data is lost on drop.
+
+```rust
+let mut db = Chisel::open_in_memory()?;
+// ... same API as a file-backed Chisel ...
+```
+
+For tuned options (cache size, superblock count), use `Chisel::open_in_memory_with_options(options)`.
+
+## API reference
+
+| Method | Purpose |
+|---|---|
+| `Chisel::open(path, options)` | Open or create a database file |
+| `Chisel::open_in_memory()` | Open a memory-backed database with default options |
+| `Chisel::open_in_memory_with_options(options)` | In-memory with explicit options |
+| `close()` | Explicit close (returns `Result`); equivalent to drop |
+| `is_poisoned()` | True if a fatal error has occurred |
 | `begin()` | Start a transaction |
 | `commit()` | Durably commit the transaction |
 | `rollback()` | Discard all changes since `begin()` |
 | `savepoint(name)` | Create a named savepoint |
 | `rollback_to(name)` | Undo to savepoint (savepoint preserved) |
-| `release(name)` | Merge savepoint into parent |
-| `allocate(value)` | Store a value, returns a `u64` handle |
-| `read(handle)` | Retrieve a value |
-| `update(handle, value)` | Replace a value (handle stays the same) |
-| `delete(handle)` | Remove a value |
-| `handles()` | Iterate all live handles |
-| `stats()` | Page count, handle count, file size |
+| `release(name)` | Merge savepoint into enclosing scope |
+| `allocate(value)` | Store a value; returns a `u64` handle |
+| `read(handle)` | Retrieve a value (takes `&self`) |
+| `update(handle, value)` | Replace a value (handle preserved) |
+| `delete(handle)` | Remove a handle |
+| `delete_many(handles)` | Batch-delete in the current transaction |
+| `set_root_name(name, handle)` | Bind a name to a handle in the named-root table |
+| `get_root_name(name)` | Look up a named root (takes `&self`) |
+| `clear_root_name(name)` | Remove a named root |
+| `handles()` | Enumerate all live handles (takes `&self`) |
+| `stats()` | Handle count, page count, file size |
 | `defrag(options)` | Consolidate sparse pages |
 
-## How It Works
-
-Chisel divides the database file into 8KB pages. A **handle table** (a radix tree) maps each `u64` handle to a physical location in a **slotted data page**. This indirection means values can move around internally without changing their handle.
-
-Every write copies the affected pages to new locations (copy-on-write). The old pages remain untouched. When you call `commit()`, the engine:
-
-1. Writes all new pages to disk and calls `fsync`
-2. Writes a new superblock (with updated root pointers) and calls `fsync`
-
-If the process crashes at any point, the old superblock still points to the old (valid) pages. On the next `open()`, the engine simply picks the superblock with the highest transaction counter and a valid checksum.
-
-## Configuration
+## Options
 
 ```rust
-Options {
-    cache_size: 1024,        // Pages to cache in memory (default: 8MB)
-    create_if_missing: true, // Create the file if it doesn't exist
-    read_only: false,        // Open in read-only mode (no transactions)
+use chisel::Options;
+
+let options = Options {
+    cache_size: 1024,        // pages in the LRU, 8 KB each → 8 MB default
+    create_if_missing: true,
+    read_only: false,
+    superblock_count: 2,     // 2..=16; only consulted on create
+};
+```
+
+`cache_size` is a count of pages, not bytes. The cache is a soft limit: a single transaction can grow past it while dirty pages pin eviction. A hard ceiling of `cache_size × 8` protects against runaway growth by returning `CacheFull` (operational; caller recovers via commit or rollback).
+
+`read_only = true` still acquires an exclusive `flock` — it only suppresses writes at the application layer. Two read-only opens cannot coexist on the same file. This is a deliberate choice: even a reader must block concurrent writers to keep the shadow-paging invariants intact.
+
+`superblock_count` is set at create time and stored on disk; reopening discovers it from the winning superblock. Higher N increases durability against consecutive torn writes at the cost of N × 8 KB of file space: N = 3 survives one torn commit plus a torn retry, N = 4 survives two retries.
+
+## Error handling
+
+`ChiselError` splits into two conceptual tiers.
+
+**Operational errors** — the database is healthy; the caller made a mistake. Catch and continue.
+
+`InvalidHandle`, `NoActiveTransaction`, `TransactionAlreadyActive`, `SavepointNotFound`, `DuplicateSavepoint`, `ReadOnlyMode`, `FileNotFound`, `InvalidRootName`, `RootNameTableFull`, `InvalidSuperblockCount`, `CacheFull`.
+
+**Fatal errors** — storage integrity is in question. Drop the handle and reopen.
+
+`IoError`, `ChecksumMismatch`, `CorruptSuperblock`, `FileSizeMismatch`, `InvalidMagic`, `LockFailed`, `UnsupportedFormatVersion`, `CorruptPage`, `InvalidPageId`, `Poisoned`.
+
+Use `ChiselError::is_fatal()` to classify at runtime.
+
+### Poison model
+
+On any fatal error — including a failed commit-protocol fsync — the `Chisel` handle becomes **poisoned**. Every subsequent call returns `ChiselError::Poisoned`, regardless of whether it is a read or a write. The only legal recovery is to drop the handle and call `Chisel::open` again; the shadow-paging recovery path then restores the database to the last durable state.
+
+```rust
+match db.commit() {
+    Ok(()) => (),
+    Err(e) if e.is_fatal() => {
+        drop(db);
+        db = Chisel::open(path, Options::default())?;
+        // Chisel is now at its last-committed state; retry the work if needed.
+    }
+    Err(e) => return Err(e),  // operational — handle per your caller's policy
 }
 ```
 
-## Requirements
+The poison model is mandatory because Linux `fsync` semantics (post-2018 "fsyncgate") do not permit safely retrying a failed fsync: the kernel may have discarded the dirty pages before reporting the error. macOS `F_FULLFSYNC` has similar semantics. PostgreSQL `PANIC`s on fsync failure for exactly this reason.
 
-- Rust stable (edition 2021)
-- macOS or Linux (uses `flock` for file locking)
+## On-disk format compatibility
 
-## Roadmap
+**Within a given major version, the on-disk format is sacred.** Any file written by any release with major version *N* will be readable by any other release with major version *N*, regardless of minor or patch level. Chisel validates the `format_version` field in the superblock on every open; a file written by a future, incompatible release fails fast with `UnsupportedFormatVersion` rather than being silently misinterpreted.
 
-- **Pack multiple values per data page** — currently each value gets its own page; packing small values together will significantly reduce file size and improve cache efficiency
-- **Wire the free page map into the allocator** — the bitmap is built but allocations currently extend the file; reusing free pages will eliminate file growth after delete-heavy workloads
-- **Selective defragmentation** — consolidate only sparse pages instead of re-inserting every value
-- **Configurable superblock count** — trade commit performance for additional crash durability (3+ superblock copies)
-- **Python bindings** — PyO3-based wrapper exposing the full Chisel API to Python, including context managers for transactions and savepoints
+Format-breaking changes happen only at major-version boundaries, and every such transition will ship with a documented upgrade path.
+
+Until Chisel reaches 1.0, the internal format version may change between pre-release builds without a major-version bump; any such pre-1.0 change will be called out in the release notes. The first 1.0 release freezes the format for the entire 1.x line.
+
+## How durability works
+
+Chisel divides the database file into 8 KB pages. The superblock(s) at the file's head name the current handle-table root, freemap page, and other per-commit roots. Each commit:
+
+1. Writes all dirty pages (handle-table COW copies, new data pages, new overflow pages, the updated freemap) and calls `fsync`. At this point every page the new superblock will reference is durable on the storage medium.
+2. Writes the new superblock to the next slot in the round-robin (`txn_counter % superblock_count`) and calls `fsync`. This is the **linearization point** — before this returns, the transaction is not crash-safe; after it returns, the new state is observable on recovery.
+
+If the process crashes at any point in the protocol, the previously-active superblock still points at a consistent set of pages. On the next `open()`, Chisel runs `Superblock::select` over all slots, picks the one with the highest transaction counter and a valid checksum, and ignores any torn or corrupt slots in favor of their siblings. No log replay, no partial recovery.
+
+Every page carries an XXH3 checksum validated on load; cache hits skip revalidation, relying on the exclusive `flock` to prevent any other process from scribbling on the file.
+
+## Platform support
+
+Chisel runs on macOS and Linux. File locking uses `flock(2)` via `libc`. Windows is not currently supported and would require a different locking primitive.
+
+Rust stable, edition 2021.
+
+## Python binding
+
+A PyO3 wrapper lives in the `python/` subdirectory and is published to PyPI as `chisel`:
+
+```bash
+pip install chisel
+```
+
+The Python API mirrors the Rust one but adds context managers for transactions and savepoints. See [`python/README.md`](python/README.md).
+
+## Design documents
+
+Deeper architectural notes live in [`docs/superpowers/specs/`](docs/superpowers/specs/):
+
+- [`2026-04-09-chisel-storage-engine-design.md`](docs/superpowers/specs/2026-04-09-chisel-storage-engine-design.md) — shadow paging, handle table, page layouts.
+- [`2026-04-13-chisel-in-memory-mode-design.md`](docs/superpowers/specs/2026-04-13-chisel-in-memory-mode-design.md) — the `Vec<u8>`-backed `PageIo`.
+- [`2026-04-14-chisel-python-interface-design.md`](docs/superpowers/specs/2026-04-14-chisel-python-interface-design.md) — the PyO3 API surface and error hierarchy.
+
+Open issues, closed issues, and the decision log live in [`ISSUES.md`](ISSUES.md).
 
 ## License
 
