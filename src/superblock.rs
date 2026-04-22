@@ -118,8 +118,14 @@ impl NamedRoot {
 /// bytes 0..52 hold the scalar fields, bytes 52..308 hold the named-root
 /// table (8 × 32-byte entries), and bytes 308..CHECKSUM_OFFSET are reserved
 /// (zero) for forward compatibility. The last 8 bytes are the checksum.
-/// Adding a field requires bumping FORMAT_VERSION and updating serialize/
-/// deserialize in lockstep.
+///
+/// `format_version` is a packed u32 (upper 16 = MAJOR, lower 16 = MINOR);
+/// see `page.rs`. Within a major version, new fields may be added by
+/// consuming bytes from the reserved region and bumping MINOR. A major
+/// bump is reserved for structural or semantic changes that cannot be
+/// expressed additively (repositioned fields, altered page formats,
+/// new checksum scheme, and so on). Any change — additive or not —
+/// requires updating serialize/deserialize in lockstep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Superblock {
     pub magic: u32,
@@ -159,7 +165,8 @@ pub struct Superblock {
 impl Superblock {
     /// Serialize the superblock into a full page buffer with a trailing checksum.
     /// The offsets below are part of the on-disk format contract — do not
-    /// reorder fields without bumping FORMAT_VERSION.
+    /// reorder fields within a MAJOR; reordering or resizing existing fields
+    /// is a major-version bump.
     pub fn serialize(&self) -> [u8; PAGE_SIZE] {
         let mut buf = [0u8; PAGE_SIZE];
         buf[0..4].copy_from_slice(&self.magic.to_le_bytes());

@@ -22,7 +22,7 @@ Priority legend:
 
 > **Status note (2026-04-17):** every item below has landed. The order is preserved here as historical context — a reader looking at this file for "what's open?" should conclude: nothing from the 2026-04-10 or 2026-04-17 review passes is still actionable. The individual entries in later sections carry the definitive status.
 >
-> **Status note (2026-04-22):** a fresh third review pass re-opened the file with new items I26 (P1, handle-table bounds), I27 (P2, savepoint freed-pages leak on commit), I28 (P2, `CacheFull` poisons during commit), and a doc-sweep bundle (C4). These are NOT in the suggested fix order above — see each entry in its own section below. The 2026-04-22 pass specifically looked for invariant mismatches across module boundaries, which is where the remaining bugs now live.
+> **Status note (2026-04-22):** a fresh third review pass re-opened the file with new items I26 (P1, handle-table bounds), I27 (P2, savepoint freed-pages leak on commit), I28 (P2, `CacheFull` poisons during commit), and a doc-sweep bundle (C4), all resolved the same day. I29 also landed later that day: a pre-1.0 infrastructure change splitting `format_version` into packed MAJOR / MINOR so the README's "sacred within a major version" promise is enforceable at the bytes level. These are NOT in the suggested fix order above — see each entry in its own section below. The 2026-04-22 pass specifically looked for invariant mismatches across module boundaries, which is where the remaining bugs now live.
 
 Dependencies and batching drove this more than raw priority. Earlier items unblocked later ones.
 
@@ -122,6 +122,27 @@ This directly violated the shadow-paging invariant spelled out in `allocate_data
 **Fix (landed 2026-04-22):** chose option (1) — at the top of `commit_inner`, before `persist_freemap`, iterate every active savepoint and `append` its `freed_pages` onto `self.txn_freed_pages`. This matches `release_inner`'s merge pattern but applied across the full stack. The existing `savepoints.clear()` at step 5 still runs afterwards; we drain rather than iterate-by-reference so the savepoints don't hold stale `freed_pages` if step 5 ever changes. No new error variant, no caller-visible behaviour change beyond the leak going away.
 
 **Regression test:** `commit_with_active_savepoint_returns_freed_pages_to_freemap` in `src/transaction.rs`. Seeds two overflow-sized handles, opens a transaction, deletes both (populating `txn_freed_pages`), takes a savepoint (which empties `txn_freed_pages` into `savepoint.freed_pages`), commits WITHOUT release, and asserts `FreeMap::is_free(&committed_freemap, id)` holds for every previously-captured id. Pre-fix, none of the ids were marked free — they were permanently leaked.
+
+### I29. Split `format_version` into packed MAJOR / MINOR for public stability promise [infrastructure 2026-04-22] — **P1** (pre-1.0 foundation) ✅ PHASE 1 LANDED 2026-04-22
+**Where:** `page.rs` `FORMAT_VERSION`, `transaction.rs::open_existing` gate at the I15 site
+
+**Motivation:** the README's "sacred within a major version" promise requires distinguishing additive minor changes from structural major changes in the on-disk marker. The pre-I29 scheme was a flat `u32 FORMAT_VERSION = 2` checked with exact equality, which conflated the two: any change bumped the number, any mismatch rejected the file. Layering the public stability guarantee on top of that would have required interpretation conventions that lived outside the field itself.
+
+**Scheme (byte-packed u32):**
+- Upper 16 bits = MAJOR. Lower 16 bits = MINOR.
+- `FORMAT_MAJOR_VERSION` and `FORMAT_MINOR_VERSION` are `u16` constants; `FORMAT_VERSION` is derived by `pack_format_version(major, minor)` at compile time.
+- First 1.0 release: MAJOR = 1, MINOR = 0, `FORMAT_VERSION = 0x00010000`.
+- Helpers: `pack_format_version(major, minor)`, `format_major(v)`, `format_minor(v)`. All `const fn` so they compose in constants.
+
+**Why packed over decimal-coded** (e.g. `major * 100 + minor`): semantics compile into the data-type (`>> 16`, `& 0xFFFF`) rather than relying on a "why 100?" arithmetic convention. Same `u32` on-disk width, same superblock bytes 4..8.
+
+**Phase 1 (landed 2026-04-22):** open-time gate now compares MAJOR only (`format_major(sb.format_version) != FORMAT_MAJOR_VERSION`). A file written by any 1.x binary opens in any other 1.x binary regardless of minor drift — which is what makes the README promise true. Minor-newer files are accepted as read+write for now because there are no minor variants yet to protect.
+
+**Phase 2 (deferred until 1.1 run-up):** add a "refuse writes if file MINOR > binary MINOR" arm to protect against a binary silently clobbering superblock fields added in a later minor. Likely shape: introduce a new operational error (`NewerFormatMinor`) or reuse `ReadOnlyMode`; set a flag on the `TransactionManager` at open time; check it in `begin_inner`. No-op today (no newer-minor files exist), so deferring costs nothing but documenting the intent now.
+
+**Pre-1.0 compatibility note:** any file written by a prior development build carries `format_version = 1` or `format_version = 2` in the flat scheme. Under the packed interpretation those decode as MAJOR = 0, MINOR = 1 or 2. MAJOR = 0 ≠ current MAJOR = 1 → rejected with `UnsupportedFormatVersion`. This is the documented pre-1.0 break; there are no production DBs to migrate, and release notes call it out. MAJOR = 0 is implicitly reserved forever as "pre-1.0 development" and will never be written by a released binary.
+
+**Regression test:** `format_version_gate_is_major_only` in `src/transaction.rs`. Creates a fresh database, closes, patches both superblock slots to (a) the current major with a bumped minor — asserts open succeeds (pre-fix this rejected with `UnsupportedFormatVersion`); then patches to a bumped major — asserts open fails with `UnsupportedFormatVersion`. Exercises both halves of the MAJOR-only check.
 
 ---
 

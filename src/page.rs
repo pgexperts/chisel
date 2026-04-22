@@ -36,12 +36,38 @@ pub const PAGE_BODY_SIZE: usize = PAGE_SIZE - DATA_PAGE_HEADER_SIZE - CHECKSUM_S
 // before we even look at the checksum.
 pub const MAGIC: u32 = 0x4348534C; // "CHSL"
 
-// Format version 2 (bumped 2026-04-10 for ISSUES.md F2 named roots — the
-// superblock grew a fixed 256-byte named-root table after the existing
-// fields). Version 1 files are refused at open time via the I15 gate.
-// Any further on-disk format change must bump this and update
-// Superblock::serialize / deserialize in lockstep.
-pub const FORMAT_VERSION: u32 = 2;
+// On-disk format version: byte-packed u32 with upper 16 bits = MAJOR,
+// lower 16 bits = MINOR. Gates at open time on MAJOR only; same-major
+// files are read-compatible regardless of minor (additive-only layout
+// changes within a major are the invariant that makes this safe).
+// Write safety across minors is a separate concern — a binary at minor
+// M opening a file at minor M' > M can read but not safely write
+// without clobbering fields it doesn't know about; this check is
+// deferred until the first 1.1 release (at which point the gate grows
+// a "newer minor ⇒ refuse writes" arm). See ISSUES.md I29.
+//
+// Pre-1.0 files (format_version = 1 or 2 in the old flat scheme) have
+// major byte = 0 and are rejected with UnsupportedFormatVersion — a
+// clean break, since there are no production DBs yet.
+pub const FORMAT_MAJOR_VERSION: u16 = 1;
+pub const FORMAT_MINOR_VERSION: u16 = 0;
+
+/// Pack a (major, minor) pair into the on-disk u32 format version.
+pub const fn pack_format_version(major: u16, minor: u16) -> u32 {
+    ((major as u32) << 16) | (minor as u32)
+}
+
+/// Extract the major-version byte pair from a packed format_version.
+pub const fn format_major(version: u32) -> u16 {
+    (version >> 16) as u16
+}
+
+/// Extract the minor-version byte pair from a packed format_version.
+pub const fn format_minor(version: u32) -> u16 {
+    (version & 0xFFFF) as u16
+}
+
+pub const FORMAT_VERSION: u32 = pack_format_version(FORMAT_MAJOR_VERSION, FORMAT_MINOR_VERSION);
 
 /// Sentinel value meaning "not yet allocated" for root page pointers
 /// (e.g. an empty database has no handle-table or freemap root yet).

@@ -231,9 +231,17 @@ Useful for:
 
 **Within a given major version, the on-disk format is sacred.** Any file written by any release with major version *N* will be readable by any other release with major version *N*, regardless of minor or patch level. Opening a file written by an incompatible future version raises `UnsupportedFormatVersionError` rather than silently misinterpreting the bytes.
 
-Format-breaking changes happen only at major-version boundaries, and every such transition will ship with a documented upgrade path.
+### How it's encoded
 
-Until Chisel reaches 1.0, the internal format version may change between pre-release builds without a major-version bump; any such pre-1.0 change will be called out in release notes. The first 1.0 release freezes the format for the entire 1.x line.
+Each superblock carries a packed `format_version` u32 — upper 16 bits = MAJOR, lower 16 bits = MINOR. The open-time gate compares MAJOR only: a 1.3 binary opens a 1.7 file cleanly, a 1.3 binary rejects a 2.0 file.
+
+Cross-minor *read* compatibility is absolute within a major. *Write* compatibility is narrower: starting with the first post-1.0 minor bump, a binary at MINOR = *m* opening a file at MINOR = *m' > m* will be restricted to read-only to avoid clobbering fields the binary doesn't know about. Until 1.1 ships this check is a no-op because no minor variants exist.
+
+### Pre-1.0 caveat
+
+Until Chisel reaches 1.0, the on-disk format may change between pre-release builds without a major-version bump. Any such pre-1.0 change will be called out in release notes. The first 1.0 release freezes MAJOR at 1 for the entire 1.x line.
+
+Files written by prior development builds (pre-1.0 flat `format_version`, which decodes as MAJOR = 0) are rejected at open time — recreate the database. No migration is provided for pre-release files.
 
 ## Design
 

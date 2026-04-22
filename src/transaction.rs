@@ -354,13 +354,21 @@ impl TransactionManager {
         // pages in the candidate list (if any) are filtered out.
         let sb = Superblock::select(&candidates).ok_or(ChiselError::CorruptSuperblock)?;
 
-        // Format-version gate (see ISSUES.md I15). We validate AFTER select()
-        // rather than inside deserialize() because the winning superblock's
-        // version is what determines compatibility — silently falling back to
-        // an older-version superblock would hand the user a stale snapshot
-        // with mysteriously missing data. If the newest valid superblock is
-        // an incompatible version, refuse to open outright.
-        if sb.format_version != page::FORMAT_VERSION {
+        // Format-version gate (see ISSUES.md I15 for the original check,
+        // I29 for the major/minor split). Compare MAJOR only: the packed
+        // u32 layout (upper 16 = major, lower 16 = minor) lets same-major
+        // files open regardless of minor drift, which is what makes the
+        // README's "sacred within a major version" promise enforceable.
+        // Minor-newer files are accepted here but may be unsafe to WRITE
+        // — I29 phase 2 will add a "refuse writes if file minor > my
+        // minor" arm when the first 1.1 release makes this observable.
+        //
+        // We validate AFTER select() rather than inside deserialize()
+        // because the winning superblock's version is what determines
+        // compatibility — silently falling back to an older-version
+        // superblock would hand the user a stale snapshot with
+        // mysteriously missing data.
+        if page::format_major(sb.format_version) != page::FORMAT_MAJOR_VERSION {
             return Err(ChiselError::UnsupportedFormatVersion {
                 found: sb.format_version,
                 expected: page::FORMAT_VERSION,
@@ -2211,5 +2219,84 @@ mod tests {
             !tm.is_poisoned(),
             "I28: CacheFull during commit must not poison — it's operational by design"
         );
+    }
+
+    // I29: the open-time format-version gate compares MAJOR only, not
+    // the full u32. Same-major files (regardless of minor) open cleanly;
+    // different-major files fail fast with UnsupportedFormatVersion.
+    // This encodes the "sacred within a major version" promise from the
+    // README: any file written by an N.x binary is readable by every
+    // other N.x binary, because minor bumps can only add fields in the
+    // superblock's reserved region (they never break backward reads).
+    //
+    // We exercise both halves in one test because they share setup
+    // (fresh-DB file → patch slots → reopen). Patching both superblock
+    // slots in lockstep matters because Superblock::select picks the
+    // highest-counter valid slot; if only slot 0 were patched, slot 1
+    // (with the unmodified version) would win on some commits.
+    #[test]
+    fn format_version_gate_is_major_only() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+
+        // Step 0: create a fresh database so there's something on disk
+        // to patch. The default superblock_count of 2 means we need to
+        // patch pages 0 AND 1.
+        {
+            let io = PageIo::open(&path, false).unwrap();
+            let cache = PageCache::new(io, 1024);
+            let _ = TransactionManager::create_new(cache, 2).unwrap();
+            // drop() releases the flock so the test can read+write the
+            // file directly below.
+        }
+
+        // Helper: patch every superblock slot to the given packed
+        // format_version and re-stamp the trailing checksum so the
+        // deserialize path still accepts it as a valid slot.
+        let patch_all_slots = |version: u32, slot_count: usize| {
+            let mut bytes = std::fs::read(&path).unwrap();
+            for slot in 0..slot_count {
+                let offset = slot * PAGE_SIZE;
+                bytes[offset + 4..offset + 8].copy_from_slice(&version.to_le_bytes());
+                let page_arr: &mut [u8; PAGE_SIZE] =
+                    (&mut bytes[offset..offset + PAGE_SIZE]).try_into().unwrap();
+                page::stamp_checksum(page_arr);
+            }
+            std::fs::write(&path, &bytes).unwrap();
+        };
+
+        // Case 1: patch both slots to (FORMAT_MAJOR_VERSION, +42). A minor
+        // bump within the same major must open cleanly — this is the
+        // whole point of the packed scheme. Pre-fix (exact-match gate)
+        // this case rejected with UnsupportedFormatVersion.
+        let minor_bump = page::pack_format_version(
+            page::FORMAT_MAJOR_VERSION,
+            page::FORMAT_MINOR_VERSION.wrapping_add(42),
+        );
+        patch_all_slots(minor_bump, 2);
+        {
+            let io = PageIo::open(&path, false).unwrap();
+            let cache = PageCache::new(io, 1024);
+            let tm = TransactionManager::open_existing(cache);
+            assert!(
+                tm.is_ok(),
+                "same-major / different-minor file should open cleanly; got {:?}",
+                tm.err()
+            );
+        }
+
+        // Case 2: patch to (FORMAT_MAJOR_VERSION + 1, 0). A major bump
+        // is a real format break and must be refused regardless of minor.
+        let major_bump = page::pack_format_version(page::FORMAT_MAJOR_VERSION.wrapping_add(1), 0);
+        patch_all_slots(major_bump, 2);
+        {
+            let io = PageIo::open(&path, false).unwrap();
+            let cache = PageCache::new(io, 1024);
+            match TransactionManager::open_existing(cache) {
+                Err(ChiselError::UnsupportedFormatVersion { .. }) => {}
+                Err(e) => panic!("expected UnsupportedFormatVersion, got {e:?}"),
+                Ok(_) => panic!("expected UnsupportedFormatVersion, got Ok"),
+            }
+        }
     }
 }
