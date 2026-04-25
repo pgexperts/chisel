@@ -5,3 +5,6 @@
 # Added by cargo
 
 /target
+
+# Credentials
+.keys
