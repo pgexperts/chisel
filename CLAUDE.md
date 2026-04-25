@@ -54,16 +54,18 @@ The module dependency graph is strictly bottom-up — no circular dependencies:
 - **Durability over performance.** Every commit does two fsyncs (data pages, then superblock). Checksums on every page.
 - **Poison on fatal error.** On any commit-path I/O failure, checksum mismatch, or corrupt superblock, the `TransactionManager` becomes poisoned (matches `std::sync::Mutex` semantics). Every subsequent call returns `ChiselError::Poisoned`; the only legal recovery is `close()` + reopen, which picks the last-durable superblock. Driven by Linux fsyncgate semantics — a failed `fsync()` cannot be safely retried.
 - **In-memory mode.** `Chisel::open_in_memory` (also `chisel.open(None)` from Python) runs the full engine against a `Vec<u8>`-backed `PageIo` with no filesystem and no `flock`. Same code path, same guarantees except durability; used for tests, benchmarks, and ephemeral work.
+- **Format-version compatibility.** The on-disk `format_version` is a packed `u32` (upper 16 bits MAJOR, lower 16 bits MINOR; see I29). Same-MAJOR files are mutually readable across any minor; a different MAJOR is rejected at open. Each non-superblock page also carries a one-byte `page_format_version` (I31) so individual page layouts can evolve within a major without a file-wide bump. Both schemes leave reserved bytes for forward-compatible extension. Touching either constant or any byte that participates in the on-disk format is a public-stability decision, not a refactor.
 
 ### Backlog and decision log
 
 `ISSUES.md` is the canonical list of open work, latent bugs, and completed
 fixes (each entry marked `✅ IMPLEMENTED <date>` or still open). Consult it
 before proposing changes — many obvious-looking simplifications have already
-been addressed (R1 value packing, R2 freemap wiring, R3 selective defrag,
-R4 configurable superblock count, F3 `read()` taking `&self`, and F2 named
-roots all landed 2026-04-10/11; the Python binding for R5 is shipped even
-though R5's entry is still formally open).
+been addressed. As of the 2026-04-22 status note, every roadmap item (R1–R5)
+and every entry from the three commenting passes (2026-04-10, 2026-04-17,
+2026-04-22) has landed; the only deferred work is two named Phase-2 followups
+(I29 minor-write enforcement; I31 eager upgrader) that are gated on triggers
+in a future minor release rather than calendar time.
 
 ## Conventions
 
@@ -84,7 +86,12 @@ encountering this code for the first time.
 
 ## Design Spec
 
-Specs in `docs/superpowers/specs/`:
+Living architecture overview in `ARCHITECTURE.md` at the repo root — layer
+model, commit protocol, recovery, full on-disk format byte-by-byte. Start
+there if you need a current map of the system before changing code.
+
+Decision-time specs (frozen at the time the work was approved) in
+`docs/superpowers/specs/`:
 - `2026-04-09-chisel-storage-engine-design.md` — storage engine design
 - `2026-04-13-chisel-in-memory-mode-design.md` — in-memory mode
 - `2026-04-14-chisel-python-interface-design.md` — Python binding API surface
