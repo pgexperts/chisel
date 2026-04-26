@@ -56,6 +56,26 @@ class Stats:
 
 
 @dataclass(frozen=True)
+class Counters:
+    """Cumulative engine-activity counters since the database was opened.
+
+    Snapshot semantics: the values are point-in-time and do not update.
+    Read counters() again to observe new totals. Counters reset implicitly
+    on close + reopen because the underlying engine state is rebuilt.
+
+    Fields:
+        cache_hits: PageCache.get returned a cached page without disk I/O.
+        cache_misses: PageCache.get had to load from disk.
+        pages_allocated: PageCache.new_page invocations.
+        fsync_calls: PageIo.fsync invocations (two per commit).
+    """
+    cache_hits: int
+    cache_misses: int
+    pages_allocated: int
+    fsync_calls: int
+
+
+@dataclass(frozen=True)
 class DefragOptions:
     """Options controlling a defragmentation pass.
 
@@ -81,7 +101,7 @@ class DefragStats:
 __all__ = [
     "__version__",
     "Chisel", "Transaction", "Savepoint", "open",
-    "Stats", "DefragOptions", "DefragStats",
+    "Stats", "Counters", "DefragOptions", "DefragStats",
     "ChiselError", "OperationalError", "FatalError",
     "InvalidHandleError", "NoActiveTransactionError",
     "TransactionAlreadyActiveError", "SavepointNotFoundError",
