@@ -169,23 +169,32 @@ impl PageCache {
         Ok(&mut entry.buf)
     }
 
-    /// Cumulative cache hit count since this PageCache was constructed.
-    pub fn cache_hit_count(&self) -> u64 {
+    /// Cumulative cache hit count. Test-only because
+    /// `PageCache::counters()` is the public aggregator and is what
+    /// production code uses; this accessor exists so unit tests can
+    /// check the individual counter without constructing a full
+    /// `ChiselCounters`.
+    #[cfg(test)]
+    fn cache_hit_count(&self) -> u64 {
         self.cache_hits.get()
     }
 
-    /// Cumulative cache miss count since this PageCache was constructed.
-    /// Includes attempted misses where `load_page` subsequently failed
-    /// (checksum mismatch, I/O error) — the counter records "we had to
-    /// reach for disk", not "the disk read succeeded".
-    pub fn cache_miss_count(&self) -> u64 {
+    /// Cumulative cache miss count. Includes attempted misses where
+    /// `load_page` subsequently failed (checksum mismatch, I/O error) —
+    /// the counter records "we had to reach for disk", not "the disk
+    /// read succeeded". Test-only for the same reason as
+    /// `cache_hit_count`.
+    #[cfg(test)]
+    fn cache_miss_count(&self) -> u64 {
         self.cache_misses.get()
     }
 
-    /// Cumulative `new_page()` invocations since this PageCache was
-    /// constructed. Counts attempted allocations: an allocation that
-    /// subsequently trips `CacheFull` in `maybe_evict` is still recorded.
-    pub fn pages_allocated_count(&self) -> u64 {
+    /// Cumulative `new_page()` invocations. Counts attempted
+    /// allocations: an allocation that subsequently trips `CacheFull`
+    /// in `maybe_evict` is still recorded. Test-only for the same
+    /// reason as `cache_hit_count`.
+    #[cfg(test)]
+    fn pages_allocated_count(&self) -> u64 {
         self.pages_allocated.get()
     }
 
@@ -195,6 +204,13 @@ impl PageCache {
     /// is owned by the underlying `PageIo` (where the actual `fsync` call
     /// happens) and is read through. The snapshot is a value type — it
     /// does not update as the engine continues to do work.
+    ///
+    /// Coverage caveat: only calls to `PageIo::fsync` are counted in
+    /// `fsync_calls`. As of this writing, all flush paths go through
+    /// that method, so the counter is exhaustive. If a future variant
+    /// (e.g. `fdatasync`) is added and called from outside `PageIo::
+    /// fsync`, this aggregator would miss it — increment that variant
+    /// into the same counter, or extend the aggregator.
     pub fn counters(&self) -> ChiselCounters {
         ChiselCounters {
             cache_hits: self.cache_hits.get(),
