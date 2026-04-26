@@ -43,6 +43,7 @@ use std::collections::{HashMap, VecDeque};
 use crate::error::{ChiselError, Result};
 use crate::page::{self, PAGE_SIZE};
 use crate::page_io::PageIo;
+use crate::stats::ChiselCounters;
 
 // Hard-ceiling multiplier on `max_pages` (ISSUES.md I19). The cache's
 // soft limit — `max_pages` — is the working-set target; dirty pages
@@ -156,7 +157,10 @@ impl PageCache {
     /// Marking dirty pins the entry against LRU eviction until the next
     /// `flush()`.
     pub fn get_mut(&mut self, page_id: u64) -> Result<&mut [u8; PAGE_SIZE]> {
-        if !self.entries.contains_key(&page_id) {
+        if self.entries.contains_key(&page_id) {
+            self.cache_hits.set(self.cache_hits.get() + 1);
+        } else {
+            self.cache_misses.set(self.cache_misses.get() + 1);
             self.load_page(page_id)?;
         }
         self.touch_lru(page_id);
@@ -183,6 +187,21 @@ impl PageCache {
     /// subsequently trips `CacheFull` in `maybe_evict` is still recorded.
     pub fn pages_allocated_count(&self) -> u64 {
         self.pages_allocated.get()
+    }
+
+    /// Snapshot all four engine-activity counters into a `ChiselCounters`.
+    ///
+    /// Three of the four counters live here in `PageCache`; `fsync_calls`
+    /// is owned by the underlying `PageIo` (where the actual `fsync` call
+    /// happens) and is read through. The snapshot is a value type — it
+    /// does not update as the engine continues to do work.
+    pub fn counters(&self) -> ChiselCounters {
+        ChiselCounters {
+            cache_hits: self.cache_hits.get(),
+            cache_misses: self.cache_misses.get(),
+            pages_allocated: self.pages_allocated.get(),
+            fsync_calls: self.io.fsync_count(),
+        }
     }
 
     /// Allocate a new zeroed page, mark it dirty, return its page_id.
@@ -731,5 +750,32 @@ mod tests {
         cache.new_page().unwrap();
         cache.new_page().unwrap();
         assert_eq!(cache.pages_allocated_count(), 3);
+    }
+
+    #[test]
+    fn counters_aggregates_cache_and_io_state() {
+        use crate::stats::ChiselCounters;
+
+        let io = PageIo::open_in_memory().unwrap();
+        let mut cache = PageCache::new(io, 16);
+
+        // Fresh cache: every counter is zero.
+        assert_eq!(cache.counters(), ChiselCounters::default());
+
+        // Allocate two pages, stamp & flush them. Allocation count goes up by 2;
+        // the flush issues one fsync (PageIo::fsync called once by flush()).
+        for _ in 0..2 {
+            let id = cache.new_page().unwrap();
+            let buf = cache.get_mut(id).unwrap();
+            crate::page::stamp_checksum(buf);
+        }
+        cache.flush().unwrap();
+
+        let c = cache.counters();
+        assert_eq!(c.pages_allocated, 2);
+        assert_eq!(c.fsync_calls, 1, "flush() does exactly one fsync");
+        // get_mut(id) on a freshly-allocated page is a hit (page is in-cache).
+        assert_eq!(c.cache_hits, 2);
+        assert_eq!(c.cache_misses, 0);
     }
 }
