@@ -32,6 +32,24 @@ pytest
 Public Python API lives in `python/chisel/__init__.py`; type stubs in
 `python/chisel/chisel.pyi`. See `python/README.md` for usage.
 
+### Bench harness
+
+The `bench/` subcrate is the foundation of an in-progress benchmark
+suite — independent crate, sibling to `python/`, path-deps on the
+root `chisel` crate. Currently provides the `Engine` trait
+(uniform façade over Chisel, redb, and SQLite) and a working
+`ChiselEngine` impl with a smoke test. Build / run locally with:
+
+```bash
+cd bench && cargo test
+```
+
+PRs 3–7 of the bench-suite series will add the redb / SQLite engines,
+workload generators, the diagnostic micro grid, output
+post-processing, scenarios, and CI integration. Design spec at
+`docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md`;
+per-PR plans alongside in `docs/superpowers/plans/`.
+
 ## Architecture
 
 The module dependency graph is strictly bottom-up — no circular dependencies:
@@ -66,6 +84,13 @@ and every entry from the three commenting passes (2026-04-10, 2026-04-17,
 2026-04-22) has landed; the only deferred work is two named Phase-2 followups
 (I29 minor-write enforcement; I31 eager upgrader) that are gated on triggers
 in a future minor release rather than calendar time.
+
+Concurrent in-progress work (tracked outside `ISSUES.md` via spec+plan
+docs): the benchmark-suite series. PRs 1 (counter instrumentation
+exposing `Chisel::counters()`) and 2 (`bench/` subcrate + `Engine`
+trait + `ChiselEngine`) have landed on `main` as of 2026-04-25;
+PRs 3–7 are pending. See `docs/superpowers/specs/2026-04-25-chisel-
+benchmark-suite-design.md`.
 
 ## Conventions
 

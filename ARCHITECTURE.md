@@ -81,16 +81,16 @@ Why bottom-up matters: it means you can read the codebase in dependency order an
 | 1 | `page.rs` | Page size, type tags, header sizes, magic, format-version constants, XXH3 checksum primitives. | `PAGE_SIZE = 8192`; checksum lives in the last 8 bytes; little-endian on disk. |
 | 1 | `error.rs` | `ChiselError` enum, `is_fatal()` classifier (operational vs fatal). | Fatal variants poison the manager (I1). |
 | 1 | `superblock.rs` | In-memory `Superblock` struct, `serialize`/`deserialize`, `select()` across N candidate slots. | Magic + checksum + `superblock_count ∈ 2..=16` filter slots before tie-breaking by `txn_counter`. |
-| 2 | `page_io.rs` | Raw `pread`/`pwrite` of fixed-size pages, exclusive `flock`, `fsync`, in-memory `Vec<u8>` backing. | The **only** module that touches the filesystem; everything else uses it through `PageCache`. |
-| 3 | `page_cache.rs` | LRU cache over `PageIo`, dirty tracking, checksum validation on load, `CacheFull` hard ceiling. | Soft limit = `max_pages`; hard ceiling = `max_pages × 8` (I19); checksums verified on disk LOAD only. |
+| 2 | `page_io.rs` | Raw `pread`/`pwrite` of fixed-size pages, exclusive `flock`, `fsync`, in-memory `Vec<u8>` backing. Tracks cumulative successful `fsync_calls` count via a `Cell<u64>`. | The **only** module that touches the filesystem; everything else uses it through `PageCache`. |
+| 3 | `page_cache.rs` | LRU cache over `PageIo`, dirty tracking, checksum validation on load, `CacheFull` hard ceiling. Owns three `Cell<u64>` engine-activity counters (cache hits/misses, pages allocated) and exposes `counters()` aggregating them with `PageIo::fsync_count`. | Soft limit = `max_pages`; hard ceiling = `max_pages × 8` (I19); checksums verified on disk LOAD only. |
 | 4 | `freemap.rs` | Bitmap of free pages, `allocate_first` / `allocate_near` / `mark_free`. | Pure buffer manipulation; no cache or I/O. |
 | 4 | `data_page.rs` | Slotted page layout (R1): slot directory grows forward, packed value data grows backward, dead-slot tombstones reclaimed only by `compact()`. | Slot indices are stable until compact; compact returns an old→new mapping for callers to rewrite. |
 | 4 | `overflow.rs` | Singly-linked overflow chains for values > inline threshold. | `total_length` repeated on every chain page; `next_page == 0` terminates; cycle detection bounded by `total_length / OVERFLOW_PAYLOAD` (I14). |
 | 5 | `handle_table.rs` | Radix tree mapping `u64` handle → `(page_id, slot_index)`. Implements its own copy-on-write atop `PageCache::new_page`. | Capacity = `510 × 1021^depth`; `find_leaf` short-circuits on `handle ≥ capacity` to `Ok(None)` (I26). |
 | 6 | `transaction.rs` | `TransactionManager`: orchestrates begin/commit/rollback, savepoints, `persist_freemap`, the commit protocol, the poison flag. | Commit protocol step ordering is load-bearing — see next section. |
 | 7 | `defrag.rs` | Sparse-page consolidation; runs inside an active transaction. | `pages_examined`/`pages_freed` are page-granular (I17). |
-| 7 | `stats.rs` | Plain snapshot struct (`handle_count`, `total_pages`, `file_size_bytes`). | Snapshot, not a live view. |
-| 8 | `lib.rs` | `Chisel` public API; thin wrapper over `TransactionManager`. | `&mut self` everywhere except `read`/`get_root_name`/`handles`/`stats` (F3). |
+| 7 | `stats.rs` | Two snapshot structs: `Stats` (`handle_count`, `total_pages`, `file_size_bytes`) and `ChiselCounters` (cache hits/misses, pages allocated, fsync calls — cumulative-from-open engine activity). | Both are point-in-time snapshots, not live views. `ChiselCounters` is `#[non_exhaustive]` so future counters can be added without a breaking change. |
+| 8 | `lib.rs` | `Chisel` public API; thin wrapper over `TransactionManager`. | `&mut self` everywhere except `read`/`get_root_name`/`handles`/`stats`/`counters` (F3). |
 
 ---
 
@@ -462,6 +462,18 @@ The cap parameter (`DefragOptions::max_pages`) bounds the number of *values* rel
 On any fatal error — an `IoError` from `fsync`, a `ChecksumMismatch` on a page load, a `CorruptSuperblock` on open, any error raised after the commit protocol has begun — the `TransactionManager` becomes **poisoned**. Every subsequent call returns `ChiselError::Poisoned`, including reads. The only legal recovery is to drop the `Chisel` handle and call `Chisel::open` again; the shadow-paging recovery path then returns the database to its last-durable state.
 
 This mirrors `std::sync::Mutex` poisoning. It is mandatory because Linux fsyncgate (post-2018) makes retrying a failed `fsync()` unsafe — the kernel may have discarded the dirty pages already, and a subsequent successful `fsync()` does not mean earlier data is durable. The reopen-to-recover idiom exercises the same code path as crash recovery, which has the side benefit of testing the recovery path on every real-world poison event. (See I1 for the full design and I29 for what `UnsupportedFormatVersion` means under the packed scheme.)
+
+### Engine-activity counters
+
+`Chisel::counters()` returns a `ChiselCounters` snapshot of four cumulative-from-open counters: `cache_hits`, `cache_misses`, `pages_allocated`, and `fsync_calls`. Each counter is a `Cell<u64>` living at the site that increments it (`PageCache` for the first three, `PageIo` for fsync), and `PageCache::counters()` aggregates them into a single struct read via `PageIo::fsync_count()`.
+
+Three semantic conventions matter:
+
+- **Counters reset on close + reopen**, because `PageCache` and `PageIo` are reconstructed. There is no persistent counter state on disk — the in-memory `Cell<u64>` is the entire record.
+- **Misses, allocations, and hit increments record *attempts*, not successes.** `cache_misses` is incremented before `load_page` (so a checksum-mismatch error still records the miss); `pages_allocated` is incremented before `maybe_evict` (so a `CacheFull` allocation still records the attempt). `fsync_calls` is the asymmetric exception: it counts only *successful* fsyncs, because a failed fsync poisons the engine (I1) and the counter on a poisoned engine has no defined further meaning.
+- **Reads via `Chisel::counters()` are `&self`** and do not mutate. The bench harness reads counters before and after a measurement and reports the delta; that's the primary intended consumer, but the counters are also useful for ad-hoc debugging ("how many cache misses did this query cause?").
+
+The counter set is fixed at four for v1 of the instrumentation (PR 1 of the bench-suite series). `#[non_exhaustive]` on `ChiselCounters` keeps the door open for adding a fifth counter later without a breaking change.
 
 ### Format versioning (two-tier)
 
