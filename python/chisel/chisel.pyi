@@ -72,14 +72,6 @@ class Counters:
     pages_allocated: int
     fsync_calls: int
 
-    def __init__(
-        self,
-        cache_hits: int,
-        cache_misses: int,
-        pages_allocated: int,
-        fsync_calls: int,
-    ) -> None: ...
-
 
 @dataclass(frozen=True)
 class DefragOptions:
