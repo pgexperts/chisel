@@ -22,6 +22,11 @@ pub struct ChiselEngine {
 
 impl ChiselEngine {
     /// Open or create a file-backed Chisel database.
+    ///
+    /// `cache_size` is the page-cache budget in 8 KB pages. The
+    /// engine's `PageCache::new` clamps this to a minimum of 1
+    /// internally, so passing 0 is safe but degenerate (you get a
+    /// 1-page cache, not a no-cache mode — Chisel does not have one).
     pub fn open_file(path: &Path, cache_size: usize) -> EngineResult<Self> {
         let db = Chisel::open(
             path,
@@ -35,6 +40,9 @@ impl ChiselEngine {
 
     /// Open an in-memory Chisel database. Same engine, no durability;
     /// for smoke tests and any benchmark that doesn't need a real file.
+    ///
+    /// `cache_size` semantics match `open_file`: pages, clamped to a
+    /// minimum of 1 by the engine.
     pub fn open_in_memory(cache_size: usize) -> EngineResult<Self> {
         let db = Chisel::open_in_memory_with_options(Options {
             cache_size,
