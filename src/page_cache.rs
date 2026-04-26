@@ -82,7 +82,6 @@ pub struct PageCache {
     // keeps the counters aggregator simpler).
     cache_hits: Cell<u64>,
     cache_misses: Cell<u64>,
-    #[allow(dead_code)]
     pages_allocated: Cell<u64>,
 }
 
@@ -179,6 +178,13 @@ impl PageCache {
         self.cache_misses.get()
     }
 
+    /// Cumulative `new_page()` invocations since this PageCache was
+    /// constructed. Counts attempted allocations: an allocation that
+    /// subsequently trips `CacheFull` in `maybe_evict` is still recorded.
+    pub fn pages_allocated_count(&self) -> u64 {
+        self.pages_allocated.get()
+    }
+
     /// Allocate a new zeroed page, mark it dirty, return its page_id.
     ///
     /// This is the heart of shadow paging: every write goes to a brand-new
@@ -204,6 +210,7 @@ impl PageCache {
         };
         self.entries.insert(page_id, entry);
         self.lru.push_front(page_id);
+        self.pages_allocated.set(self.pages_allocated.get() + 1);
         self.maybe_evict()?;
         Ok(page_id)
     }
@@ -713,5 +720,16 @@ mod tests {
         let dh = cache.cache_hit_count() - h1;
         let dm = cache.cache_miss_count() - m1;
         assert_eq!(dh + dm, 1, "exactly one of hits/misses must increment");
+    }
+
+    #[test]
+    fn pages_allocated_counter_increments_per_new_page() {
+        let io = PageIo::open_in_memory().unwrap();
+        let mut cache = PageCache::new(io, 16);
+        assert_eq!(cache.pages_allocated_count(), 0);
+        cache.new_page().unwrap();
+        cache.new_page().unwrap();
+        cache.new_page().unwrap();
+        assert_eq!(cache.pages_allocated_count(), 3);
     }
 }
