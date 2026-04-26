@@ -54,6 +54,7 @@ use crate::handle_table::{HandleEntry, HandleFlags, HandleTable};
 use crate::overflow::Overflow;
 use crate::page::{self, PAGE_ID_NONE, PAGE_SIZE};
 use crate::page_cache::PageCache;
+use crate::stats::ChiselCounters;
 use crate::superblock::{
     NamedRoot, Superblock, MAX_SUPERBLOCKS, NAMED_ROOT_COUNT, NAMED_ROOT_NAME_LEN,
 };
@@ -1424,6 +1425,16 @@ impl TransactionManager {
         let mut cache = self.cache.borrow_mut();
         let entries = self.handle_table.iter_live(&mut cache, root)?;
         Ok(entries.into_iter().map(|(h, _)| h).collect())
+    }
+
+    /// Snapshot the four engine-activity counters (cache hits/misses,
+    /// pages allocated, fsync calls). Counters are cumulative from the
+    /// most recent open; the bench harness reads-subtract-reads for
+    /// per-cell deltas. Takes `&self` (F3); poison-aware via
+    /// `check_alive`.
+    pub fn counters(&self) -> Result<ChiselCounters> {
+        self.check_alive()?;
+        Ok(self.cache.borrow().counters())
     }
 
     // --- Named roots (ISSUES.md F2) ---

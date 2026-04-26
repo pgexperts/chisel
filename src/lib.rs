@@ -348,6 +348,17 @@ impl Chisel {
         })
     }
 
+    /// Snapshot the four engine-activity counters (cache hits/misses,
+    /// pages allocated, fsync calls). Cumulative from the most recent
+    /// `open()`; the bench harness reads-subtract-reads to compute
+    /// deltas for individual operations or workloads.
+    ///
+    /// Same `&self` semantic-read shape as `stats()`. Returns
+    /// `ChiselError::Poisoned` if the engine is poisoned.
+    pub fn counters(&self) -> Result<stats::ChiselCounters> {
+        self.txm.counters()
+    }
+
     /// Returns true if this database handle has been poisoned by a
     /// previous fatal error. A poisoned handle returns
     /// `ChiselError::Poisoned` from every operation; the caller must drop
