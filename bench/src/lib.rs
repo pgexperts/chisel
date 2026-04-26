@@ -14,6 +14,8 @@
 // workload + runner + micro grid (PR 4), the reporter (PR 5),
 // scenarios (PR 6), and CI integration (PR 7).
 
+pub mod chisel_engine;
 pub mod engine;
 
+pub use chisel_engine::ChiselEngine;
 pub use engine::{Engine, EngineResult, Identifier};
