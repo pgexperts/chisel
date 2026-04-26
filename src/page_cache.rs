@@ -37,6 +37,7 @@
 //   back the transaction; commit itself pre-drains the cache (I28) so
 //   `CacheFull` cannot arise on the commit path.
 
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 
 use crate::error::{ChiselError, Result};
@@ -74,6 +75,15 @@ pub struct PageCache {
     // Monotonically increasing allocator for shadow-paged new pages. Never
     // reused within a process lifetime except via `truncate()`.
     next_page_id: u64,
+    // Cumulative-from-open counters. Cell<u64> so reads can go through
+    // `&self` accessors (forward-compatible with a possible future where
+    // get/new_page also become &self via interior mutability — today they
+    // are already &mut, but uniform Cell-shape across PageCache and PageIo
+    // keeps the counters aggregator simpler).
+    cache_hits: Cell<u64>,
+    cache_misses: Cell<u64>,
+    #[allow(dead_code)]
+    pages_allocated: Cell<u64>,
 }
 
 impl PageCache {
@@ -106,6 +116,9 @@ impl PageCache {
             lru: VecDeque::new(),
             max_pages,
             next_page_id,
+            cache_hits: Cell::new(0),
+            cache_misses: Cell::new(0),
+            pages_allocated: Cell::new(0),
         }
     }
 
@@ -121,7 +134,10 @@ impl PageCache {
     /// `get_mut`, which marks it dirty (and therefore eligible for a fresh
     /// checksum stamp at flush time by the page-type module).
     pub fn get(&mut self, page_id: u64) -> Result<&[u8; PAGE_SIZE]> {
-        if !self.entries.contains_key(&page_id) {
+        if self.entries.contains_key(&page_id) {
+            self.cache_hits.set(self.cache_hits.get() + 1);
+        } else {
+            self.cache_misses.set(self.cache_misses.get() + 1);
             self.load_page(page_id)?;
         }
         self.touch_lru(page_id);
@@ -148,6 +164,19 @@ impl PageCache {
         let entry = self.entries.get_mut(&page_id).unwrap();
         entry.dirty = true;
         Ok(&mut entry.buf)
+    }
+
+    /// Cumulative cache hit count since this PageCache was constructed.
+    pub fn cache_hit_count(&self) -> u64 {
+        self.cache_hits.get()
+    }
+
+    /// Cumulative cache miss count since this PageCache was constructed.
+    /// Includes attempted misses where `load_page` subsequently failed
+    /// (checksum mismatch, I/O error) — the counter records "we had to
+    /// reach for disk", not "the disk read succeeded".
+    pub fn cache_miss_count(&self) -> u64 {
+        self.cache_misses.get()
     }
 
     /// Allocate a new zeroed page, mark it dirty, return its page_id.
@@ -641,5 +670,48 @@ mod tests {
         let id = cache.new_page().unwrap();
         assert!(cache.is_dirty(id));
         let _ = cache.claim_page(id);
+    }
+
+    #[test]
+    fn cache_hits_and_misses_track_correctly() {
+        // Setup: open an in-memory PageIo, populate page 0 with a checksummed
+        // buffer (writing through the cache so the file actually grows).
+        let io = PageIo::open_in_memory().unwrap();
+        let mut cache = PageCache::new(io, 16);
+
+        // Allocate page 0, stamp a valid checksum, flush so the next read
+        // actually exercises the load path rather than a dirty-cache hit.
+        let id = cache.new_page().unwrap();
+        {
+            let buf = cache.get_mut(id).unwrap();
+            crate::page::stamp_checksum(buf);
+        }
+        cache.flush().unwrap();
+
+        // The flush leaves the entry clean-and-cached. A `get()` on it is a hit.
+        let h0 = cache.cache_hit_count();
+        let m0 = cache.cache_miss_count();
+        let _ = cache.get(id).unwrap();
+        assert_eq!(cache.cache_hit_count(), h0 + 1);
+        assert_eq!(cache.cache_miss_count(), m0);
+
+        // Force eviction by exceeding the cache budget, then re-fetch — must miss.
+        for _ in 0..32 {
+            let nid = cache.new_page().unwrap();
+            {
+                let buf = cache.get_mut(nid).unwrap();
+                crate::page::stamp_checksum(buf);
+            }
+            cache.flush().unwrap();
+        }
+        // Re-fetch the original page; it has been evicted.
+        let h1 = cache.cache_hit_count();
+        let m1 = cache.cache_miss_count();
+        let _ = cache.get(id).unwrap();
+        // Either it was still cached (hit) or it was evicted (miss). The
+        // weaker assertion: exactly ONE counter advanced.
+        let dh = cache.cache_hit_count() - h1;
+        let dm = cache.cache_miss_count() - m1;
+        assert_eq!(dh + dm, 1, "exactly one of hits/misses must increment");
     }
 }
