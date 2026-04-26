@@ -169,7 +169,8 @@ For tuned options (cache size, superblock count), use `Chisel::open_in_memory_wi
 | `get_root_name(name)` | Look up a named root (takes `&self`) |
 | `clear_root_name(name)` | Remove a named root |
 | `handles()` | Enumerate all live handles (takes `&self`) |
-| `stats()` | Handle count, page count, file size |
+| `stats()` | Handle count, page count, file size (takes `&self`) |
+| `counters()` | Engine-activity counters: cache hits/misses, fsync calls, pages allocated (takes `&self`) |
 | `defrag(options)` | Consolidate sparse pages |
 
 ## Options
