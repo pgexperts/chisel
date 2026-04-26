@@ -66,6 +66,14 @@ class Stats:
 
 
 @dataclass(frozen=True)
+class Counters:
+    cache_hits: int
+    cache_misses: int
+    pages_allocated: int
+    fsync_calls: int
+
+
+@dataclass(frozen=True)
 class DefragOptions:
     sparse_threshold: float = 0.25
     max_pages: int = 0
@@ -113,6 +121,7 @@ class Chisel:
 
     def handles(self) -> Iterable[int]: ...
     def stats(self) -> Stats: ...
+    def counters(self) -> Counters: ...
 
     def set_root_name(self, name: str, handle: int) -> None: ...
     def get_root_name(self, name: str) -> int | None: ...

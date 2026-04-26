@@ -247,6 +247,21 @@ impl PyChisel {
         Ok(cls.call((), Some(&kwargs))?.unbind())
     }
 
+    // counters() is read-only on the engine side (`&self`), so the usual
+    // immutable borrow path is sufficient. We materialize a
+    // `chisel.Counters` dataclass — same shape as stats().
+    fn counters(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let c = self.with_inner_io(py, |c| c.counters())?;
+        let module = py.import_bound("chisel")?;
+        let cls = module.getattr("Counters")?;
+        let kwargs = pyo3::types::PyDict::new_bound(py);
+        kwargs.set_item("cache_hits", c.cache_hits)?;
+        kwargs.set_item("cache_misses", c.cache_misses)?;
+        kwargs.set_item("pages_allocated", c.pages_allocated)?;
+        kwargs.set_item("fsync_calls", c.fsync_calls)?;
+        Ok(cls.call((), Some(&kwargs))?.unbind())
+    }
+
     // defrag() runs inside the caller's active transaction — see
     // src/defrag.rs "Transactionality" note. If no transaction is
     // active, the engine surfaces NoActiveTransactionError, which
