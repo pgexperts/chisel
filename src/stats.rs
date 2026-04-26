@@ -44,8 +44,13 @@ pub struct Stats {
 /// - `pages_allocated` — `PageCache::new_page` invocations. Each is one new
 ///   page id past the prior high-water mark; the actual disk write happens
 ///   on the next `flush()`.
-/// - `fsync_calls` — `PageIo::fsync` invocations. Two per Chisel commit
-///   (data pages, then superblock); zero between commits in a normal txn.
+/// - `fsync_calls` — `PageIo::fsync` invocations that SUCCEEDED. Two per
+///   Chisel commit (data pages, then superblock); zero between commits in
+///   a normal txn. A failed fsync poisons the engine (I1 / fsyncgate) and
+///   is not counted; `cache_misses` by contrast counts attempted misses
+///   even when the subsequent load fails. The asymmetry is intentional —
+///   see `PageIo::fsync` and I1 in ISSUES.md for the rationale.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChiselCounters {
     pub cache_hits: u64,

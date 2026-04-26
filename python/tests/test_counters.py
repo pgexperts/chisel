@@ -30,11 +30,14 @@ def test_counters_is_frozen(mem_db):
 
 def test_counters_snapshot_does_not_mutate(mem_db):
     snap = mem_db.counters()
-    # Do work.
+    snap_fsync_at_capture = snap.fsync_calls
+    # Do work that must produce fsyncs.
     with mem_db.transaction() as tx:
         tx.allocate(b"x")
-    # The original snapshot is unchanged.
+    # Engine counters must have advanced (commit fsyncs).
     snap2 = mem_db.counters()
-    assert snap.fsync_calls < snap2.fsync_calls or snap == snap2
-    # The original `snap` itself is immutable (frozen dataclass) — its
-    # field values are still whatever they were at capture time.
+    assert snap2.fsync_calls > snap.fsync_calls, "commit must advance fsync_calls"
+    # The original snapshot's field value is the same as captured —
+    # the snapshot is a value, not a live view. (Frozen-dataclass
+    # immutability is separately covered by test_counters_is_frozen.)
+    assert snap.fsync_calls == snap_fsync_at_capture
