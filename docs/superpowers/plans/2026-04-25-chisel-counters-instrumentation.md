@@ -614,11 +614,14 @@ use tempfile::NamedTempFile;
 fn counters_after_open_in_memory_have_construction_overhead() {
     let db = Chisel::open_in_memory().unwrap();
     let c = db.counters().unwrap();
-    // Open does some work (writes initial superblock, etc.) so allocations
-    // and fsyncs are non-zero. We pin only the public guarantee: the type
-    // is constructible and readable, and pages_allocated reflects the
-    // bootstrap.
-    assert!(c.pages_allocated > 0, "open_in_memory must allocate at least the superblock pages");
+    // Open does some work (writes initial superblock, etc.) so fsyncs are
+    // non-zero. Note: pages_allocated counts PageCache::new_page() calls,
+    // not the bootstrap superblock writes — those go through PageIo::
+    // write_page directly, bypassing the cache allocator. So
+    // pages_allocated starts at 0 even on a fresh in-memory db. We pin
+    // fsync_calls instead — it's the cleanest invariant the bootstrap
+    // path produces.
+    assert!(c.fsync_calls > 0, "open_in_memory must fsync at least once (superblock bootstrap)");
 }
 
 #[test]
