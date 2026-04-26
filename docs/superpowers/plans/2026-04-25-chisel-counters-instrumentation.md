@@ -71,12 +71,12 @@ Append after the existing `Stats` struct:
 /// Fields:
 /// - `cache_hits` — `PageCache::get` returned a cached page without disk I/O.
 /// - `cache_misses` — `PageCache::get` had to load from disk (and validate
-///    checksum). Hit rate is `hits / (hits + misses)`.
+///   checksum). Hit rate is `hits / (hits + misses)`.
 /// - `pages_allocated` — `PageCache::new_page` invocations. Each is one new
-///    page id past the prior high-water mark; the actual disk write happens
-///    on the next `flush()`.
+///   page id past the prior high-water mark; the actual disk write happens
+///   on the next `flush()`.
 /// - `fsync_calls` — `PageIo::fsync` invocations. Two per Chisel commit
-///    (data pages, then superblock); zero between commits in a normal txn.
+///   (data pages, then superblock); zero between commits in a normal txn.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChiselCounters {
     pub cache_hits: u64,
