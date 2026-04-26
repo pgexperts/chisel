@@ -1,0 +1,12 @@
+[package]
+name = "chisel-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Benchmark harness for Chisel — Engine trait abstraction, workload generators, and cross-engine comparison runners. Internal use only; not published."
+publish = false
+
+[dependencies]
+chisel = { path = ".." }
+
+[dev-dependencies]
+tempfile = "3"
