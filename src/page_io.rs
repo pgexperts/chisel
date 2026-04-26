@@ -23,6 +23,7 @@
 // - On-disk format is little-endian (see page.rs); this module is
 //   format-agnostic and just moves fixed-size buffers.
 
+use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -51,6 +52,12 @@ pub struct PageIo {
     // matters: a ReadOnlyMode error is operational — the caller just used
     // the wrong open mode — while a fatal IoError poisons the manager.
     read_only: bool,
+    // Cumulative fsync count. Cell<u64> because `fsync(&self)` takes &self
+    // (single-writer + same-thread reads — see project memory note
+    // `project_chisel_single_client_design`). Read-only opens never fsync,
+    // so this stays at 0 for the read-only lifetime — a useful invariant
+    // when interpreting the counter.
+    fsync_calls: Cell<u64>,
 }
 
 impl PageIo {
@@ -83,6 +90,7 @@ impl PageIo {
         Ok(PageIo {
             backing: Backing::File { file },
             read_only,
+            fsync_calls: Cell::new(0),
         })
     }
 
@@ -98,6 +106,7 @@ impl PageIo {
         Ok(PageIo {
             backing: Backing::Memory { pages: Vec::new() },
             read_only: false,
+            fsync_calls: Cell::new(0),
         })
     }
 
@@ -234,13 +243,27 @@ impl PageIo {
         match &self.backing {
             Backing::File { file } => {
                 file.sync_all()?;
-                Ok(())
             }
             // No durable storage to flush. The commit protocol still calls
             // fsync twice per commit; that overhead (two method calls and
             // two matches) is preserved for benchmark fidelity.
-            Backing::Memory { .. } => Ok(()),
+            Backing::Memory { .. } => {}
         }
+        // Increment AFTER the operation succeeds. A failed fsync is fatal
+        // (fsyncgate — see I1) and the manager will be poisoned, so the
+        // counter going off-by-one on a poisoned engine is the least of
+        // anyone's worries — but we don't want a successful retry (which
+        // we do not allow) to be undercounted by a prior failure.
+        self.fsync_calls.set(self.fsync_calls.get() + 1);
+        Ok(())
+    }
+
+    /// Cumulative successful fsync calls since this `PageIo` was opened.
+    /// Failed fsyncs are not counted (a failed fsync poisons the engine
+    /// — see I1 — so the counter on a poisoned engine has no defined
+    /// meaning beyond "at least this many succeeded").
+    pub fn fsync_count(&self) -> u64 {
+        self.fsync_calls.get()
     }
 
     /// Return the number of whole pages in the file.
@@ -355,6 +378,17 @@ mod read_only_tests {
         let buf = io.read_page(0).unwrap();
         assert_eq!(buf, [0u8; PAGE_SIZE]);
     }
+
+    #[test]
+    fn fsync_count_increments_per_successful_fsync() {
+        let f = seeded_file();
+        let io = PageIo::open(f.path(), false).unwrap();
+        assert_eq!(io.fsync_count(), 0);
+        io.fsync().unwrap();
+        assert_eq!(io.fsync_count(), 1);
+        io.fsync().unwrap();
+        assert_eq!(io.fsync_count(), 2);
+    }
 }
 
 #[cfg(test)]
@@ -456,5 +490,17 @@ mod memory_backing_tests {
         for p in 1..4 {
             assert_eq!(io.read_page(p).unwrap(), [0u8; PAGE_SIZE]);
         }
+    }
+
+    #[test]
+    fn fsync_count_in_memory_backing_also_increments() {
+        // Memory backing's fsync is a no-op for durability but still counts:
+        // benchmarks against in-memory PageIo should see commit-equivalent
+        // counter behaviour.
+        let io = PageIo::open_in_memory().unwrap();
+        assert_eq!(io.fsync_count(), 0);
+        io.fsync().unwrap();
+        io.fsync().unwrap();
+        assert_eq!(io.fsync_count(), 2);
     }
 }
