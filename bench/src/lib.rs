@@ -13,3 +13,7 @@
 // ChiselEngine. Subsequent PRs add the other engines (PR 3), the
 // workload + runner + micro grid (PR 4), the reporter (PR 5),
 // scenarios (PR 6), and CI integration (PR 7).
+
+pub mod engine;
+
+pub use engine::{Engine, EngineResult, Identifier};
