@@ -42,6 +42,20 @@ fn smoke_full_lifecycle_through_engine_trait() {
     engine.delete_many(&[b, c]).expect("delete_many b,c");
     engine.commit().expect("commit");
 
+    // Verify the deletes actually invalidated the handles. Without
+    // this, a no-op delete (or delete_many that drops the slice
+    // silently) would slip past the smoke test — the next call to
+    // read() on a deleted handle must error, not return stale bytes.
+    assert!(engine.read(a).is_err(), "delete must invalidate handle a");
+    assert!(
+        engine.read(b).is_err(),
+        "delete_many must invalidate handle b"
+    );
+    assert!(
+        engine.read(c).is_err(),
+        "delete_many must invalidate handle c"
+    );
+
     // Rollback path: begin, allocate, rollback. Resulting handle
     // must not be readable after rollback (it never became durable).
     engine.begin().expect("begin");
