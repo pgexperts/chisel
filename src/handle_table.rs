@@ -320,7 +320,10 @@ impl HandleTable {
             if prev_entry.is_none() {
                 // Recursion did not write a tombstone (subtree already
                 // tombstoned or absent at the leaf). No COW at this
-                // level either; the child pointer is unchanged.
+                // level either: the original `page` is still referenced
+                // by the committed superblock and remains unmodified,
+                // and we have no new child id to link in — returning
+                // `(page, None)` preserves the COW invariant.
                 return Ok((page, None));
             }
             // Recursion COWed below us. COW this interior page so it
