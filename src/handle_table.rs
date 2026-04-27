@@ -216,20 +216,130 @@ impl HandleTable {
         self.insert_recursive(cache, current_root, handle, entry, self.depth)
     }
 
-    /// Mark a handle as deleted. Returns the new root page ID (COW).
+    /// Delete a handle: write a tombstone for it and return the previous
+    /// entry in a single tree descent.
     ///
-    /// Delete is a tombstone write, not slot reclamation: the leaf entry
-    /// stays at its fixed (handle % 510) position forever. This is why
-    /// `next_handle` is monotonic in the transaction layer — reusing a
-    /// deleted handle would be ambiguous against a stale reader's cached
-    /// handle value.
-    pub fn delete(&mut self, cache: &mut PageCache, root: u64, handle: u64) -> Result<u64> {
-        let deleted_entry = HandleEntry {
-            page_id: 0,
-            slot_index: 0,
-            flags: HandleFlags::Deleted,
-        };
-        self.insert(cache, root, handle, &deleted_entry)
+    /// Returns `(new_root, Some(entry))` if the handle had a Live or
+    /// Overflow entry that was just tombstoned. Returns `(root, None)`
+    /// — note unchanged root — if the handle was absent or already a
+    /// tombstone; in those cases no COW is performed and the tree is
+    /// not grown. This contrasts with the historical `insert(deleted)`
+    /// implementation which always COWed and could grow the tree even
+    /// for no-op deletes.
+    ///
+    /// Tombstone-write semantics are unchanged: the leaf entry stays
+    /// at its fixed `(handle % ENTRIES_PER_LEAF)` position forever
+    /// once written. This is why `next_handle` in the transaction
+    /// layer is monotonic — reusing a deleted handle would be
+    /// ambiguous against a stale reader.
+    pub fn delete(
+        &mut self,
+        cache: &mut PageCache,
+        root: u64,
+        handle: u64,
+    ) -> Result<(u64, Option<HandleEntry>)> {
+        // Empty tree: nothing to delete.
+        if root == PAGE_ID_NONE {
+            return Ok((root, None));
+        }
+        // I26-style guard: handle outside tree's reach is definitionally
+        // absent. No tree growth (insert grows; delete doesn't).
+        if handle >= self.capacity() {
+            return Ok((root, None));
+        }
+        self.delete_recursive(cache, root, handle, self.depth)
+    }
+
+    /// Single-pass recursive descent that reads the existing entry at
+    /// the leaf and writes the tombstone via COW on the way back up.
+    /// If the leaf entry is already Deleted (or the subtree is absent
+    /// via a zero child pointer), no COW is performed at any level —
+    /// the original page IDs propagate back up unchanged.
+    fn delete_recursive(
+        &mut self,
+        cache: &mut PageCache,
+        page: u64,
+        handle: u64,
+        level: u32,
+    ) -> Result<(u64, Option<HandleEntry>)> {
+        if level == 0 {
+            // Leaf: read the entry. Decide whether to write tombstone.
+            let index = (handle as usize) % ENTRIES_PER_LEAF;
+            let entry = {
+                let buf = cache.get(page)?;
+                Self::read_entry(buf, index)
+            };
+            match entry.flags {
+                HandleFlags::Deleted => {
+                    // Already tombstoned (or never written — read_entry
+                    // on a zeroed slot decodes flag byte 0 which is not
+                    // Live (1) or Overflow (2), so it presents as
+                    // Deleted by elimination). No COW.
+                    Ok((page, None))
+                }
+                HandleFlags::Live | HandleFlags::Overflow => {
+                    // COW the leaf, write tombstone, return Some(entry).
+                    // Pattern mirrors insert_recursive's leaf branch.
+                    let new_leaf = cache.new_page()?;
+                    debug_assert_ne!(new_leaf, 0); // I8
+                    {
+                        let buf_copy: [u8; PAGE_SIZE] = *cache.get(page)?;
+                        let new_buf = cache.get_mut(new_leaf)?;
+                        *new_buf = buf_copy;
+                    }
+                    let tombstone = HandleEntry {
+                        page_id: 0,
+                        slot_index: 0,
+                        flags: HandleFlags::Deleted,
+                    };
+                    {
+                        let new_buf = cache.get_mut(new_leaf)?;
+                        Self::write_entry(new_buf, index, &tombstone);
+                        page::stamp_checksum(new_buf);
+                    }
+                    Ok((new_leaf, Some(entry)))
+                }
+            }
+        } else {
+            // Interior: descend the appropriate child.
+            let child_span = self.span_at_level(level);
+            let child_idx = (handle / child_span) as usize;
+            let child_page = {
+                let buf = cache.get(page)?;
+                let offset = DATA_PAGE_HEADER_SIZE + child_idx * CHILD_PTR_SIZE;
+                u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())
+            };
+            if child_page == 0 {
+                // Subtree never allocated — handle is definitionally
+                // absent. No COW at any level above; return the
+                // original page id unchanged.
+                return Ok((page, None));
+            }
+            let (new_child, prev_entry) =
+                self.delete_recursive(cache, child_page, handle % child_span, level - 1)?;
+            if prev_entry.is_none() {
+                // Recursion did not write a tombstone (subtree already
+                // tombstoned or absent at the leaf). No COW at this
+                // level either; the child pointer is unchanged.
+                return Ok((page, None));
+            }
+            // Recursion COWed below us. COW this interior page so it
+            // points at the new child.
+            let new_page = cache.new_page()?;
+            debug_assert_ne!(new_page, 0); // I8
+            {
+                let buf_copy: [u8; PAGE_SIZE] = *cache.get(page)?;
+                let new_buf = cache.get_mut(new_page)?;
+                *new_buf = buf_copy;
+            }
+            {
+                let new_buf = cache.get_mut(new_page)?;
+                let offset = DATA_PAGE_HEADER_SIZE + child_idx * CHILD_PTR_SIZE;
+                new_buf[offset..offset + 8].copy_from_slice(&new_child.to_le_bytes());
+                page::stamp_checksum(new_buf);
+            }
+            Ok((new_page, prev_entry))
+        }
     }
 
     /// Iterate over all live entries. Returns (handle, HandleEntry) pairs.
@@ -614,6 +724,139 @@ mod tests {
         assert_eq!(
             result, None,
             "sparse handle must report absent, not a bogus entry"
+        );
+    }
+
+    #[test]
+    fn delete_returns_some_for_live_entry() {
+        let mut cache = make_cache();
+        let mut ht = HandleTable::new();
+        let root = ht.create_root(&mut cache).unwrap();
+
+        // Insert a Live entry.
+        let live_entry = HandleEntry {
+            page_id: 42,
+            slot_index: 7,
+            flags: HandleFlags::Live,
+        };
+        let root_after_insert = ht.insert(&mut cache, root, 100, &live_entry).unwrap();
+
+        // Delete it. Expect (new_root, Some(live_entry-equivalent)).
+        let (new_root, prev_entry) = ht.delete(&mut cache, root_after_insert, 100).unwrap();
+
+        assert_ne!(
+            new_root, root_after_insert,
+            "delete of a Live entry must COW the leaf"
+        );
+        let entry = prev_entry.expect("delete of a Live entry must return Some(entry)");
+        assert_eq!(entry.page_id, 42);
+        assert_eq!(entry.slot_index, 7);
+        assert_eq!(entry.flags, HandleFlags::Live);
+    }
+
+    #[test]
+    fn delete_returns_some_for_overflow_entry() {
+        let mut cache = make_cache();
+        let mut ht = HandleTable::new();
+        let root = ht.create_root(&mut cache).unwrap();
+
+        let overflow_entry = HandleEntry {
+            page_id: 99,
+            slot_index: 0,
+            flags: HandleFlags::Overflow,
+        };
+        let root_after_insert = ht.insert(&mut cache, root, 200, &overflow_entry).unwrap();
+
+        let (new_root, prev_entry) = ht.delete(&mut cache, root_after_insert, 200).unwrap();
+
+        assert_ne!(
+            new_root, root_after_insert,
+            "delete of an Overflow entry must COW the leaf"
+        );
+        let entry = prev_entry.expect("delete of an Overflow entry must return Some(entry)");
+        assert_eq!(entry.page_id, 99);
+        assert_eq!(entry.flags, HandleFlags::Overflow);
+    }
+
+    #[test]
+    fn delete_returns_none_for_already_deleted() {
+        let mut cache = make_cache();
+        let mut ht = HandleTable::new();
+        let root = ht.create_root(&mut cache).unwrap();
+
+        let live_entry = HandleEntry {
+            page_id: 42,
+            slot_index: 7,
+            flags: HandleFlags::Live,
+        };
+        let root_after_insert = ht.insert(&mut cache, root, 100, &live_entry).unwrap();
+
+        // First delete: returns Some(entry).
+        let (root_after_first_delete, _) = ht.delete(&mut cache, root_after_insert, 100).unwrap();
+
+        // Second delete: handle is now a tombstone. Expect (root, None) with NO COW.
+        let (root_after_second_delete, prev_entry) =
+            ht.delete(&mut cache, root_after_first_delete, 100).unwrap();
+
+        assert_eq!(
+            prev_entry, None,
+            "delete of an already-tombstoned handle must return None"
+        );
+        assert_eq!(
+            root_after_second_delete, root_after_first_delete,
+            "no-op delete must not COW the tree (root unchanged)"
+        );
+    }
+
+    #[test]
+    fn delete_returns_none_for_absent_handle_in_existing_subtree() {
+        let mut cache = make_cache();
+        let mut ht = HandleTable::new();
+        let root = ht.create_root(&mut cache).unwrap();
+
+        // Insert handle 100 — this allocates the depth-0 leaf containing slots
+        // 0..510. Handle 200 lands in the same leaf (slot 200) but was never
+        // written, so its slot is zeroed (read_entry returns flags = 0 = treated
+        // as Deleted by the leaf-level branch).
+        let live_entry = HandleEntry {
+            page_id: 42,
+            slot_index: 7,
+            flags: HandleFlags::Live,
+        };
+        let root_after_insert = ht.insert(&mut cache, root, 100, &live_entry).unwrap();
+
+        let (new_root, prev_entry) = ht.delete(&mut cache, root_after_insert, 200).unwrap();
+
+        assert_eq!(
+            prev_entry, None,
+            "delete of an absent slot must return None"
+        );
+        assert_eq!(
+            new_root, root_after_insert,
+            "delete of an absent slot must not COW the tree"
+        );
+    }
+
+    #[test]
+    fn delete_does_not_grow_tree_for_handle_beyond_capacity() {
+        let mut cache = make_cache();
+        let mut ht = HandleTable::new();
+        let root = ht.create_root(&mut cache).unwrap();
+
+        // Tree is at depth 0 (capacity = 510). u64::MAX is far beyond.
+        assert_eq!(ht.depth(), 0);
+
+        let (new_root, prev_entry) = ht.delete(&mut cache, root, u64::MAX).unwrap();
+
+        assert_eq!(prev_entry, None);
+        assert_eq!(
+            new_root, root,
+            "delete beyond capacity must not COW the tree"
+        );
+        assert_eq!(
+            ht.depth(),
+            0,
+            "delete beyond capacity must NOT grow the tree (insert would have grown; delete must not)"
         );
     }
 
