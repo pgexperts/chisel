@@ -1370,7 +1370,10 @@ impl TransactionManager {
                 // Unreachable: handle_table::delete returns None for
                 // already-tombstoned entries, and we escalated None
                 // to InvalidHandle above.
-                unreachable!("handle_table::delete returns None for Deleted entries");
+                unreachable!(
+                    "handle_table::delete returns None for Deleted entries; \
+                     None was already escalated to InvalidHandle by ok_or above"
+                );
             }
         }
 
