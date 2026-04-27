@@ -1337,17 +1337,24 @@ impl TransactionManager {
             return Err(ChiselError::NoActiveTransaction);
         }
 
-        let entry = {
+        // Single tree walk (I32): writes the tombstone AND returns the
+        // previous entry. Returns Some(entry) if a Live/Overflow handle
+        // was tombstoned; None if the handle was absent or already a
+        // tombstone. We escalate None to InvalidHandle here at the
+        // caller layer to preserve the public-API behavior.
+        let (new_root, prev_entry) = {
             let mut cache = self.cache.borrow_mut();
             self.handle_table
-                .lookup(&mut cache, self.current_roots.handle_table_page, handle)?
-                .ok_or(ChiselError::InvalidHandle(handle))?
+                .delete(&mut cache, self.current_roots.handle_table_page, handle)?
         };
+        let entry = prev_entry.ok_or(ChiselError::InvalidHandle(handle))?;
 
-        // Free the old location. Same slot-level semantics as update
-        // (see the comment there): inline entries decrement the page's
-        // live-slot count and only free the page when it hits zero;
-        // overflow chains are deleted in full.
+        // Tombstone is now in current_roots; release the value's
+        // storage. Order vs. the tombstone write doesn't matter for
+        // correctness — both halves become durable (or rolled back)
+        // atomically at commit. Tombstone-first is simpler than the
+        // historical lookup-release-tombstone shape and avoids the
+        // redundant lookup walk.
         match entry.flags {
             HandleFlags::Live => {
                 self.release_data_slot(entry.page_id);
@@ -1359,16 +1366,15 @@ impl TransactionManager {
                 };
                 self.txn_freed_pages.extend_from_slice(&freed);
             }
-            HandleFlags::Deleted => {}
+            HandleFlags::Deleted => {
+                // Unreachable: handle_table::delete returns None for
+                // already-tombstoned entries, and we escalated None
+                // to InvalidHandle above.
+                unreachable!("handle_table::delete returns None for Deleted entries");
+            }
         }
 
-        let new_root = {
-            let mut cache = self.cache.borrow_mut();
-            self.handle_table
-                .delete(&mut cache, self.current_roots.handle_table_page, handle)?
-        };
         self.current_roots.handle_table_page = new_root;
-
         Ok(())
     }
 
