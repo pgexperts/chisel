@@ -475,7 +475,9 @@ fn test_handle_table_delete() {
         flags: HandleFlags::Live,
     };
     root = ht.insert(&mut cache, root, 0, &entry).unwrap();
-    root = ht.delete(&mut cache, root, 0).unwrap();
+    let (new_root, prev) = ht.delete(&mut cache, root, 0).unwrap();
+    root = new_root;
+    assert!(prev.is_some(), "delete of a live entry must return Some");
     let found = ht.lookup(&mut cache, root, 0).unwrap();
     assert!(found.is_none());
 }
