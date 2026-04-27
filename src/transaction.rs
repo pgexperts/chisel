@@ -1337,17 +1337,24 @@ impl TransactionManager {
             return Err(ChiselError::NoActiveTransaction);
         }
 
-        let entry = {
+        // Single tree walk (I32): writes the tombstone AND returns the
+        // previous entry. Returns Some(entry) if a Live/Overflow handle
+        // was tombstoned; None if the handle was absent or already a
+        // tombstone. We escalate None to InvalidHandle here at the
+        // caller layer to preserve the public-API behavior.
+        let (new_root, prev_entry) = {
             let mut cache = self.cache.borrow_mut();
             self.handle_table
-                .lookup(&mut cache, self.current_roots.handle_table_page, handle)?
-                .ok_or(ChiselError::InvalidHandle(handle))?
+                .delete(&mut cache, self.current_roots.handle_table_page, handle)?
         };
+        let entry = prev_entry.ok_or(ChiselError::InvalidHandle(handle))?;
 
-        // Free the old location. Same slot-level semantics as update
-        // (see the comment there): inline entries decrement the page's
-        // live-slot count and only free the page when it hits zero;
-        // overflow chains are deleted in full.
+        // Tombstone is now in current_roots; release the value's
+        // storage. Order vs. the tombstone write doesn't matter for
+        // correctness — both halves become durable (or rolled back)
+        // atomically at commit. Tombstone-first is simpler than the
+        // historical lookup-release-tombstone shape and avoids the
+        // redundant lookup walk.
         match entry.flags {
             HandleFlags::Live => {
                 self.release_data_slot(entry.page_id);
@@ -1359,35 +1366,35 @@ impl TransactionManager {
                 };
                 self.txn_freed_pages.extend_from_slice(&freed);
             }
-            HandleFlags::Deleted => {}
+            HandleFlags::Deleted => {
+                // Unreachable: handle_table::delete returns None for
+                // already-tombstoned entries, and we escalated None
+                // to InvalidHandle above.
+                unreachable!(
+                    "handle_table::delete returns None for Deleted entries; \
+                     None was already escalated to InvalidHandle by ok_or above"
+                );
+            }
         }
 
-        let new_root = {
-            let mut cache = self.cache.borrow_mut();
-            self.handle_table
-                .delete(&mut cache, self.current_roots.handle_table_page, handle)?
-        };
         self.current_roots.handle_table_page = new_root;
-
         Ok(())
     }
 
-    /// Delete many handles in a single transaction (ISSUES.md F1 / I12).
+    /// Delete many handles in a single transaction.
     ///
-    /// The motivating use case is client-side `drop_table` /
-    /// `drop_index_table`, which need to remove many row and node
-    /// handles at once without leaking their pages. Under the
-    /// freemap-aware delete (I10), every single delete returns its
-    /// pages to `txn_freed_pages`; this helper just loops over them
-    /// inside a single transaction so the whole bulk delete is atomic
-    /// on commit.
+    /// Today: this is a loop over `delete_inner`. After PR-A's fusion
+    /// (I32), each delete walks the handle table once per handle. For
+    /// dense delete patterns (many handles in the same leaf), a
+    /// per-leaf batched implementation would walk once per leaf
+    /// instead — that's tracked as I33 in ISSUES.md, deferred until
+    /// a workload demonstrates the win is worth the complexity.
     ///
     /// Error semantics: on the first error the loop stops and returns
-    /// the error. Handles deleted before the failure remain marked for
-    /// deletion in `current_roots`, so the caller can choose between
-    /// `rollback()` (abandon the whole batch) or `commit()` (keep the
-    /// partial work). This matches the rest of the API where
-    /// individual operations fail in isolation.
+    /// the error. Handles deleted before the failure remain marked
+    /// for deletion in `current_roots`, so the caller can choose
+    /// between `rollback()` (abandon the whole batch) or `commit()`
+    /// (keep the partial work).
     pub fn delete_many(&mut self, handles: &[u64]) -> Result<()> {
         self.check_alive()?;
         let result = self.delete_many_inner(handles);
@@ -1398,6 +1405,7 @@ impl TransactionManager {
         if !self.active_txn {
             return Err(ChiselError::NoActiveTransaction);
         }
+        // See I33 in ISSUES.md for the deferred per-leaf batching work.
         for &handle in handles {
             self.delete_inner(handle)?;
         }
