@@ -204,6 +204,66 @@ For any `handle >= HandleTable::capacity()`, the descent loop computes `child_id
 
 **Regression test:** `lookup_handle_beyond_capacity_returns_none` in `src/handle_table.rs`. Grows the tree to depth 1 and asserts both the first-overflow boundary (`handle == ENTRIES_PER_LEAF * PTRS_PER_INTERIOR`, the historical reads-checksum-as-child case — which without the fix returned `Err(InvalidPageId { page_id: <xxhash of interior page> })`) and `handle == u64::MAX` (the would-panic case) both return `Ok(None)`.
 
+### I32. `delete_inner` walks the handle table twice per handle [perf-review 2026-04-26] — **P2** ✅ IMPLEMENTED 2026-04-26
+**Where:** `transaction.rs` `delete_inner`; `handle_table.rs` `delete`
+
+**Problem:** `delete_inner` calls `handle_table::lookup` to read the
+existing entry, then calls `handle_table::delete` which is
+`insert(deleted_entry)` underneath — that walks the tree a second time,
+COWing as it goes. Per handle, the radix tree is descended twice. For
+1000 sequential deletes inside one transaction, that's 2000 tree walks
+instead of 1000.
+
+**Fix:** Fuse the two operations. `handle_table::delete` becomes a
+single recursive descent that reads the existing entry from the leaf,
+writes the tombstone in the same COW pass, and returns
+`(new_root, Option<HandleEntry>)`. The Option lets `delete_inner`
+distinguish "was Live/Overflow → escalate to release" from "was absent
+or already tombstoned → escalate to InvalidHandle." `delete_inner`
+becomes one tree walk per handle.
+
+**Bonus optimizations falling out of the fusion:**
+  - For absent handles or already-tombstoned entries, the new
+    implementation returns `(root, None)` immediately without COWing
+    the path or growing the tree. Today's code path (unreachable from
+    `delete_inner` since `lookup` short-circuits first) would have
+    COWed and possibly grown — wasted writes that no caller benefits
+    from.
+  - `delete` no longer calls `grow()`. Tree growth stays in `insert`.
+
+**Regression tests:** Five new unit tests in `handle_table.rs`
+covering the four return-value cases (Live, Overflow, already-Deleted,
+absent) plus a no-tree-growth assertion for the beyond-capacity case.
+
+### I33. `delete_many` is not actually batched per-leaf [perf-review 2026-04-26] — **P3** (deferred)
+**Where:** `transaction.rs` `delete_many_inner`
+
+**Problem:** `delete_many` is a thin loop over `delete_inner`. After
+I32, each delete walks the handle table once per handle. For dense
+delete patterns (e.g., 1000 handles concentrated in 5 leaves), a true
+batched implementation would walk once per unique leaf — 5 walks
+instead of 1000, with all tombstones for each leaf written in a
+single COW pass.
+
+**Why deferred:** Sparse delete patterns get no benefit; the win is
+shape-specific. No concrete client currently demands bulk delete
+latency below the fsync floor. PR 4 of the bench-suite series
+(scenario tier S3 "mutation log") will surface whether real workloads
+hit the dense pattern; if they do, this becomes actionable. Until
+then, YAGNI.
+
+**Fix when actionable:**
+  - Sort handles by their target leaf (computed via `handle / span`
+    decomposition without actually descending).
+  - Group handles by leaf.
+  - For each unique leaf: descend the tree once, COW the path, write
+    all tombstones for that leaf in one pass.
+  - Parallel optimization for `release_data_slot`: handles whose Live
+    entries point to the same data page can have their slot-count
+    decrements batched.
+  - Estimated 5–10× speedup for dense delete patterns; no change for
+    sparse.
+
 ---
 
 ## Space leaks (freemap not wired)
