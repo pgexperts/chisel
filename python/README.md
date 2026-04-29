@@ -67,6 +67,8 @@ A second explicit drive (after a previous `.commit()`, `.rollback()`, or implici
 
 For code that needs finer control, `db.begin() / db.commit() / db.rollback()` are available directly on the `Chisel` object. Mixing them with the `with db.transaction()` form in the same block is not supported.
 
+Savepoints are not available in the low-level form: there is no `db.savepoint()`. If you need savepoints, use the `with db.transaction() as tx:` form — savepoints are exposed as `tx.savepoint(name)`, deliberately tied to a `Transaction` object so its lifetime bounds the savepoint stack.
+
 ## Savepoints
 
 Named marks within a transaction. `Savepoint` is itself a context manager: on clean exit it calls `release()`; on exception it calls `rollback_to()`.
@@ -84,6 +86,7 @@ with db.transaction() as tx:
 - `sp.release()` flattens the savepoint into the enclosing scope; any savepoints layered on top are also released.
 - `sp.rollback_to()` undoes changes back to the savepoint and leaves it on the stack so you can try again.
 - A second explicit `.release()` or `.rollback_to()` raises `AlreadyFinishedError`.
+- `sp.name` is a read-only attribute returning the savepoint's name — useful for logging or debugging mid-transaction.
 
 ## Values (buffer protocol)
 
@@ -107,6 +110,13 @@ with db.transaction() as tx:
 # tx.read(h) would raise InvalidHandleError post-commit
 ```
 
+For bulk deletes, `delete_many` takes a sequence of handles in one call:
+
+```python
+with db.transaction() as tx:
+    tx.delete_many([h1, h2, h3])
+```
+
 `db.handles()` enumerates every live handle (order unspecified).
 
 ## Named roots
@@ -124,6 +134,13 @@ meta = db.get_root_name("meta")  # -> int, or None if unbound
 
 Names must be non-empty, UTF-8, bounded in length, and contain no NUL bytes. The table has a small fixed capacity; `RootNameTableFullError` fires on overflow.
 
+`tx.clear_root_name(name)` removes a binding. Like `set_root_name`, it's transactional — the unbinding takes effect on commit and reverts on rollback:
+
+```python
+with db.transaction() as tx:
+    tx.clear_root_name("meta")
+```
+
 ## Stats and defrag
 
 ```python
@@ -138,6 +155,35 @@ with db.transaction() as tx:
 ```
 
 `defrag()` requires an active transaction so it composes with other work and is atomic on commit. `max_pages = 0` means "no cap"; otherwise it bounds how many values get relocated in one pass (the name is a legacy carry-over — see `DefragOptions.max_pages`'s docstring).
+
+## Engine counters
+
+`db.counters()` returns a `Counters` snapshot of four cumulative engine-activity counters since the database was opened. Useful for debugging hot reads, characterising commit overhead, or driving an external benchmark harness.
+
+```python
+c = db.counters()
+# Counters(cache_hits=1234, cache_misses=89, pages_allocated=42, fsync_calls=14)
+```
+
+The four fields:
+
+- `cache_hits` — `PageCache.get` returned a cached page without disk I/O.
+- `cache_misses` — `PageCache.get` had to load from disk (and validate the page's XXH3 checksum).
+- `pages_allocated` — `PageCache.new_page` invocations; counts attempted allocations even when the cache subsequently hits its hard ceiling.
+- `fsync_calls` — successful `PageIo.fsync` invocations; two per commit (data pages, then superblock).
+
+The counters are point-in-time snapshots; they do not update after the call. Read them again to observe new totals. They reset implicitly on `close()` + reopen because the underlying engine state is rebuilt; nothing is persisted to disk.
+
+The typical pattern is read-subtract-read for per-operation deltas:
+
+```python
+before = db.counters()
+with db.transaction() as tx:
+    tx.allocate(b"...")
+after = db.counters()
+print(after.fsync_calls - before.fsync_calls)   # commit cost: 2 (data + superblock)
+print(after.pages_allocated - before.pages_allocated)
+```
 
 ## Opening a database
 
@@ -212,6 +258,14 @@ except chisel.FatalError:
 ```
 
 The shadow-paging recovery path guarantees the reopened database is at a consistent, committed state — there is no log replay and no partial-recovery window.
+
+You can also check the poisoned state explicitly via the `is_poisoned` read-only property (useful for periodic health checks or reading state after catching a `PoisonedError`):
+
+```python
+if db.is_poisoned:
+    db.close()
+    db = chisel.open("db.chisel")
+```
 
 ## Thread safety
 
