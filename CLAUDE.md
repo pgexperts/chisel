@@ -36,19 +36,22 @@ Public Python API lives in `python/chisel/__init__.py`; type stubs in
 
 The `bench/` subcrate is the foundation of an in-progress benchmark
 suite — independent crate, sibling to `python/`, path-deps on the
-root `chisel` crate. Currently provides the `Engine` trait
-(uniform façade over Chisel, redb, and SQLite) and a working
-`ChiselEngine` impl with a smoke test. Build / run locally with:
+root `chisel` crate. Currently provides the `Engine` trait (uniform
+façade over Chisel, redb, and SQLite), working `ChiselEngine`,
+`RedbEngine`, and `SqliteEngine` impls, and cross-engine equivalence
+tests (5 scenarios × 3 engines = 15 tests). Build / run locally with:
 
 ```bash
 cd bench && cargo test
 ```
 
-PRs 3–7 of the bench-suite series will add the redb / SQLite engines,
-workload generators, the diagnostic micro grid, output
-post-processing, scenarios, and CI integration. Design spec at
-`docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md`;
-per-PR plans alongside in `docs/superpowers/plans/`.
+PRs 4–8 of the bench-suite series will add workload generators, the
+diagnostic micro grid, output post-processing, scenarios, CI
+integration, and cross-engine relative-performance tests
+(Chisel vs redb vs SQLite). Design spec at
+`docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md`
+covers PRs 1–7; PR 8 is an addendum tracked here pending its own
+spec/plan. Per-PR plans alongside in `docs/superpowers/plans/`.
 
 ## Architecture
 
@@ -87,10 +90,13 @@ in a future minor release rather than calendar time.
 
 Concurrent in-progress work (tracked outside `ISSUES.md` via spec+plan
 docs): the benchmark-suite series. PRs 1 (counter instrumentation
-exposing `Chisel::counters()`) and 2 (`bench/` subcrate + `Engine`
-trait + `ChiselEngine`) have landed on `main` as of 2026-04-25;
-PRs 3–7 are pending. See `docs/superpowers/specs/2026-04-25-chisel-
-benchmark-suite-design.md`.
+exposing `Chisel::counters()`), 2 (`bench/` subcrate + `Engine` trait
++ `ChiselEngine`), and 3 (`RedbEngine` + `SqliteEngine` + cross-engine
+equivalence tests) have landed on `main` as of 2026-04-30; PRs 4–8
+are pending. PR 8 (cross-engine relative-performance tests, Chisel vs
+redb vs SQLite) is an addendum to the original design — it will get
+its own spec/plan pair when brainstormed. See
+`docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md`.
 
 ## Conventions
 
