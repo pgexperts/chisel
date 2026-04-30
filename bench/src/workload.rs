@@ -109,6 +109,25 @@ pub fn gen_read_random(seed: u64, prepop_count: usize, count: usize) -> Workload
     }
 }
 
+/// Row 5/6 of the micro grid (update, 1 op/tx and 1000 ops/tx).
+/// Same selection scheme as `gen_read_random` — uniform random with
+/// replacement — but emits Update ops with `size` bytes of filler.
+pub fn gen_update_random(seed: u64, prepop_count: usize, count: usize, size: usize) -> Workload {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let ops = (0..count)
+        .map(|_| Operation::Update {
+            alloc_index: rng.gen_range(0..prepop_count),
+            size,
+        })
+        .collect();
+    Workload {
+        name: "update_random".to_string(),
+        seed,
+        prepop_count,
+        ops,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +202,31 @@ mod tests {
         let a = gen_read_random(1, 1000, 100);
         let b = gen_read_random(2, 1000, 100);
         assert_ne!(a.ops, b.ops);
+    }
+
+    #[test]
+    fn gen_update_random_determinism() {
+        let a = gen_update_random(42, 1000, 100, 64);
+        let b = gen_update_random(42, 1000, 100, 64);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn gen_update_random_validity() {
+        let prepop = 1000;
+        let w = gen_update_random(1, prepop, 500, 256);
+        assert_eq!(w.name, "update_random");
+        assert_eq!(w.seed, 1);
+        assert_eq!(w.prepop_count, prepop);
+        assert_eq!(w.ops.len(), 500);
+        for op in &w.ops {
+            match op {
+                Operation::Update { alloc_index, size } => {
+                    assert!(*alloc_index < prepop, "out-of-range index {}", alloc_index);
+                    assert_eq!(*size, 256);
+                }
+                other => panic!("expected Update, got {:?}", other),
+            }
+        }
     }
 }
