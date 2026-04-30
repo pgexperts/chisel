@@ -78,6 +78,15 @@ pub struct PageCache {
     // `retain` scans on every page touch and showed up at 66% of CPU
     // on a 70k-row INSERT profile, prompting the swap).
     lru: LruIndex,
+    /// Count of dirty entries. Maintained incrementally on every
+    /// dirty-flag transition (`get_mut`, `new_page`, `claim_page`,
+    /// `flush`, `discard`, `discard_all_dirty`, `truncate`). Lets
+    /// `maybe_evict` short-circuit when `dirty_count == entries.len()` —
+    /// without it, the eviction scan walks the full LRU on every
+    /// allocation in a write-heavy transaction (where all pages are
+    /// dirty and no victim exists), trivially making page-allocation
+    /// O(n) per call. With this counter the early-out is O(1).
+    dirty_count: usize,
     max_pages: usize,
     // Monotonically increasing allocator for shadow-paged new pages. Never
     // reused within a process lifetime except via `truncate()`.
@@ -120,6 +129,7 @@ impl PageCache {
             io,
             entries: HashMap::new(),
             lru: LruIndex::new(),
+            dirty_count: 0,
             max_pages,
             next_page_id,
             cache_hits: Cell::new(0),
@@ -171,7 +181,12 @@ impl PageCache {
         }
         self.touch_lru(page_id);
         let entry = self.entries.get_mut(&page_id).unwrap();
-        entry.dirty = true;
+        // Track clean→dirty transitions for the dirty_count counter.
+        // No-op on dirty→dirty (entry was already counted).
+        if !entry.dirty {
+            self.dirty_count += 1;
+            entry.dirty = true;
+        }
         Ok(&mut entry.buf)
     }
 
@@ -250,6 +265,7 @@ impl PageCache {
             dirty: true,
         };
         self.entries.insert(page_id, entry);
+        self.dirty_count += 1;
         self.lru.push_front(page_id);
         self.pages_allocated.set(self.pages_allocated.get() + 1);
         self.maybe_evict()?;
@@ -305,6 +321,8 @@ impl PageCache {
             self.io.write_page(page_id, &entry.buf)?;
             entry.dirty = false;
         }
+        // Every dirty entry was flipped clean above; the counter resets.
+        self.dirty_count = 0;
         self.io.fsync()?;
         Ok(())
     }
@@ -321,7 +339,11 @@ impl PageCache {
     /// hand the same ID to two different allocations. Leaving `next_page_id`
     /// monotonic sacrifices a tiny amount of address space for correctness.
     pub fn discard(&mut self, page_id: u64) {
-        self.entries.remove(&page_id);
+        if let Some(entry) = self.entries.remove(&page_id) {
+            if entry.dirty {
+                self.dirty_count -= 1;
+            }
+        }
         self.lru.remove(page_id);
     }
 
@@ -348,6 +370,8 @@ impl PageCache {
             self.entries.remove(&id);
             self.lru.remove(id);
         }
+        // Every removed entry was dirty; the counter resets.
+        self.dirty_count = 0;
     }
 
     /// Return the number of whole pages the underlying file can hold.
@@ -394,7 +418,11 @@ impl PageCache {
             .copied()
             .collect();
         for id in to_remove {
-            self.entries.remove(&id);
+            if let Some(entry) = self.entries.remove(&id) {
+                if entry.dirty {
+                    self.dirty_count -= 1;
+                }
+            }
             self.lru.remove(id);
         }
         self.io.set_page_count(n)?;
@@ -490,16 +518,19 @@ impl PageCache {
         );
         // Remove any pre-existing entry so a stale cached copy from a
         // prior reader doesn't leak into the new transaction's view.
+        // The debug_assert above guarantees any prior entry was clean,
+        // so removing it doesn't change `dirty_count`. Then insert a
+        // fresh dirty entry, incrementing the counter.
         // `LruIndex::push_front` auto-removes any prior entry for this
-        // id before inserting at MRU, so an explicit remove on the LRU
-        // side isn't needed (the entries map still needs the explicit
-        // remove because we're rebinding it to a fresh CacheEntry).
+        // id before inserting at MRU, so an explicit LRU remove isn't
+        // needed.
         self.entries.remove(&page_id);
         let entry = CacheEntry {
             buf: Box::new([0u8; PAGE_SIZE]),
             dirty: true,
         };
         self.entries.insert(page_id, entry);
+        self.dirty_count += 1;
         self.lru.push_front(page_id);
         self.maybe_evict()?;
         Ok(())
@@ -595,6 +626,15 @@ impl PageCache {
     /// a stale LRU id.
     fn maybe_evict(&mut self) -> Result<()> {
         while self.entries.len() > self.max_pages {
+            // Short-circuit: if every cached entry is dirty there can be
+            // no eviction victim, so don't bother walking the LRU. This
+            // is the common case during write-heavy transactions, where
+            // the unconditional walk was an O(n) cost on every
+            // page allocation. With `dirty_count` maintained on every
+            // dirty-flag transition we can decide in O(1).
+            if self.dirty_count == self.entries.len() {
+                break;
+            }
             let victim = self
                 .lru
                 .iter_lru_to_mru()
@@ -604,7 +644,10 @@ impl PageCache {
                     self.entries.remove(&id);
                     self.lru.remove(id);
                 }
-                None => break, // All pages are dirty; fall through to the hard-ceiling check.
+                None => break, // Should be unreachable given the short-circuit
+                               // above, but kept defensively in case dirty_count
+                               // ever drifts from the truth (debug_assert in
+                               // tests catches drift; release falls back here).
             }
         }
         let hard_ceiling = self.max_pages.saturating_mul(HARD_CEILING_MULTIPLIER);
