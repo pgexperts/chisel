@@ -128,6 +128,36 @@ pub fn gen_update_random(seed: u64, prepop_count: usize, count: usize, size: usi
     }
 }
 
+/// Row 7/8 of the micro grid (delete, 1 op/tx and 1000 ops/tx).
+/// Sampled WITHOUT replacement so no index is deleted twice within
+/// the workload — uses Floyd-style sampling via `rand::seq::index::sample`,
+/// O(count) time, no need to materialize the full `0..prepop_count` Vec.
+///
+/// Panics if `count > prepop_count`. This is a generator-author bug
+/// (you cannot delete more records than exist), not a runtime
+/// condition; failing loud at construction time beats silently
+/// producing a malformed workload.
+pub fn gen_delete_random(seed: u64, prepop_count: usize, count: usize) -> Workload {
+    assert!(
+        count <= prepop_count,
+        "gen_delete_random: count ({}) exceeds prepop_count ({})",
+        count,
+        prepop_count
+    );
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let indices = rand::seq::index::sample(&mut rng, prepop_count, count);
+    let ops = indices
+        .iter()
+        .map(|alloc_index| Operation::Delete { alloc_index })
+        .collect();
+    Workload {
+        name: "delete_random".to_string(),
+        seed,
+        prepop_count,
+        ops,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +258,44 @@ mod tests {
                 other => panic!("expected Update, got {:?}", other),
             }
         }
+    }
+
+    #[test]
+    fn gen_delete_random_determinism() {
+        let a = gen_delete_random(42, 1000, 500);
+        let b = gen_delete_random(42, 1000, 500);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn gen_delete_random_no_replacement() {
+        use std::collections::HashSet;
+        let prepop = 1000;
+        let count = 500;
+        let w = gen_delete_random(1, prepop, count);
+        assert_eq!(w.name, "delete_random");
+        assert_eq!(w.seed, 1);
+        assert_eq!(w.prepop_count, prepop);
+        assert_eq!(w.ops.len(), count);
+
+        let mut seen: HashSet<usize> = HashSet::new();
+        for op in &w.ops {
+            match op {
+                Operation::Delete { alloc_index } => {
+                    assert!(*alloc_index < prepop, "out-of-range index {}", alloc_index);
+                    assert!(seen.insert(*alloc_index), "duplicate index {}", alloc_index);
+                }
+                other => panic!("expected Delete, got {:?}", other),
+            }
+        }
+        assert_eq!(seen.len(), count);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds prepop_count")]
+    fn gen_delete_random_panics_on_overcount() {
+        // count > prepop_count is a generator-author bug; we panic
+        // rather than silently produce an invalid workload.
+        let _ = gen_delete_random(0, 10, 11);
     }
 }
