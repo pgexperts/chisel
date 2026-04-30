@@ -16,7 +16,10 @@ fn smoke_full_lifecycle_through_engine_trait() {
     let mut engine = ChiselEngine::open_in_memory(64).expect("open in-memory");
 
     // Counters must be Some for ChiselEngine (the spec's contract).
-    let baseline = engine.internal_counters().expect("Chisel exposes counters");
+    let baseline = engine
+        .internal_counters()
+        .expect("counters must not error")
+        .expect("Chisel exposes counters");
 
     // Allocate three values inside one transaction.
     engine.begin().expect("begin");
@@ -69,6 +72,7 @@ fn smoke_full_lifecycle_through_engine_trait() {
     // Counters advanced.
     let after = engine
         .internal_counters()
+        .expect("counters must not error")
         .expect("Chisel still exposes counters");
     assert!(
         after.fsync_calls > baseline.fsync_calls,

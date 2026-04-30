@@ -82,23 +82,25 @@ impl Engine for ChiselEngine {
     }
 
     fn delete_many(&mut self, ids: &[Identifier]) -> EngineResult<()> {
-        // Allocate-and-collect rather than transmute: Identifier is
-        // `#[repr(transparent)]`-shaped today (pure newtype) but we
-        // don't depend on that — the conversion is cheap and the
-        // intent is clear.
-        let handles: Vec<u64> = ids.iter().map(|i| i.0).collect();
-        Ok(self.db.delete_many(&handles)?)
+        // SAFETY: Identifier is #[repr(transparent)] over u64, so a
+        // slice of Identifier and a slice of u64 have identical
+        // layout. The borrow ends with this call; no aliasing
+        // concern; no 'static lifetime escapes. Saves the per-call
+        // Vec<u64> allocation that the previous safe-collect form
+        // required (audit F5).
+        let handles: &[u64] =
+            unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const u64, ids.len()) };
+        Ok(self.db.delete_many(handles)?)
     }
 
     fn file_size_bytes(&self) -> EngineResult<u64> {
         Ok(self.db.stats()?.file_size_bytes)
     }
 
-    fn internal_counters(&self) -> Option<ChiselCounters> {
-        // Counters returns Result<ChiselCounters>. A poisoned engine
-        // gives Err — surface as None so the runner doesn't propagate
-        // poison through the Option-shaped trait method. The runner's
-        // own happy-path checks will catch poison at the next call.
-        self.db.counters().ok()
+    fn internal_counters(&self) -> EngineResult<Option<ChiselCounters>> {
+        // Propagate poison via ?, in contrast to the previous
+        // `.ok()` mapping that silently masked poison as
+        // Ok(None). Audit F4 fix.
+        Ok(Some(self.db.counters()?))
     }
 }

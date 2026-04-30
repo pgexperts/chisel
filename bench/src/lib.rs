@@ -18,4 +18,4 @@ pub mod chisel_engine;
 pub mod engine;
 
 pub use chisel_engine::ChiselEngine;
-pub use engine::{Engine, EngineResult, Identifier};
+pub use engine::{DurabilityMode, Engine, EngineResult, Identifier};
