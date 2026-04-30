@@ -361,6 +361,36 @@ In practice the window is narrow: the transaction has to be at the hard ceiling 
 
 **Regression test:** `commit_does_not_poison_when_cache_is_past_hard_ceiling` in `src/transaction.rs`. Constructs a `TransactionManager` with `max_pages=4` (hard ceiling 32), saturates the cache via an allocate-until-`CacheFull` loop in a transaction that also has a non-empty `txn_freed_pages` (so `persist_freemap` does not take its early-exit), then calls `commit()` and asserts both `Ok(())` and `!is_poisoned()`. Pre-fix commit returned `Err(CacheFull { limit: 32 })` and poisoned the manager; post-fix both assertions hold.
 
+### I34. mmap-backed shadow page cache region [client 2026-04-30] — **P3** (deferred design)
+**Where:** `page_cache.rs` (cache storage backing)
+
+**Problem:** Today's `PageCache` stores pages as `Box<[u8; PAGE_SIZE]>` heap allocations indexed by `HashMap<u64, CacheEntry>`. Memory is process RSS, capped by the soft `max_pages` limit and the `max_pages × HARD_CEILING_MULTIPLIER` hard ceiling (default 64 MB at `cache_size=1024`). Workloads with working sets larger than the hard ceiling either need the user to crank `cache_size` up (consuming proportional RSS) or accept high cache-miss rates against the database file.
+
+**Proposed design:** Keep the cache logic unchanged — `HashMap<u64, CacheEntry>`, `LruIndex`, `dirty_count`, hit/miss counters. Replace the `Box<[u8; PAGE_SIZE]>` storage with offsets into an mmap'd region backed by a separate ephemeral file:
+
+- On `PageCache::new`, allocate a sized region in a temp file (preferably `O_TMPFILE` on Linux, or `open(O_CREAT, O_EXCL) + unlink` on macOS — the file has no path on the filesystem after the unlink, and is auto-released on process exit or crash). Cleanup is automatic; no leftover state.
+- Each `CacheEntry` stores an offset into the region rather than a heap pointer. Reads / writes go through the mmap pointer.
+- The OS pages cold cache entries to the cache file under memory pressure; pages them back in on access. Effective cache capacity becomes the file size (configurable in GBs), not the RSS budget (capped at MBs).
+
+**Architectural compatibility:**
+
+- *Checksum-on-load invariant unchanged.* Cache loads still go through `load_page`, which validates the XXH3 checksum from the database file before the bytes enter the cache. The mmap region is a transient, process-private store; what's in it has already been validated.
+- *COW lifecycle unchanged.* New pages are allocated via `cache.new_page()` the same way; dirty pages still pinned against eviction; the mmap is just where the bytes live.
+- *Counter semantics unchanged.* `cache_hits` / `cache_misses` continue to mean "was the entry in our HashMap?" — orthogonal to whether the kernel currently has the mmap'd page resident in RAM. The Chisel-internal cache abstraction is one layer above the OS's page-resident state.
+- *Commit protocol unchanged.* Database-file fsync semantics are unaffected — the cache file is never part of the durability path. The two-fsync ordering, the pre-drain flush, and the poison model all stay exactly as today.
+
+**Implementation questions for the eventual design pass:**
+
+- Slot allocator within the mmap region: linear append vs. free-list of fixed-size slots indexed by offset.
+- Cache file size policy: fixed at open vs. grow-as-needed via `ftruncate`.
+- Behavior at cache-file `ENOSPC`: surface as a new error, evict more aggressively, or fall back to heap allocation.
+- `O_TMPFILE` availability is Linux-specific; macOS needs the open-then-unlink dance, which has a tiny window where the path exists.
+- Default-on or feature-flagged: a feature flag preserves the current `Box<[u8]>` cache for users who prefer it (tests can stay unchanged), at the cost of two code paths to maintain.
+
+**Why deferred:** The actual win shows up at working sets larger than ~64 MB (the current hard ceiling). PR 4's micro grid will tell us whether real workloads hit that limit. If they do, this becomes actionable; if they don't, the existing in-process cache is fine and the implementation complexity isn't justified.
+
+**Source:** Proposed by the Chisel client on 2026-04-30 during PR 3 brainstorming.
+
 ---
 
 ## Python binding
