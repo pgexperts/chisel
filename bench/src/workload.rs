@@ -70,6 +70,22 @@ pub fn gen_prepopulate(count: usize, size: usize) -> Workload {
     }
 }
 
+/// Row 1/2 of the micro grid (allocate, 1 op/tx and 1000 ops/tx).
+/// `count` Allocate ops of `size` bytes. No randomness; takes no
+/// seed (parallels `gen_prepopulate`, where seedless and unambiguous
+/// beats symmetry-with-an-unused-arg). The Workload's `seed` field
+/// is set to 0; `prepop_count` is 0 because rows 1/2 measure
+/// allocate against an empty database.
+pub fn gen_allocate(count: usize, size: usize) -> Workload {
+    let ops = (0..count).map(|_| Operation::Allocate { size }).collect();
+    Workload {
+        name: "allocate".to_string(),
+        seed: 0,
+        prepop_count: 0,
+        ops,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,6 +115,18 @@ mod tests {
         assert_eq!(w.ops.len(), 10);
         for op in &w.ops {
             assert!(matches!(op, Operation::Allocate { size: 32 }));
+        }
+    }
+
+    #[test]
+    fn gen_allocate_shape() {
+        let w = gen_allocate(10, 64);
+        assert_eq!(w.name, "allocate");
+        assert_eq!(w.seed, 0);
+        assert_eq!(w.prepop_count, 0);
+        assert_eq!(w.ops.len(), 10);
+        for op in &w.ops {
+            assert!(matches!(op, Operation::Allocate { size: 64 }));
         }
     }
 }
