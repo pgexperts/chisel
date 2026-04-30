@@ -38,9 +38,10 @@
 //   `CacheFull` cannot arise on the commit path.
 
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use crate::error::{ChiselError, Result};
+use crate::lru::LruIndex;
 use crate::page::{self, PAGE_SIZE};
 use crate::page_io::PageIo;
 use crate::stats::ChiselCounters;
@@ -69,9 +70,14 @@ struct CacheEntry {
 pub struct PageCache {
     io: PageIo,
     entries: HashMap<u64, CacheEntry>,
-    // Front of the deque = most recently used. `maybe_evict` walks from the
-    // back (LRU) looking for a clean victim.
-    lru: VecDeque<u64>,
+    // O(1) LRU index over page IDs. Head of the index = most recently
+    // used; `maybe_evict` walks `iter_lru_to_mru()` looking for a clean
+    // victim. Backed by a HashMap-of-(prev,next) doubly-linked list —
+    // every operation is O(1). See `lru.rs` for the implementation
+    // history (the original `VecDeque<u64>`-based design did O(n)
+    // `retain` scans on every page touch and showed up at 66% of CPU
+    // on a 70k-row INSERT profile, prompting the swap).
+    lru: LruIndex,
     max_pages: usize,
     // Monotonically increasing allocator for shadow-paged new pages. Never
     // reused within a process lifetime except via `truncate()`.
@@ -113,7 +119,7 @@ impl PageCache {
         PageCache {
             io,
             entries: HashMap::new(),
-            lru: VecDeque::new(),
+            lru: LruIndex::new(),
             max_pages,
             next_page_id,
             cache_hits: Cell::new(0),
@@ -316,7 +322,7 @@ impl PageCache {
     /// monotonic sacrifices a tiny amount of address space for correctness.
     pub fn discard(&mut self, page_id: u64) {
         self.entries.remove(&page_id);
-        self.lru.retain(|&id| id != page_id);
+        self.lru.remove(page_id);
     }
 
     /// Discard every dirty entry from the cache regardless of id
@@ -340,7 +346,7 @@ impl PageCache {
             .collect();
         for id in dirty_ids {
             self.entries.remove(&id);
-            self.lru.retain(|&lid| lid != id);
+            self.lru.remove(id);
         }
     }
 
@@ -389,7 +395,7 @@ impl PageCache {
             .collect();
         for id in to_remove {
             self.entries.remove(&id);
-            self.lru.retain(|&lid| lid != id);
+            self.lru.remove(id);
         }
         self.io.set_page_count(n)?;
         if self.next_page_id > n {
@@ -484,8 +490,11 @@ impl PageCache {
         );
         // Remove any pre-existing entry so a stale cached copy from a
         // prior reader doesn't leak into the new transaction's view.
+        // `LruIndex::push_front` auto-removes any prior entry for this
+        // id before inserting at MRU, so an explicit remove on the LRU
+        // side isn't needed (the entries map still needs the explicit
+        // remove because we're rebinding it to a fresh CacheEntry).
         self.entries.remove(&page_id);
-        self.lru.retain(|&id| id != page_id);
         let entry = CacheEntry {
             buf: Box::new([0u8; PAGE_SIZE]),
             dirty: true,
@@ -543,14 +552,15 @@ impl PageCache {
         Ok(())
     }
 
-    /// Move `page_id` to the MRU (front) of the LRU list.
+    /// Move `page_id` to the MRU (front) of the LRU index.
     ///
-    /// O(n) in the cache size due to the `retain` scan. Acceptable for v1
-    /// because `max_pages` is small (hundreds to low thousands); a proper
-    /// intrusive linked list would be the optimization if this shows up
-    /// in profiles.
+    /// O(1). Backed by `LruIndex`, whose `push_front` re-locates an
+    /// existing id to the MRU end (or inserts if absent). Originally
+    /// O(n) on `VecDeque::retain`; the swap to `LruIndex` happened
+    /// after a samply profile of a 70k-row INSERT showed 66% of CPU
+    /// in the retain-driven memmoves. See `lru.rs` doc for full
+    /// rationale.
     fn touch_lru(&mut self, page_id: u64) {
-        self.lru.retain(|&id| id != page_id);
         self.lru.push_front(page_id);
     }
 
@@ -587,14 +597,12 @@ impl PageCache {
         while self.entries.len() > self.max_pages {
             let victim = self
                 .lru
-                .iter()
-                .rev()
-                .find(|&&id| !self.entries.get(&id).is_none_or(|e| e.dirty))
-                .copied();
+                .iter_lru_to_mru()
+                .find(|&id| !self.entries.get(&id).is_none_or(|e| e.dirty));
             match victim {
                 Some(id) => {
                     self.entries.remove(&id);
-                    self.lru.retain(|&lid| lid != id);
+                    self.lru.remove(id);
                 }
                 None => break, // All pages are dirty; fall through to the hard-ceiling check.
             }

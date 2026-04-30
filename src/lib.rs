@@ -24,6 +24,7 @@ pub mod defrag;
 pub mod error;
 pub mod freemap;
 pub mod handle_table;
+mod lru;
 pub mod overflow;
 pub mod page;
 pub mod page_cache;
