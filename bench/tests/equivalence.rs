@@ -45,10 +45,11 @@ fn scenario_inline_range<E: Engine>(engine: &mut E) {
 }
 
 fn scenario_just_overflow_boundary<E: Engine>(engine: &mut E) {
-    // Sizes bracket Chisel's MAX_INLINE_VALUE = 8162. 8160 fits inline;
-    // 8200 and 9000 spill to overflow. For redb / SQLite this is just
-    // storage of the same byte ranges.
-    let sizes = [8160usize, 8200, 9000];
+    // Sizes bracket Chisel's MAX_INLINE_VALUE = 8162. 8160 and 8161 fit
+    // inline; 8163, 8200, and 9000 spill to overflow. The 8161/8163 pair
+    // probes the exact edge — the off-by-one most likely to regress.
+    // For redb / SQLite this is just storage of the same byte ranges.
+    let sizes = [8160usize, 8161, 8163, 8200, 9000];
     let values: Vec<Vec<u8>> = sizes
         .iter()
         .map(|&n| (0..n).map(|i| (i % 251) as u8).collect())

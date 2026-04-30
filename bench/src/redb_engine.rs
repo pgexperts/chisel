@@ -117,6 +117,10 @@ impl Engine for RedbEngine {
             let value = table.get(id.0)?.ok_or("identifier not found")?;
             Ok(value.value().to_vec())
         } else {
+            // Outside a write transaction, open a fresh read transaction.
+            // Under redb's MVCC this is a consistent snapshot of the
+            // last-committed state — matches the trait's "readable
+            // outside a transaction" semantic.
             let read_tx = self.db.begin_read()?;
             let table = read_tx.open_table(TABLE)?;
             let value = table.get(id.0)?.ok_or("identifier not found")?;

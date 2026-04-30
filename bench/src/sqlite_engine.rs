@@ -92,6 +92,13 @@ impl Engine for SqliteEngine {
     }
 
     fn allocate(&mut self, value: &[u8]) -> EngineResult<Identifier> {
+        // SQLite is autocommit by default — without an explicit BEGIN, this
+        // INSERT would silently persist. The trait promises that mutations
+        // outside a transaction return Err; enforce that here. Same guard
+        // pattern repeats on update / delete / delete_many.
+        if !self.active_tx {
+            return Err("no active transaction".into());
+        }
         self.conn.execute(
             "INSERT INTO chisel_bench (value) VALUES (?)",
             rusqlite::params![value],
@@ -112,6 +119,9 @@ impl Engine for SqliteEngine {
     }
 
     fn update(&mut self, id: Identifier, value: &[u8]) -> EngineResult<()> {
+        if !self.active_tx {
+            return Err("no active transaction".into());
+        }
         let n = self.conn.execute(
             "UPDATE chisel_bench SET value = ? WHERE id = ?",
             rusqlite::params![value, id.0 as i64],
@@ -123,6 +133,9 @@ impl Engine for SqliteEngine {
     }
 
     fn delete(&mut self, id: Identifier) -> EngineResult<()> {
+        if !self.active_tx {
+            return Err("no active transaction".into());
+        }
         let n = self.conn.execute(
             "DELETE FROM chisel_bench WHERE id = ?",
             rusqlite::params![id.0 as i64],
@@ -134,6 +147,9 @@ impl Engine for SqliteEngine {
     }
 
     fn delete_many(&mut self, ids: &[Identifier]) -> EngineResult<()> {
+        if !self.active_tx {
+            return Err("no active transaction".into());
+        }
         let mut stmt = self.conn.prepare("DELETE FROM chisel_bench WHERE id = ?")?;
         for id in ids {
             let n = stmt.execute(rusqlite::params![id.0 as i64])?;
