@@ -7,6 +7,9 @@
 // function. We pin `ChaCha8Rng` rather than `StdRng` so result
 // reproducibility survives `rand` minor bumps.
 
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+
 /// One unit of work the Runner executes against an Engine.
 ///
 /// `alloc_index` is a position in the Runner's "allocations seen so
@@ -86,6 +89,26 @@ pub fn gen_allocate(count: usize, size: usize) -> Workload {
     }
 }
 
+/// Row 3/4 of the micro grid (read warm/cold). `count` Read ops with
+/// alloc_indices sampled uniformly with replacement from
+/// `0..prepop_count`. The same alloc_index may appear multiple times
+/// in the workload — that is intentional, mirroring real read access
+/// where popular records get hit repeatedly.
+pub fn gen_read_random(seed: u64, prepop_count: usize, count: usize) -> Workload {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let ops = (0..count)
+        .map(|_| Operation::Read {
+            alloc_index: rng.gen_range(0..prepop_count),
+        })
+        .collect();
+    Workload {
+        name: "read_random".to_string(),
+        seed,
+        prepop_count,
+        ops,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +151,37 @@ mod tests {
         for op in &w.ops {
             assert!(matches!(op, Operation::Allocate { size: 64 }));
         }
+    }
+
+    #[test]
+    fn gen_read_random_determinism() {
+        let a = gen_read_random(42, 1000, 100);
+        let b = gen_read_random(42, 1000, 100);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn gen_read_random_validity() {
+        let prepop = 1000;
+        let w = gen_read_random(1, prepop, 500);
+        assert_eq!(w.name, "read_random");
+        assert_eq!(w.seed, 1);
+        assert_eq!(w.prepop_count, prepop);
+        assert_eq!(w.ops.len(), 500);
+        for op in &w.ops {
+            match op {
+                Operation::Read { alloc_index } => {
+                    assert!(*alloc_index < prepop, "out-of-range index {}", alloc_index);
+                }
+                other => panic!("expected Read, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn gen_read_random_cross_seed_independence() {
+        let a = gen_read_random(1, 1000, 100);
+        let b = gen_read_random(2, 1000, 100);
+        assert_ne!(a.ops, b.ops);
     }
 }
