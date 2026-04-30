@@ -54,6 +54,22 @@ pub struct Workload {
     pub ops: Vec<Operation>,
 }
 
+/// Pre-population: `count` Allocate ops of `size` bytes each.
+/// No randomness — the Workload is fully determined by its arguments.
+/// `seed` is fixed at 0 and `name` at "prepopulate" so that
+/// pre-population does not appear as a varying axis in Criterion ids.
+/// `prepop_count` is 0 because the workload itself does the populating
+/// — it does not assume any pre-existing records.
+pub fn gen_prepopulate(count: usize, size: usize) -> Workload {
+    let ops = (0..count).map(|_| Operation::Allocate { size }).collect();
+    Workload {
+        name: "prepopulate".to_string(),
+        seed: 0,
+        prepop_count: 0,
+        ops,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +88,17 @@ mod tests {
         };
         assert_eq!(w.name, "test");
         assert_eq!(w.ops.len(), 1);
+    }
+
+    #[test]
+    fn gen_prepopulate_shape() {
+        let w = gen_prepopulate(10, 32);
+        assert_eq!(w.name, "prepopulate");
+        assert_eq!(w.seed, 0);
+        assert_eq!(w.prepop_count, 0);
+        assert_eq!(w.ops.len(), 10);
+        for op in &w.ops {
+            assert!(matches!(op, Operation::Allocate { size: 32 }));
+        }
     }
 }
