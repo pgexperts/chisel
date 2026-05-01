@@ -330,6 +330,71 @@ pub fn populate_snapshot(
     Ok(PopulatedSnapshot { file, ids })
 }
 
+/// Capture per-cell aux metrics for the snapshot-restore-style rows
+/// (8 of 9 rows: rows 1, 2, 4–9). One calibration iteration: copy
+/// the snapshot, open the engine, snapshot counters + file size,
+/// drive the workload, snapshot again, return deltas.
+///
+/// Panics on engine errors during the calibration run — same rationale
+/// as `drive_workload_with_tx_granularity`: an engine error during
+/// bench setup means the bench is broken.
+pub fn capture_aux_metrics_snapshot_restore(
+    cell_id: CellId,
+    mode: EngineMode,
+    snapshot_path: &Path,
+    snapshot_ids: &[u64],
+    workload: &Workload,
+    ops_per_tx: usize,
+) -> CellAuxMetrics {
+    let working = NamedTempFile::new().unwrap();
+    std::fs::copy(snapshot_path, working.path()).unwrap();
+    let mut engine = mode.open(working.path(), CACHE_SIZE_PAGES).unwrap();
+
+    let counters_before = engine.internal_counters().unwrap();
+    let size_before = engine.file_size_bytes().unwrap();
+
+    drive_workload_with_tx_granularity(&mut *engine, workload, ops_per_tx, snapshot_ids);
+
+    let counters_after = engine.internal_counters().unwrap();
+    let size_after = engine.file_size_bytes().unwrap();
+
+    CellAuxMetrics {
+        cell_id,
+        file_size_delta_bytes: (size_after as i64) - (size_before as i64),
+        counters: counter_delta(counters_before, counters_after),
+    }
+}
+
+/// Capture per-cell aux metrics for the warm-read row (row 3 only).
+/// Runs against the SAME persistent engine the cell-runner just used
+/// for measurements — cache is warm, OS page cache is warm. Captures
+/// counters + size around one extra read at this state, giving the
+/// steady-state warm-cache counter activity (mostly cache hits).
+///
+/// Doing snapshot-restore-style calibration for warm-read would
+/// produce *cold* counter activity, contradicting the row's name and
+/// purpose. See spec §4.2.
+pub fn capture_aux_metrics_warm_read(
+    cell_id: CellId,
+    engine: &mut dyn Engine,
+    workload: &Workload,
+    snapshot_ids: &[u64],
+) -> CellAuxMetrics {
+    let counters_before = engine.internal_counters().unwrap();
+    let size_before = engine.file_size_bytes().unwrap();
+
+    apply_op(engine, &workload.ops[0], snapshot_ids, &mut Vec::new());
+
+    let counters_after = engine.internal_counters().unwrap();
+    let size_after = engine.file_size_bytes().unwrap();
+
+    CellAuxMetrics {
+        cell_id,
+        file_size_delta_bytes: (size_after as i64) - (size_before as i64),
+        counters: counter_delta(counters_before, counters_after),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
