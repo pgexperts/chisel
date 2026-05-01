@@ -35,16 +35,18 @@ This spec follows on from `2026-04-25-chisel-benchmark-suite-design.md` (the ove
 | File | Touch | Responsibility |
 |------|-------|----------------|
 | `bench/Cargo.toml` | Modify | Add `serde`, `serde_json` to `[dependencies]`. Add `criterion = "0.5"` to `[dev-dependencies]`. Add `[[bench]] name = "micro_grid"` with `harness = false`. |
-| `bench/src/runner.rs` | Create | `EngineMode` enum, `PopulatedSnapshot`, `populate_snapshot`, the three `run_*_cell` functions, `AuxMetricsWriter`, `CellAuxMetrics`, `capture_aux_metrics`, `apply_op` helper, `drive_workload_with_tx_granularity` helper. ~300 LOC. |
-| `bench/src/lib.rs` | Modify | `pub mod runner;` + re-exports of `EngineMode` and the cell-runner functions. |
-| `bench/benches/micro_grid.rs` | Create | Top-level `micro_grid` function, the 9 row-bench functions, `criterion_main!`. ~150 LOC. |
+| `bench/src/runner.rs` | Create | `EngineMode` enum, `PopulatedSnapshot`, `populate_snapshot`, `AuxMetricsWriter`, `CellAuxMetrics`, `CellId`, `ChiselCountersDelta`, `apply_op`, `drive_workload_with_tx_granularity`, `capture_aux_metrics_snapshot_restore`, `capture_aux_metrics_warm_read`, `counter_delta`. No Criterion dependency. ~280 LOC. |
+| `bench/src/lib.rs` | Modify | `pub mod runner;` + re-exports of `EngineMode`, `PopulatedSnapshot`, `AuxMetricsWriter`, `CellAuxMetrics`, `CellId`. |
+| `bench/benches/micro_grid.rs` | Create | Top-level `micro_grid` function, the 9 row-bench functions, three private cell-runner helpers (`run_snapshot_restore_cell`, `run_warm_read_cell`, `run_cold_read_cell` — Criterion-shaped, hence here not in `runner.rs`), `criterion_main!`. ~220 LOC. |
 | `bench/tests/runner_smoke.rs` | Create | One end-to-end smoke test that runs a single cell via `run_snapshot_restore_cell` against a minimal `Criterion::default()`. ~40 LOC. |
 
 `runner.rs` is library code and reusable by PR 6's scenarios. `micro_grid.rs` is bench-binary glue and contains the iteration loops.
 
 ### 2.2 Library separation rationale
 
-The Runner is library-resident (not inlined in the bench file) for two reasons. First, PR 6's four scenarios will drive workloads against engines with the same snapshot-restore + engine-construction + aux-metric capture machinery; if it lived under `benches/`, PR 6 couldn't import it. Second, library placement makes the Runner unit-testable independently of "did the whole bench finish?" smoke tests.
+The non-Criterion-dependent machinery (engine construction, snapshot population, workload application, aux-metric capture, JSONL writer) is library-resident in `runner.rs`. PR 6's four scenarios will drive workloads against engines with the same snapshot-restore + engine-construction + aux-metric capture machinery; if it lived under `benches/`, PR 6 couldn't import it. Library placement also makes this code unit-testable without spinning up Criterion.
+
+The three cell-runner helpers (`run_snapshot_restore_cell`, `run_warm_read_cell`, `run_cold_read_cell`) live in `bench/benches/micro_grid.rs` as private helpers because they take `&mut BenchmarkGroup` — a Criterion type, and Criterion is in `[dev-dependencies]`. PR 6's scenarios have a different iteration shape (one big workload run, not per-iteration cells) and won't reuse these helpers anyway.
 
 ### 2.3 Dependency choices
 
