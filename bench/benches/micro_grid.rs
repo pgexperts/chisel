@@ -11,8 +11,6 @@
 // Run the full grid: `cargo bench --bench micro_grid`. Filter to one row:
 // `cargo bench --bench micro_grid read-warm`.
 
-#![allow(unused_imports)] // task 11 will use the remaining workload generators
-
 use chisel_bench::runner::{
     apply_op, capture_aux_metrics_snapshot_restore, capture_aux_metrics_warm_read,
     drive_workload_with_tx_granularity, populate_snapshot, AuxMetricsWriter, CellId, EngineMode,
@@ -273,6 +271,162 @@ fn bench_row_read_cold(c: &mut Criterion, aux: &mut AuxMetricsWriter) {
     group.finish();
 }
 
+/// Rows 5 and 6: update, 1-per-tx and 1000-per-tx.
+/// Same skip-when-too-big pattern as `bench_row_allocate_n_per_tx`:
+/// 1000 × 16KB updates exceed Chisel's per-tx cache budget.
+fn bench_row_update_n_per_tx(
+    c: &mut Criterion,
+    aux: &mut AuxMetricsWriter,
+    group_name: &str,
+    ops_per_tx: usize,
+) {
+    let mut group = c.benchmark_group(group_name);
+    group.throughput(Throughput::Elements(ops_per_tx as u64));
+
+    for (size_bytes, size_label, prepop_count) in SIZES {
+        if ops_per_tx * size_bytes > TX_BUDGET_BYTES {
+            continue; // skip cells too large to fit in Chisel's cache
+        }
+        let workload =
+            gen_update_random(seed_for(group_name), prepop_count, ops_per_tx, size_bytes);
+        for mode in EngineMode::ALL {
+            let snap = populate_snapshot(mode, size_bytes, prepop_count).unwrap();
+            run_snapshot_restore_cell(
+                &mut group,
+                mode,
+                size_label,
+                snap.path(),
+                snap.ids(),
+                &workload,
+                ops_per_tx,
+            );
+            aux.append(&capture_aux_metrics_snapshot_restore(
+                CellId {
+                    row: leak_str(group_name),
+                    mode: mode.label(),
+                    size: size_label,
+                },
+                mode,
+                snap.path(),
+                snap.ids(),
+                &workload,
+                ops_per_tx,
+            ))
+            .unwrap();
+        }
+    }
+
+    group.finish();
+}
+
+/// Rows 7 and 8: delete, 1-per-tx and 1000-per-tx.
+/// Deletes don't accumulate dirty pages the same way as allocates/updates,
+/// so no TX_BUDGET_BYTES skip is needed. The only constraint is
+/// gen_delete_random's count <= prepop_count assertion: clamp to fit.
+fn bench_row_delete_n_per_tx(
+    c: &mut Criterion,
+    aux: &mut AuxMetricsWriter,
+    group_name: &str,
+    ops_per_tx: usize,
+) {
+    let mut group = c.benchmark_group(group_name);
+    group.throughput(Throughput::Elements(ops_per_tx as u64));
+
+    for (size_bytes, size_label, prepop_count) in SIZES {
+        // For the 1000-per-tx variant at the 1MB row, prepop_count=25 < 1000,
+        // so we'd violate gen_delete_random's count <= prepop_count assert.
+        // Clamp to the smaller of the two; reported throughput stays at
+        // ops_per_tx for cross-row comparability, the actual delete count
+        // is just smaller.
+        let workload_count = ops_per_tx.min(prepop_count);
+        if workload_count == 0 {
+            continue;
+        }
+        let workload = gen_delete_random(seed_for(group_name), prepop_count, workload_count);
+        for mode in EngineMode::ALL {
+            let snap = populate_snapshot(mode, size_bytes, prepop_count).unwrap();
+            run_snapshot_restore_cell(
+                &mut group,
+                mode,
+                size_label,
+                snap.path(),
+                snap.ids(),
+                &workload,
+                ops_per_tx,
+            );
+            aux.append(&capture_aux_metrics_snapshot_restore(
+                CellId {
+                    row: leak_str(group_name),
+                    mode: mode.label(),
+                    size: size_label,
+                },
+                mode,
+                snap.path(),
+                snap.ids(),
+                &workload,
+                ops_per_tx,
+            ))
+            .unwrap();
+        }
+    }
+
+    group.finish();
+}
+
+/// Row 9: delete_many bulk. One DeleteMany op per iteration carrying
+/// 1000 distinct ids. Throughput::Elements(1000) since one bulk call
+/// deletes 1000 records.
+///
+/// Currently unused: 1000-id bulk deletes pin ~1000 dirty data pages
+/// against the 2048-page cache ceiling, exceeding it once handle-table
+/// COW pages are added in. Kept around so the row can be re-enabled
+/// once the harness gains a configurable larger cache.
+#[allow(dead_code)]
+fn bench_row_delete_many(c: &mut Criterion, aux: &mut AuxMetricsWriter) {
+    let mut group = c.benchmark_group("delete_many");
+    group.throughput(Throughput::Elements(1000));
+
+    for (size_bytes, size_label, prepop_count) in SIZES {
+        let batch_size = 1000.min(prepop_count);
+        if batch_size == 0 {
+            continue;
+        }
+        let workload = gen_delete_many(
+            seed_for("delete_many"),
+            prepop_count,
+            /*batches*/ 1,
+            batch_size,
+        );
+        for mode in EngineMode::ALL {
+            let snap = populate_snapshot(mode, size_bytes, prepop_count).unwrap();
+            run_snapshot_restore_cell(
+                &mut group,
+                mode,
+                size_label,
+                snap.path(),
+                snap.ids(),
+                &workload,
+                /*ops_per_tx*/ 1,
+            );
+            aux.append(&capture_aux_metrics_snapshot_restore(
+                CellId {
+                    row: "delete_many",
+                    mode: mode.label(),
+                    size: size_label,
+                },
+                mode,
+                snap.path(),
+                snap.ids(),
+                &workload,
+                1,
+            ))
+            .unwrap();
+        }
+    }
+
+    group.finish();
+}
+
 /// `CellId.row` is `&'static str`. The two allocate rows have group names
 /// passed in dynamically as a parameter — we leak them to satisfy the
 /// `'static` requirement. There are exactly 2 such leaks per process
@@ -292,7 +446,13 @@ fn micro_grid(c: &mut Criterion) {
     bench_row_allocate_n_per_tx(c, &mut aux, "allocate-1000pertx", 1000);
     bench_row_read_warm(c, &mut aux);
     bench_row_read_cold(c, &mut aux);
-    // Tasks 11 will add the remaining 5 calls (update × 2, delete × 2, delete_many).
+    bench_row_update_n_per_tx(c, &mut aux, "update-1pertx", 1);
+    // update-1000pertx, delete-1000pertx, and delete_many all skipped:
+    // 1000 random updates/deletes (or one bulk delete of 1000 ids) pin
+    // ~1000 distinct dirty data pages, exceeding Chisel's 2048-page cache
+    // ceiling. The cells are not measurable under default cache settings;
+    // revisit with a larger CACHE_SIZE_PAGES in a future PR.
+    bench_row_delete_n_per_tx(c, &mut aux, "delete-1pertx", 1);
 }
 
 criterion_group!(benches, micro_grid);
