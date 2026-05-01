@@ -296,13 +296,37 @@ impl PopulatedSnapshot {
     }
 }
 
+/// Per-tx byte budget for snapshot population. Chunked at this size to
+/// keep each populate transaction under Chisel's cache hard ceiling
+/// (16 MB = 2048 pages × 8KB at default settings). 4 MB raw payload
+/// leaves headroom: large records (size > 8KB) need ceil(size/8152)
+/// overflow pages each plus handle-table radix COW pages plus freemap
+/// pages — all dirty within the tx and pinned against eviction —
+/// pushing actual cache footprint substantially above raw bytes.
+/// Internal to `populate_snapshot`; the row-bench skip threshold in
+/// micro_grid.rs is a different concern (workload-time, not setup).
+const POPULATE_TX_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
+/// Per-tx record-count cap for snapshot population, applied alongside
+/// the byte budget. Each Chisel allocate() COWs a fresh root page for
+/// the handle-table radix tree on every insert (even back-to-back
+/// inserts produce distinct dirty pages — see `insert_recursive` in
+/// handle_table.rs). At depth 1 that is two new dirty pages per insert
+/// (interior + leaf), so 1024 inserts already produce 2048 dirty
+/// pages — the hard ceiling. 500 records per chunk leaves headroom
+/// for the data-page and freemap COW that runs alongside.
+const POPULATE_TX_MAX_RECORDS: usize = 500;
+
 /// Build a fresh DB file populated with `prepop_count` records of `size_bytes`
 /// each, capturing the engine-assigned identifiers in allocation order.
 ///
-/// Pre-population uses one `begin/.../commit` block, not one tx per op —
-/// matches scenario-style allocation more closely and is much faster
-/// for large counts. Returns the snapshot ready for the cell-runners
-/// to copy-and-restore from.
+/// Pre-population is chunked into multiple `begin/.../commit` blocks of at
+/// most `POPULATE_TX_BUDGET_BYTES` worth of payload each. A single tx for
+/// large sizes (e.g. 16KB × 1500 records = 24 MB) blows past Chisel's
+/// 16 MB cache hard ceiling and panics with `CacheFull`; chunking keeps
+/// each populate tx safely under the budget while preserving the snapshot
+/// content (same records, same ids in the same allocation order — only
+/// the internal tx granularity changes).
 ///
 /// The returned `PopulatedSnapshot` owns the file via `NamedTempFile`;
 /// callers must keep it alive until all cells using its `path()` are
@@ -319,12 +343,23 @@ pub fn populate_snapshot(
     let mut ids = Vec::with_capacity(prepop_count);
     let payload = vec![0u8; size_bytes];
 
-    engine.begin()?;
-    for _ in 0..prepop_count {
-        let id = engine.allocate(&payload)?;
-        ids.push(id.0);
+    // Chunk so each tx stays under both per-tx caps: byte budget
+    // (large overflow records, where each record costs multiple
+    // cache pages) and record count (tiny records that fit many per
+    // chunk by bytes but blow the cache by handle count).
+    let chunk_size =
+        (POPULATE_TX_BUDGET_BYTES / size_bytes.max(1)).clamp(1, POPULATE_TX_MAX_RECORDS);
+    let mut remaining = prepop_count;
+    while remaining > 0 {
+        let this_chunk = remaining.min(chunk_size);
+        engine.begin()?;
+        for _ in 0..this_chunk {
+            let id = engine.allocate(&payload)?;
+            ids.push(id.0);
+        }
+        engine.commit()?;
+        remaining -= this_chunk;
     }
-    engine.commit()?;
     drop(engine); // explicit close before returning the file
 
     Ok(PopulatedSnapshot { file, ids })
@@ -456,6 +491,14 @@ mod tests {
         let snap = populate_snapshot(EngineMode::SqliteStrict, 256, 100).unwrap();
         assert_eq!(snap.ids().len(), 100);
         assert!(std::fs::metadata(snap.path()).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn populate_snapshot_chisel_large_size_chunks() {
+        // 1500 × 16KB = 24 MB raw payload — exceeds the 16 MB cache
+        // hard ceiling if done in one tx. Chunked populate must succeed.
+        let snap = populate_snapshot(EngineMode::ChiselStrict, 16_384, 1500).unwrap();
+        assert_eq!(snap.ids().len(), 1500);
     }
 
     #[test]
