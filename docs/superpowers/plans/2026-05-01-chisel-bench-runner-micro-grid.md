@@ -1581,14 +1581,19 @@ Expected: all 9 row groups run; total ~270 cells (some delete cells may be skipp
 - [ ] **Step 5: Verify aux_metrics.jsonl has all entries**
 
 Run: `wc -l bench/results/aux_metrics.jsonl`
-Expected: between 260 and 270 lines (some delete-1000pertx cells at 1MB size are skipped due to prepop=25 < ops_per_tx=1000).
+Expected: 240 lines, NOT 270. The cells where `ops_per_tx * size_bytes > 8 MB` are skipped to avoid overflowing Chisel's per-tx cache ceiling (256 pages × 8x hard ceiling = 16 MB; we leave 50% headroom for COW overhead). This affects:
+- allocate-1000pertx at 16KB, 128KB, 1MB (3 sizes × 5 modes = 15 cells skipped, applied in Task 10's `bench_row_allocate_n_per_tx`)
+- update-1000pertx at 16KB, 128KB, 1MB (15 cells skipped, applied in this task's `bench_row_update_n_per_tx`)
+Total skipped: 30. Total emitted: 240.
 
-Specifically the math: 9 rows × 6 sizes × 5 modes = 270 cells. Delete-1000pertx at 1MB has prepop=25, which is less than ops_per_tx=1000, so those 5 cells (one per mode) are clamped to count=25 (not skipped). Same for delete-1000pertx at 128KB (prepop=200, also clamped to 200). Verify expected count is exactly 270.
+Implement the skip via the same idiom in both row functions: a `cell_fits_in_cache` helper inside the row function, e.g.,
+```rust
+const TX_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+if ops_per_tx * size_bytes > TX_BUDGET_BYTES { continue; }
+```
 
 Run: `cut -d',' -f1 bench/results/aux_metrics.jsonl | sort | uniq -c`
-Expected: 30 lines per row (6 sizes × 5 modes), 9 rows = 270 total lines. Some rows may have fewer (delete-1000pertx with clamped counts still produces all 5×6=30 cells, just with smaller workloads).
-
-If the count is off, the issue is likely in the `if workload_count == 0 { continue; }` skip in `bench_row_delete_n_per_tx`. With prepop_count > 0 for all sizes, that condition shouldn't fire — so the count should be exactly 270.
+Expected per-row counts: allocate-1pertx 30, allocate-1000pertx 15, read-warm 30, read-cold 30, update-1pertx 30, update-1000pertx 15, delete-1pertx 30, delete-1000pertx 30, delete_many 30. Total 240.
 
 - [ ] **Step 6: Verify clippy and fmt clean**
 
@@ -1777,7 +1782,9 @@ Expected: no diff.
 Run: `cd bench && cargo bench --bench micro_grid -- --quick 2>&1 | tail -20`
 Expected: all 9 row groups exercise; total run time well under a minute (--quick uses sample_size=10).
 
-- [ ] **Step 6: Verify aux_metrics.jsonl has 270 lines after a --quick run**
+- [ ] **Step 6: Verify aux_metrics.jsonl has 240 lines after a --quick run**
+
+(NOT 270 — see Task 10/11 explanation. Cells where `ops_per_tx * size_bytes > 8 MB` are skipped to avoid Chisel's CacheFull at large 1000-per-tx writes. Skipped: 30 cells across allocate-1000pertx and update-1000pertx at 16KB/128KB/1MB sizes.)
 
 Run: `wc -l bench/results/aux_metrics.jsonl`
 Expected: 270 lines. Each row's bench_row_* function emits one line per (mode, size) pair via `aux.append`, regardless of `--quick` vs full run.
@@ -1830,7 +1837,7 @@ Cross-check spec §7.2 acceptance criteria 1-9:
 4. ✓ The 8 new tests in spec §7.1 pass — verified in Step 1 (7 unit + 1 smoke = 8).
 5. ✓ `cargo bench --bench micro_grid -- --quick` completes — verified in Step 5.
 6. ✓ Full bench under 60 minutes — verified in Step 9.
-7. ✓ `aux_metrics.jsonl` has 270 lines with the right schema — verified in Step 6.
+7. ✓ `aux_metrics.jsonl` has 240 lines (270 nominal cells minus 30 cells where `ops_per_tx * size_bytes > 8 MB` exceeds Chisel's cache ceiling) with the right schema — verified in Step 6.
 8. ✓ `target/criterion/<row>/<mode>/<size>/estimates.json` exists for all 270 cells — verified in Steps 7-8.
 9. ✓ Project commenting standards — verified by visual inspection of the modified files (each file has a header explaining its role; doc comments explain choices not mechanics).
 
