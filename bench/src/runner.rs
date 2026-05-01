@@ -149,6 +149,50 @@ pub fn counter_delta(
     })
 }
 
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Write};
+
+/// Append-only JSONL writer for the per-cell aux-metrics output.
+/// One line per cell. Truncates the file on `create()` so re-runs
+/// don't accumulate stale entries; appends thereafter via `append()`.
+///
+/// The file is opened in buffered mode; every `append()` call ends
+/// with `flush()` so a Ctrl-C mid-grid leaves the partial output
+/// parseable (each completed cell is one full line).
+pub struct AuxMetricsWriter {
+    writer: BufWriter<File>,
+}
+
+impl AuxMetricsWriter {
+    /// Open `path` for write, truncating any prior contents. Creates
+    /// parent directories if missing (so the bench can write to
+    /// `bench/results/aux_metrics.jsonl` without the runner having to
+    /// pre-create `bench/results/`).
+    pub fn create(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        Ok(Self {
+            writer: BufWriter::new(file),
+        })
+    }
+
+    /// Append one cell's metrics as a single JSON line. Flushes after
+    /// the write so partial output is parseable on interrupt.
+    pub fn append(&mut self, metrics: &CellAuxMetrics) -> std::io::Result<()> {
+        serde_json::to_writer(&mut self.writer, metrics)?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +233,91 @@ mod tests {
             engine.begin().unwrap();
             engine.commit().unwrap();
         }
+    }
+
+    #[test]
+    fn aux_metrics_writer_jsonl_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/aux_metrics.jsonl");
+        let mut writer = AuxMetricsWriter::create(&path).unwrap();
+
+        writer
+            .append(&CellAuxMetrics {
+                cell_id: CellId {
+                    row: "allocate-1pertx",
+                    mode: "chisel-strict",
+                    size: "32B",
+                },
+                file_size_delta_bytes: 262_144,
+                counters: Some(ChiselCountersDelta {
+                    cache_hits: 12,
+                    cache_misses: 35,
+                    fsync_calls: 2,
+                    pages_allocated: 18,
+                }),
+            })
+            .unwrap();
+
+        writer
+            .append(&CellAuxMetrics {
+                cell_id: CellId {
+                    row: "allocate-1pertx",
+                    mode: "redb-strict",
+                    size: "32B",
+                },
+                file_size_delta_bytes: 196_608,
+                counters: None,
+            })
+            .unwrap();
+
+        writer
+            .append(&CellAuxMetrics {
+                cell_id: CellId {
+                    row: "delete-1pertx",
+                    mode: "chisel-strict",
+                    size: "1MB",
+                },
+                file_size_delta_bytes: -1_048_576, // delete shrinks
+                counters: Some(ChiselCountersDelta {
+                    cache_hits: 0,
+                    cache_misses: 1,
+                    fsync_calls: 1,
+                    pages_allocated: 0,
+                }),
+            })
+            .unwrap();
+
+        // Read the file back and verify each line is parseable JSON
+        // with the expected schema.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 3, "exactly 3 lines for 3 appends");
+
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            // top-level row/mode/size from the flatten attr
+            assert!(v.get("row").is_some());
+            assert!(v.get("mode").is_some());
+            assert!(v.get("size").is_some());
+            assert!(v.get("file_size_delta_bytes").is_some());
+            // counters key must be present (null or object)
+            assert!(v.get("counters").is_some());
+        }
+
+        // Spot-check one line in detail.
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["row"], "allocate-1pertx");
+        assert_eq!(v["mode"], "chisel-strict");
+        assert_eq!(v["size"], "32B");
+        assert_eq!(v["file_size_delta_bytes"], 262_144);
+        assert_eq!(v["counters"]["cache_hits"], 12);
+
+        // The non-Chisel line should have counters: null.
+        let v2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert!(v2["counters"].is_null());
+
+        // The negative-delta line should serialize as a negative number.
+        let v3: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(v3["file_size_delta_bytes"], -1_048_576);
     }
 }
