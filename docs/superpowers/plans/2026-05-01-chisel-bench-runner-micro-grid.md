@@ -30,7 +30,9 @@ rand = "0.8"
 rand_chacha = "0.3"
 ```
 
-Add `serde` and `serde_json` to `[dependencies]`, replace `[dev-dependencies]` to add `criterion`, and add a new `[[bench]]` section. The full result:
+Add `serde` and `serde_json` to `[dependencies]`, and append `criterion` to `[dev-dependencies]`. **Do NOT add a `[[bench]]` block here** — that lands in Task 8 atomically with the bench file. (Cargo parses `[[bench]]` paths at manifest-load time; declaring a `[[bench]]` whose file doesn't exist yet causes a manifest parse error that blocks every cargo command.)
+
+The full result:
 
 ```toml
 [package]
@@ -52,13 +54,7 @@ serde_json = "1"
 [dev-dependencies]
 tempfile = "3"
 criterion = "0.5"
-
-[[bench]]
-name = "micro_grid"
-harness = false
 ```
-
-The `harness = false` line is required for Criterion. Without it, Cargo links the unstable `libtest` benchmark harness and you get cryptic linker errors.
 
 - [ ] **Step 2: Edit `bench/.gitignore`**
 
@@ -86,12 +82,7 @@ Expected: clean build, "Finished" line. New crates `serde`, `serde_json`, `crite
 Run: `cd bench && cargo test`
 Expected: all PR 3 + PR 4a tests still pass (15 equivalence + 14 workload + 1 smoke = 30 tests).
 
-- [ ] **Step 5: Verify the bench target compiles (even with no bench file yet)**
-
-Run: `cd bench && cargo bench --no-run 2>&1 | tail -3`
-Expected: error "couldn't find target file `benches/micro_grid.rs`" (we haven't written it yet — that's task 8). The error confirms Cargo IS looking for the target, which proves the `[[bench]]` declaration is wired correctly.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add bench/Cargo.toml bench/Cargo.lock bench/.gitignore
@@ -101,7 +92,9 @@ bench: add criterion + serde deps for runner + micro_grid
 criterion goes in [dev-dependencies] (only the [[bench]] target uses
 it; keeps its transitive graph out of consumers). serde + serde_json in
 [dependencies] because runner.rs (library code) writes the JSONL
-aux-metrics file. New [[bench]] target micro_grid with harness=false.
+aux-metrics file. The [[bench]] target itself lands in task 8
+together with bench/benches/micro_grid.rs — declaring it now would
+cause a manifest parse error blocking every cargo command.
 results/ added to bench/.gitignore so bench output isn't committed.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
@@ -1005,12 +998,16 @@ EOF
 
 ---
 
-## Task 8: `micro_grid.rs` scaffold (constants, `seed_for`, empty `micro_grid`, `criterion_main!`)
+## Task 8: `micro_grid.rs` scaffold (constants, `seed_for`, empty `micro_grid`, `criterion_main!`) + `[[bench]]` declaration
 
 **Files:**
 - Create: `bench/benches/micro_grid.rs`
+- Modify: `bench/Cargo.toml`
 
-- [ ] **Step 1: Create the bench file with constants and stub**
+- [ ] **Step 1a: Create the bench file with constants and stub**
+
+(File MUST be created before adding the `[[bench]]` block to Cargo.toml — otherwise cargo's manifest parser rejects the manifest, blocking every cargo command. Create the file first, then add the manifest entry in Step 1b.)
+
 
 Create `bench/benches/micro_grid.rs` with:
 
@@ -1085,6 +1082,19 @@ criterion_main!(benches);
 
 The `let _aux = ...` and `let _ = c;` are placeholders so the function compiles. Tasks 10 and 11 will replace the body with the real row-bench calls.
 
+- [ ] **Step 1b: Add the `[[bench]]` block to `bench/Cargo.toml`**
+
+Now that the file exists, add the `[[bench]]` declaration. Append to the end of `bench/Cargo.toml` (after the `[dev-dependencies]` block):
+
+```toml
+
+[[bench]]
+name = "micro_grid"
+harness = false
+```
+
+The `harness = false` line is required for Criterion. Without it, Cargo links the unstable `libtest` benchmark harness and you get cryptic linker errors. (This block was deferred from Task 1 because cargo's manifest parser rejects `[[bench]]` declarations whose target file doesn't exist yet — it must land together with the file.)
+
 - [ ] **Step 2: Verify the bench target compiles**
 
 Run: `cd bench && cargo bench --no-run 2>&1 | tail -5`
@@ -1114,14 +1124,16 @@ If clippy DOES fire on unused imports, add this attribute to the top of `micro_g
 - [ ] **Step 6: Commit**
 
 ```bash
-git add bench/benches/micro_grid.rs
+git add bench/benches/micro_grid.rs bench/Cargo.toml
 git commit -m "$(cat <<'EOF'
-bench: scaffold micro_grid bench binary
+bench: scaffold micro_grid bench binary + [[bench]] declaration
 
-Constants (SIZES, seed_for), imports, criterion_main! glue. The
-micro_grid function body is empty — tasks 10/11 will fill in row-bench
-calls. With this commit, cargo bench --bench micro_grid succeeds and
-creates bench/results/aux_metrics.jsonl as an empty file.
+Constants (SIZES, seed_for), imports, criterion_main! glue, plus the
+[[bench]] target block in Cargo.toml (deferred from task 1 because
+the manifest parser rejects [[bench]] entries with no file). The
+micro_grid function body is empty — tasks 10/11 will fill in
+row-bench calls. With this commit, cargo bench --bench micro_grid
+succeeds and creates bench/results/aux_metrics.jsonl as an empty file.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
