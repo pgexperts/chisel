@@ -48,13 +48,28 @@ cd bench && cargo test
 PR 4a (workload data layer — `Operation`/`Workload` types + six
 seeded generators in `bench/src/workload.rs`, ChaCha8Rng-pinned for
 cross-version reproducibility) landed on `main` as of 2026-04-30.
-The original PR 4 from the master spec was split into 4a + 4b
-once it became clear ~600 LOC in one PR was less reviewable than
-two ~300 LOC PRs.
+PR 4b (Runner machinery + 6-row Criterion micro grid in
+`bench/src/runner.rs` + `bench/benches/micro_grid.rs`, producing
+165 cells of wall-clock + file-size + Chisel-internal-counter
+metrics into `target/criterion/...` and `bench/results/aux_metrics.jsonl`)
+landed on `main` as of 2026-05-01. The original PR 4 from the master
+spec was split into 4a + 4b once it became clear ~600 LOC in one PR
+was less reviewable than two smaller PRs.
 
-PRs 4b–8 of the bench-suite series will add the Runner + 270-cell
-Criterion registration (4b), output post-processing (5), scenarios
-(6), CI integration (7), and cross-engine relative-performance
+The 4b grid is 6 rows, not the 9 the master spec called for: three
+1000-per-tx variants (update, delete, delete_many) were dropped during
+implementation because 1000 random ops over the prepopulated DB pin a
+working set of dirty pages exceeding Chisel's 2048-page cache ceiling.
+The dropped row functions remain in `micro_grid.rs` (with `#[allow(dead_code)]`)
+so they can be re-enabled in a future PR with a configurable larger cache.
+SQLite snapshot-restore needed a special `Engine::flush_for_snapshot()`
+hook (default no-op; SQLite override does `journal_mode=DELETE`) because
+WAL mode leaves committed data in the `-wal` sibling between explicit
+checkpoints — `std::fs::copy` of the main `.db` alone otherwise yields
+"database disk image is malformed" on reopen.
+
+PRs 5–8 of the bench-suite series will add output post-processing (5),
+scenarios (6), CI integration (7), and cross-engine relative-performance
 tests (8 — Chisel vs redb vs SQLite). Design spec at
 `docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md`
 covers PRs 1–7; PR 8 is an addendum tracked here pending its own
