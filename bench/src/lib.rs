@@ -10,17 +10,22 @@
 //   Reporter      ── Markdown + JSON output post-processing
 //
 // PRs 1–2 + PR-A + PR 3 landed the Engine trait and all three engine
-// impls. PR 4a (this PR) lands the Workload data layer. PR 4b adds
+// impls. PR 4a landed the Workload data layer. PR 4b (this PR) adds
 // the Runner + 270-cell registration. PRs 5–7 follow.
 
 pub mod chisel_engine;
 pub mod engine;
 pub mod redb_engine;
+pub mod runner;
 pub mod sqlite_engine;
 pub mod workload;
 
 pub use chisel_engine::ChiselEngine;
 pub use engine::{DurabilityMode, Engine, EngineResult, Identifier};
 pub use redb_engine::RedbEngine;
+pub use runner::{
+    AuxMetricsWriter, CellAuxMetrics, CellId, ChiselCountersDelta, EngineMode, PopulatedSnapshot,
+    CACHE_SIZE_PAGES,
+};
 pub use sqlite_engine::SqliteEngine;
 pub use workload::{Operation, Workload};

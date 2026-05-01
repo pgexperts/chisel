@@ -154,4 +154,22 @@ pub trait Engine {
     /// `chisel::ChiselError::Poisoned` here rather than masking it
     /// as `Ok(None)`).
     fn internal_counters(&self) -> EngineResult<Option<ChiselCounters>>;
+
+    /// Make the backing file fully self-contained on disk so a sibling
+    /// `std::fs::copy` of the main file alone yields a re-openable database.
+    ///
+    /// Default implementation is a no-op: Chisel writes everything into
+    /// the single `.db` file at commit time (shadow paging), and redb
+    /// likewise. SQLite in WAL mode overrides this — committed data may
+    /// live only in the `-wal` sibling between commits and explicit
+    /// checkpoints; copying just the `.db` produces a file whose page
+    /// metadata disagrees with the missing WAL, manifesting on reopen
+    /// as "database disk image is malformed".
+    ///
+    /// Called at snapshot-seal points (`populate_snapshot`,
+    /// `capture_aux_metrics_snapshot_restore`), NOT inside per-iteration
+    /// timed regions — overrides may be O(database size).
+    fn flush_for_snapshot(&mut self) -> EngineResult<()> {
+        Ok(())
+    }
 }
