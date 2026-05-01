@@ -17,3 +17,7 @@ tempfile = "3"
 
 [dev-dependencies]
 criterion = "0.5"
+
+[[bench]]
+name = "micro_grid"
+harness = false
