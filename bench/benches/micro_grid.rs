@@ -11,7 +11,7 @@
 // Run the full grid: `cargo bench --bench micro_grid`. Filter to one row:
 // `cargo bench --bench micro_grid read-warm`.
 
-#![allow(unused_imports, dead_code)] // tasks 10/11 will use these row-bench imports + SIZES/seed_for
+#![allow(unused_imports)] // task 11 will use the remaining workload generators
 
 use chisel_bench::runner::{
     apply_op, capture_aux_metrics_snapshot_restore, capture_aux_metrics_warm_read,
@@ -144,10 +144,146 @@ fn run_cold_read_cell(
     });
 }
 
+/// Rows 1 and 2: allocate, 1-per-tx and 1000-per-tx.
+/// Empty pre-populated DB; workload is `ops_per_tx` Allocate ops; cell
+/// runs one tx of `ops_per_tx` ops. Throughput::Elements(ops_per_tx).
+fn bench_row_allocate_n_per_tx(
+    c: &mut Criterion,
+    aux: &mut AuxMetricsWriter,
+    group_name: &str,
+    ops_per_tx: usize,
+) {
+    let mut group = c.benchmark_group(group_name);
+    group.throughput(Throughput::Elements(ops_per_tx as u64));
+
+    for (size_bytes, size_label, _) in SIZES {
+        let workload = gen_allocate(ops_per_tx, size_bytes);
+        for mode in EngineMode::ALL {
+            // "Empty snapshot" = a fresh tempfile with a freshly-opened-and-closed
+            // engine. populate_snapshot with prepop_count=0 gives exactly that.
+            let snap = populate_snapshot(mode, size_bytes, 0).unwrap();
+            run_snapshot_restore_cell(
+                &mut group,
+                mode,
+                size_label,
+                snap.path(),
+                snap.ids(),
+                &workload,
+                ops_per_tx,
+            );
+            aux.append(&capture_aux_metrics_snapshot_restore(
+                CellId {
+                    row: leak_str(group_name),
+                    mode: mode.label(),
+                    size: size_label,
+                },
+                mode,
+                snap.path(),
+                snap.ids(),
+                &workload,
+                ops_per_tx,
+            ))
+            .unwrap();
+        }
+    }
+
+    group.finish();
+}
+
+/// Row 3: read warm. Persistent engine across iterations — cache warms
+/// naturally. Workload is 64 random reads (cycled per iteration).
+fn bench_row_read_warm(c: &mut Criterion, aux: &mut AuxMetricsWriter) {
+    let mut group = c.benchmark_group("read-warm");
+    group.throughput(Throughput::Elements(64));
+
+    for (size_bytes, size_label, prepop_count) in SIZES {
+        let workload = gen_read_random(seed_for("read-warm"), prepop_count, 64);
+        for mode in EngineMode::ALL {
+            let snap = populate_snapshot(mode, size_bytes, prepop_count).unwrap();
+            let mut engine = mode.open(snap.path(), CACHE_SIZE_PAGES).unwrap();
+            run_warm_read_cell(
+                &mut group,
+                mode,
+                size_label,
+                &mut *engine,
+                &workload,
+                snap.ids(),
+            );
+            aux.append(&capture_aux_metrics_warm_read(
+                CellId {
+                    row: "read-warm",
+                    mode: mode.label(),
+                    size: size_label,
+                },
+                &mut *engine,
+                &workload,
+                snap.ids(),
+            ))
+            .unwrap();
+            // engine drops here, before snap drops at end of for body
+        }
+    }
+
+    group.finish();
+}
+
+/// Row 4: read cold. Fresh engine opened inside the timed routine; "cold"
+/// means first read after open. Workload is 1 read.
+fn bench_row_read_cold(c: &mut Criterion, aux: &mut AuxMetricsWriter) {
+    let mut group = c.benchmark_group("read-cold");
+    group.throughput(Throughput::Elements(1));
+
+    for (size_bytes, size_label, prepop_count) in SIZES {
+        let workload = gen_read_random(seed_for("read-cold"), prepop_count, 1);
+        for mode in EngineMode::ALL {
+            let snap = populate_snapshot(mode, size_bytes, prepop_count).unwrap();
+            run_cold_read_cell(
+                &mut group,
+                mode,
+                size_label,
+                snap.path(),
+                snap.ids(),
+                &workload,
+            );
+            aux.append(&capture_aux_metrics_snapshot_restore(
+                CellId {
+                    row: "read-cold",
+                    mode: mode.label(),
+                    size: size_label,
+                },
+                mode,
+                snap.path(),
+                snap.ids(),
+                &workload,
+                /*ops_per_tx*/ 1,
+            ))
+            .unwrap();
+        }
+    }
+
+    group.finish();
+}
+
+/// `CellId.row` is `&'static str`. The two allocate rows have group names
+/// passed in dynamically as a parameter — we leak them to satisfy the
+/// `'static` requirement. There are exactly 2 such leaks per process
+/// (one per allocate row); negligible memory.
+fn leak_str(s: &str) -> &'static str {
+    Box::leak(s.to_string().into_boxed_str())
+}
+
 fn micro_grid(c: &mut Criterion) {
-    let _aux = AuxMetricsWriter::create("bench/results/aux_metrics.jsonl").unwrap();
-    // Row-bench function calls land in tasks 10 and 11.
-    let _ = c;
+    let mut aux = AuxMetricsWriter::create(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/results/aux_metrics.jsonl"
+    ))
+    .unwrap();
+
+    bench_row_allocate_n_per_tx(c, &mut aux, "allocate-1pertx", 1);
+    bench_row_allocate_n_per_tx(c, &mut aux, "allocate-1000pertx", 1000);
+    bench_row_read_warm(c, &mut aux);
+    bench_row_read_cold(c, &mut aux);
+    // Tasks 11 will add the remaining 5 calls (update × 2, delete × 2, delete_many).
 }
 
 criterion_group!(benches, micro_grid);
