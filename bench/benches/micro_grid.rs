@@ -57,6 +57,93 @@ fn seed_for(row_name: &str) -> u64 {
     }
 }
 
+/// Snapshot-restore cell-runner — used by 8 of 9 rows (allocate, cold-read,
+/// update, delete, delete_many). Each iteration copies the pre-built
+/// snapshot, opens a fresh engine, runs the workload's ops grouped into
+/// transactions of `ops_per_tx`, then drops engine + tempfile.
+fn run_snapshot_restore_cell(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    mode: EngineMode,
+    size_label: &str,
+    snapshot_path: &std::path::Path,
+    snapshot_ids: &[u64],
+    workload: &Workload,
+    ops_per_tx: usize,
+) {
+    group.bench_with_input(BenchmarkId::new(mode.label(), size_label), &(), |b, _| {
+        b.iter_batched(
+            || {
+                let working = NamedTempFile::new().unwrap();
+                std::fs::copy(snapshot_path, working.path()).unwrap();
+                let engine = mode.open(working.path(), CACHE_SIZE_PAGES).unwrap();
+                (engine, working)
+            },
+            |(mut engine, _working)| {
+                drive_workload_with_tx_granularity(
+                    &mut *engine,
+                    workload,
+                    ops_per_tx,
+                    snapshot_ids,
+                );
+            },
+            BatchSize::PerIteration,
+        );
+    });
+}
+
+/// Warm-read cell-runner — row 3 only. Engine is opened once per cell
+/// and reused across all iterations; the cache warms naturally during
+/// Criterion's warmup phase. Reads don't mutate engine-visible state,
+/// so persistent engine is safe.
+fn run_warm_read_cell(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    mode: EngineMode,
+    size_label: &str,
+    engine: &mut dyn Engine,
+    workload: &Workload,
+    snapshot_ids: &[u64],
+) {
+    group.bench_with_input(BenchmarkId::new(mode.label(), size_label), &(), |b, _| {
+        b.iter(|| {
+            for op in &workload.ops {
+                apply_op(engine, op, snapshot_ids, &mut Vec::new());
+            }
+        });
+    });
+}
+
+/// Cold-read cell-runner — row 4 only. Engine open is INSIDE the timed
+/// routine: cold means "fresh open, no values touched, first read is
+/// the timed call" (master spec §5.2). File copy stays in setup.
+fn run_cold_read_cell(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    mode: EngineMode,
+    size_label: &str,
+    snapshot_path: &std::path::Path,
+    snapshot_ids: &[u64],
+    workload: &Workload,
+) {
+    group.bench_with_input(BenchmarkId::new(mode.label(), size_label), &(), |b, _| {
+        b.iter_batched(
+            || {
+                let working = NamedTempFile::new().unwrap();
+                std::fs::copy(snapshot_path, working.path()).unwrap();
+                working
+            },
+            |working| {
+                let mut engine = mode.open(working.path(), CACHE_SIZE_PAGES).unwrap();
+                apply_op(
+                    &mut *engine,
+                    &workload.ops[0],
+                    snapshot_ids,
+                    &mut Vec::new(),
+                );
+            },
+            BatchSize::PerIteration,
+        );
+    });
+}
+
 fn micro_grid(c: &mut Criterion) {
     let _aux = AuxMetricsWriter::create("bench/results/aux_metrics.jsonl").unwrap();
     // Row-bench function calls land in tasks 10 and 11.
