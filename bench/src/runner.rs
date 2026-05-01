@@ -9,7 +9,7 @@
 // shape, which is "one big workload run" rather than the per-iteration
 // micro-grid cells PR 4b registers.
 
-use crate::engine::{DurabilityMode, Engine, EngineResult};
+use crate::engine::{DurabilityMode, Engine, EngineResult, Identifier};
 use crate::{ChiselEngine, RedbEngine, SqliteEngine};
 use std::path::Path;
 
@@ -190,6 +190,79 @@ impl AuxMetricsWriter {
         self.writer.write_all(b"\n")?;
         self.writer.flush()?;
         Ok(())
+    }
+}
+
+use crate::workload::{Operation, Workload};
+
+/// Translate one Operation into the engine method call that implements
+/// it, resolving `alloc_index` references through `snapshot_ids` (for
+/// pre-populated records) or `new_ids` (for records allocated earlier
+/// in the same iteration). Newly-allocated identifiers are pushed to
+/// `new_ids` so subsequent ops in the same iteration can reference them.
+///
+/// The micro-grid workloads only reference one of the two id sources
+/// (alloc workloads have `prepop_count == 0`; read/update/delete
+/// workloads have no Allocate ops in their iteration), but a unified
+/// resolver keeps this helper general for PR 6 scenarios that mix.
+pub fn apply_op(
+    engine: &mut dyn Engine,
+    op: &Operation,
+    snapshot_ids: &[u64],
+    new_ids: &mut Vec<Identifier>,
+) {
+    let resolve = |i: usize| -> Identifier {
+        if i < snapshot_ids.len() {
+            Identifier(snapshot_ids[i])
+        } else {
+            new_ids[i - snapshot_ids.len()]
+        }
+    };
+    match op {
+        Operation::Allocate { size } => {
+            let id = engine.allocate(&vec![0u8; *size]).unwrap();
+            new_ids.push(id);
+        }
+        Operation::Read { alloc_index } => {
+            engine.read(resolve(*alloc_index)).unwrap();
+        }
+        Operation::Update { alloc_index, size } => {
+            engine
+                .update(resolve(*alloc_index), &vec![0u8; *size])
+                .unwrap();
+        }
+        Operation::Delete { alloc_index } => {
+            engine.delete(resolve(*alloc_index)).unwrap();
+        }
+        Operation::DeleteMany { alloc_indices } => {
+            let ids: Vec<Identifier> = alloc_indices.iter().map(|&i| resolve(i)).collect();
+            engine.delete_many(&ids).unwrap();
+        }
+    }
+}
+
+/// Run the workload's ops against the engine, grouped into transactions
+/// of `ops_per_tx` ops each. Used by both the snapshot-restore
+/// cell-runner (in the timed routine) and `capture_aux_metrics_*` (in
+/// the calibration run).
+///
+/// `unwrap()` on engine errors is intentional: an engine error inside a
+/// timed bench iteration means the bench is broken, and panicking gives
+/// a clear stack trace. A user-recoverable error path here would
+/// silently corrupt timing measurements.
+pub fn drive_workload_with_tx_granularity(
+    engine: &mut dyn Engine,
+    workload: &Workload,
+    ops_per_tx: usize,
+    snapshot_ids: &[u64],
+) {
+    let mut new_ids: Vec<Identifier> = Vec::new();
+    for chunk in workload.ops.chunks(ops_per_tx) {
+        engine.begin().unwrap();
+        for op in chunk {
+            apply_op(engine, op, snapshot_ids, &mut new_ids);
+        }
+        engine.commit().unwrap();
     }
 }
 
