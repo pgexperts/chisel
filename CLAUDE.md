@@ -45,10 +45,17 @@ tests (5 scenarios × 3 engines = 15 tests). Build / run locally with:
 cd bench && cargo test
 ```
 
-PRs 4–8 of the bench-suite series will add workload generators, the
-diagnostic micro grid, output post-processing, scenarios, CI
-integration, and cross-engine relative-performance tests
-(Chisel vs redb vs SQLite). Design spec at
+PR 4a (workload data layer — `Operation`/`Workload` types + six
+seeded generators in `bench/src/workload.rs`, ChaCha8Rng-pinned for
+cross-version reproducibility) landed on `main` as of 2026-04-30.
+The original PR 4 from the master spec was split into 4a + 4b
+once it became clear ~600 LOC in one PR was less reviewable than
+two ~300 LOC PRs.
+
+PRs 4b–8 of the bench-suite series will add the Runner + 270-cell
+Criterion registration (4b), output post-processing (5), scenarios
+(6), CI integration (7), and cross-engine relative-performance
+tests (8 — Chisel vs redb vs SQLite). Design spec at
 `docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md`
 covers PRs 1–7; PR 8 is an addendum tracked here pending its own
 spec/plan. Per-PR plans alongside in `docs/superpowers/plans/`.
