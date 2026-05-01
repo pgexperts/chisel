@@ -39,6 +39,12 @@ const SIZES: [(usize, &str, usize); 6] = [
     (1_048_576, "1MB", 25),
 ];
 
+/// Per-transaction byte budget. Cells where `ops_per_tx * size_bytes` exceeds
+/// this are skipped to avoid Chisel's CacheFull at large 1000-per-tx writes
+/// (cache hard ceiling is ~16 MB; 8 MB leaves headroom for COW overhead).
+/// Affects allocate-1000pertx and update-1000pertx at sizes ≥ 16KB.
+const TX_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+
 /// Hardcoded per-row seeds for workload determinism. Hardcoded rather
 /// than derived from row names because Rust's DefaultHasher randomizes
 /// per-process — derived seeds would change between invocations.
@@ -157,6 +163,9 @@ fn bench_row_allocate_n_per_tx(
     group.throughput(Throughput::Elements(ops_per_tx as u64));
 
     for (size_bytes, size_label, _) in SIZES {
+        if ops_per_tx * size_bytes > TX_BUDGET_BYTES {
+            continue; // skip cells too large to fit in Chisel's cache
+        }
         let workload = gen_allocate(ops_per_tx, size_bytes);
         for mode in EngineMode::ALL {
             // "Empty snapshot" = a fresh tempfile with a freshly-opened-and-closed
