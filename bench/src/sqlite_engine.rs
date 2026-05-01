@@ -179,3 +179,23 @@ impl Engine for SqliteEngine {
         Ok(None)
     }
 }
+
+// Force a WAL checkpoint+truncate at drop so the main `.db` file is
+// fully self-contained on disk by the time any sibling code (notably
+// the bench harness's snapshot-restore path) file-copies it. Without
+// this, committed data may live only in the `-wal` sibling; copying
+// the `.db` alone yields a file whose page-count metadata disagrees
+// with the missing WAL, which SQLite reports as "database disk image
+// is malformed" on the next open. Manifested as a transient failure
+// at sqlite-strict/128KB during PR 4b development.
+//
+// Errors are swallowed: Drop can't propagate them, and any genuine
+// checkpoint failure (e.g. SQLITE_BUSY from a still-active tx) would
+// surface loudly the moment the copied file is opened. Panicking in
+// Drop risks abort-during-unwind, which is far worse than a deferred
+// loud failure.
+impl Drop for SqliteEngine {
+    fn drop(&mut self) {
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+}
