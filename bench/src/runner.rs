@@ -13,6 +13,12 @@ use crate::engine::{DurabilityMode, Engine, EngineResult, Identifier};
 use crate::{ChiselEngine, RedbEngine, SqliteEngine};
 use std::path::Path;
 
+/// Page-cache budget passed to every engine when constructing for the
+/// micro grid. 256 pages × 8 KB = 2 MB ≈ 8% of the 25 MB raw payload
+/// per cell, so random-access workloads will miss frequently. See spec
+/// §6.1.
+pub const CACHE_SIZE_PAGES: usize = 256;
+
 /// One of the five engine-mode columns of the micro grid.
 ///
 /// Hides the per-engine constructor asymmetry behind `EngineMode::open`:
@@ -266,6 +272,64 @@ pub fn drive_workload_with_tx_granularity(
     }
 }
 
+use tempfile::NamedTempFile;
+
+/// A populated database file paired with its alloc-order → engine-id map.
+///
+/// The file is a `tempfile::NamedTempFile` so it auto-deletes on drop.
+/// `ids()` returns the identifiers in allocation order — element `i` is
+/// the engine identifier that the `i`-th `gen_prepopulate` Allocate
+/// produced. Workloads reference records by `alloc_index` (per PR 4a's
+/// contract); the cell-runners pass `ids()` through to `apply_op` to
+/// resolve those indices to engine identifiers.
+pub struct PopulatedSnapshot {
+    file: NamedTempFile,
+    ids: Vec<u64>,
+}
+
+impl PopulatedSnapshot {
+    pub fn path(&self) -> &Path {
+        self.file.path()
+    }
+    pub fn ids(&self) -> &[u64] {
+        &self.ids
+    }
+}
+
+/// Build a fresh DB file populated with `prepop_count` records of `size_bytes`
+/// each, capturing the engine-assigned identifiers in allocation order.
+///
+/// Pre-population uses one `begin/.../commit` block, not one tx per op —
+/// matches scenario-style allocation more closely and is much faster
+/// for large counts. Returns the snapshot ready for the cell-runners
+/// to copy-and-restore from.
+///
+/// The returned `PopulatedSnapshot` owns the file via `NamedTempFile`;
+/// callers must keep it alive until all cells using its `path()` are
+/// done. (The micro-grid bench file pattern naturally does this — the
+/// snapshot is created at the top of the per-(mode, size) block and
+/// drops at the end, after the cell-runner returns.)
+pub fn populate_snapshot(
+    mode: EngineMode,
+    size_bytes: usize,
+    prepop_count: usize,
+) -> EngineResult<PopulatedSnapshot> {
+    let file = NamedTempFile::new()?;
+    let mut engine = mode.open(file.path(), CACHE_SIZE_PAGES)?;
+    let mut ids = Vec::with_capacity(prepop_count);
+    let payload = vec![0u8; size_bytes];
+
+    engine.begin()?;
+    for _ in 0..prepop_count {
+        let id = engine.allocate(&payload)?;
+        ids.push(id.0);
+    }
+    engine.commit()?;
+    drop(engine); // explicit close before returning the file
+
+    Ok(PopulatedSnapshot { file, ids })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +370,27 @@ mod tests {
             engine.begin().unwrap();
             engine.commit().unwrap();
         }
+    }
+
+    #[test]
+    fn populate_snapshot_chisel_basic() {
+        let snap = populate_snapshot(EngineMode::ChiselStrict, 256, 100).unwrap();
+        assert_eq!(snap.ids().len(), 100);
+        assert!(std::fs::metadata(snap.path()).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn populate_snapshot_redb_basic() {
+        let snap = populate_snapshot(EngineMode::RedbStrict, 256, 100).unwrap();
+        assert_eq!(snap.ids().len(), 100);
+        assert!(std::fs::metadata(snap.path()).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn populate_snapshot_sqlite_basic() {
+        let snap = populate_snapshot(EngineMode::SqliteStrict, 256, 100).unwrap();
+        assert_eq!(snap.ids().len(), 100);
+        assert!(std::fs::metadata(snap.path()).unwrap().len() > 0);
     }
 
     #[test]
