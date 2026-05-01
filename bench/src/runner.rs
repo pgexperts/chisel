@@ -360,6 +360,10 @@ pub fn populate_snapshot(
         engine.commit()?;
         remaining -= this_chunk;
     }
+    // Force engines that maintain sibling journal files (SQLite WAL) to
+    // flush them into the main DB so a sibling file-copy of `file.path()`
+    // alone produces a re-openable database. No-op for Chisel and redb.
+    engine.flush_for_snapshot()?;
     drop(engine); // explicit close before returning the file
 
     Ok(PopulatedSnapshot { file, ids })
@@ -389,6 +393,13 @@ pub fn capture_aux_metrics_snapshot_restore(
     let size_before = engine.file_size_bytes().unwrap();
 
     drive_workload_with_tx_granularity(&mut *engine, workload, ops_per_tx, snapshot_ids);
+
+    // Match populate_snapshot: ensure sibling journal files (SQLite WAL)
+    // are folded into the main DB before we read file size or hand the
+    // working file off. file_size_bytes already includes -wal/-shm, so
+    // this primarily affects re-openability symmetry, not the captured
+    // delta — but keeps the post-workload state honestly self-contained.
+    engine.flush_for_snapshot().unwrap();
 
     let counters_after = engine.internal_counters().unwrap();
     let size_after = engine.file_size_bytes().unwrap();

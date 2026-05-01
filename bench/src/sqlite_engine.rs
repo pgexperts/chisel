@@ -178,24 +178,32 @@ impl Engine for SqliteEngine {
     fn internal_counters(&self) -> EngineResult<Option<ChiselCounters>> {
         Ok(None)
     }
-}
 
-// Force a WAL checkpoint+truncate at drop so the main `.db` file is
-// fully self-contained on disk by the time any sibling code (notably
-// the bench harness's snapshot-restore path) file-copies it. Without
-// this, committed data may live only in the `-wal` sibling; copying
-// the `.db` alone yields a file whose page-count metadata disagrees
-// with the missing WAL, which SQLite reports as "database disk image
-// is malformed" on the next open. Manifested as a transient failure
-// at sqlite-strict/128KB during PR 4b development.
-//
-// Errors are swallowed: Drop can't propagate them, and any genuine
-// checkpoint failure (e.g. SQLITE_BUSY from a still-active tx) would
-// surface loudly the moment the copied file is opened. Panicking in
-// Drop risks abort-during-unwind, which is far worse than a deferred
-// loud failure.
-impl Drop for SqliteEngine {
-    fn drop(&mut self) {
-        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    // WAL mode keeps committed data in the `-wal` sibling until
+    // checkpointed. Copying just the `.db` file (as the bench harness
+    // does at snapshot-restore boundaries) produces a re-openable file
+    // only if the WAL has been merged into the main DB and truncated;
+    // otherwise SQLite reports "database disk image is malformed" on
+    // the next open. TRUNCATE is the only checkpoint mode that both
+    // flushes WAL pages into `.db` and shrinks the WAL to zero bytes,
+    // making the main file genuinely self-contained.
+    //
+    // Manifested as a transient failure at sqlite-strict/128KB during
+    // PR 4b development. Not placed in `Drop` because per-iteration
+    // bench cells open and drop engines inside the timed region; an
+    // always-on Drop checkpoint adds ~80% time to every snapshot-restore
+    // measurement.
+    //
+    // `synchronous=FULL` is set before the checkpoint to make the
+    // checkpoint durable even when the engine was opened in Unsafe
+    // mode (synchronous=OFF). Without this, the checkpoint's I/O may
+    // sit in OS buffers when the bench file-copies the snapshot,
+    // yielding the same "malformed" error on reopen — distinct from
+    // the WAL-not-merged case but with the same surface symptom.
+    fn flush_for_snapshot(&mut self) -> EngineResult<()> {
+        self.conn.execute_batch(
+            "PRAGMA synchronous=FULL; PRAGMA wal_checkpoint(TRUNCATE);",
+        )?;
+        Ok(())
     }
 }
