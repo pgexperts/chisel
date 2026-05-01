@@ -23,6 +23,6 @@ pub mod workload;
 pub use chisel_engine::ChiselEngine;
 pub use engine::{DurabilityMode, Engine, EngineResult, Identifier};
 pub use redb_engine::RedbEngine;
-pub use runner::EngineMode;
+pub use runner::{CellAuxMetrics, CellId, ChiselCountersDelta, EngineMode};
 pub use sqlite_engine::SqliteEngine;
 pub use workload::{Operation, Workload};
