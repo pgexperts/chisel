@@ -89,6 +89,66 @@ impl EngineMode {
     }
 }
 
+use chisel::stats::ChiselCounters;
+
+/// Per-cell deltas of the four Chisel internal counters (master spec
+/// §6.1). Reported in the JSONL aux-metrics file for cells where the
+/// engine is Chisel; `None` for redb / SQLite.
+///
+/// Values are subtracted (after - before) and are guaranteed
+/// non-negative because counters are cumulative-from-open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ChiselCountersDelta {
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub fsync_calls: u64,
+    pub pages_allocated: u64,
+}
+
+/// Identifier of one micro-grid cell — the 3-tuple (row, mode, size).
+/// Serialized via `#[serde(flatten)]` into `CellAuxMetrics` so the
+/// JSONL line has top-level `row`, `mode`, `size` fields rather than
+/// nested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CellId {
+    pub row: &'static str,
+    pub mode: &'static str,
+    pub size: &'static str,
+}
+
+/// One JSONL line in `bench/results/aux_metrics.jsonl`. The full payload
+/// for one cell of the micro grid: identifier + file-size delta + (for
+/// Chisel) counter deltas. PR 5's post-processor reads this alongside
+/// Criterion's `estimates.json` to produce the markdown summary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CellAuxMetrics {
+    #[serde(flatten)]
+    pub cell_id: CellId,
+    pub file_size_delta_bytes: i64,
+    pub counters: Option<ChiselCountersDelta>, // serialized as `counters: null` for non-Chisel
+}
+
+/// Compute the per-field delta between two ChiselCounters snapshots.
+/// Returns `None` if either snapshot is `None` (i.e., for non-Chisel
+/// engines whose `internal_counters()` returns `Ok(None)`).
+///
+/// Subtraction uses `saturating_sub` defensively even though the
+/// invariant is that counters are cumulative-from-open (so after >=
+/// before always). This guards against any future re-architecture that
+/// would otherwise produce a debug-build panic.
+pub fn counter_delta(
+    before: Option<ChiselCounters>,
+    after: Option<ChiselCounters>,
+) -> Option<ChiselCountersDelta> {
+    let (b, a) = before.zip(after)?;
+    Some(ChiselCountersDelta {
+        cache_hits: a.cache_hits.saturating_sub(b.cache_hits),
+        cache_misses: a.cache_misses.saturating_sub(b.cache_misses),
+        fsync_calls: a.fsync_calls.saturating_sub(b.fsync_calls),
+        pages_allocated: a.pages_allocated.saturating_sub(b.pages_allocated),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
