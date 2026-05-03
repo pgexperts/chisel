@@ -103,7 +103,7 @@ use chisel::stats::ChiselCounters;
 ///
 /// Values are subtracted (after - before) and are guaranteed
 /// non-negative because counters are cumulative-from-open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChiselCountersDelta {
     pub cache_hits: u64,
     pub cache_misses: u64,
