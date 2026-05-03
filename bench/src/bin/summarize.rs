@@ -58,7 +58,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Render markdown + JSON.
     let md = render_markdown(&cells, &metadata);
-    let json = render_json(&cells, &metadata);
+    let json = render_json(&cells, &[], &metadata);
 
     // 5. Write output artifacts.
     std::fs::write(out_dir.join("summary.md"), &md)?;
