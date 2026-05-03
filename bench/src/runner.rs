@@ -498,13 +498,40 @@ pub fn run_scenario_cell(
         .open(working.path(), CACHE_SIZE_PAGES)
         .expect("open engine");
 
-    // Pre-population phase (untimed). Each allocate in its own tx
-    // for engine compatibility; we don't care about pre-pop throughput.
+    // Pre-population phase (untimed). Batches ops into chunked
+    // transactions sized by POPULATE_TX_BUDGET_BYTES / POPULATE_TX_MAX_RECORDS
+    // to amortize fsync cost — single-op-per-tx prepop is fsync-bound and
+    // blows the runtime budget at 100K-record scale (an Allocate-each-tx
+    // loop on chisel-strict is ~12 min for 100K records on macOS APFS).
+    // Mirror of PR 4b's `populate_snapshot` strategy, generalized via a
+    // running byte accumulator since scenario prepop has heterogeneous op
+    // sizes (mutation-log uses uniform [64, 4096]; document-store uses
+    // lognormal). Reads/Deletes accumulate zero bytes since they don't
+    // dirty new payload pages.
     let mut snapshot_ids: Vec<u64> = Vec::with_capacity(prepopulate_workload.ops.len());
     let mut new_ids_during_prepop: Vec<Identifier> = Vec::new();
-    for op in &prepopulate_workload.ops {
+    let mut i = 0;
+    while i < prepopulate_workload.ops.len() {
         engine.begin().expect("begin prepop tx");
-        apply_op(&mut *engine, op, &snapshot_ids, &mut new_ids_during_prepop);
+        let mut accumulated_bytes: usize = 0;
+        let mut accumulated_records: usize = 0;
+        while i < prepopulate_workload.ops.len()
+            && accumulated_records < POPULATE_TX_MAX_RECORDS
+            && accumulated_bytes < POPULATE_TX_BUDGET_BYTES
+        {
+            let op = &prepopulate_workload.ops[i];
+            let cost = match op {
+                Operation::Allocate { size } => *size,
+                Operation::Update { size, .. } => *size,
+                Operation::Read { .. }
+                | Operation::Delete { .. }
+                | Operation::DeleteMany { .. } => 0,
+            };
+            apply_op(&mut *engine, op, &snapshot_ids, &mut new_ids_during_prepop);
+            accumulated_bytes += cost;
+            accumulated_records += 1;
+            i += 1;
+        }
         engine.commit().expect("commit prepop tx");
     }
     // Move new_ids_during_prepop into snapshot_ids for the timed phase.
