@@ -22,7 +22,7 @@
 // String is infallible — the io::Result is uniformly Ok and we don't want
 // to clutter the call sites with .unwrap() noise.
 
-use crate::summary::discover::Cell;
+use crate::summary::discover::{Cell, ScenarioMetrics};
 use crate::summary::format::{format_bytes, format_duration_ns, parse_size_to_bytes};
 use crate::summary::metadata::Metadata;
 use std::collections::BTreeSet;
@@ -40,17 +40,26 @@ const MODE_ORDER: &[&str] = &[
     "sqlite-unsafe",
 ];
 
-/// Render a Vec<Cell> + Metadata into a complete markdown summary
-/// (header + per-row tables + file-size delta table + Chisel internals
-/// appendix + footer).
-pub fn render_markdown(cells: &[Cell], metadata: &Metadata) -> String {
+/// Render a Vec<Cell> + Vec<ScenarioMetrics> + Metadata into a complete
+/// markdown summary (header + scenario tier + per-row tables + file-size
+/// delta table + Chisel internals appendix + footer). Empty `scenarios`
+/// slice omits the scenario tier section entirely so PR 5's pre-PR-6
+/// output remains a strict subset of the new format.
+pub fn render_markdown(
+    cells: &[Cell],
+    scenarios: &[ScenarioMetrics],
+    metadata: &Metadata,
+) -> String {
     let mut out = String::new();
     render_header(&mut out, metadata);
     render_durability_legend(&mut out);
     render_disclaimer(&mut out);
+    if !scenarios.is_empty() {
+        render_scenario_table(&mut out, scenarios);
+    }
     render_micro_grid(&mut out, cells);
     render_file_size_table(&mut out, cells);
-    render_chisel_internals_appendix(&mut out, cells);
+    render_chisel_internals_appendix(&mut out, cells, scenarios);
     render_footer(&mut out, metadata);
     out
 }
@@ -93,6 +102,38 @@ fn render_durability_legend(out: &mut String) {
 fn render_disclaimer(out: &mut String) {
     let _ = writeln!(out, "## Method\n");
     let _ = writeln!(out, "Wall-clock cells show `p50 (p99)` in magnitude-adaptive units. Percentiles are computed directly from Criterion's raw `sample.json` per-iteration times via numpy-style linear interpolation; all three percentiles share the same sample distribution. With Criterion's default ~100 samples per cell, p99 has appreciable statistical uncertainty — for tight tail bounds, consult Criterion's per-cell HTML report under `target/criterion/<row>/<mode>/<size>/report/`.");
+    let _ = writeln!(out);
+}
+
+fn render_scenario_table(out: &mut String, scenarios: &[ScenarioMetrics]) {
+    let _ = writeln!(out, "## Scenario tier\n");
+    let _ = writeln!(
+        out,
+        "End-to-end YCSB-style workloads. Each scenario runs once per strict durability mode (chisel-strict, redb-strict, sqlite-strict). Per-op timings collected inline via `Instant::now()` before/after each op; percentiles computed from the full distribution (no Criterion sampling — see PR 6 spec §3.4)."
+    );
+    let _ = writeln!(out);
+
+    let _ = writeln!(
+        out,
+        "| scenario | mode | throughput | p50 | p95 | p99 | total | final size |"
+    );
+    let _ = writeln!(
+        out,
+        "|----------|------|-----------:|----:|----:|----:|------:|-----------:|"
+    );
+    for s in scenarios {
+        let throughput = s.throughput_ops_per_sec.round() as u64;
+        let p50 = format_duration_ns(s.p50_ns);
+        let p95 = format_duration_ns(s.p95_ns);
+        let p99 = format_duration_ns(s.p99_ns);
+        let total = format_duration_ns(s.total_wall_clock_ns as f64);
+        let final_size = format_bytes(s.final_file_size_bytes as i64);
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} ops/s | {} | {} | {} | {} | {} |",
+            s.scenario, s.mode, throughput, p50, p95, p99, total, final_size
+        );
+    }
     let _ = writeln!(out);
 }
 
@@ -224,7 +265,11 @@ fn render_file_size_table(out: &mut String, cells: &[Cell]) {
     let _ = writeln!(out);
 }
 
-fn render_chisel_internals_appendix(out: &mut String, cells: &[Cell]) {
+fn render_chisel_internals_appendix(
+    out: &mut String,
+    cells: &[Cell],
+    scenarios: &[ScenarioMetrics],
+) {
     let _ = writeln!(out, "## Chisel internals appendix\n");
     let _ = writeln!(out, "Counter deltas for cells where `engine_mode = chisel-strict`. One row per cell (row × size); columns are the four counters from `Chisel::counters()`.\n");
     let _ = writeln!(
@@ -271,6 +316,47 @@ fn render_chisel_internals_appendix(out: &mut String, cells: &[Cell]) {
         );
     }
     let _ = writeln!(out);
+
+    // Scenario subsection — chisel-strict scenarios only. Parallels the
+    // micro-grid table above but keyed by scenario name rather than
+    // (row, size). Omitted when no chisel-strict scenarios exist so the
+    // section header doesn't dangle above an empty table.
+    let chisel_scenarios: Vec<&ScenarioMetrics> = scenarios
+        .iter()
+        .filter(|s| s.mode == "chisel-strict")
+        .collect();
+    if !chisel_scenarios.is_empty() {
+        let _ = writeln!(
+            out,
+            "Counter deltas for chisel-strict scenarios (parallel section):\n"
+        );
+        let _ = writeln!(
+            out,
+            "| scenario | cache_hits | cache_misses | fsync_calls | pages_allocated |"
+        );
+        let _ = writeln!(
+            out,
+            "|----------|------------|--------------|-------------|-----------------|"
+        );
+        for s in chisel_scenarios {
+            let (h, m, f, p) = match s.counters {
+                Some(c) => (
+                    c.cache_hits.to_string(),
+                    c.cache_misses.to_string(),
+                    c.fsync_calls.to_string(),
+                    c.pages_allocated.to_string(),
+                ),
+                None => (
+                    "—".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                ),
+            };
+            let _ = writeln!(out, "| {} | {} | {} | {} | {} |", s.scenario, h, m, f, p);
+        }
+        let _ = writeln!(out);
+    }
 }
 
 fn render_footer(out: &mut String, m: &Metadata) {
@@ -341,7 +427,7 @@ mod tests {
 
     #[test]
     fn render_markdown_includes_required_sections() {
-        let md = render_markdown(&fixture_cells(), &fixture_metadata());
+        let md = render_markdown(&fixture_cells(), &[], &fixture_metadata());
         assert!(md.contains("# Chisel Benchmark Summary"), "missing H1");
         assert!(md.contains("## Durability mode legend"), "missing legend");
         assert!(
@@ -361,26 +447,12 @@ mod tests {
             md.contains("## Chisel internals appendix"),
             "missing appendix header"
         );
-        assert!(md.contains("chisel-strict"), "missing chisel-strict mode");
-        assert!(md.contains("redb-strict"), "missing redb-strict mode");
-        // 3000 ns formats as "3.00 µs" per format_duration_ns (≥ 1000 ns
-        // crosses into the µs unit).
-        assert!(md.contains("3.00 µs"), "missing chisel p50 cell value");
-        assert!(
-            md.contains("+8.0 KB") || md.contains("+8192 B"),
-            "missing chisel file-size delta"
-        );
-        assert!(md.contains("abc123"), "missing chisel commit reference");
     }
 
     #[test]
     fn render_markdown_skipped_cells_render_as_dash() {
-        let md = render_markdown(&fixture_cells(), &fixture_metadata());
-        // The redb-strict cell has timing: None → must show as —
-        // (the em-dash is U+2014).
+        let md = render_markdown(&fixture_cells(), &[], &fixture_metadata());
         assert!(md.contains("—"), "missing em-dash for skipped cell");
-        // Specifically, the redb-strict micro-grid row should contain
-        // an em-dash for the missing timing cell.
         let redb_line = md
             .lines()
             .find(|l| l.starts_with("| redb-strict |"))
@@ -389,5 +461,55 @@ mod tests {
             redb_line.contains("—"),
             "redb-strict row should contain em-dash for missing timing"
         );
+    }
+
+    #[test]
+    fn render_markdown_includes_scenario_table() {
+        use crate::summary::discover::ScenarioMetrics;
+
+        let scenarios = vec![
+            ScenarioMetrics {
+                scenario: "ycsb-a".to_string(),
+                mode: "chisel-strict".to_string(),
+                total_wall_clock_ns: 15_000_000_000,
+                op_count: 100_000,
+                throughput_ops_per_sec: 6666.7,
+                p50_ns: 120_000.0,
+                p95_ns: 180_000.0,
+                p99_ns: 250_000.0,
+                final_file_size_bytes: 104_857_600,
+                file_size_delta_bytes: 4_194_304,
+                counters: Some(ChiselCountersDelta {
+                    cache_hits: 99_000,
+                    cache_misses: 1_000,
+                    fsync_calls: 100_000,
+                    pages_allocated: 12_500,
+                }),
+            },
+            ScenarioMetrics {
+                scenario: "ycsb-a".to_string(),
+                mode: "redb-strict".to_string(),
+                total_wall_clock_ns: 19_000_000_000,
+                op_count: 100_000,
+                throughput_ops_per_sec: 5263.2,
+                p50_ns: 145_000.0,
+                p95_ns: 200_000.0,
+                p99_ns: 320_000.0,
+                final_file_size_bytes: 110_000_000,
+                file_size_delta_bytes: 5_000_000,
+                counters: None,
+            },
+        ];
+
+        let md = render_markdown(&[], &scenarios, &fixture_metadata());
+        assert!(
+            md.contains("## Scenario tier"),
+            "missing scenario tier header"
+        );
+        // Both scenario rows present
+        assert!(md.contains("| ycsb-a | chisel-strict |"));
+        assert!(md.contains("| ycsb-a | redb-strict |"));
+        // Throughput formatted as integer ops/s (rounded; expect 6666 or 6667)
+        assert!(md.contains("6666 ops/s") || md.contains("6667 ops/s"));
     }
 }

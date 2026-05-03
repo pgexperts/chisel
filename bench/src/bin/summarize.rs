@@ -57,7 +57,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let metadata = gather_metadata(&cli.criterion, &cli.aux, cells.len())?;
 
     // 4. Render markdown + JSON.
-    let md = render_markdown(&cells, &metadata);
+    let md = render_markdown(&cells, &[], &metadata);
     let json = render_json(&cells, &[], &metadata);
 
     // 5. Write output artifacts.
