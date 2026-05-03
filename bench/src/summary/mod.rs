@@ -14,4 +14,5 @@
 //   render_json   — Vec<Cell> + Metadata -> serde_json::Value
 //   render_md     — Vec<Cell> + Metadata -> String
 
+pub mod discover;
 pub mod format;
