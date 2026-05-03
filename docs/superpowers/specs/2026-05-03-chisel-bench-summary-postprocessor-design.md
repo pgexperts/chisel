@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-03
 **Status:** Design approved; implementation plan pending.
-**Scope:** Add a Rust binary `chisel-bench-summarize` (in `bench/src/bin/summarize.rs`) plus a supporting library module (`bench/src/summary/`) that reads PR 4b's bench output (Criterion `estimates.json` files + `aux_metrics.jsonl`) and produces three artifacts in a timestamped output directory: a human-readable `summary.md`, a machine-readable `results.json` indexed by cell-key for PR 7's CI diff, and a `raw/` archive of the per-cell Criterion JSON for reproducibility. PR 5 of the bench-suite series.
+**Scope:** Add a Rust binary `chisel-bench-summarize` (in `bench/src/bin/summarize.rs`) plus a supporting library module (`bench/src/summary/`) that reads PR 4b's bench output (Criterion `sample.json` files + `aux_metrics.jsonl`) and produces three artifacts in a timestamped output directory: a human-readable `summary.md`, a machine-readable `results.json` indexed by cell-key for PR 7's CI diff, and a `raw/` archive of the per-cell Criterion JSON (both `sample.json` and `estimates.json`) for reproducibility. PR 5 of the bench-suite series.
 
 This spec follows on from `2026-04-25-chisel-benchmark-suite-design.md` (the overall bench-suite design, especially §7.1 on output artifacts) and `2026-05-01-chisel-bench-runner-micro-grid-design.md` (PR 4b, which produces the input data this PR consumes). PR 5 is a pure post-processor — no benches run, no engines touched.
 
@@ -10,7 +10,7 @@ This spec follows on from `2026-04-25-chisel-benchmark-suite-design.md` (the ove
 
 ### Goals
 
-- Land a single Rust binary `summarize` that reads `target/criterion/<row>/<mode>/<size>/estimates.json` files plus `bench/results/aux_metrics.jsonl` and emits three output artifacts under `bench/results/<UTC-ISO8601>/`: `summary.md`, `results.json`, `raw/`.
+- Land a single Rust binary `summarize` that reads `target/criterion/<row>/<mode>/<size>/sample.json` files plus `bench/results/aux_metrics.jsonl` and emits three output artifacts under `bench/results/<UTC-ISO8601>/`: `summary.md`, `results.json`, `raw/`.
 - Markdown summary follows master spec §7.1 layout, adjusted for the 6-row reality of PR 4b's micro grid: header (timestamp, chisel commit, machine, durability legend), one table per micro-grid row with cells `p50 (p99)` in magnitude-adaptive units, file-size delta table, Chisel internals appendix.
 - JSON results uses a flat composite-key schema (`<row>/<mode>/<size>` keys) to keep PR 7's CI diff trivially `before[k] vs after[k]`. Includes metadata (timestamp, chisel commit, machine info, cell count) for provenance.
 - Raw archive copies only `estimates.json` and `sample.json` per cell (not the full Criterion HTML reports) to keep the archive ~330 KB rather than many MB.
@@ -93,16 +93,15 @@ pub struct Cell {
     pub row: String,             // "allocate-1pertx"
     pub mode: String,            // "chisel-strict"
     pub size: String,            // "32B"
-    pub timing: Option<TimingStats>,    // None if estimates.json missing/corrupt
+    pub timing: Option<TimingStats>,    // None if sample.json missing/corrupt
     pub aux: Option<AuxMetrics>,        // None if cell missing from aux_metrics.jsonl
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct TimingStats {
-    pub p50_ns: f64,                            // median.point_estimate
-    pub p95_ns: f64,                            // mean.confidence_interval.upper_bound
-    pub p99_ns: f64,                            // mean.point_estimate + 2 * standard_error
-    pub throughput_per_sec: Option<f64>,        // if Throughput::Elements was set
+    pub p50_ns: f64,    // 50th percentile of sample distribution (per §3.3)
+    pub p95_ns: f64,    // 95th percentile of sample distribution
+    pub p99_ns: f64,    // 99th percentile of sample distribution
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
@@ -116,7 +115,7 @@ pub struct AuxMetrics {
 
 - Both present: normal cell.
 - Timing present, aux missing: aux_metrics.jsonl truncated mid-write or bench crashed between Criterion's last sample and `aux.append`.
-- Aux present, timing missing: rare; possible if Criterion's estimates.json got corrupted (especially relevant given the SQLite WAL flake we hit in PR 4b — a partial write path could in principle land aux without estimates).
+- Aux present, timing missing: rare; possible if Criterion's sample.json got corrupted (especially relevant given the SQLite WAL flake we hit in PR 4b — a partial write path could in principle land aux without sample data).
 
 Renderers handle each case: missing data shows as `—` in markdown and `null` in JSON.
 
@@ -132,13 +131,13 @@ pub fn discover_cells(
 Implementation steps:
 
 1. **Load aux_metrics.jsonl** into `HashMap<(String, String, String), AuxMetrics>` keyed by `(row, mode, size)`. Single pass; bad lines logged to stderr but don't abort the whole load.
-2. **Walk `criterion_dir`** with `walkdir::WalkDir::new(criterion_dir).max_depth(3).min_depth(3)`. Each leaf at depth 3 is a `<row>/<mode>/<size>` directory. For each leaf, read `sample.json` (compute p50, p95, p99 from the raw distribution per §3.3) and `estimates.json` (extract `throughput_per_sec`). Combine into `TimingStats`.
+2. **Walk `criterion_dir`** with `walkdir::WalkDir::new(criterion_dir).max_depth(3).min_depth(3)`. Each leaf at depth 3 is a `<row>/<mode>/<size>` directory. For each leaf, read `sample.json` (compute p50, p95, p99 from the raw distribution per §3.3) into `TimingStats`. We do not read `estimates.json` for the timing fields — `sample.json` is sufficient and authoritative.
 3. **Join** by `(row, mode, size)` key. Cells with either source produce a `Cell`; missing-on-one-side entries get `None` for the missing field.
 4. **Sort** the result by `(row, mode, size)` so output is deterministic.
 
 ### 3.3 Criterion JSON parsing — what we read
 
-We read two files per cell: `estimates.json` for throughput, and `sample.json` for the raw sample distribution (used to compute p50, p95, p99 with consistent semantics).
+We read one file per cell: `sample.json`. Criterion does not store throughput in any per-cell JSON file (it computes throughput at HTML-render time from `Throughput::Elements(N)` set per row group in PR 4b's bench file), so PR 5 does not surface a `throughput_per_sec` field — PR 7's CI diff can compute it from `p50_ns` + a hardcoded N-per-row table if it wants. This keeps PR 5 decoupled from PR 4b's per-row N values.
 
 **`sample.json`** (Criterion 0.5) is the raw measurement data:
 
@@ -169,7 +168,7 @@ fn compute_percentiles(times: &[f64], iters: &[f64]) -> (f64, f64, f64) {
 
 Computing all three percentiles from the same sample distribution makes them mutually comparable: a regression that shifts `p50` and `p99` together has a clearer signal than one where p50 comes from `median.point_estimate` (Criterion's bootstrap-related computation) and p99 comes from a CI proxy. Trade-off: we lose any benefit from Criterion's bootstrap-stabilized median estimate, but for the regression-detection use case (compare two distributions), self-consistent samples beat heterogeneous estimators.
 
-**`estimates.json`** is read only for `throughput_per_sec`, which Criterion computes from `Throughput::Elements(N)` plus the per-iteration time and exposes under the `slope` analysis (or `mean` when slope is degenerate). We surface it as-is.
+**`estimates.json`** is not read for the rendered output. The raw archive (§7.4) still copies it alongside `sample.json` for forensic / reproducibility purposes — Criterion's mean-and-slope statistical estimates are useful when a reader is debugging an unexpected percentile result and wants to see what Criterion's own bootstrap analysis said.
 
 **Honest disclosure** in the markdown header: the percentiles are computed from Criterion's raw samples (typically 100 per cell at default config). At small sample counts, p99 has high statistical uncertainty — readers wanting tighter tail bounds use Criterion's per-cell HTML report which shows the full distribution.
 
@@ -266,7 +265,6 @@ Flat composite-key map with metadata block:
       "p50_ns": 1234.5,
       "p95_ns": 1567.8,
       "p99_ns": 1890.2,
-      "throughput_per_sec": 813008.13,
       "file_size_delta_bytes": 8192,
       "counters": { "cache_hits": 0, "cache_misses": 1, "fsync_calls": 2, "pages_allocated": 4 }
     },
@@ -274,7 +272,6 @@ Flat composite-key map with metadata block:
       "p50_ns": 1456.2,
       "p95_ns": 1789.4,
       "p99_ns": 2012.8,
-      "throughput_per_sec": 686813.19,
       "file_size_delta_bytes": 4096,
       "counters": null
     }
@@ -286,7 +283,7 @@ Key design points:
 
 - **Composite key string `<row>/<mode>/<size>`** matches Criterion's directory layout 1:1 — same join key on disk and in JSON. Grep-friendly for debugging.
 - **Missing data is explicit `null`**, not omitted — keeps the schema rectangular for PR 7's diff to do `before["k"] vs after["k"]` without conditional-existence checks.
-- **`throughput_per_sec`** is pre-computed by Criterion (which knows about `Throughput::Elements(N)`); surfacing it directly avoids PR 7 having to duplicate the per-row N table.
+- **No `throughput_per_sec` field.** Criterion does not store throughput in any per-cell JSON file (per §3.3); computing it would require hardcoding PR 4b's per-row N table in the post-processor, which is the kind of cross-PR coupling we avoid. Consumers (PR 7's diff) can compute throughput from `p50_ns + N` if they want.
 - **`counters: null` for non-Chisel modes** mirrors the JSONL aux-metrics format exactly.
 - **`metadata.machine` is an object**, not a single string — easier to filter in CI ("only flag regressions on linux-aarch64 hosts").
 
@@ -307,7 +304,6 @@ fn render_cell_json(cell: &Cell) -> serde_json::Value {
         "p50_ns": cell.timing.map(|t| t.p50_ns),
         "p95_ns": cell.timing.map(|t| t.p95_ns),
         "p99_ns": cell.timing.map(|t| t.p99_ns),
-        "throughput_per_sec": cell.timing.and_then(|t| t.throughput_per_sec),
         "file_size_delta_bytes": cell.aux.map(|a| a.file_size_delta_bytes),
         "counters": cell.aux.and_then(|a| a.counters),
     })
@@ -394,10 +390,10 @@ The CLI is thin — most work is in the library functions.
 | Failure mode | Behavior |
 |--------------|----------|
 | `criterion_dir` doesn't exist | Exit 1, message: `error: Criterion output directory '<path>' does not exist; run cargo bench --bench micro_grid first` |
-| `criterion_dir` exists but has no estimates.json files | Exit 1, message: `error: no cells found under '<path>'; the directory exists but contains no estimates.json` |
+| `criterion_dir` exists but has no sample.json files | Exit 1, message: `error: no cells found under '<path>'; the directory exists but contains no sample.json` |
 | `aux_metrics_path` missing | Warn to stderr: `warning: aux-metrics file '<path>' missing; cells will have no file-size or counter data`. Continue with `aux: None` for every cell. |
 | `aux_metrics_path` exists but malformed lines | Warn per bad line to stderr: `warning: skipping malformed aux line N: <error>`. Continue. |
-| Individual `estimates.json` malformed | Warn to stderr: `warning: skipping malformed estimates.json at <path>: <error>`. Set that cell's `timing: None`. |
+| Individual `sample.json` malformed | Warn to stderr: `warning: skipping malformed sample.json at <path>: <error>`. Set that cell's `timing: None`. |
 | `git rev-parse HEAD` fails | Set `chisel_commit = "unknown"`. Continue silently. |
 | Output directory creation fails | Exit 1 with the underlying I/O error. |
 | Write of summary.md or results.json fails | Exit 1. |
@@ -423,7 +419,7 @@ Principle: refuse-to-run only when there's nothing to render. Warn-and-continue 
 **In `discover.rs`** (~3 tests):
 7. `discover_cells_joins_criterion_with_aux` — uses fixtures; asserts cell vec has expected (row, mode, size) keys with correctly populated `timing` and `aux`.
 8. `discover_cells_handles_missing_aux_gracefully` — `aux_metrics_path` points to nonexistent file; cells have `aux: None`.
-9. `discover_cells_handles_malformed_estimates_json` — fixture has one corrupt estimates.json; that cell has `timing: None`, others unaffected.
+9. `discover_cells_handles_malformed_sample_json` — fixture has one corrupt sample.json; that cell has `timing: None`, others unaffected.
 
 **In `render_json.rs` and `render_md.rs`** (~3 tests):
 10. `render_json_schema_round_trips` — render against 2-cell fixture, parse the output, assert key set + value types match the schema.
@@ -447,8 +443,8 @@ bench/tests/fixtures/
 │   ├── allocate-1pertx/
 │   │   ├── chisel-strict/32B/{estimates.json, sample.json}
 │   │   └── redb-strict/32B/{estimates.json, sample.json}
-│   └── corrupt/                            # for the malformed-estimates test
-│       └── chisel-strict/32B/estimates.json    # invalid JSON
+│   └── corrupt/                            # for the malformed-sample test
+│       └── chisel-strict/32B/sample.json    # invalid JSON
 └── aux_metrics.jsonl                       # 2 lines matching the 2 valid cells
 ```
 
@@ -512,8 +508,7 @@ PR 5 fails review or is reverted: PR 4b's bench harness still works (produces `t
 
 These are deferred to the implementation plan:
 
-- Whether the test fixtures' `estimates.json` and `sample.json` files should be hand-crafted minimal valid JSON or copied from a real Criterion run. The plan resolves; hand-crafted is cleaner for known assertions (we control the per-iteration times exactly, so the percentile assertions are exact) but less faithful to Criterion's actual output shape.
-- Whether to extract `throughput_per_sec` from `slope.point_estimate` directly or recompute from `Throughput::Elements(N)` + median time. The plan picks the simplest reliable form.
+- Whether the test fixtures' `sample.json` files (and the companion `estimates.json` files for the raw-archive copy test) should be hand-crafted minimal valid JSON or copied from a real Criterion run. The plan resolves; hand-crafted is cleaner for known assertions (we control the per-iteration times exactly, so the percentile assertions are exact) but less faithful to Criterion's actual output shape.
 - Whether `assert_cmd` is the right integration-test framework or if `std::process::Command` suffices. The plan picks the simplest form.
 - Specific clap subcommand structure (none for v1; `--out` etc. as flags).
 
