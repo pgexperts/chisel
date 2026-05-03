@@ -49,13 +49,13 @@ rand = "0.8"
 rand_chacha = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 chrono = "0.4"
 walkdir = "2"
 clap = { version = "4", features = ["derive"] }
 hostname = "0.4"
 
 [dev-dependencies]
-tempfile = "3"
 criterion = "0.5"
 assert_cmd = "2"
 
@@ -63,10 +63,13 @@ assert_cmd = "2"
 name = "micro_grid"
 harness = false
 
-[[bin]]
-name = "summarize"
-path = "src/bin/summarize.rs"
+# Note: [[bin]] summarize is added in Task 10 when src/bin/summarize.rs is created.
+# Declaring it here would break `cargo build` because Cargo validates target sources at parse time.
 ```
+
+Note `tempfile = "3"` stays in `[dependencies]` (NOT moved to dev-dependencies). PR 4b's `runner.rs` exposes `NamedTempFile` through the public type `PopulatedSnapshot`, so it's a runtime dep, not test-only.
+
+The `[[bin]]` declaration is deferred to Task 10 to keep this commit's `cargo build` green.
 
 - [ ] **Step 2: Verify the bench subcrate still builds**
 
@@ -78,12 +81,7 @@ Expected: clean build, "Finished" line. New crates `chrono`, `walkdir`, `clap`, 
 Run: `cd bench && cargo test`
 Expected: 22 lib tests + 15 equivalence + 1 lib smoke + 1 runner smoke = 39 tests, all passing.
 
-- [ ] **Step 4: Verify the [[bin]] target compiles even with no source file yet**
-
-Run: `cd bench && cargo build --bin summarize 2>&1 | tail -5`
-Expected: compile error like "couldn't find target source file `src/bin/summarize.rs`". This proves the `[[bin]]` declaration is wired correctly — Cargo IS looking for the file. Task 9 will create it.
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add bench/Cargo.toml bench/Cargo.lock
@@ -1780,11 +1778,30 @@ EOF
 
 ---
 
-## Task 10: `bench/src/bin/summarize.rs` (CLI binary) + finalize re-exports
+## Task 10: `bench/src/bin/summarize.rs` (CLI binary) + add [[bin]] target + finalize re-exports
 
 **Files:**
 - Create: `bench/src/bin/summarize.rs`
+- Modify: `bench/Cargo.toml`
 - Modify: `bench/src/summary/mod.rs`
+
+- [ ] **Step 0: Add the [[bin]] declaration to Cargo.toml**
+
+Task 1 deferred this declaration because the source file didn't exist yet. Now we add it. After the existing `[[bench]]` block in `bench/Cargo.toml` (and AFTER the comment placeholder Task 1 left there), add:
+
+```toml
+[[bin]]
+name = "summarize"
+path = "src/bin/summarize.rs"
+```
+
+Replace the comment placeholder Task 1 left:
+```toml
+# Note: [[bin]] summarize is added in Task 10 when src/bin/summarize.rs is created.
+# Declaring it here would break `cargo build` because Cargo validates target sources at parse time.
+```
+
+— with the actual `[[bin]]` block above. (You'll create the source file in Step 2; the order between Step 0 and Step 2 doesn't matter for build correctness as long as both are present before any `cargo build` runs.)
 
 - [ ] **Step 1: Add re-exports to `mod.rs`**
 
