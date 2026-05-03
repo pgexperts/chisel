@@ -11,10 +11,7 @@
 // Hardcoded per-scenario seeds (see `seed_for`) — DefaultHasher
 // randomizes per-process, so derived seeds wouldn't reproduce.
 
-// Imports for the workload primitives (zipfian_indices, lognormal_sizes,
-// mix_operations, OpKind, Operation, Workload) and rand types are
-// added by Task 6 when the first scenario generator (gen_ycsb_a) lands.
-// For Task 5's seed_for + tests, only std types are needed.
+use crate::workload::{mix_operations, zipfian_indices, OpKind, Operation, Workload};
 
 /// Per-scenario seeds. Hardcoded rather than hashed — Rust's
 /// DefaultHasher randomizes per-process state so derived seeds
@@ -26,6 +23,84 @@ pub fn seed_for(scenario: &str) -> u64 {
         "mutation-log" => 0x6003,
         "document-store" => 0x6004,
         _ => panic!("unknown scenario: {scenario}"),
+    }
+}
+
+/// S1: YCSB-A — 100K records × 1KB pre-pop, 100K ops 50/50 read/update,
+/// Zipfian θ=0.99 (heavy skew, ~75% of accesses to ~10% of records).
+/// Master spec §4.1.
+pub fn gen_ycsb_a(seed: u64) -> Workload {
+    let prepop_count = 100_000;
+    let op_count = 100_000;
+    let theta = 0.99;
+    // Each Read or Update consumes one access entry; total = op_count.
+    let access = zipfian_indices(seed, op_count, prepop_count, theta);
+    // Each Update consumes one size; ~50K of them. To stay simple,
+    // pre-allocate op_count sizes (extras are unused). All 1KB fixed.
+    let sizes = vec![1024usize; op_count];
+    let ops = mix_operations(
+        seed,
+        op_count,
+        &[(OpKind::Read, 0.5), (OpKind::Update, 0.5)],
+        &access,
+        &sizes,
+    );
+    Workload {
+        name: "ycsb-a".to_string(),
+        seed,
+        prepop_count,
+        ops,
+    }
+}
+
+/// Pre-population for YCSB-A: 100K Allocate ops of 1KB each.
+pub fn gen_ycsb_a_prepopulate(seed: u64) -> Workload {
+    let prepop_count = 100_000;
+    let ops: Vec<Operation> = (0..prepop_count)
+        .map(|_| Operation::Allocate { size: 1024 })
+        .collect();
+    Workload {
+        name: "ycsb-a-prepopulate".to_string(),
+        seed,
+        prepop_count: 0,
+        ops,
+    }
+}
+
+/// S2: YCSB-B — same setup as S1, mix is 95% read / 5% update.
+/// Master spec §4.2.
+pub fn gen_ycsb_b(seed: u64) -> Workload {
+    let prepop_count = 100_000;
+    let op_count = 100_000;
+    let theta = 0.99;
+    let access = zipfian_indices(seed, op_count, prepop_count, theta);
+    let sizes = vec![1024usize; op_count];
+    let ops = mix_operations(
+        seed,
+        op_count,
+        &[(OpKind::Read, 0.95), (OpKind::Update, 0.05)],
+        &access,
+        &sizes,
+    );
+    Workload {
+        name: "ycsb-b".to_string(),
+        seed,
+        prepop_count,
+        ops,
+    }
+}
+
+/// Pre-population for YCSB-B: identical to YCSB-A (100K × 1KB).
+pub fn gen_ycsb_b_prepopulate(seed: u64) -> Workload {
+    let prepop_count = 100_000;
+    let ops: Vec<Operation> = (0..prepop_count)
+        .map(|_| Operation::Allocate { size: 1024 })
+        .collect();
+    Workload {
+        name: "ycsb-b-prepopulate".to_string(),
+        seed,
+        prepop_count: 0,
+        ops,
     }
 }
 
@@ -45,5 +120,39 @@ mod tests {
     #[should_panic(expected = "unknown scenario")]
     fn seed_for_panics_on_unknown_scenario() {
         let _ = seed_for("not-a-real-scenario");
+    }
+
+    #[test]
+    fn gen_ycsb_a_shape() {
+        let seed = seed_for("ycsb-a");
+        let prepop = gen_ycsb_a_prepopulate(seed);
+        let workload = gen_ycsb_a(seed);
+
+        // Pre-population: 100K Allocate ops of 1KB each
+        assert_eq!(prepop.name, "ycsb-a-prepopulate");
+        assert_eq!(prepop.ops.len(), 100_000);
+        assert_eq!(prepop.prepop_count, 0);
+        for op in &prepop.ops {
+            assert!(matches!(op, Operation::Allocate { size: 1024 }));
+        }
+
+        // Main workload: 100K ops, 50/50 read/update over 100K records
+        assert_eq!(workload.name, "ycsb-a");
+        assert_eq!(workload.ops.len(), 100_000);
+        assert_eq!(workload.prepop_count, 100_000);
+        let reads = workload
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Operation::Read { .. }))
+            .count();
+        let updates = workload
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Operation::Update { .. }))
+            .count();
+        // 50/50 mix over 100K → expect ~50K of each (binomial ±500)
+        assert!((49_500..=50_500).contains(&reads));
+        assert!((49_500..=50_500).contains(&updates));
+        assert_eq!(reads + updates, 100_000);
     }
 }
