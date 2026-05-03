@@ -20,7 +20,10 @@ pub mod metadata;
 pub mod render_json;
 pub mod render_md;
 
-pub use discover::{copy_raw_archive, discover_cells, AuxMetrics, Cell, TimingStats};
+pub use discover::{
+    copy_raw_archive, discover_cells, load_scenarios_jsonl, AuxMetrics, Cell, ScenarioMetrics,
+    TimingStats,
+};
 pub use metadata::{gather_metadata, MachineInfo, Metadata};
 pub use render_json::render_json;
 pub use render_md::render_markdown;
