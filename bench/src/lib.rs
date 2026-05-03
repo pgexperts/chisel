@@ -17,6 +17,7 @@ pub mod chisel_engine;
 pub mod engine;
 pub mod redb_engine;
 pub mod runner;
+pub mod scenarios;
 pub mod sqlite_engine;
 pub mod summary;
 pub mod workload;
