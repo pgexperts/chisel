@@ -26,8 +26,13 @@ pub use chisel_engine::ChiselEngine;
 pub use engine::{DurabilityMode, Engine, EngineResult, Identifier};
 pub use redb_engine::RedbEngine;
 pub use runner::{
-    AuxMetricsWriter, CellAuxMetrics, CellId, ChiselCountersDelta, EngineMode, PopulatedSnapshot,
-    CACHE_SIZE_PAGES,
+    run_scenario_cell, AuxMetricsWriter, CellAuxMetrics, CellId, ChiselCountersDelta, EngineMode,
+    PopulatedSnapshot, ScenarioResult, CACHE_SIZE_PAGES,
+};
+pub use scenarios::{
+    gen_document_store, gen_document_store_prepopulate, gen_mutation_log,
+    gen_mutation_log_prepopulate, gen_ycsb_a, gen_ycsb_a_prepopulate, gen_ycsb_b,
+    gen_ycsb_b_prepopulate, seed_for,
 };
 pub use sqlite_engine::SqliteEngine;
-pub use workload::{Operation, Workload};
+pub use workload::{OpKind, Operation, Workload};

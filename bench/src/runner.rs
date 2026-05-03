@@ -10,8 +10,10 @@
 // micro-grid cells PR 4b registers.
 
 use crate::engine::{DurabilityMode, Engine, EngineResult, Identifier};
+use crate::summary::format::percentile_linear_interp;
 use crate::{ChiselEngine, RedbEngine, SqliteEngine};
 use std::path::Path;
+use std::time::Instant;
 
 /// Page-cache budget passed to every engine when constructing for the
 /// micro grid. 256 pages × 8 KB = 2 MB ≈ 8% of the 25 MB raw payload
@@ -441,6 +443,128 @@ pub fn capture_aux_metrics_warm_read(
     }
 }
 
+/// Result of running one (scenario, mode) cell. Captures everything
+/// the post-processor will surface in the markdown + JSON.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ScenarioResult {
+    pub scenario: String,
+    pub mode: String,
+    pub total_wall_clock_ns: u64,
+    pub op_count: usize,
+    pub throughput_ops_per_sec: f64,
+    pub p50_ns: f64,
+    pub p95_ns: f64,
+    pub p99_ns: f64,
+    pub final_file_size_bytes: u64,
+    pub file_size_delta_bytes: i64,
+    pub counters: Option<ChiselCountersDelta>,
+}
+
+/// Helper: returns true iff applying this op to an engine requires
+/// a transaction (Allocate / Update / Delete / DeleteMany). Reads
+/// happen outside any explicit tx.
+fn op_is_mutating(op: &Operation) -> bool {
+    matches!(
+        op,
+        Operation::Allocate { .. }
+            | Operation::Update { .. }
+            | Operation::Delete { .. }
+            | Operation::DeleteMany { .. }
+    )
+}
+
+/// Run one scenario cell end-to-end:
+///   1. Open a fresh engine in `mode` at a tempfile path
+///   2. Run `prepopulate_workload` untimed (each Allocate in its own tx
+///      for simplicity; pre-pop time is excluded from the measurement)
+///   3. Snapshot file size + counters (the "before" state for deltas)
+///   4. Start wall-clock timer
+///   5. Iterate `scenario_workload.ops`, calling apply_op on each;
+///      mutating ops get wrapped in a single-op tx (begin/commit);
+///      reads happen bare. Per-op `Instant::now()` captures latency.
+///   6. Stop wall-clock timer
+///   7. Snapshot file size + counters (the "after" state)
+///   8. Compute percentiles from per-op timings via percentile_linear_interp
+///
+/// Engine drops at end of function; tempfile is auto-deleted.
+pub fn run_scenario_cell(
+    mode: EngineMode,
+    scenario_name: &str,
+    prepopulate_workload: &Workload,
+    scenario_workload: &Workload,
+) -> ScenarioResult {
+    let working = tempfile::NamedTempFile::new().expect("create tempfile");
+    let mut engine = mode
+        .open(working.path(), CACHE_SIZE_PAGES)
+        .expect("open engine");
+
+    // Pre-population phase (untimed). Each allocate in its own tx
+    // for engine compatibility; we don't care about pre-pop throughput.
+    let mut snapshot_ids: Vec<u64> = Vec::with_capacity(prepopulate_workload.ops.len());
+    let mut new_ids_during_prepop: Vec<Identifier> = Vec::new();
+    for op in &prepopulate_workload.ops {
+        engine.begin().expect("begin prepop tx");
+        apply_op(&mut *engine, op, &snapshot_ids, &mut new_ids_during_prepop);
+        engine.commit().expect("commit prepop tx");
+    }
+    // Move new_ids_during_prepop into snapshot_ids for the timed phase.
+    snapshot_ids.extend(new_ids_during_prepop.iter().map(|id| id.0));
+
+    // Capture "before" state right after prepopulate.
+    let counters_before = engine.internal_counters().expect("counters before");
+    let size_after_prepop = engine.file_size_bytes().expect("file size before");
+
+    // Timed phase: run scenario_workload with per-op Instant::now().
+    let mut per_op_ns: Vec<u64> = Vec::with_capacity(scenario_workload.ops.len());
+    let mut new_ids: Vec<Identifier> = Vec::new();
+    let total_start = Instant::now();
+    for op in &scenario_workload.ops {
+        let op_start = Instant::now();
+        if op_is_mutating(op) {
+            engine.begin().expect("begin tx");
+            apply_op(&mut *engine, op, &snapshot_ids, &mut new_ids);
+            engine.commit().expect("commit tx");
+        } else {
+            apply_op(&mut *engine, op, &snapshot_ids, &mut new_ids);
+        }
+        per_op_ns.push(op_start.elapsed().as_nanos() as u64);
+    }
+    let total_wall_clock = total_start.elapsed();
+
+    // Capture "after" state.
+    let counters_after = engine.internal_counters().expect("counters after");
+    let size_after = engine.file_size_bytes().expect("file size after");
+
+    // Compute percentiles from per-op distribution.
+    let mut sorted: Vec<f64> = per_op_ns.iter().map(|&n| n as f64).collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p50 = percentile_linear_interp(&sorted, 0.50).unwrap_or(0.0);
+    let p95 = percentile_linear_interp(&sorted, 0.95).unwrap_or(0.0);
+    let p99 = percentile_linear_interp(&sorted, 0.99).unwrap_or(0.0);
+
+    let total_ns = total_wall_clock.as_nanos() as u64;
+    let op_count = scenario_workload.ops.len();
+    let throughput = if total_ns == 0 {
+        0.0
+    } else {
+        op_count as f64 / (total_ns as f64 / 1e9)
+    };
+
+    ScenarioResult {
+        scenario: scenario_name.to_string(),
+        mode: mode.label().to_string(),
+        total_wall_clock_ns: total_ns,
+        op_count,
+        throughput_ops_per_sec: throughput,
+        p50_ns: p50,
+        p95_ns: p95,
+        p99_ns: p99,
+        final_file_size_bytes: size_after,
+        file_size_delta_bytes: size_after as i64 - size_after_prepop as i64,
+        counters: counter_delta(counters_before, counters_after),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,5 +720,62 @@ mod tests {
         // The negative-delta line should serialize as a negative number.
         let v3: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(v3["file_size_delta_bytes"], -1_048_576);
+    }
+
+    #[test]
+    fn run_scenario_cell_chisel_smoke() {
+        // Small synthetic scenario: 50 prepop, 100 timed ops.
+        let prepop = Workload {
+            name: "test-prepop".to_string(),
+            seed: 0x9001,
+            prepop_count: 0,
+            ops: (0..50).map(|_| Operation::Allocate { size: 256 }).collect(),
+        };
+        let workload = Workload {
+            name: "test-scenario".to_string(),
+            seed: 0x9001,
+            prepop_count: 50,
+            ops: (0..100)
+                .map(|i| Operation::Read {
+                    alloc_index: i % 50,
+                })
+                .collect(),
+        };
+        let result = run_scenario_cell(EngineMode::ChiselStrict, "smoke", &prepop, &workload);
+        assert_eq!(result.scenario, "smoke");
+        assert_eq!(result.mode, "chisel-strict");
+        assert_eq!(result.op_count, 100);
+        assert!(result.total_wall_clock_ns > 0);
+        assert!(result.throughput_ops_per_sec > 0.0);
+        // p50 <= p95 <= p99 (sanity, percentile ordering)
+        assert!(result.p50_ns <= result.p95_ns);
+        assert!(result.p95_ns <= result.p99_ns);
+        // ChiselStrict produces non-null counters
+        assert!(result.counters.is_some());
+    }
+
+    #[test]
+    fn run_scenario_cell_returns_counters_only_for_chisel() {
+        let prepop = Workload {
+            name: "test-prepop".to_string(),
+            seed: 0x9002,
+            prepop_count: 0,
+            ops: (0..50).map(|_| Operation::Allocate { size: 256 }).collect(),
+        };
+        let workload = Workload {
+            name: "test-scenario".to_string(),
+            seed: 0x9002,
+            prepop_count: 50,
+            ops: (0..100)
+                .map(|i| Operation::Read {
+                    alloc_index: i % 50,
+                })
+                .collect(),
+        };
+        let result = run_scenario_cell(EngineMode::RedbStrict, "smoke", &prepop, &workload);
+        assert!(
+            result.counters.is_none(),
+            "redb cells produce counters: None"
+        );
     }
 }
