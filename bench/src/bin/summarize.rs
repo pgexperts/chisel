@@ -1,0 +1,84 @@
+// CLI entry point for the chisel-bench-summarize post-processor.
+// Reads PR 4b's bench output (Criterion sample.json + aux_metrics.jsonl)
+// and emits summary.md + results.json + raw/ under bench/results/<UTC>/.
+//
+// All logic lives in the chisel_bench::summary library module; this
+// file is just argv parsing, error printing, and exit codes.
+
+use chisel_bench::summary::{
+    copy_raw_archive, discover_cells, gather_metadata, render_json, render_markdown,
+};
+use clap::Parser;
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(name = "chisel-bench-summarize", version)]
+#[command(about = "Post-process Criterion + aux-metrics output into summary.md + results.json")]
+struct Cli {
+    /// Output directory (default: bench/results/<UTC-ISO8601>/)
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// Criterion output directory.
+    #[arg(long, default_value = "target/criterion")]
+    criterion: PathBuf,
+
+    /// Aux-metrics JSONL produced by the bench harness.
+    #[arg(long, default_value = "bench/results/aux_metrics.jsonl")]
+    aux: PathBuf,
+}
+
+fn main() -> std::process::ExitCode {
+    let cli = Cli::parse();
+    match run(cli) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Discover cells.
+    let cells = discover_cells(&cli.criterion, &cli.aux)?;
+    if cells.is_empty() {
+        return Err("no cells discovered — did you run cargo bench --bench micro_grid?".into());
+    }
+
+    // 2. Resolve output directory.
+    let out_dir = cli.out.unwrap_or_else(|| {
+        let ts = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
+        PathBuf::from(format!("bench/results/{ts}"))
+    });
+    std::fs::create_dir_all(&out_dir)?;
+
+    // 3. Gather metadata.
+    let metadata = gather_metadata(&cli.criterion, &cli.aux, cells.len())?;
+
+    // 4. Render markdown + JSON.
+    let md = render_markdown(&cells, &metadata);
+    let json = render_json(&cells, &metadata);
+
+    // 5. Write output artifacts.
+    std::fs::write(out_dir.join("summary.md"), &md)?;
+    std::fs::write(
+        out_dir.join("results.json"),
+        serde_json::to_string_pretty(&json)?,
+    )?;
+    copy_raw_archive(&cli.criterion, &out_dir.join("raw"))?;
+
+    // 6. Tell user where to find it.
+    println!("Wrote {} cells to {}", cells.len(), out_dir.display());
+    println!(
+        "  - summary.md  ({} bytes)",
+        std::fs::metadata(out_dir.join("summary.md"))?.len()
+    );
+    println!(
+        "  - results.json ({} bytes)",
+        std::fs::metadata(out_dir.join("results.json"))?.len()
+    );
+    println!("  - raw/ (Criterion estimates.json + sample.json archive)");
+
+    Ok(())
+}
