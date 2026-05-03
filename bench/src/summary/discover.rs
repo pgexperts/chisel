@@ -245,6 +245,39 @@ fn parse_sample_json(path: &Path) -> Result<Option<TimingStats>, Box<dyn std::er
     }))
 }
 
+/// Copy `estimates.json` and `sample.json` files from `criterion_dir`
+/// into `raw_out_dir`, preserving the directory structure. Skips
+/// Criterion's HTML reports, plot images, change/ subdirectories, and
+/// other supporting files — those stay in target/criterion/ for live
+/// browsing; the archive's job is reproducibility (so the markdown
+/// numbers can be regenerated from the archive if target/ is wiped).
+///
+/// 165 cells × 2 small JSON files ≈ 330 KB total archive size.
+pub fn copy_raw_archive(criterion_dir: &Path, raw_out_dir: &Path) -> std::io::Result<()> {
+    for entry in walkdir::WalkDir::new(criterion_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        if name != "estimates.json" && name != "sample.json" {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(criterion_dir)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let dest = raw_out_dir.join(rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(entry.path(), &dest)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
