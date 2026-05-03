@@ -18,6 +18,7 @@ pub mod engine;
 pub mod redb_engine;
 pub mod runner;
 pub mod sqlite_engine;
+pub mod summary;
 pub mod workload;
 
 pub use chisel_engine::ChiselEngine;
