@@ -28,6 +28,10 @@ assert_cmd = "2"
 name = "micro_grid"
 harness = false
 
+[[bench]]
+name = "scenarios"
+harness = false
+
 [[bin]]
 name = "summarize"
 path = "src/bin/summarize.rs"
