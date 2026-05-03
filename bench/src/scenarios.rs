@@ -11,7 +11,9 @@
 // Hardcoded per-scenario seeds (see `seed_for`) — DefaultHasher
 // randomizes per-process, so derived seeds wouldn't reproduce.
 
-use crate::workload::{mix_operations, zipfian_indices, OpKind, Operation, Workload};
+use crate::workload::{
+    lognormal_sizes, mix_operations, zipfian_indices, OpKind, Operation, Workload,
+};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -160,6 +162,54 @@ pub fn gen_mutation_log_prepopulate(seed: u64) -> Workload {
     }
 }
 
+/// S4: Document Store — 10K records, log-normal sizes (median 4KB,
+/// p99 ≈ 1MB), 50K ops 70%/20%/10% read/allocate/update, Zipfian
+/// θ=0.7 (moderate skew, more spread than YCSB-A's 0.99).
+/// Master spec §4.4.
+pub fn gen_document_store(seed: u64) -> Workload {
+    let prepop_count = 10_000;
+    let op_count = 50_000;
+    let theta = 0.7;
+    let access = zipfian_indices(seed, op_count, prepop_count, theta);
+    // Sizes for Allocate (~10K of them) and Update (~5K of them):
+    // lognormal with median 4KB, p99 1MB.
+    let sizes = lognormal_sizes(seed.wrapping_add(1), op_count, 4096, 1_048_576);
+    let ops = mix_operations(
+        seed,
+        op_count,
+        &[
+            (OpKind::Read, 0.70),
+            (OpKind::Allocate, 0.20),
+            (OpKind::Update, 0.10),
+        ],
+        &access,
+        &sizes,
+    );
+    Workload {
+        name: "document-store".to_string(),
+        seed,
+        prepop_count,
+        ops,
+    }
+}
+
+/// Pre-population for Document Store: 10K Allocate ops with log-normal
+/// sizes (median 4KB, p99 ≈ 1MB).
+pub fn gen_document_store_prepopulate(seed: u64) -> Workload {
+    let prepop_count = 10_000;
+    let sizes = lognormal_sizes(seed.wrapping_add(2), prepop_count, 4096, 1_048_576);
+    let ops: Vec<Operation> = sizes
+        .iter()
+        .map(|&size| Operation::Allocate { size })
+        .collect();
+    Workload {
+        name: "document-store-prepopulate".to_string(),
+        seed,
+        prepop_count: 0,
+        ops,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +314,54 @@ mod tests {
         assert!((24_500..=25_500).contains(&update));
         assert!((24_500..=25_500).contains(&delete));
         assert_eq!(alloc + read + update + delete, 100_000);
+    }
+
+    #[test]
+    fn gen_document_store_shape() {
+        let seed = seed_for("document-store");
+        let prepop = gen_document_store_prepopulate(seed);
+        let workload = gen_document_store(seed);
+
+        // Pre-population: 10K Allocate ops with log-normal sizes
+        assert_eq!(prepop.name, "document-store-prepopulate");
+        assert_eq!(prepop.ops.len(), 10_000);
+        assert_eq!(prepop.prepop_count, 0);
+        for op in &prepop.ops {
+            match op {
+                Operation::Allocate { size } => {
+                    // Sizes clamped to [16, 4_194_304] by lognormal_sizes
+                    assert!(
+                        (16usize..=4_194_304).contains(size),
+                        "prepop size {size} out of clamp range"
+                    );
+                }
+                _ => panic!("expected only Allocate ops in prepop"),
+            }
+        }
+
+        // Main workload: 50K ops, 70/20/10 read/alloc/update
+        assert_eq!(workload.name, "document-store");
+        assert_eq!(workload.ops.len(), 50_000);
+        assert_eq!(workload.prepop_count, 10_000);
+        let read = workload
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Operation::Read { .. }))
+            .count();
+        let alloc = workload
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Operation::Allocate { .. }))
+            .count();
+        let update = workload
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Operation::Update { .. }))
+            .count();
+        // 70/20/10 over 50K → expect 35K/10K/5K (multinomial ±500)
+        assert!((34_500..=35_500).contains(&read));
+        assert!((9_500..=10_500).contains(&alloc));
+        assert!((4_500..=5_500).contains(&update));
+        assert_eq!(read + alloc + update, 50_000);
     }
 }
