@@ -16,3 +16,4 @@
 
 pub mod discover;
 pub mod format;
+pub mod metadata;
