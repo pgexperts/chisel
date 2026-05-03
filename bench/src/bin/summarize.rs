@@ -1,19 +1,21 @@
 // CLI entry point for the chisel-bench-summarize post-processor.
 // Reads PR 4b's bench output (Criterion sample.json + aux_metrics.jsonl)
-// and emits summary.md + results.json + raw/ under bench/results/<UTC>/.
+// PLUS PR 6's scenarios_metrics.jsonl, and emits summary.md +
+// results.json + raw/ under bench/results/<UTC>/.
 //
 // All logic lives in the chisel_bench::summary library module; this
 // file is just argv parsing, error printing, and exit codes.
 
 use chisel_bench::summary::{
-    copy_raw_archive, discover_cells, gather_metadata, render_json, render_markdown,
+    copy_raw_archive, discover_cells, gather_metadata, load_scenarios_jsonl, render_json,
+    render_markdown,
 };
 use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "chisel-bench-summarize", version)]
-#[command(about = "Post-process Criterion + aux-metrics output into summary.md + results.json")]
+#[command(about = "Post-process Criterion + aux-metrics + scenarios output")]
 struct Cli {
     /// Output directory (default: bench/results/<UTC-ISO8601>/)
     #[arg(long)]
@@ -23,9 +25,13 @@ struct Cli {
     #[arg(long, default_value = "target/criterion")]
     criterion: PathBuf,
 
-    /// Aux-metrics JSONL produced by the bench harness.
+    /// Aux-metrics JSONL produced by the micro-grid bench.
     #[arg(long, default_value = "bench/results/aux_metrics.jsonl")]
     aux: PathBuf,
+
+    /// Scenarios-metrics JSONL produced by the scenario bench.
+    #[arg(long, default_value = "bench/results/scenarios_metrics.jsonl")]
+    scenarios: PathBuf,
 }
 
 fn main() -> std::process::ExitCode {
@@ -40,10 +46,11 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Discover cells.
+    // 1. Discover cells (micro grid) and load scenarios (PR 6).
     let cells = discover_cells(&cli.criterion, &cli.aux)?;
-    if cells.is_empty() {
-        return Err("no cells discovered — did you run cargo bench --bench micro_grid?".into());
+    let scenarios = load_scenarios_jsonl(&cli.scenarios);
+    if cells.is_empty() && scenarios.is_empty() {
+        return Err("no cells or scenarios discovered — did you run cargo bench?".into());
     }
 
     // 2. Resolve output directory.
@@ -57,8 +64,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let metadata = gather_metadata(&cli.criterion, &cli.aux, cells.len())?;
 
     // 4. Render markdown + JSON.
-    let md = render_markdown(&cells, &[], &metadata);
-    let json = render_json(&cells, &[], &metadata);
+    let md = render_markdown(&cells, &scenarios, &metadata);
+    let json = render_json(&cells, &scenarios, &metadata);
 
     // 5. Write output artifacts.
     std::fs::write(out_dir.join("summary.md"), &md)?;
@@ -69,7 +76,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     copy_raw_archive(&cli.criterion, &out_dir.join("raw"))?;
 
     // 6. Tell user where to find it.
-    println!("Wrote {} cells to {}", cells.len(), out_dir.display());
+    println!(
+        "Wrote {} cells + {} scenarios to {}",
+        cells.len(),
+        scenarios.len(),
+        out_dir.display()
+    );
     println!(
         "  - summary.md  ({} bytes)",
         std::fs::metadata(out_dir.join("summary.md"))?.len()
