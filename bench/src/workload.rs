@@ -9,7 +9,7 @@
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use rand_distr::{Distribution, LogNormal, Zipf};
+use rand_distr::{Distribution, LogNormal, WeightedIndex, Zipf};
 
 /// One unit of work the Runner executes against an Engine.
 ///
@@ -140,6 +140,85 @@ pub fn lognormal_sizes(seed: u64, n: usize, median_bytes: usize, p99_bytes: usiz
             }
         })
         .collect()
+}
+
+/// Compose a mixed-op sequence from per-op-kind probabilities.
+/// Decouples op-kind sampling from access-pattern + size sampling —
+/// each op gets a fresh sample from the appropriate input slice.
+///
+/// `op_specs` is a slice of (OpKind, weight) pairs; weights are
+/// normalized internally by `WeightedIndex`. `access_pattern` provides
+/// alloc_index values for Read/Update/Delete ops (consumed in order).
+/// `sizes` provides byte counts for Allocate/Update ops (consumed in
+/// order).
+///
+/// The function consumes one access_pattern entry and/or one sizes
+/// entry per op based on op kind:
+///   - Allocate → consumes one size
+///   - Read → consumes one access_pattern entry
+///   - Update → consumes one access_pattern entry AND one size
+///   - Delete → consumes one access_pattern entry
+///
+/// Caller must provide enough entries; the function panics with a
+/// clear message on under-provision. The scenario generators
+/// precompute the right counts based on the op-mix probabilities.
+///
+/// Deterministic: same (seed, count, op_specs, access_pattern, sizes)
+/// → same Vec.
+pub fn mix_operations(
+    seed: u64,
+    count: usize,
+    op_specs: &[(OpKind, f64)],
+    access_pattern: &[usize],
+    sizes: &[usize],
+) -> Vec<Operation> {
+    assert!(
+        !op_specs.is_empty(),
+        "mix_operations: op_specs must be non-empty"
+    );
+    let weights: Vec<f64> = op_specs.iter().map(|(_, w)| *w).collect();
+    let kinds: Vec<OpKind> = op_specs.iter().map(|(k, _)| *k).collect();
+    let weighted = WeightedIndex::new(&weights).unwrap();
+
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut access_iter = access_pattern.iter();
+    let mut sizes_iter = sizes.iter();
+    let mut out: Vec<Operation> = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let kind = kinds[weighted.sample(&mut rng)];
+        let op = match kind {
+            OpKind::Allocate => {
+                let size = *sizes_iter
+                    .next()
+                    .expect("mix_operations: not enough sizes for Allocate ops");
+                Operation::Allocate { size }
+            }
+            OpKind::Read => {
+                let alloc_index = *access_iter
+                    .next()
+                    .expect("mix_operations: not enough access entries for Read ops");
+                Operation::Read { alloc_index }
+            }
+            OpKind::Update => {
+                let alloc_index = *access_iter
+                    .next()
+                    .expect("mix_operations: not enough access entries for Update ops");
+                let size = *sizes_iter
+                    .next()
+                    .expect("mix_operations: not enough sizes for Update ops");
+                Operation::Update { alloc_index, size }
+            }
+            OpKind::Delete => {
+                let alloc_index = *access_iter
+                    .next()
+                    .expect("mix_operations: not enough access entries for Delete ops");
+                Operation::Delete { alloc_index }
+            }
+        };
+        out.push(op);
+    }
+    out
 }
 
 /// Pre-population: `count` Allocate ops of `size` bytes each.
@@ -504,6 +583,71 @@ mod tests {
                 s <= 4_194_304,
                 "lognormal_sizes should clamp at <= 4_194_304, got {s}"
             );
+        }
+    }
+
+    #[test]
+    fn mix_operations_op_proportions() {
+        // 50/50 read/update mix over 10_000 ops should produce ~5000
+        // of each (binomial slack: ±200 covers > 99.99% of cases).
+        let access: Vec<usize> = (0..10_000).map(|i| i % 100).collect();
+        let sizes: Vec<usize> = (0..10_000).map(|_| 1024).collect();
+        let ops = mix_operations(
+            42,
+            10_000,
+            &[(OpKind::Read, 0.5), (OpKind::Update, 0.5)],
+            &access,
+            &sizes,
+        );
+        assert_eq!(ops.len(), 10_000);
+        let reads = ops
+            .iter()
+            .filter(|o| matches!(o, Operation::Read { .. }))
+            .count();
+        let updates = ops
+            .iter()
+            .filter(|o| matches!(o, Operation::Update { .. }))
+            .count();
+        assert!(
+            (4800..=5200).contains(&reads),
+            "expected ~5000 reads ±200, got {reads}"
+        );
+        assert!(
+            (4800..=5200).contains(&updates),
+            "expected ~5000 updates ±200, got {updates}"
+        );
+        assert_eq!(reads + updates, 10_000);
+    }
+
+    #[test]
+    fn mix_operations_uses_provided_inputs() {
+        // Allocate ops should use sizes; Read ops should use access_pattern.
+        let access: Vec<usize> = vec![7, 13, 21, 35];
+        let sizes: Vec<usize> = vec![64, 128, 256, 512];
+        let ops = mix_operations(
+            42,
+            4,
+            &[(OpKind::Allocate, 0.5), (OpKind::Read, 0.5)],
+            &access,
+            &sizes,
+        );
+        assert_eq!(ops.len(), 4);
+        for op in &ops {
+            match op {
+                Operation::Allocate { size } => {
+                    assert!(
+                        sizes.contains(size),
+                        "allocate size {size} not in sizes slice"
+                    );
+                }
+                Operation::Read { alloc_index } => {
+                    assert!(
+                        access.contains(alloc_index),
+                        "read alloc_index {alloc_index} not in access slice"
+                    );
+                }
+                _ => panic!("expected only Allocate or Read"),
+            }
         }
     }
 }
