@@ -56,6 +56,19 @@ landed on `main` as of 2026-05-01. The original PR 4 from the master
 spec was split into 4a + 4b once it became clear ~600 LOC in one PR
 was less reviewable than two smaller PRs.
 
+PR 5 (markdown summary post-processor: a binary `chisel-bench-summarize`
+in `bench/src/bin/summarize.rs` plus a library module under
+`bench/src/summary/`) landed on `main` as of 2026-05-03. Reads
+`target/criterion/<row>/<mode>/<size>/sample.json` plus `bench/results/aux_metrics.jsonl`
+and emits three artifacts under `bench/results/<UTC-ISO8601>/`:
+`summary.md` (per-row markdown tables with magnitude-adaptive units),
+`results.json` (flat composite-key schema for PR 7's CI diff), and
+`raw/` (archival copy of estimates.json + sample.json per cell).
+Percentiles are computed directly from `sample.json` per-iteration
+times via numpy-style linear interpolation (consistent p50/p95/p99
+semantics rather than mixing Criterion's bootstrap median with a CI
+proxy). Run with `cd bench && cargo run --bin summarize`.
+
 The 4b grid is 6 rows, not the 9 the master spec called for: three
 1000-per-tx variants (update, delete, delete_many) were dropped during
 implementation because 1000 random ops over the prepopulated DB pin a
