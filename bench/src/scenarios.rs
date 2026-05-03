@@ -16,6 +16,7 @@ use crate::workload::{
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use rand_distr::{Distribution, WeightedIndex};
 
 /// Per-scenario seeds. Hardcoded rather than hashed — Rust's
 /// DefaultHasher randomizes per-process state so derived seeds
@@ -111,31 +112,75 @@ pub fn gen_ycsb_b_prepopulate(seed: u64) -> Workload {
 /// S3: Mutation Log — 10K records, sizes uniform [64B, 4KB], 100K ops
 /// 25%/25%/25%/25% allocate/read/update/delete, uniform random access.
 /// Master spec §4.3.
+///
+/// Unlike YCSB-A/B/document-store (which have no Deletes and so can
+/// use the stateless `mix_operations` over a precomputed access vector),
+/// this workload must be generated with a live-index pool. A naive
+/// independent-uniform sampler over `[0, prepop_count)` would emit
+/// Read/Update/Delete ops referencing already-deleted indices, which
+/// engines reject at apply time with `InvalidHandle`. The pool tracks
+/// which indices in apply_op's `(snapshot_ids ++ new_ids)` resolve
+/// view are currently allocated; non-Allocate ops sample only from
+/// it, and Delete removes its target. With symmetric 25/25 alloc /
+/// delete weights, E[|live|] stays at prepop_count, so the
+/// "demote to Allocate when live is empty" branch is purely defensive
+/// against pathological RNG sequences and never triggers in practice.
 pub fn gen_mutation_log(seed: u64) -> Workload {
     let prepop_count = 10_000;
     let op_count = 100_000;
-    // Uniform random access; a fresh Vec each call (deterministic via seed).
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let access: Vec<usize> = (0..op_count)
-        .map(|_| rng.gen_range(0..prepop_count))
-        .collect();
-    // Sizes uniform [64, 4096] inclusive.
+    let weighted = WeightedIndex::new([0.25, 0.25, 0.25, 0.25]).unwrap();
+
+    // Sizes for Allocate and Update — uniform [64, 4096] inclusive,
+    // drawn from a separate stream (seed+1) to match the earlier
+    // generator's seeding convention and keep the size sequence
+    // independent of the op-kind / position sampling.
     let mut size_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1));
-    let sizes: Vec<usize> = (0..op_count)
-        .map(|_| size_rng.gen_range(64..=4096))
-        .collect();
-    let ops = mix_operations(
-        seed,
-        op_count,
-        &[
-            (OpKind::Allocate, 0.25),
-            (OpKind::Read, 0.25),
-            (OpKind::Update, 0.25),
-            (OpKind::Delete, 0.25),
-        ],
-        &access,
-        &sizes,
-    );
+
+    let mut live: Vec<usize> = (0..prepop_count).collect();
+    let mut next_alloc_index = prepop_count;
+    let mut ops: Vec<Operation> = Vec::with_capacity(op_count);
+
+    for _ in 0..op_count {
+        let mut kind = weighted.sample(&mut rng);
+        // Defensive: Read/Update/Delete need at least one live index.
+        if kind != 0 && live.is_empty() {
+            kind = 0;
+        }
+        let op = match kind {
+            0 => {
+                let idx = next_alloc_index;
+                next_alloc_index += 1;
+                live.push(idx);
+                Operation::Allocate {
+                    size: size_rng.gen_range(64..=4096),
+                }
+            }
+            1 => {
+                let j = rng.gen_range(0..live.len());
+                Operation::Read {
+                    alloc_index: live[j],
+                }
+            }
+            2 => {
+                let j = rng.gen_range(0..live.len());
+                Operation::Update {
+                    alloc_index: live[j],
+                    size: size_rng.gen_range(64..=4096),
+                }
+            }
+            3 => {
+                // swap_remove is O(1); ordering is irrelevant since
+                // selection above is uniform-random.
+                let j = rng.gen_range(0..live.len());
+                let alloc_index = live.swap_remove(j);
+                Operation::Delete { alloc_index }
+            }
+            _ => unreachable!("WeightedIndex over 4 weights"),
+        };
+        ops.push(op);
+    }
+
     Workload {
         name: "mutation-log".to_string(),
         seed,
@@ -314,6 +359,47 @@ mod tests {
         assert!((24_500..=25_500).contains(&update));
         assert!((24_500..=25_500).contains(&delete));
         assert_eq!(alloc + read + update + delete, 100_000);
+    }
+
+    #[test]
+    fn mutation_log_op_sequence_is_engine_applicable() {
+        // Walk the generated workload simulating apply_op's view of the
+        // live-index set. Reads/Updates/Deletes that reference a dead or
+        // never-allocated index would panic the engine — assert here that
+        // the generator never produces such references. Catches the bug
+        // class where a stateful workload's live-set tracking gets out of
+        // sync with the index space apply_op resolves through.
+        let seed = seed_for("mutation-log");
+        let prepop = gen_mutation_log_prepopulate(seed);
+        let workload = gen_mutation_log(seed);
+        let prepop_count = prepop.ops.len();
+
+        let mut live: std::collections::HashSet<usize> = (0..prepop_count).collect();
+        let mut next_alloc_index = prepop_count;
+
+        for (i, op) in workload.ops.iter().enumerate() {
+            match op {
+                Operation::Allocate { .. } => {
+                    assert!(live.insert(next_alloc_index));
+                    next_alloc_index += 1;
+                }
+                Operation::Read { alloc_index } | Operation::Update { alloc_index, .. } => {
+                    assert!(
+                        live.contains(alloc_index),
+                        "op {i} ({op:?}) references dead index {alloc_index}"
+                    );
+                }
+                Operation::Delete { alloc_index } => {
+                    assert!(
+                        live.remove(alloc_index),
+                        "op {i} (Delete) references dead index {alloc_index}"
+                    );
+                }
+                Operation::DeleteMany { .. } => {
+                    panic!("mutation-log workload should not emit DeleteMany");
+                }
+            }
+        }
     }
 
     #[test]
