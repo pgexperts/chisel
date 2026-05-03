@@ -9,7 +9,7 @@
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use rand_distr::{Distribution, Zipf};
+use rand_distr::{Distribution, LogNormal, Zipf};
 
 /// One unit of work the Runner executes against an Engine.
 ///
@@ -94,6 +94,50 @@ pub fn zipfian_indices(seed: u64, count: usize, prepop_count: usize, theta: f64)
             // Zipf samples in [1, n], convert to [0, n-1] by subtracting 1.
             let v = zipf.sample(&mut rng) as usize;
             v.saturating_sub(1).min(prepop_count - 1)
+        })
+        .collect()
+}
+
+/// Log-normal-distributed sizes in bytes. `median_bytes` and
+/// `p99_bytes` parameterize the distribution: log-normal has shape
+/// (mu, sigma); we solve for mu/sigma such that exp(mu) = median
+/// and exp(mu + 2.326 * sigma) ≈ p99 (z-score 2.326 for the 99th
+/// percentile of a standard normal).
+///
+/// Returns Vec<usize> of length `n`. Sizes clamped to [16, 4_194_304]
+/// (16B floor, 4MB ceiling) to avoid pathological outliers from the
+/// log-normal tail. ~0.001% of unbounded log-normal samples land at
+/// multi-GB sizes; clamping accepts a tiny bias in exchange for stable
+/// wall-clock measurements.
+///
+/// Deterministic: same (seed, n, median_bytes, p99_bytes) → same Vec.
+pub fn lognormal_sizes(seed: u64, n: usize, median_bytes: usize, p99_bytes: usize) -> Vec<usize> {
+    assert!(
+        median_bytes > 0,
+        "lognormal_sizes: median_bytes must be > 0"
+    );
+    assert!(
+        p99_bytes >= median_bytes,
+        "lognormal_sizes: p99_bytes must be >= median_bytes"
+    );
+    let mu = (median_bytes as f64).ln();
+    // z-score 2.326 for the 99th percentile of a standard normal.
+    let sigma = ((p99_bytes as f64).ln() - mu) / 2.326;
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let dist = LogNormal::new(mu, sigma).unwrap();
+    (0..n)
+        .map(|_| {
+            let raw = dist.sample(&mut rng);
+            // Clamp to [16, 4_194_304]. NaN/inf samples shunted to the
+            // floor explicitly: f64::clamp is only safe when min/max are
+            // non-NaN (true here), but it propagates NaN from the input,
+            // and a NaN-as-usize cast is UB-adjacent — so the
+            // is_finite() gate stays.
+            if raw.is_finite() {
+                raw.clamp(16.0, 4_194_304.0) as usize
+            } else {
+                16
+            }
         })
         .collect()
 }
@@ -438,5 +482,28 @@ mod tests {
             pct > 0.50,
             "zipfian θ=0.99 over 10K samples expected ≥50% in top decile, got {pct:.3}"
         );
+    }
+
+    #[test]
+    fn lognormal_sizes_determinism() {
+        let a = lognormal_sizes(42, 1000, 4096, 1_048_576);
+        let b = lognormal_sizes(42, 1000, 4096, 1_048_576);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 1000);
+    }
+
+    #[test]
+    fn lognormal_sizes_clamps_outliers() {
+        // Generate 10K samples; assert all fall inside [16, 4_194_304].
+        // The lognormal tail can produce both ~0-byte and gigabyte
+        // values; the clamp protects bench timing from outliers.
+        let samples = lognormal_sizes(7, 10_000, 4096, 1_048_576);
+        for &s in &samples {
+            assert!(s >= 16, "lognormal_sizes should clamp at >= 16, got {s}");
+            assert!(
+                s <= 4_194_304,
+                "lognormal_sizes should clamp at <= 4_194_304, got {s}"
+            );
+        }
     }
 }
