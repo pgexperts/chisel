@@ -17,3 +17,4 @@
 pub mod discover;
 pub mod format;
 pub mod metadata;
+pub mod render_json;
