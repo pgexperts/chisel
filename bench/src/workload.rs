@@ -9,6 +9,7 @@
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use rand_distr::{Distribution, Zipf};
 
 /// One unit of work the Runner executes against an Engine.
 ///
@@ -55,6 +56,46 @@ pub struct Workload {
     pub seed: u64,
     pub prepop_count: usize,
     pub ops: Vec<Operation>,
+}
+
+/// Tag for the four mutating-or-reading operation kinds, used by
+/// `mix_operations` to pick which `Operation` variant to emit.
+/// `DeleteMany` is intentionally absent — scenarios use the single
+/// `Delete` variant per master spec §4.3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpKind {
+    Allocate,
+    Read,
+    Update,
+    Delete,
+}
+
+/// Zipfian-distributed random indices into [0, prepop_count). `theta`
+/// controls skew: 0.0 = uniform, 0.99 = YCSB default (heavy skew,
+/// ~75% of accesses to ~10% of records).
+///
+/// Returns Vec<usize> of length `count`. Uses `rand_distr::Zipf`,
+/// which models the Zipf distribution Z(N, s). The `Zipf` constructor
+/// takes (n, s) where s is the exponent: s=0 is uniform, s=1.0+ is
+/// heavily skewed. We translate YCSB's `theta` to s via `s = theta`
+/// (rand_distr's parameterization matches YCSB's directly).
+///
+/// Deterministic: same (seed, count, prepop_count, theta) → same Vec.
+/// Uses ChaCha8Rng seeded from `seed` for cross-platform reproducibility.
+pub fn zipfian_indices(seed: u64, count: usize, prepop_count: usize, theta: f64) -> Vec<usize> {
+    assert!(
+        prepop_count > 0,
+        "zipfian_indices: prepop_count must be > 0"
+    );
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let zipf = Zipf::new(prepop_count as u64, theta).unwrap();
+    (0..count)
+        .map(|_| {
+            // Zipf samples in [1, n], convert to [0, n-1] by subtracting 1.
+            let v = zipf.sample(&mut rng) as usize;
+            v.saturating_sub(1).min(prepop_count - 1)
+        })
+        .collect()
 }
 
 /// Pre-population: `count` Allocate ops of `size` bytes each.
@@ -375,5 +416,27 @@ mod tests {
     #[should_panic(expected = "exceeds prepop_count")]
     fn gen_delete_many_panics_on_overcount() {
         let _ = gen_delete_many(0, 10, 3, 4); // 3 * 4 = 12 > 10
+    }
+
+    #[test]
+    fn zipfian_indices_determinism() {
+        let a = zipfian_indices(42, 1000, 100, 0.99);
+        let b = zipfian_indices(42, 1000, 100, 0.99);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 1000);
+    }
+
+    #[test]
+    fn zipfian_indices_distribution_is_skewed() {
+        // Theta=0.99 (YCSB default) means heavy skew. Over 10K samples
+        // from [0, 100), the top decile (indices 0..10) should receive
+        // ~75% of accesses per spec §4.1. Allow generous tolerance.
+        let samples = zipfian_indices(7, 10_000, 100, 0.99);
+        let top_decile = samples.iter().filter(|&&i| i < 10).count();
+        let pct = (top_decile as f64) / 10_000.0;
+        assert!(
+            pct > 0.50,
+            "zipfian θ=0.99 over 10K samples expected ≥50% in top decile, got {pct:.3}"
+        );
     }
 }
