@@ -132,31 +132,46 @@ pub fn discover_cells(
 Implementation steps:
 
 1. **Load aux_metrics.jsonl** into `HashMap<(String, String, String), AuxMetrics>` keyed by `(row, mode, size)`. Single pass; bad lines logged to stderr but don't abort the whole load.
-2. **Walk `criterion_dir`** with `walkdir::WalkDir::new(criterion_dir).max_depth(3).min_depth(3)`. Each leaf at depth 3 is a `<row>/<mode>/<size>` directory. For each leaf, read `estimates.json` and parse `TimingStats`.
+2. **Walk `criterion_dir`** with `walkdir::WalkDir::new(criterion_dir).max_depth(3).min_depth(3)`. Each leaf at depth 3 is a `<row>/<mode>/<size>` directory. For each leaf, read `sample.json` (compute p50, p95, p99 from the raw distribution per §3.3) and `estimates.json` (extract `throughput_per_sec`). Combine into `TimingStats`.
 3. **Join** by `(row, mode, size)` key. Cells with either source produce a `Cell`; missing-on-one-side entries get `None` for the missing field.
 4. **Sort** the result by `(row, mode, size)` so output is deterministic.
 
 ### 3.3 Criterion JSON parsing — what we read
 
-Criterion's `estimates.json` schema (Criterion 0.5):
+We read two files per cell: `estimates.json` for throughput, and `sample.json` for the raw sample distribution (used to compute p50, p95, p99 with consistent semantics).
+
+**`sample.json`** (Criterion 0.5) is the raw measurement data:
 
 ```json
 {
-  "mean":   { "point_estimate": 1567.8, "confidence_interval": { "lower_bound": 1234.5, "upper_bound": 1890.2 }, "standard_error": 12.3 },
-  "median": { "point_estimate": 1456.2, ... },
-  "median_abs_dev": {...},
-  "slope":  {...}
+  "iters": [10.0, 10.0, 10.0, ...],
+  "times": [12340.5, 15678.2, 12450.1, ...]
 }
 ```
 
-We map:
-- `p50_ns` ← `median.point_estimate`
-- `p95_ns` ← `mean.confidence_interval.upper_bound` (Criterion's natural 95th percentile of mean)
-- `p99_ns` ← `mean.point_estimate + 2.0 * mean.standard_error` (rough 99th of mean)
+Each `times[i]` is the wall-clock time for a batch of `iters[i]` iterations. Per-iteration time = `times[i] / iters[i]`. We compute all three percentiles from the per-iteration times:
 
-Honest disclosure: Criterion does not natively compute a sample-distribution p99. The upper bound of the mean confidence interval is the closest comparable proxy. The markdown header documents this so readers can interpret correctly. True p99 (sort `sample.json` and pick `0.99 * len`) is deferred to a future PR if regression-detection sensitivity demands it.
+```rust
+fn compute_percentiles(times: &[f64], iters: &[f64]) -> (f64, f64, f64) {
+    let mut per_iter: Vec<f64> = times.iter().zip(iters)
+        .map(|(t, i)| t / i)
+        .collect();
+    per_iter.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (
+        percentile_linear_interp(&per_iter, 0.50),
+        percentile_linear_interp(&per_iter, 0.95),
+        percentile_linear_interp(&per_iter, 0.99),
+    )
+}
+```
 
-Throughput: when present in Criterion's output (it is, since PR 4b sets `Throughput::Elements(N)` on every group), `throughput_per_sec` lives in `target/criterion/<row>/<mode>/<size>/new/estimates.json` under the slope analysis. We surface it as-is; PR 7 prefers diffing throughput when the row has `N != 1`.
+`percentile_linear_interp` follows numpy's default: `idx_f = q * (n - 1)`, then linear interpolation between `sorted[floor(idx_f)]` and `sorted[ceil(idx_f)]`. This gives well-defined values even when the percentile index lands between samples — important for the Criterion default of 100 samples where `p99` is between the 99th and 100th sorted element.
+
+Computing all three percentiles from the same sample distribution makes them mutually comparable: a regression that shifts `p50` and `p99` together has a clearer signal than one where p50 comes from `median.point_estimate` (Criterion's bootstrap-related computation) and p99 comes from a CI proxy. Trade-off: we lose any benefit from Criterion's bootstrap-stabilized median estimate, but for the regression-detection use case (compare two distributions), self-consistent samples beat heterogeneous estimators.
+
+**`estimates.json`** is read only for `throughput_per_sec`, which Criterion computes from `Throughput::Elements(N)` plus the per-iteration time and exposes under the `slope` analysis (or `mean` when slope is degenerate). We surface it as-is.
+
+**Honest disclosure** in the markdown header: the percentiles are computed from Criterion's raw samples (typically 100 per cell at default config). At small sample counts, p99 has high statistical uncertainty — readers wanting tighter tail bounds use Criterion's per-cell HTML report which shows the full distribution.
 
 ### 3.4 Pre-populated identifier map analogue
 
@@ -171,7 +186,7 @@ The markdown is composed top-to-bottom:
 1. **H1 title** — `# Chisel Benchmark Summary`.
 2. **Header block** — bolded key/value lines for timestamp, chisel commit, machine info, cell count (with skip count if any).
 3. **Durability mode legend** — bulleted list explaining the five modes.
-4. **Wall-clock unit and p99 disclaimer** — one paragraph noting magnitude-adaptive units and the p99 proxy: Criterion does not natively compute a sample-distribution p99, so we report `mean.point_estimate + 2 × standard_error` (a rough 97.5%-of-mean upper bound). Readers wanting true tail-latency consult Criterion's per-cell HTML report.
+4. **Wall-clock unit and percentile disclaimer** — one paragraph noting magnitude-adaptive units and the percentile computation: p50, p95, and p99 are computed directly from Criterion's raw `sample.json` per-iteration times via numpy-style linear interpolation. Three percentiles share the same sample distribution so they're mutually comparable. With Criterion's default ~100 samples per cell, p99 has appreciable statistical uncertainty — readers wanting tight tail bounds consult Criterion's per-cell HTML report which shows the full distribution.
 5. **Micro grid section** (`## Micro grid`) — one H3 subsection per row group with a 5-row × 6-column table. Cell format: `<p50> (<p99>)` in magnitude-adaptive units. Missing cells: `—`.
 6. **File-size delta section** (`## File-size delta`) — single table; rows = (row, mode) pairs, columns = sizes. Cell format: `<signed_byte_delta>` in magnitude-adaptive bytes (B/KB/MB).
 7. **Chisel internals appendix** (`## Chisel internals appendix`) — single table; rows = (row, size) pairs filtered to `chisel-strict`, columns = `cache_hits`, `cache_misses`, `fsync_calls`, `pages_allocated`.
@@ -466,10 +481,10 @@ Deferred to PR 7 (CI):
 - GitHub Actions workflow for posting bench-diff comments on PRs.
 
 Out of scope entirely:
-- True p99 from `sample.json` sorting (spec §3.3 documents the CI-upper-bound proxy).
 - HTML output beyond Criterion's native reports.
 - Variance-driven sample-size tuning recommendations.
 - Multi-run history / trend analysis.
+- Bootstrap-stabilized percentile estimates. We compute percentiles directly from the sample distribution; Criterion has bootstrap machinery for the mean but not for arbitrary percentiles, and rolling our own would multiply scope.
 
 ## 11. Build sequence relationship
 
@@ -497,8 +512,8 @@ PR 5 fails review or is reverted: PR 4b's bench harness still works (produces `t
 
 These are deferred to the implementation plan:
 
-- Exact Criterion field-extraction logic for `p99_ns` (whether to read from `slope` analysis or compute from `mean.point_estimate + 2 * standard_error`). The plan picks the simplest reliable form.
-- Whether the test fixtures' `estimates.json` files should be hand-crafted minimal valid JSON or copied from a real Criterion run. The plan resolves; hand-crafted is cleaner for known assertions but less faithful to Criterion's actual output shape.
+- Whether the test fixtures' `estimates.json` and `sample.json` files should be hand-crafted minimal valid JSON or copied from a real Criterion run. The plan resolves; hand-crafted is cleaner for known assertions (we control the per-iteration times exactly, so the percentile assertions are exact) but less faithful to Criterion's actual output shape.
+- Whether to extract `throughput_per_sec` from `slope.point_estimate` directly or recompute from `Throughput::Elements(N)` + median time. The plan picks the simplest reliable form.
 - Whether `assert_cmd` is the right integration-test framework or if `std::process::Command` suffices. The plan picks the simplest form.
 - Specific clap subcommand structure (none for v1; `--out` etc. as flags).
 
