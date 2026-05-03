@@ -12,6 +12,8 @@
 // randomizes per-process, so derived seeds wouldn't reproduce.
 
 use crate::workload::{mix_operations, zipfian_indices, OpKind, Operation, Workload};
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 
 /// Per-scenario seeds. Hardcoded rather than hashed — Rust's
 /// DefaultHasher randomizes per-process state so derived seeds
@@ -104,6 +106,60 @@ pub fn gen_ycsb_b_prepopulate(seed: u64) -> Workload {
     }
 }
 
+/// S3: Mutation Log — 10K records, sizes uniform [64B, 4KB], 100K ops
+/// 25%/25%/25%/25% allocate/read/update/delete, uniform random access.
+/// Master spec §4.3.
+pub fn gen_mutation_log(seed: u64) -> Workload {
+    let prepop_count = 10_000;
+    let op_count = 100_000;
+    // Uniform random access; a fresh Vec each call (deterministic via seed).
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let access: Vec<usize> = (0..op_count)
+        .map(|_| rng.gen_range(0..prepop_count))
+        .collect();
+    // Sizes uniform [64, 4096] inclusive.
+    let mut size_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1));
+    let sizes: Vec<usize> = (0..op_count)
+        .map(|_| size_rng.gen_range(64..=4096))
+        .collect();
+    let ops = mix_operations(
+        seed,
+        op_count,
+        &[
+            (OpKind::Allocate, 0.25),
+            (OpKind::Read, 0.25),
+            (OpKind::Update, 0.25),
+            (OpKind::Delete, 0.25),
+        ],
+        &access,
+        &sizes,
+    );
+    Workload {
+        name: "mutation-log".to_string(),
+        seed,
+        prepop_count,
+        ops,
+    }
+}
+
+/// Pre-population for Mutation Log: 10K Allocate ops, sizes uniform
+/// [64B, 4KB] inclusive.
+pub fn gen_mutation_log_prepopulate(seed: u64) -> Workload {
+    let prepop_count = 10_000;
+    let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(2));
+    let ops: Vec<Operation> = (0..prepop_count)
+        .map(|_| Operation::Allocate {
+            size: rng.gen_range(64..=4096),
+        })
+        .collect();
+    Workload {
+        name: "mutation-log-prepopulate".to_string(),
+        seed,
+        prepop_count: 0,
+        ops,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +210,59 @@ mod tests {
         assert!((49_500..=50_500).contains(&reads));
         assert!((49_500..=50_500).contains(&updates));
         assert_eq!(reads + updates, 100_000);
+    }
+
+    #[test]
+    fn gen_mutation_log_shape() {
+        let seed = seed_for("mutation-log");
+        let prepop = gen_mutation_log_prepopulate(seed);
+        let workload = gen_mutation_log(seed);
+
+        // Pre-population: 10K Allocate ops, sizes uniform [64, 4096]
+        assert_eq!(prepop.name, "mutation-log-prepopulate");
+        assert_eq!(prepop.ops.len(), 10_000);
+        assert_eq!(prepop.prepop_count, 0);
+        for op in &prepop.ops {
+            match op {
+                Operation::Allocate { size } => {
+                    assert!(
+                        (64..=4096).contains(size),
+                        "prepop size {size} out of [64, 4096]"
+                    );
+                }
+                _ => panic!("expected only Allocate ops in prepop"),
+            }
+        }
+
+        // Main workload: 100K ops, 25/25/25/25 alloc/read/update/delete
+        assert_eq!(workload.name, "mutation-log");
+        assert_eq!(workload.ops.len(), 100_000);
+        assert_eq!(workload.prepop_count, 10_000);
+        let alloc = workload
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Operation::Allocate { .. }))
+            .count();
+        let read = workload
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Operation::Read { .. }))
+            .count();
+        let update = workload
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Operation::Update { .. }))
+            .count();
+        let delete = workload
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Operation::Delete { .. }))
+            .count();
+        // 25/25/25/25 over 100K → expect ~25K each (multinomial ±500)
+        assert!((24_500..=25_500).contains(&alloc));
+        assert!((24_500..=25_500).contains(&read));
+        assert!((24_500..=25_500).contains(&update));
+        assert!((24_500..=25_500).contains(&delete));
+        assert_eq!(alloc + read + update + delete, 100_000);
     }
 }
