@@ -27,5 +27,6 @@ assert_cmd = "2"
 name = "micro_grid"
 harness = false
 
-# Note: [[bin]] summarize target is added in Task 10 when src/bin/summarize.rs is created.
-# Declaring it here would break `cargo build` because Cargo validates target sources at parse time.
+[[bin]]
+name = "summarize"
+path = "src/bin/summarize.rs"
