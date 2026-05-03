@@ -278,6 +278,73 @@ pub fn copy_raw_archive(criterion_dir: &Path, raw_out_dir: &Path) -> std::io::Re
     Ok(())
 }
 
+/// Per-scenario metrics, one per (scenario, mode) cell. Mirrors the
+/// scenarios_metrics.jsonl schema produced by bench/benches/scenarios.rs.
+/// Renderers (render_json, render_md) consume Vec<ScenarioMetrics>
+/// alongside Vec<Cell> to produce the full PR 5 + PR 6 output.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ScenarioMetrics {
+    pub scenario: String,
+    pub mode: String,
+    pub total_wall_clock_ns: u64,
+    pub op_count: usize,
+    pub throughput_ops_per_sec: f64,
+    pub p50_ns: f64,
+    pub p95_ns: f64,
+    pub p99_ns: f64,
+    pub final_file_size_bytes: u64,
+    pub file_size_delta_bytes: i64,
+    pub counters: Option<ChiselCountersDelta>,
+}
+
+/// Load the scenarios_metrics.jsonl file produced by the scenario
+/// bench binary. Returns Vec<ScenarioMetrics> sorted by (scenario,
+/// mode) for deterministic output. Missing file → empty Vec (matches
+/// PR 5's "warn-and-continue for missing aux" pattern). Malformed
+/// lines logged to stderr but don't abort.
+pub fn load_scenarios_jsonl(path: &Path) -> Vec<ScenarioMetrics> {
+    if !path.exists() {
+        eprintln!(
+            "warning: scenarios-metrics file '{}' missing; markdown will omit the scenario section",
+            path.display()
+        );
+        return Vec::new();
+    }
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "warning: could not read scenarios-metrics '{}': {}",
+                path.display(),
+                e
+            );
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for (lineno, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<ScenarioMetrics>(line) {
+            Ok(m) => out.push(m),
+            Err(e) => {
+                eprintln!(
+                    "warning: skipping malformed scenarios-metrics line {}: {}",
+                    lineno + 1,
+                    e
+                );
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        a.scenario
+            .cmp(&b.scenario)
+            .then_with(|| a.mode.cmp(&b.mode))
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
