@@ -14,10 +14,18 @@ rand_chacha = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+chrono = "0.4"
+walkdir = "2"
+clap = { version = "4", features = ["derive"] }
+hostname = "0.4"
 
 [dev-dependencies]
 criterion = "0.5"
+assert_cmd = "2"
 
 [[bench]]
 name = "micro_grid"
 harness = false
+
+# Note: [[bin]] summarize target is added in Task 10 when src/bin/summarize.rs is created.
+# Declaring it here would break `cargo build` because Cargo validates target sources at parse time.
