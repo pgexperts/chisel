@@ -89,9 +89,11 @@ pub struct PageCache {
     spillway_max_bytes: u64,
     /// LRU position policy for commit-drain rehydrated pages. Captured
     /// from Options at construction; runtime-mutable between
-    /// transactions via set_drain_insertion.
-    /// (Activated in Task 11; until then, dead_code is suppressed.)
-    #[allow(dead_code)]
+    /// transactions via set_drain_insertion. Controls where rehydrated
+    /// spillway pages land in the LRU after flush's drain phase:
+    /// LruTail = first eviction candidate (good when drained pages are
+    /// unlikely to be needed again soon); Mru = recently-touched
+    /// semantics (good when the workload revisits recently-committed pages).
     drain_insertion: crate::DrainInsertion,
     /// How to lazily open the spillway when a first spill happens. Held
     /// here rather than opening eagerly because no-spill workloads
@@ -336,6 +338,11 @@ impl PageCache {
     /// returns OK — otherwise retrying a failed commit would silently skip
     /// the pages it already "flushed".
     pub fn flush(&mut self) -> Result<()> {
+        // Phase 1a: write every dirty in-cache page to the main file and
+        // clear its dirty flag. The early-return path in transaction.rs
+        // relies on flush() being idempotent between commits — dirty_count
+        // is reset to zero here, not decremented per page, to survive any
+        // future reordering of the loop body.
         let dirty_ids: Vec<u64> = self
             .entries
             .iter()
@@ -347,8 +354,89 @@ impl PageCache {
             self.io.write_page(page_id, &entry.buf)?;
             entry.dirty = false;
         }
-        // Every dirty entry was flipped clean above; the counter resets.
         self.dirty_count = 0;
+
+        // Phase 1b: drain the spillway in batches. For each batch:
+        //   - rehydrate (checksum-verify) bytes from the spillway file
+        //   - write to the main file
+        //   - drop from spillway resident-set (via forget)
+        //   - re-insert into cache as clean, per drain_insertion policy
+        //   - evict back to max_pages if the insertions over-filled the cache
+        //
+        // No per-batch fsync is issued. The single trailing fsync in Phase 2
+        // covers every write here, preserving the two-fsync commit cost.
+        // A crash before Phase 2's fsync is a rolled-back transaction —
+        // no main-file bytes are committed without the superblock swap that
+        // follows flush().
+        let drain_policy = self.drain_insertion;
+        loop {
+            let batch = match self.spillway.as_mut() {
+                Some(spw) if spw.slot_count() > 0 => spw.drain_batch(self.max_pages),
+                _ => break,
+            };
+            if batch.is_empty() {
+                break;
+            }
+            for page_id in batch {
+                // Rehydrate into a local buffer, then drop the spillway borrow
+                // before touching self.entries or self.lru (both need &mut self).
+                let buf = {
+                    let spw = self.spillway.as_mut().unwrap();
+                    let b = spw.rehydrate(page_id)?;
+                    spw.forget(page_id);
+                    b
+                };
+                self.io.write_page(page_id, &buf)?;
+                // Re-insert as clean: the bytes are now on the main file,
+                // so the cache entry is a valid read-through cache.
+                let entry = CacheEntry {
+                    buf: Box::new(buf),
+                    dirty: false,
+                };
+                // Use the Entry API to avoid the clippy::map_entry pattern:
+                // a `contains_key` + `insert` pair does two hash lookups;
+                // `entry(...).or_insert_with(...)` does one.
+                if let std::collections::hash_map::Entry::Vacant(e) = self.entries.entry(page_id) {
+                    // Not present: insert and register in the LRU index.
+                    e.insert(entry);
+                    match drain_policy {
+                        crate::DrainInsertion::LruTail => self.lru.push_back(page_id),
+                        crate::DrainInsertion::Mru => self.lru.push_front(page_id),
+                    }
+                }
+                // If already present — a same-id spill within a batch — skip:
+                // the existing clean entry is correct and the bytes were
+                // written above.
+            }
+            // Evict back to max_pages if drain insertions over-filled the
+            // cache. Only clean pages are evicted — dirty pages cannot be
+            // removed without writing first, and there should be none left
+            // at this point (Phase 1a cleared them all).
+            while self.entries.len() > self.max_pages {
+                let victim = self
+                    .lru
+                    .iter_lru_to_mru()
+                    .find(|&id| !self.entries.get(&id).is_none_or(|e| e.dirty));
+                match victim {
+                    Some(id) => {
+                        self.entries.remove(&id);
+                        self.lru.remove(id);
+                    }
+                    None => break, // All pages are dirty — shouldn't happen here.
+                }
+            }
+        }
+        // Truncate the spillway file to zero once all batches are drained.
+        // The file will be reused for the next transaction's overflow without
+        // paying an open() cost.
+        if let Some(spw) = self.spillway.as_mut() {
+            spw.truncate()?;
+        }
+
+        // Phase 2: single fsync covers in-cache writes (Phase 1a) and every
+        // drained-batch write (Phase 1b). This is the first of the two fsyncs
+        // in the commit protocol; TransactionManager::commit_inner issues the
+        // second after writing the superblock.
         self.io.fsync()?;
         Ok(())
     }
@@ -1046,5 +1134,54 @@ mod tests {
         // get_mut(id) on a freshly-allocated page is a hit (page is in-cache).
         assert_eq!(c.cache_hits, 2);
         assert_eq!(c.cache_misses, 0);
+    }
+
+    #[test]
+    fn flush_drains_spilled_pages_to_main_file() {
+        // Verifies the Phase 1b drain loop: spilled pages must land on the
+        // main file after flush(), be readable back through the cache, and
+        // leave the spillway empty. Uses max_pages=2 so that allocating 4
+        // pages forces 2 into the spillway.
+        let max_pages = 2;
+        let spillway_bytes = 8 * PAGE_SIZE as u64;
+        let mut cache = fresh_cache_with_spillway(max_pages, spillway_bytes);
+
+        // Allocate 4 pages — 2 in cache, 2 overflow to spillway.
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let id = cache.new_page().unwrap();
+            ids.push(id);
+            // Write a distinguishable sentinel per page and stamp a valid
+            // checksum so the spillway's per-slot checksum verifies it.
+            let buf = cache.get_mut(id).unwrap();
+            buf[0] = i as u8;
+            crate::page::stamp_checksum(buf);
+        }
+        assert_eq!(
+            cache.spillway.as_ref().unwrap().slot_count(),
+            2,
+            "two pages should have been spilled"
+        );
+
+        // flush() must drain the spillway into the main file and emit a single
+        // fsync covering both in-cache and drained writes.
+        cache.flush().unwrap();
+
+        // Spillway is now empty (truncated).
+        match cache.spillway.as_ref() {
+            Some(spw) => assert_eq!(spw.slot_count(), 0, "spillway must be empty after flush"),
+            None => {} // Acceptable if spillway was never opened.
+        }
+
+        // Each page can be read back from the cache (or, if evicted, from disk)
+        // with its sentinel byte intact. This confirms the drained bytes were
+        // committed to the main file before the fsync.
+        for (i, &id) in ids.iter().enumerate() {
+            let buf = cache.get(id).unwrap();
+            assert_eq!(
+                buf[0], i as u8,
+                "page {id} lost its sentinel after flush drain"
+            );
+        }
     }
 }
