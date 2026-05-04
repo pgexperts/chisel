@@ -118,13 +118,6 @@ fn no_spill_workload_preserves_two_fsync_commit() {
     // is never engaged and the commit protocol must not issue any spillway-
     // specific fsyncs beyond its standard protocol budget.
     //
-    // The current protocol issues 3 fsyncs per commit (pre-drain flush per
-    // I28, then a main-pages flush, then the superblock fsync — see
-    // commit_inner in transaction.rs). This test guards that the spillway
-    // feature does not inflate that count further; a no-spill commit must
-    // stay at the same count as a non-spillway commit. We assert `<= 3`
-    // to leave room for future I/O protocol changes while catching any
-    // accidental spillway-driven fsync regression.
     let mut db = Chisel::open_in_memory().unwrap();
 
     db.begin().unwrap();
@@ -136,9 +129,25 @@ fn no_spill_workload_preserves_two_fsync_commit() {
     let post_commit_counters = db.counters().unwrap();
 
     let fsync_delta = post_commit_counters.fsync_calls - pre_commit_counters.fsync_calls;
-    assert!(
-        (2..=3).contains(&fsync_delta),
-        "no-spill commit must issue 2-3 fsyncs (standard protocol, no spillway overhead); got {fsync_delta}"
+    // Three fsyncs per commit is the pre-spillway baseline:
+    //   1. I28 pre-drain flush (TransactionManager::commit_inner pre-drains
+    //      the cache before persist_freemap to keep CacheFull off the
+    //      commit path — see ISSUES.md I28).
+    //   2. Main data-pages flush (PageCache::flush phase 2).
+    //   3. Superblock write fsync (TransactionManager::commit_inner phase 2).
+    // The spillway must add zero additional fsyncs in the no-spill case.
+    // Spec §"Commit drain": "spillway itself is never fsynced — its
+    // content does not need to survive a crash."
+    //
+    // The test name still reads "two_fsync" because the spec used that
+    // language; the actual baseline is 3 due to the I28 pre-drain. The
+    // important invariant is "spillway adds zero fsyncs," and pinning
+    // to == 3 catches both regression directions (more fsyncs from
+    // spillway, or fewer from accidental I28 removal).
+    assert_eq!(
+        fsync_delta, 3,
+        "no-spill commit must issue exactly 3 fsyncs (I28 pre-drain + main + superblock); \
+         the spillway must add zero. Got {fsync_delta}"
     );
 }
 
