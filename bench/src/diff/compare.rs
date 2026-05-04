@@ -276,4 +276,99 @@ mod tests {
             assert_eq!(md.delta_pct, Some(0.0));
         }
     }
+
+    #[test]
+    fn pr_throughput_10pct_lower_is_regressed() {
+        // Throughput threshold is 5%; 10% lower trips it.
+        let baseline = one_scenario(
+            "ycsb-a/chisel-strict",
+            ScenarioMetrics {
+                throughput_ops_per_sec: 1000.0,
+                p50_ns: 100_000.0,
+                p95_ns: 200_000.0,
+                p99_ns: 500_000.0,
+            },
+        );
+        let pr = one_scenario(
+            "ycsb-a/chisel-strict",
+            ScenarioMetrics {
+                throughput_ops_per_sec: 900.0, // 10% lower
+                p50_ns: 100_000.0,
+                p95_ns: 200_000.0,
+                p99_ns: 500_000.0,
+            },
+        );
+        let report = compare(
+            &baseline,
+            &pr,
+            PathBuf::from("b"),
+            PathBuf::from("p"),
+            now(),
+        );
+        assert_eq!(report.regression_count, 1);
+        let s = &report.scenarios[0];
+        let throughput_md = &s.metrics[0];
+        assert_eq!(throughput_md.metric, Metric::Throughput);
+        match &throughput_md.status {
+            DeltaStatus::Regressed { pct, threshold_pct } => {
+                assert!((pct - 10.0).abs() < 0.001, "expected ~10.0, got {pct}");
+                assert_eq!(*threshold_pct, 5.0);
+            }
+            other => panic!("expected Regressed, got {other:?}"),
+        }
+        assert!(s.worst_regression.is_some());
+        assert_eq!(
+            s.worst_regression.as_ref().unwrap().metric,
+            Metric::Throughput
+        );
+    }
+
+    #[test]
+    fn pr_p99_6pct_higher_is_unchanged() {
+        // p99 threshold is 10%; 6% does not trip it.
+        let baseline = one_scenario("ycsb-a/chisel-strict", fixed_metrics());
+        let pr_metrics = ScenarioMetrics {
+            p99_ns: 530_000.0, // 6% higher than 500_000
+            ..fixed_metrics()
+        };
+        let pr = one_scenario("ycsb-a/chisel-strict", pr_metrics);
+        let report = compare(
+            &baseline,
+            &pr,
+            PathBuf::from("b"),
+            PathBuf::from("p"),
+            now(),
+        );
+        assert_eq!(report.regression_count, 0);
+        let p99_md = &report.scenarios[0].metrics[3];
+        assert_eq!(p99_md.metric, Metric::P99);
+        assert!(matches!(p99_md.status, DeltaStatus::Unchanged));
+    }
+
+    #[test]
+    fn pr_p99_12pct_higher_is_regressed() {
+        // p99 threshold is 10%; 12% trips it.
+        let baseline = one_scenario("ycsb-a/chisel-strict", fixed_metrics());
+        let pr_metrics = ScenarioMetrics {
+            p99_ns: 560_000.0, // 12% higher than 500_000
+            ..fixed_metrics()
+        };
+        let pr = one_scenario("ycsb-a/chisel-strict", pr_metrics);
+        let report = compare(
+            &baseline,
+            &pr,
+            PathBuf::from("b"),
+            PathBuf::from("p"),
+            now(),
+        );
+        assert_eq!(report.regression_count, 1);
+        let p99_md = &report.scenarios[0].metrics[3];
+        match &p99_md.status {
+            DeltaStatus::Regressed { pct, threshold_pct } => {
+                assert!((pct - 12.0).abs() < 0.001);
+                assert_eq!(*threshold_pct, 10.0);
+            }
+            other => panic!("expected Regressed, got {other:?}"),
+        }
+    }
 }
