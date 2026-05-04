@@ -114,6 +114,39 @@ impl LruIndex {
         self.head = Some(id);
     }
 
+    /// Insert (or move) `id` to the LRU-tail end (least recently used).
+    ///
+    /// The drain-insertion policy uses this when `DrainInsertion::LruTail`
+    /// is set: rehydrated-but-not-yet-needed pages become first eviction
+    /// candidates so hot in-flight pages stay in the MRU region.
+    ///
+    /// If `id` is already present it moves to the tail. O(1) either way —
+    /// mirrors `push_front` but inserts adjacent to `tail` instead of `head`.
+    pub fn push_back(&mut self, id: u64) {
+        if self.contains(id) {
+            self.unlink(id);
+        }
+        // Re-link at tail (LRU end). tail.next is None by invariant;
+        // the new node's next is also None, making it the new tail.
+        let new_node = Node {
+            prev: self.tail,
+            next: None,
+        };
+        match self.tail {
+            Some(old_tail) => {
+                if let Some(n) = self.nodes.get_mut(&old_tail) {
+                    n.next = Some(id);
+                }
+            }
+            None => {
+                // List was empty; this id is also the new head.
+                self.head = Some(id);
+            }
+        }
+        self.nodes.insert(id, new_node);
+        self.tail = Some(id);
+    }
+
     /// Remove `id` from the LRU. Returns `true` if it was present.
     pub fn remove(&mut self, id: u64) -> bool {
         if !self.contains(id) {
@@ -286,6 +319,38 @@ mod tests {
         idx.push_front(1);
         assert!(!idx.remove(99));
         assert_eq!(collect_lru_to_mru(&idx), vec![1]);
+    }
+
+    #[test]
+    fn push_back_inserts_at_tail() {
+        let mut idx = LruIndex::new();
+        idx.push_front(1);
+        idx.push_front(2); // 2 is MRU, 1 is LRU: [1, 2] (LRU→MRU)
+        idx.push_back(3); // 3 should become new LRU
+        let order: Vec<u64> = collect_lru_to_mru(&idx);
+        assert_eq!(order, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn push_back_moves_existing_to_tail() {
+        let mut idx = LruIndex::new();
+        idx.push_front(1);
+        idx.push_front(2);
+        idx.push_front(3); // 3=MRU, 2=mid, 1=LRU
+                           // Move 2 to LRU tail.
+        idx.push_back(2);
+        // LRU-to-MRU now: 2, 1, 3.
+        assert_eq!(collect_lru_to_mru(&idx), vec![2, 1, 3]);
+        assert_eq!(idx.len(), 3);
+    }
+
+    #[test]
+    fn push_back_on_empty() {
+        let mut idx = LruIndex::new();
+        idx.push_back(5);
+        assert_eq!(collect_lru_to_mru(&idx), vec![5]);
+        assert_eq!(idx.head, Some(5));
+        assert_eq!(idx.tail, Some(5));
     }
 
     #[test]
