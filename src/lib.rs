@@ -101,6 +101,15 @@ pub enum DrainInsertion {
     Mru,
 }
 
+/// How to open a spillway sidecar. `Path` for file-backed databases
+/// (path is the main db path; spillway will be at `<path>.spillway`),
+/// `InMemory` for memory-backed.
+#[derive(Debug, Clone)]
+pub enum SpillwayLocation {
+    Path(std::path::PathBuf),
+    InMemory,
+}
+
 impl Default for Options {
     fn default() -> Options {
         let cache_max_bytes = 8 * 1024 * 1024; // 8 MiB = 1024 × 8 KiB pages
@@ -186,6 +195,7 @@ impl Chisel {
             options.cache_max_bytes,
             options.spillway_max_bytes,
             options.drain_insertion,
+            SpillwayLocation::Path(path.to_path_buf()),
         );
 
         let txm = if file_exists {
@@ -239,6 +249,7 @@ impl Chisel {
             options.cache_max_bytes,
             options.spillway_max_bytes,
             options.drain_insertion,
+            SpillwayLocation::InMemory,
         );
         let txm = TransactionManager::create_new(cache, options.superblock_count)?;
         Ok(Chisel { txm })

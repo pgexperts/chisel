@@ -1852,6 +1852,7 @@ mod tests {
             1024 * PAGE_SIZE as u64,
             0,
             crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
         );
         let mut tm = TransactionManager::create_new(cache, 2).unwrap();
         // Commit once so there's a real baseline to read/write against.
@@ -2187,7 +2188,13 @@ mod tests {
         // operations (handle-table root + superblocks + freemap) to
         // coexist, small enough that a few dozen big allocations
         // saturate it. spillway_max_bytes=0 preserves CacheFull-at-cap.
-        let cache = PageCache::new(io, 4 * PAGE_SIZE as u64, 0, crate::DrainInsertion::LruTail);
+        let cache = PageCache::new(
+            io,
+            4 * PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
         let mut tm = TransactionManager::create_new(cache, 2).unwrap();
         tm.begin().unwrap();
         tm.commit().unwrap();
@@ -2272,6 +2279,7 @@ mod tests {
                 1024 * PAGE_SIZE as u64,
                 0,
                 crate::DrainInsertion::LruTail,
+                crate::SpillwayLocation::InMemory,
             );
             let _ = TransactionManager::create_new(cache, 2).unwrap();
             // drop() releases the flock so the test can read+write the
@@ -2309,6 +2317,7 @@ mod tests {
                 1024 * PAGE_SIZE as u64,
                 0,
                 crate::DrainInsertion::LruTail,
+                crate::SpillwayLocation::InMemory,
             );
             let tm = TransactionManager::open_existing(cache);
             assert!(
@@ -2329,6 +2338,7 @@ mod tests {
                 1024 * PAGE_SIZE as u64,
                 0,
                 crate::DrainInsertion::LruTail,
+                crate::SpillwayLocation::InMemory,
             );
             match TransactionManager::open_existing(cache) {
                 Err(ChiselError::UnsupportedFormatVersion { .. }) => {}

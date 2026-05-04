@@ -137,6 +137,7 @@ fn test_reopen_preserves_data() {
             64 * chisel::page::PAGE_SIZE as u64,
             0,
             chisel::DrainInsertion::LruTail,
+            chisel::SpillwayLocation::InMemory,
         );
         let mut txm = TransactionManager::create_new(cache, 2).unwrap();
         txm.begin().unwrap();
@@ -150,6 +151,7 @@ fn test_reopen_preserves_data() {
             64 * chisel::page::PAGE_SIZE as u64,
             0,
             chisel::DrainInsertion::LruTail,
+            chisel::SpillwayLocation::InMemory,
         );
         let txm = TransactionManager::open_existing(cache).unwrap();
         let data = txm.read(handle).unwrap();

@@ -201,6 +201,7 @@ fn test_cache_write_and_read() {
         16 * chisel::page::PAGE_SIZE as u64,
         0,
         chisel::DrainInsertion::LruTail,
+        chisel::SpillwayLocation::InMemory,
     );
 
     let page_id = cache.new_page().unwrap();
@@ -227,6 +228,7 @@ fn test_cache_flush_persists_to_disk() {
             16 * chisel::page::PAGE_SIZE as u64,
             0,
             chisel::DrainInsertion::LruTail,
+            chisel::SpillwayLocation::InMemory,
         );
         let page_id = cache.new_page().unwrap();
         {
@@ -254,6 +256,7 @@ fn test_cache_eviction_does_not_evict_dirty() {
         2 * chisel::page::PAGE_SIZE as u64,
         0,
         chisel::DrainInsertion::LruTail,
+        chisel::SpillwayLocation::InMemory,
     );
 
     let p0 = cache.new_page().unwrap();
@@ -410,6 +413,7 @@ fn ht_cache(max_pages: usize) -> PageCache {
         max_pages as u64 * chisel::page::PAGE_SIZE as u64,
         0,
         chisel::DrainInsertion::LruTail,
+        chisel::SpillwayLocation::InMemory,
     );
     cache.set_next_page_id(2);
     cache
