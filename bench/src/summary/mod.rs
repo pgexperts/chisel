@@ -26,5 +26,6 @@ pub use discover::{
     ScenarioMetrics, TimingStats,
 };
 pub use metadata::{gather_metadata, MachineInfo, Metadata};
+pub use render_cross_engine::render_cross_engine_markdown;
 pub use render_json::render_json;
 pub use render_md::render_markdown;
