@@ -127,18 +127,56 @@ WAL mode leaves committed data in the `-wal` sibling between explicit
 checkpoints — `std::fs::copy` of the main `.db` alone otherwise yields
 "database disk image is malformed" on reopen.
 
-PRs 7–8 of the bench-suite series remain: PR 7 (CI integration —
-runs `cargo bench --bench scenarios` on each PR, captures
-`results.json`, diffs against `main`'s baseline, posts a regression
-report) and PR 8 (cross-engine relative-performance tests, Chisel
-vs redb vs SQLite, with the macOS-fsync fairness fix noted above).
-Design spec at
+PR 7 (CI integration — `chisel-bench-diff` binary at
+`bench/src/bin/diff.rs` plus `.github/workflows/bench.yml` workflow
+that runs the scenario tier on each PR, diffs against `main`'s
+baseline, posts a sticky regression-report comment) landed on
+`main` as of 2026-05-04. Workflow does a two-checkout strategy:
+build + run scenarios on `main`, build + run on PR HEAD, summarize
+both, run the diff binary, post the result via
+`peter-evans/find-comment` + `create-or-update-comment` keyed on
+the marker `<!-- chisel-bench-diff -->` (subsequent pushes update
+the same comment instead of stacking). Thresholds: throughput +
+p50 at 5%, p95 + p99 at 10%, worse-direction only, no absolute
+time floor in v1. Pinned to `ubuntu-latest` per the PR 6 macOS
+fsync caveat — Linux makes chisel-strict and sqlite-strict
+fsync costs comparable. Workflow is signal-only — never blocks
+merge. Run cost on Linux: ~10 min for the full two-side
+comparison.
+
+PR 7's spec/plan at
+`docs/superpowers/specs/2026-05-04-chisel-bench-ci-design.md` +
+`docs/superpowers/plans/2026-05-04-chisel-bench-ci.md`. The
+subagent-driven review caught three substantive issues that all
+got fixed: missing test for `MalformedScenarioEntry`,
+`(None, None)` arm silently returning `Unchanged` instead of
+`unreachable!`, and a `-0.0%` display bug for zero-delta
+throughput cells (found at two sites in `render.rs`). Worth
+remembering as evidence that the two-stage review pattern (spec
+compliance + code quality) finds things even when the plan
+provides verbatim source.
+
+PR 7's first acceptance gate (the workflow runs against PR 7
+itself per spec §7.1) caught a real environmental issue:
+`origin/main` was 76 commits behind local `main` because PRs
+4-6 were merged locally but never pushed to GitHub. The
+workflow's `Checkout main` step pulled the PR-3-state bench
+subcrate which lacked the `summarize` binary, and the build
+failed at the `Build bench (main)` step. Fix was a single
+`git push origin main` after which the re-run went green.
+The pattern to remember: any workflow that does `Checkout main`
++ build assumes `origin/main` is current; pre-push should
+include `git log origin/main..main` as a sanity check when
+the work depends on prior PRs being on GitHub.
+
+PR 8 (cross-engine relative-performance tests, Chisel vs redb
+vs SQLite, with the macOS-fsync fairness fix noted above) is
+the only remaining bench-suite item. PR 8 is an addendum to
+the original design and will get its own spec/plan pair when
+brainstormed. The master design spec at
 `docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md`
-covers PRs 1–7; PR 8 is an addendum tracked here pending its own
-spec/plan. PR 6's spec/plan at
-`docs/superpowers/specs/2026-05-03-chisel-bench-scenario-tier-design.md`
-+ `docs/superpowers/plans/2026-05-03-chisel-bench-scenario-tier.md`.
-Per-PR plans alongside in `docs/superpowers/plans/`.
+covers PRs 1–7. Per-PR plans alongside in
+`docs/superpowers/plans/`.
 
 ## Architecture
 
@@ -180,10 +218,12 @@ docs): the benchmark-suite series. PRs 1 (counter instrumentation
 exposing `Chisel::counters()`), 2 (`bench/` subcrate + `Engine` trait
 + `ChiselEngine`), and 3 (`RedbEngine` + `SqliteEngine` + cross-engine
 equivalence tests) have landed on `main` as of 2026-04-30; PRs 4a, 4b,
-5, and 6 have landed as of 2026-05-03. PRs 7 (CI integration) and 8
-(cross-engine relative-performance tests, Chisel vs redb vs SQLite)
-remain pending. PR 8 is an addendum to the original design — it will
-get its own spec/plan pair when brainstormed. See
+5, and 6 have landed as of 2026-05-03; PR 7 (CI integration) has landed
+as of 2026-05-04. PR 8 (cross-engine relative-performance tests, Chisel
+vs redb vs SQLite, with the macOS-fsync fairness fix `PRAGMA fullfsync=ON`
+on `SqliteEngine`) is the only remaining bench-suite item. PR 8 is an
+addendum to the original design — it will get its own spec/plan pair
+when brainstormed. See
 `docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md`.
 
 ## Conventions
