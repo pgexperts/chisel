@@ -45,6 +45,32 @@ pub fn format_bytes(bytes: i64) -> String {
     }
 }
 
+/// Format a byte count using binary IEC suffixes (B / KiB / MiB / GiB).
+/// Positive values only; no sign prefix. Distinct from `format_bytes`
+/// which signs the output and uses 1024-base "KB/MB/GB" labels — the
+/// cross-engine comparison tables (PR 8) need IEC labels for technical
+/// clarity ("MiB" is unambiguously 2^20, "MB" can mean 10^6 in some
+/// contexts).
+///
+/// Boundary convention: switch to the next-larger unit at exactly 1024
+/// of the smaller unit. So 1023 B → "1023 B", 1024 B → "1.0 KiB".
+/// One decimal for KiB and MiB; two decimals for GiB (since GiB values
+/// are typically 2-3 digits and the extra precision matters more).
+pub fn format_bytes_iec(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes < KIB {
+        format!("{} B", bytes)
+    } else if bytes < MIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else if bytes < GIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    }
+}
+
 /// Parse a size label like "32B", "2KB", "1MB" into the corresponding
 /// byte count. Returns None for unrecognized formats. Used by the
 /// markdown renderer to sort size columns numerically rather than
@@ -150,6 +176,34 @@ mod tests {
         assert_eq!(parse_size_to_bytes("foobar"), None);
         assert_eq!(parse_size_to_bytes("32"), None); // missing unit
         assert_eq!(parse_size_to_bytes(""), None);
+    }
+
+    #[test]
+    fn format_bytes_iec_under_1k_uses_bytes() {
+        assert_eq!(format_bytes_iec(0), "0 B");
+        assert_eq!(format_bytes_iec(1), "1 B");
+        assert_eq!(format_bytes_iec(512), "512 B");
+        assert_eq!(format_bytes_iec(1023), "1023 B");
+    }
+
+    #[test]
+    fn format_bytes_iec_uses_binary_suffixes_at_each_boundary() {
+        // Exact boundaries — 1024 of the smaller unit becomes 1.0 of larger.
+        assert_eq!(format_bytes_iec(1024), "1.0 KiB");
+        assert_eq!(format_bytes_iec(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes_iec(1024_u64.pow(3)), "1.00 GiB");
+    }
+
+    #[test]
+    fn format_bytes_iec_intermediate_values_round_correctly() {
+        // 1.5 KiB
+        assert_eq!(format_bytes_iec(1536), "1.5 KiB");
+        // 100 MiB exactly
+        assert_eq!(format_bytes_iec(100 * 1024 * 1024), "100.0 MiB");
+        // 4.2 MiB approximately
+        assert_eq!(format_bytes_iec(4_404_019), "4.2 MiB");
+        // 8 GiB
+        assert_eq!(format_bytes_iec(8 * 1024_u64.pow(3)), "8.00 GiB");
     }
 
     #[test]
