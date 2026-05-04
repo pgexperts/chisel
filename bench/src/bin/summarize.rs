@@ -1,7 +1,9 @@
 // CLI entry point for the chisel-bench-summarize post-processor.
 // Reads PR 4b's bench output (Criterion sample.json + aux_metrics.jsonl)
 // PLUS PR 6's scenarios_metrics.jsonl, and emits summary.md +
-// results.json + raw/ under bench/results/<UTC>/.
+// results.json + cross-engine.md + raw/ under bench/results/<UTC>/.
+// (cross-engine.md is the PR 8 artifact: a per-metric Chisel-vs-redb-vs-SQLite
+// comparison rendered from the same scenarios slice as summary.md.)
 //
 // All logic lives in the chisel_bench::summary library module; this
 // file is just argv parsing, error printing, and exit codes.

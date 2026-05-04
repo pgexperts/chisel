@@ -111,7 +111,7 @@ Methodology: each cell is the result of a single end-to-end run of the
 named scenario against the engine in strict durability mode. See
 [`summary.md`](summary.md) in the same directory for the full per-cell
 detail (p50, p95, total wall clock, file-size delta, and Chisel-internal
-counter snapshots) and [the master bench spec](../../docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md)
+counter snapshots) and [the master bench spec](../../../docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md)
 for workload definitions. Each engine takes a single fsync per commit
 through the disk write cache; numbers depend on the platform's storage
 stack and are not portable across machine classes.
