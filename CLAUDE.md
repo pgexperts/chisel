@@ -184,7 +184,8 @@ The module dependency graph is strictly bottom-up — no circular dependencies:
 
 1. `page.rs`, `superblock.rs`, `error.rs` — Pure types, constants, checksums. No I/O.
 2. `page_io.rs` — Raw file I/O with `flock`. The only module that touches the filesystem.
-3. `page_cache.rs` — LRU cache over `PageIo`. All other modules access pages through this.
+3. `page_cache.rs` — LRU cache over `PageIo` with a strict `cache_max_bytes` cap; dirty overflow spills to `spillway.rs` (a sidecar file or in-memory buffer). All other modules access pages through this; the spill/rehydrate path is invisible above the cache.
+3a. `spillway.rs` — sidecar overflow file (`<db_path>.spillway`) that absorbs LRU-tail dirty pages when the cache is full of dirty pages. Per-slot XXH3 checksums; truncated at open and at every commit/rollback; never fsynced. Owned by `PageCache`.
 4. `freemap.rs`, `data_page.rs`, `overflow.rs` — Page-type-specific logic. Each operates on raw `[u8; PAGE_SIZE]` buffers.
 5. `handle_table.rs` — Radix tree mapping `u64` handles to `(page_id, slot_index)`. Implements its own COW.
 6. `transaction.rs` — Orchestrates handle table, data pages, overflow, and superblock into transactional operations.
@@ -197,7 +198,9 @@ The module dependency graph is strictly bottom-up — no circular dependencies:
 - **COW is per-module, not centralized.** The handle table and freemap each implement their own copy-on-write using `PageCache::new_page()`. This avoids a monolithic COW abstraction.
 - **Handle table indirection.** Handles are stable u64 IDs that map through a radix tree to physical `(page, slot)` locations. Values can move freely on update or defrag.
 - **N superblocks** (default 2, configurable 2..=16 at create time via `Options::superblock_count`) rotate by `txn_counter % N`. The slot with the highest `txn_counter` and a valid checksum wins. This is the atomic commit mechanism; higher N survives consecutive torn writes.
-- **Durability over performance.** Every commit does two fsyncs (data pages, then superblock). Checksums on every page.
+- **Durability over performance.** Every commit does fsyncs at well-defined points (I28 pre-drain + main-pages flush + superblock). The spillway is never fsynced — its content does not need to survive a crash.
+- **Spillway over hard ceiling.** The cache is a strict bound; dirty overflow spills to a `<db_path>.spillway` sidecar file (default cap `1024 × cache_max_bytes` = 8 GiB). This replaced the pre-existing 8× `HARD_CEILING_MULTIPLIER` elasticity. Setting `Options::spillway_max_bytes = 0` disables the spillway and restores `CacheFull`-at-cap semantics. New operational error `SpillwayFull { limit_bytes }` fires when both cache and spillway are exhausted. Spec: `docs/superpowers/specs/2026-05-03-chisel-spillway-design.md`.
+- **Checksums on every page.** Both main-file pages (the existing XXH3 stamp) and spillway slots (an additional per-slot XXH3 over `page_id || page_bytes`) are checksum-verified on read; mismatch is fatal and poisons the transaction.
 - **Poison on fatal error.** On any commit-path I/O failure, checksum mismatch, or corrupt superblock, the `TransactionManager` becomes poisoned (matches `std::sync::Mutex` semantics). Every subsequent call returns `ChiselError::Poisoned`; the only legal recovery is `close()` + reopen, which picks the last-durable superblock. Driven by Linux fsyncgate semantics — a failed `fsync()` cannot be safely retried.
 - **In-memory mode.** `Chisel::open_in_memory` (also `chisel.open(None)` from Python) runs the full engine against a `Vec<u8>`-backed `PageIo` with no filesystem and no `flock`. Same code path, same guarantees except durability; used for tests, benchmarks, and ephemeral work.
 - **Format-version compatibility.** The on-disk `format_version` is a packed `u32` (upper 16 bits MAJOR, lower 16 bits MINOR; see I29). Same-MAJOR files are mutually readable across any minor; a different MAJOR is rejected at open. Each non-superblock page also carries a one-byte `page_format_version` (I31) so individual page layouts can evolve within a major without a file-wide bump. Both schemes leave reserved bytes for forward-compatible extension. Touching either constant or any byte that participates in the on-disk format is a public-stability decision, not a refactor.
@@ -225,6 +228,47 @@ on `SqliteEngine`) is the only remaining bench-suite item. PR 8 is an
 addendum to the original design — it will get its own spec/plan pair
 when brainstormed. See
 `docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md`.
+
+The **spillway feature** (out-of-band from the bench-suite series) landed
+on `main` as of 2026-05-04. Adds `src/spillway.rs` plus integration
+across `PageCache` (spill on dirty overflow, rehydrate on miss, drain
+under the existing fsync, truncate on rollback) and the public API
+(`Chisel::set_cache_max_bytes` / `set_spillway_max_bytes` /
+`set_drain_insertion`). Breaking change: `Options::cache_size: usize`
+(page count) → `Options::cache_max_bytes: u64` (bytes); default
+unchanged at 8 MiB. Plus new `Options::spillway_max_bytes` (default
+1024× = 8 GiB; 0 disables spillway and restores legacy `CacheFull`-at-cap
+semantics) and `Options::drain_insertion` (`LruTail` default | `Mru`).
+The pre-existing 8× `HARD_CEILING_MULTIPLIER` elasticity is removed.
+The bench engine (`bench/src/chisel_engine.rs`) was updated mid-PR to
+enable the spillway by default — the original "spillway disabled for
+cross-engine fairness" reasoning was backwards (SQLite uses a temp file
+for transaction overflow, redb uses on-disk btrees; disabling Chisel's
+spillway makes Chisel the only engine that fails on big transactions,
+which is the unfair config). Spec/plan at
+`docs/superpowers/specs/2026-05-03-chisel-spillway-design.md` +
+`docs/superpowers/plans/2026-05-04-chisel-spillway.md`.
+
+Lessons captured during the spillway rollout, worth remembering:
+1. **Per-task `cargo test` from the repo root does NOT run the bench
+   subcrate's tests.** Bench is a sibling crate, not a workspace member.
+   `cd bench && cargo test` is documented in CLAUDE.md as a separate
+   step but per-task gates skipped it. The final whole-PR review caught
+   the missed bench test failures, but follow-up will add bench tests
+   to `ci.yml`.
+2. **A breaking change in cache discipline ripples to every consumer
+   that papered over a different limitation.** The bench engine had
+   been quietly relying on the 8× elasticity as a substitute for proper
+   transaction-overflow handling. Removing the elasticity exposed the
+   missing config; the right fix was to give Chisel the spillway
+   (production parity), not to keep it disabled and lower other budgets.
+3. **No-spill commit cost is 3 fsyncs, not 2.** I28 pre-drain flush +
+   main-pages flush + superblock. The spec called it "two-fsync" because
+   the spec author was thinking only of the spillway's contribution
+   (zero); the actual baseline was already 3. The
+   `no_spill_workload_preserves_two_fsync_commit` test now pins to
+   `== 3` with documentation of the protocol so a future reader knows
+   what each fsync covers.
 
 ## Conventions
 
