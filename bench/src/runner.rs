@@ -299,15 +299,21 @@ impl PopulatedSnapshot {
 }
 
 /// Per-tx byte budget for snapshot population. Chunked at this size to
-/// keep each populate transaction under Chisel's cache hard ceiling
-/// (16 MB = 2048 pages × 8KB at default settings). 4 MB raw payload
-/// leaves headroom: large records (size > 8KB) need ceil(size/8152)
-/// overflow pages each plus handle-table radix COW pages plus freemap
-/// pages — all dirty within the tx and pinned against eviction —
-/// pushing actual cache footprint substantially above raw bytes.
+/// keep each populate transaction under Chisel's strict cache cap.
+/// Bench engines run with `spillway_max_bytes = 0` (spillway disabled)
+/// so each engine is measured under its own cache discipline without
+/// Chisel getting a spillway escape hatch that SQLite and redb lack.
+/// The effective cap is `CACHE_SIZE_PAGES × PAGE_SIZE` = 256 × 8 KiB
+/// = 2 MiB. Large records (size > 8 KiB) need ceil(size/8152)
+/// overflow pages each plus handle-table radix COW pages (2 per
+/// insert at tree depth 1) plus freemap pages — all dirty within
+/// the tx and pinned against eviction — pushing actual cache
+/// footprint to roughly 5× raw-byte count for large overflow records.
+/// 128 KiB keeps the per-chunk page pressure well under the 256-page
+/// cap even at maximum record size (16 KiB → ~10 records → ~50 pages).
 /// Internal to `populate_snapshot`; the row-bench skip threshold in
 /// micro_grid.rs is a different concern (workload-time, not setup).
-const POPULATE_TX_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+const POPULATE_TX_BUDGET_BYTES: usize = 128 * 1024;
 
 /// Per-tx record-count cap for snapshot population, applied alongside
 /// the byte budget. Each Chisel allocate() COWs a fresh root page for
@@ -323,12 +329,14 @@ const POPULATE_TX_MAX_RECORDS: usize = 500;
 /// each, capturing the engine-assigned identifiers in allocation order.
 ///
 /// Pre-population is chunked into multiple `begin/.../commit` blocks of at
-/// most `POPULATE_TX_BUDGET_BYTES` worth of payload each. A single tx for
-/// large sizes (e.g. 16KB × 1500 records = 24 MB) blows past Chisel's
-/// 16 MB cache hard ceiling and panics with `CacheFull`; chunking keeps
-/// each populate tx safely under the budget while preserving the snapshot
-/// content (same records, same ids in the same allocation order — only
-/// the internal tx granularity changes).
+/// most `POPULATE_TX_BUDGET_BYTES` worth of payload each. Bench engines
+/// run with `spillway_max_bytes = 0` so the cache is a strict 2 MiB cap
+/// (256 pages × 8 KiB) with no spillway relief. A single tx for large
+/// sizes (e.g. 16 KiB × 1500 records = 24 MB) exceeds that cap and
+/// panics with `CacheFull`; chunking keeps each populate tx safely under
+/// the budget while preserving the snapshot content (same records, same
+/// ids in the same allocation order — only the internal tx granularity
+/// changes).
 ///
 /// The returned `PopulatedSnapshot` owns the file via `NamedTempFile`;
 /// callers must keep it alive until all cells using its `path()` are
@@ -657,8 +665,9 @@ mod tests {
 
     #[test]
     fn populate_snapshot_chisel_large_size_chunks() {
-        // 1500 × 16KB = 24 MB raw payload — exceeds the 16 MB cache
-        // hard ceiling if done in one tx. Chunked populate must succeed.
+        // 1500 × 16 KiB = 24 MiB raw payload — far exceeds the 2 MiB
+        // strict cache cap (256 pages, no spillway) if done in one tx.
+        // Chunked populate must succeed.
         let snap = populate_snapshot(EngineMode::ChiselStrict, 16_384, 1500).unwrap();
         assert_eq!(snap.ids().len(), 1500);
     }

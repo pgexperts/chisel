@@ -142,7 +142,12 @@ fn scenario_delete_and_allocate<E: Engine>(engine: &mut E) {
 // === Per-engine constructors ===
 
 fn make_chisel() -> ChiselEngine {
-    ChiselEngine::open_in_memory(64).expect("open chisel")
+    // 256 pages × 8 KiB = 2 MiB strict cache cap (no spillway in bench
+    // engines). Must be large enough for the largest single-tx allocation
+    // in any equivalence scenario: scenario_large_overflow allocates 1 MiB,
+    // which requires ~130 overflow pages plus handle-table and freemap COW
+    // pages. 256 pages gives comfortable headroom.
+    ChiselEngine::open_in_memory(256).expect("open chisel")
 }
 
 fn make_redb() -> (RedbEngine, NamedTempFile) {
