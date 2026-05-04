@@ -111,9 +111,9 @@ magnitude faster. Full 12-cell grid takes ~70–90 minutes on
 macOS APFS at the spec's workload sizes; Linux CI runners (no
 F_FULLFSYNC overhead) will be much faster. The cross-engine
 fairness gap is pre-existing from PR 3's `SqliteEngine` wrapper
-and is deferred to PR 8 (cross-engine relative-performance
-tests), which will need `PRAGMA fullfsync=ON` to be apples-to-
-apples on macOS.
+and was closed by PR 8, which adds `PRAGMA fullfsync=ON` to the
+Strict-mode branch of `SqliteEngine::open_file` to make SQLite
+apples-to-apples with Chisel on macOS.
 
 The 4b grid is 6 rows, not the 9 the master spec called for: three
 1000-per-tx variants (update, delete, delete_many) were dropped during
@@ -169,14 +169,50 @@ The pattern to remember: any workflow that does `Checkout main`
 include `git log origin/main..main` as a sanity check when
 the work depends on prior PRs being on GitHub.
 
-PR 8 (cross-engine relative-performance tests, Chisel vs redb
-vs SQLite, with the macOS-fsync fairness fix noted above) is
-the only remaining bench-suite item. PR 8 is an addendum to
-the original design and will get its own spec/plan pair when
-brainstormed. The master design spec at
+PR 8 (cross-engine comparison report + macOS-fsync fairness
+fix) landed on `main` as of 2026-05-04, completing the
+bench-suite series. Two changes: (a) `chisel-bench-summarize`
+now emits `cross-engine.md` alongside `summary.md` and
+`results.json` — three per-metric tables (throughput, p99
+latency, file size) comparing Chisel vs redb vs SQLite over
+the four PR 6 scenarios in strict mode, absolute numbers,
+suitable for the README and 1.0 release notes; rendered by a
+new `bench/src/summary/render_cross_engine.rs` module that
+reads the same `Vec<ScenarioMetrics>` slice the existing
+artifacts use, so the discover/load path is unchanged. (b)
+`SqliteEngine::open_file` issues `PRAGMA fullfsync=ON` for
+`DurabilityMode::Strict` — no `#[cfg(target_os)]` gate (Linux
+ignores it; macOS uses `fcntl(F_FULLFSYNC)`), one extra PRAGMA
+exec at open time. Also adds a `format_bytes_iec` helper for
+binary IEC byte formatting (KiB/MiB/GiB) used by the file-size
+table.
+
+PR 8's spec/plan at
+`docs/superpowers/specs/2026-05-04-chisel-bench-cross-engine-design.md` +
+`docs/superpowers/plans/2026-05-04-chisel-bench-cross-engine.md`.
+The master design spec at
 `docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md`
-covers PRs 1–7. Per-PR plans alongside in
+covers PRs 1–7; PR 8 is an addendum captured in its own
+spec/plan pair. Per-PR plans alongside in
 `docs/superpowers/plans/`.
+
+PR 8's first-run bench-diff signal is worth remembering as a
+calibration point for GitHub-runner variance on the scenario
+tier: two `document-store` p50 cells flagged as "regressed"
+(redb-strict +9.4%, chisel-strict +5.6%) while throughput on
+both was within ±1% (genuine noise on microsecond-scale
+measurements). Simultaneously chisel-strict throughput
+"improved" 11–14% on three other scenarios (mutation-log
++12.4%, ycsb-a +14.1%, ycsb-b +11.3%) — also CI variance, in
+the user-favorable direction (the cross-engine PR doesn't
+touch Chisel's hot path). Future bench-diff readers should
+treat ≤±15% deltas on the scenario tier as plausible runner
+noise rather than real perf signals; the diff binary's job is
+to surface them, not to gate merges. Separately, the diff
+confirmed `PRAGMA fullfsync=ON` is a true no-op on Linux:
+SQLite-strict cells moved by ≤1.5% across all four scenarios.
+The pragma is purely a macOS-fairness thing, vindicating the
+spec's "no `#[cfg(target_os)]` gate" decision.
 
 ## Architecture
 
@@ -216,18 +252,20 @@ and every entry from the three commenting passes (2026-04-10, 2026-04-17,
 (I29 minor-write enforcement; I31 eager upgrader) that are gated on triggers
 in a future minor release rather than calendar time.
 
-Concurrent in-progress work (tracked outside `ISSUES.md` via spec+plan
-docs): the benchmark-suite series. PRs 1 (counter instrumentation
-exposing `Chisel::counters()`), 2 (`bench/` subcrate + `Engine` trait
-+ `ChiselEngine`), and 3 (`RedbEngine` + `SqliteEngine` + cross-engine
-equivalence tests) have landed on `main` as of 2026-04-30; PRs 4a, 4b,
-5, and 6 have landed as of 2026-05-03; PR 7 (CI integration) has landed
-as of 2026-05-04. PR 8 (cross-engine relative-performance tests, Chisel
-vs redb vs SQLite, with the macOS-fsync fairness fix `PRAGMA fullfsync=ON`
-on `SqliteEngine`) is the only remaining bench-suite item. PR 8 is an
-addendum to the original design — it will get its own spec/plan pair
-when brainstormed. See
-`docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md`.
+Completed work (tracked outside `ISSUES.md` via spec+plan docs):
+the benchmark-suite series, all eight PRs landed. PRs 1 (counter
+instrumentation exposing `Chisel::counters()`), 2 (`bench/`
+subcrate + `Engine` trait + `ChiselEngine`), and 3 (`RedbEngine`
++ `SqliteEngine` + cross-engine equivalence tests) on `main` as
+of 2026-04-30; PRs 4a, 4b, 5, and 6 as of 2026-05-03; PR 7 (CI
+integration) and PR 8 (cross-engine comparison report `cross-engine.md`
++ macOS fairness fix `PRAGMA fullfsync=ON` on `SqliteEngine`)
+both as of 2026-05-04. The bench-suite series is complete. The
+master design at
+`docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md`
+covers PRs 1–7; PR 8's own spec/plan pair lives at
+`docs/superpowers/specs/2026-05-04-chisel-bench-cross-engine-design.md`
+and `docs/superpowers/plans/2026-05-04-chisel-bench-cross-engine.md`.
 
 The **spillway feature** (out-of-band from the bench-suite series) landed
 on `main` as of 2026-05-04. Adds `src/spillway.rs` plus integration
