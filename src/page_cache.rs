@@ -682,6 +682,54 @@ impl PageCache {
         self.next_page_id = id;
     }
 
+    /// Update the cache's strict upper bound to `bytes`. Caller must
+    /// ensure no transaction is in flight (TransactionManager checks
+    /// this). Shrinking evicts clean LRU-tail entries until we fit;
+    /// dirty entries (which shouldn't exist between transactions) are
+    /// preserved and may push the cache temporarily over the new cap
+    /// — the next allocation reasserts the limit via maybe_evict.
+    pub fn set_cache_max_bytes(&mut self, bytes: u64) -> Result<()> {
+        let new_max_pages = (bytes / PAGE_SIZE as u64).max(1) as usize;
+        self.max_pages = new_max_pages;
+        // Best-effort shrink: evict clean entries from LRU tail.
+        while self.entries.len() > self.max_pages {
+            if self.dirty_count == self.entries.len() {
+                break;
+            }
+            let victim = self
+                .lru
+                .iter_lru_to_mru()
+                .find(|&id| !self.entries.get(&id).is_none_or(|e| e.dirty));
+            match victim {
+                Some(id) => {
+                    self.entries.remove(&id);
+                    self.lru.remove(id);
+                }
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Update the spillway cap. The spillway is empty between
+    /// transactions (truncated at every commit/rollback), so resize
+    /// is a state-free operation. Shrinking to 0 disables the
+    /// spillway; subsequent overflow trips CacheFull.
+    pub fn set_spillway_max_bytes(&mut self, bytes: u64) -> Result<()> {
+        self.spillway_max_bytes = bytes;
+        if let Some(spw) = self.spillway.as_mut() {
+            spw.set_max_bytes(bytes);
+        }
+        Ok(())
+    }
+
+    /// Update the drain insertion policy. Captured for use by the next
+    /// `flush()` invocation.
+    pub fn set_drain_insertion(&mut self, policy: crate::DrainInsertion) -> Result<()> {
+        self.drain_insertion = policy;
+        Ok(())
+    }
+
     /// Check if a page is dirty in the cache.
     ///
     /// Used by the transaction layer to reason about whether a page is

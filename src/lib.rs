@@ -439,4 +439,29 @@ impl Chisel {
     pub fn defrag(&mut self, options: defrag::DefragOptions) -> Result<defrag::DefragStats> {
         defrag::defrag(&mut self.txm, &options)
     }
+
+    /// Resize the in-memory cache cap. Returns
+    /// `ChiselError::TransactionInProgress` if a transaction is
+    /// active. Shrinking evicts clean LRU-tail entries to fit;
+    /// growing takes effect on the next allocation. See spec
+    /// §"Runtime mutability".
+    pub fn set_cache_max_bytes(&mut self, bytes: u64) -> Result<()> {
+        self.txm.set_cache_max_bytes(bytes)
+    }
+
+    /// Resize the spillway cap. Setting to 0 disables the spillway
+    /// (subsequent overflow trips CacheFull at the cache cap).
+    /// Returns `ChiselError::TransactionInProgress` if a transaction
+    /// is active. The spillway is empty between transactions, so
+    /// resize is state-free.
+    pub fn set_spillway_max_bytes(&mut self, bytes: u64) -> Result<()> {
+        self.txm.set_spillway_max_bytes(bytes)
+    }
+
+    /// Update the drain insertion policy used at the next commit.
+    /// Returns `ChiselError::TransactionInProgress` if a transaction
+    /// is active.
+    pub fn set_drain_insertion(&mut self, policy: DrainInsertion) -> Result<()> {
+        self.txm.set_drain_insertion(policy)
+    }
 }

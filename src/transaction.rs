@@ -1702,6 +1702,30 @@ impl TransactionManager {
         self.active_txn
     }
 
+    pub fn set_cache_max_bytes(&mut self, bytes: u64) -> Result<()> {
+        self.check_alive()?;
+        if self.active_txn {
+            return Err(ChiselError::TransactionInProgress);
+        }
+        self.cache.borrow_mut().set_cache_max_bytes(bytes)
+    }
+
+    pub fn set_spillway_max_bytes(&mut self, bytes: u64) -> Result<()> {
+        self.check_alive()?;
+        if self.active_txn {
+            return Err(ChiselError::TransactionInProgress);
+        }
+        self.cache.borrow_mut().set_spillway_max_bytes(bytes)
+    }
+
+    pub fn set_drain_insertion(&mut self, policy: crate::DrainInsertion) -> Result<()> {
+        self.check_alive()?;
+        if self.active_txn {
+            return Err(ChiselError::TransactionInProgress);
+        }
+        self.cache.borrow_mut().set_drain_insertion(policy)
+    }
+
     // --- Private helpers ---
 
     /// Release one slot from a data page (ISSUES.md R1). Decrements
