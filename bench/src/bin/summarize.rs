@@ -1,14 +1,16 @@
 // CLI entry point for the chisel-bench-summarize post-processor.
 // Reads PR 4b's bench output (Criterion sample.json + aux_metrics.jsonl)
 // PLUS PR 6's scenarios_metrics.jsonl, and emits summary.md +
-// results.json + raw/ under bench/results/<UTC>/.
+// results.json + cross-engine.md + raw/ under bench/results/<UTC>/.
+// (cross-engine.md is the PR 8 artifact: a per-metric Chisel-vs-redb-vs-SQLite
+// comparison rendered from the same scenarios slice as summary.md.)
 //
 // All logic lives in the chisel_bench::summary library module; this
 // file is just argv parsing, error printing, and exit codes.
 
 use chisel_bench::summary::{
-    copy_raw_archive, discover_cells, gather_metadata, load_scenarios_jsonl, render_json,
-    render_markdown, DiscoverError,
+    copy_raw_archive, discover_cells, gather_metadata, load_scenarios_jsonl,
+    render_cross_engine_markdown, render_json, render_markdown, DiscoverError,
 };
 use clap::Parser;
 use std::path::PathBuf;
@@ -79,9 +81,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // 3. Gather metadata.
     let metadata = gather_metadata(&cli.criterion, &cli.aux, cells.len())?;
 
-    // 4. Render markdown + JSON.
+    // 4. Render markdown + JSON + cross-engine.
     let md = render_markdown(&cells, &scenarios, &metadata);
     let json = render_json(&cells, &scenarios, &metadata);
+    let cross_engine_md = render_cross_engine_markdown(&scenarios, &metadata);
 
     // 5. Write output artifacts.
     std::fs::write(out_dir.join("summary.md"), &md)?;
@@ -89,6 +92,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         out_dir.join("results.json"),
         serde_json::to_string_pretty(&json)?,
     )?;
+    std::fs::write(out_dir.join("cross-engine.md"), &cross_engine_md)?;
     copy_raw_archive(&cli.criterion, &out_dir.join("raw"))?;
 
     // 6. Tell user where to find it.
@@ -105,6 +109,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "  - results.json ({} bytes)",
         std::fs::metadata(out_dir.join("results.json"))?.len()
+    );
+    println!(
+        "  - cross-engine.md ({} bytes)",
+        std::fs::metadata(out_dir.join("cross-engine.md"))?.len()
     );
     println!("  - raw/ (Criterion estimates.json + sample.json archive)");
 
