@@ -43,6 +43,19 @@ pub enum ChiselError {
     // (which flushes dirty pages and clears the backlog) or roll back
     // (which discards the in-flight work entirely). See ISSUES.md I19.
     CacheFull { limit: usize },
+    // The spillway file has reached its `spillway_max_bytes` cap with
+    // every cached entry dirty, so there is neither room in the cache
+    // nor room in the spillway. Operational: the DB on disk is still
+    // intact. Recovery is to commit (which drains the spillway and
+    // resets it) or roll back. Spec 2026-05-03-chisel-spillway-design.md.
+    SpillwayFull { limit_bytes: u64 },
+    // Raised when a configuration mutator (e.g. set_cache_max_bytes,
+    // set_spillway_max_bytes, set_drain_insertion) is called while a
+    // transaction is in flight. Operational: caller commits or rolls
+    // back, then retries. The mutators only operate on between-
+    // transactions state; mid-transaction shrink would either reject
+    // or silently spill, neither of which is a clean story.
+    TransactionInProgress,
 
     // Fatal — database integrity is in question. Close and re-open
     // before attempting further work. The reopen will re-run superblock
@@ -147,6 +160,14 @@ impl fmt::Display for ChiselError {
             ChiselError::CacheFull { limit } => write!(
                 f,
                 "page cache full: {limit} dirty pages held; commit or roll back to free cache"
+            ),
+            ChiselError::SpillwayFull { limit_bytes } => write!(
+                f,
+                "spillway full: {limit_bytes} bytes used; commit or roll back to free cache and spillway"
+            ),
+            ChiselError::TransactionInProgress => write!(
+                f,
+                "configuration changes are only allowed between transactions; commit or roll back first"
             ),
             ChiselError::IoError(e) => write!(f, "I/O error: {e}"),
             ChiselError::ChecksumMismatch { page_id } => {

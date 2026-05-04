@@ -88,6 +88,17 @@ pub struct PageCache {
     /// O(n) per call. With this counter the early-out is O(1).
     dirty_count: usize,
     max_pages: usize,
+    /// Strict upper bound on the spillway sidecar file in bytes
+    /// (excluding per-slot headers). 0 means spillway disabled —
+    /// overflow trips CacheFull at the cache cap. Set via Options;
+    /// runtime-mutable between transactions via set_spillway_max_bytes.
+    #[allow(dead_code)]
+    spillway_max_bytes: u64,
+    /// LRU position policy for commit-drain rehydrated pages. Captured
+    /// from Options at construction; runtime-mutable between
+    /// transactions via set_drain_insertion.
+    #[allow(dead_code)]
+    drain_insertion: crate::DrainInsertion,
     // Monotonically increasing allocator for shadow-paged new pages. Never
     // reused within a process lifetime except via `truncate()`.
     next_page_id: u64,
@@ -104,26 +115,36 @@ pub struct PageCache {
 impl PageCache {
     /// Construct a cache over an already-opened `PageIo`.
     ///
-    /// `next_page_id` is seeded from the file's current length. Note that
-    /// this is the PHYSICAL page count, not the logical
-    /// `Superblock::total_pages` — they may differ if a previous crash left
-    /// the file extended past the last durable superblock. The transaction
-    /// manager is expected to call `set_next_page_id` after recovering the
-    /// authoritative superblock so that new allocations don't collide with
-    /// post-crash garbage.
+    /// `cache_max_bytes` is the strict upper bound on the in-memory cache,
+    /// in bytes. Converted internally to a page count via
+    /// `bytes / PAGE_SIZE as u64`, clamped to at least one page.
+    ///
+    /// `spillway_max_bytes` is the strict upper bound on the spillway
+    /// sidecar file (in bytes, header overhead excluded). Spillway open is
+    /// deferred to the first spill; we just record the cap here. Setting
+    /// to 0 means "no spillway"; overflow trips `CacheFull` at the
+    /// `cache_max_bytes` cap.
+    ///
+    /// `drain_insertion` is captured for use during commit drain (see
+    /// `flush`).
+    ///
+    /// `next_page_id` is seeded from the file's current length. The
+    /// transaction manager calls `set_next_page_id` later to install the
+    /// authoritative high-water mark from the chosen superblock.
     ///
     /// `unwrap_or(0)` on page_count failure is a tradeoff: we'd rather
     /// construct a usable cache and surface the underlying I/O error on
     /// the next real operation than fail the constructor.
     ///
-    /// `max_pages` is clamped to at least 1. A value of 0 would set the
-    /// hard ceiling (`max_pages * HARD_CEILING_MULTIPLIER`) to 0 too,
-    /// tripping `CacheFull` on the first allocation regardless of
-    /// workload. Callers should never pass 0 in practice — `Options`
-    /// defaults to 1024 — but the clamp turns a confusing constructor-
-    /// time mistake into correct (if inefficient) behaviour.
-    pub fn new(mut io: PageIo, max_pages: usize) -> PageCache {
-        let max_pages = max_pages.max(1);
+    /// `max_pages` is clamped to at least 1. A value of 0 would trip
+    /// `CacheFull` on the first allocation regardless of workload.
+    pub fn new(
+        mut io: PageIo,
+        cache_max_bytes: u64,
+        spillway_max_bytes: u64,
+        drain_insertion: crate::DrainInsertion,
+    ) -> PageCache {
+        let max_pages = (cache_max_bytes / PAGE_SIZE as u64).max(1) as usize;
         let next_page_id = io.page_count().unwrap_or(0);
         PageCache {
             io,
@@ -131,6 +152,8 @@ impl PageCache {
             lru: LruIndex::new(),
             dirty_count: 0,
             max_pages,
+            spillway_max_bytes,
+            drain_insertion,
             next_page_id,
             cache_hits: Cell::new(0),
             cache_misses: Cell::new(0),
@@ -673,7 +696,10 @@ mod tests {
         // function; tests drop the cache at end of scope, which closes
         // the fd and releases the flock cleanly.
         std::mem::forget(file);
-        PageCache::new(io, max_pages)
+        // spillway_max_bytes=0 preserves the legacy "fail fast on cache
+        // pressure" contract for all existing page_cache tests.
+        let cache_max_bytes = max_pages as u64 * PAGE_SIZE as u64;
+        PageCache::new(io, cache_max_bytes, 0, crate::DrainInsertion::LruTail)
     }
 
     // Regression test for ISSUES.md I19. The cache is a SOFT limit by
@@ -770,7 +796,8 @@ mod tests {
         // Setup: open an in-memory PageIo, populate page 0 with a checksummed
         // buffer (writing through the cache so the file actually grows).
         let io = PageIo::open_in_memory().unwrap();
-        let mut cache = PageCache::new(io, 16);
+        let mut cache =
+            PageCache::new(io, 16 * PAGE_SIZE as u64, 0, crate::DrainInsertion::LruTail);
 
         // Allocate page 0, stamp a valid checksum, flush so the next read
         // actually exercises the load path rather than a dirty-cache hit.
@@ -811,7 +838,8 @@ mod tests {
     #[test]
     fn pages_allocated_counter_increments_per_new_page() {
         let io = PageIo::open_in_memory().unwrap();
-        let mut cache = PageCache::new(io, 16);
+        let mut cache =
+            PageCache::new(io, 16 * PAGE_SIZE as u64, 0, crate::DrainInsertion::LruTail);
         assert_eq!(cache.pages_allocated_count(), 0);
         cache.new_page().unwrap();
         cache.new_page().unwrap();
@@ -824,7 +852,8 @@ mod tests {
         use crate::stats::ChiselCounters;
 
         let io = PageIo::open_in_memory().unwrap();
-        let mut cache = PageCache::new(io, 16);
+        let mut cache =
+            PageCache::new(io, 16 * PAGE_SIZE as u64, 0, crate::DrainInsertion::LruTail);
 
         // Fresh cache: every counter is zero.
         assert_eq!(cache.counters(), ChiselCounters::default());

@@ -1842,13 +1842,17 @@ mod tests {
     fn fresh_manager() -> TransactionManager {
         let file = NamedTempFile::new().unwrap();
         let io = PageIo::open(file.path(), false).unwrap();
-        // Match Options::default()'s cache_size of 1024 so tests that
-        // intentionally allocate many pages in a single transaction
-        // (e.g. the I3+I7 handle-table-growth test allocates 510+) stay
-        // well under the I19 hard ceiling of `cache_size *
-        // HARD_CEILING_MULTIPLIER`. Tiny test caches were fine before
-        // I19 because the cache had no upper bound.
-        let cache = PageCache::new(io, 1024);
+        // Match Options::default()'s cache_max_bytes of 8 MiB (1024 pages)
+        // so tests that intentionally allocate many pages in a single
+        // transaction (e.g. the I3+I7 handle-table-growth test allocates
+        // 510+) stay well under the I19 hard ceiling. spillway_max_bytes=0
+        // preserves the legacy CacheFull-at-cap behavior in tests.
+        let cache = PageCache::new(
+            io,
+            1024 * PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+        );
         let mut tm = TransactionManager::create_new(cache, 2).unwrap();
         // Commit once so there's a real baseline to read/write against.
         tm.begin().unwrap();
@@ -2182,8 +2186,8 @@ mod tests {
         // max_pages=4 → hard ceiling = 32. Big enough for baseline
         // operations (handle-table root + superblocks + freemap) to
         // coexist, small enough that a few dozen big allocations
-        // saturate it.
-        let cache = PageCache::new(io, 4);
+        // saturate it. spillway_max_bytes=0 preserves CacheFull-at-cap.
+        let cache = PageCache::new(io, 4 * PAGE_SIZE as u64, 0, crate::DrainInsertion::LruTail);
         let mut tm = TransactionManager::create_new(cache, 2).unwrap();
         tm.begin().unwrap();
         tm.commit().unwrap();
@@ -2263,7 +2267,12 @@ mod tests {
         // patch pages 0 AND 1.
         {
             let io = PageIo::open(&path, false).unwrap();
-            let cache = PageCache::new(io, 1024);
+            let cache = PageCache::new(
+                io,
+                1024 * PAGE_SIZE as u64,
+                0,
+                crate::DrainInsertion::LruTail,
+            );
             let _ = TransactionManager::create_new(cache, 2).unwrap();
             // drop() releases the flock so the test can read+write the
             // file directly below.
@@ -2295,7 +2304,12 @@ mod tests {
         patch_all_slots(minor_bump, 2);
         {
             let io = PageIo::open(&path, false).unwrap();
-            let cache = PageCache::new(io, 1024);
+            let cache = PageCache::new(
+                io,
+                1024 * PAGE_SIZE as u64,
+                0,
+                crate::DrainInsertion::LruTail,
+            );
             let tm = TransactionManager::open_existing(cache);
             assert!(
                 tm.is_ok(),
@@ -2310,7 +2324,12 @@ mod tests {
         patch_all_slots(major_bump, 2);
         {
             let io = PageIo::open(&path, false).unwrap();
-            let cache = PageCache::new(io, 1024);
+            let cache = PageCache::new(
+                io,
+                1024 * PAGE_SIZE as u64,
+                0,
+                crate::DrainInsertion::LruTail,
+            );
             match TransactionManager::open_existing(cache) {
                 Err(ChiselError::UnsupportedFormatVersion { .. }) => {}
                 Err(e) => panic!("expected UnsupportedFormatVersion, got {e:?}"),

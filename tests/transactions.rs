@@ -132,7 +132,12 @@ fn test_reopen_preserves_data() {
     let handle;
     {
         let io = PageIo::open(&path, false).unwrap();
-        let cache = PageCache::new(io, 64);
+        let cache = PageCache::new(
+            io,
+            64 * chisel::page::PAGE_SIZE as u64,
+            0,
+            chisel::DrainInsertion::LruTail,
+        );
         let mut txm = TransactionManager::create_new(cache, 2).unwrap();
         txm.begin().unwrap();
         handle = txm.allocate(b"persistent").unwrap();
@@ -140,7 +145,12 @@ fn test_reopen_preserves_data() {
     }
     {
         let io = PageIo::open(&path, false).unwrap();
-        let cache = PageCache::new(io, 64);
+        let cache = PageCache::new(
+            io,
+            64 * chisel::page::PAGE_SIZE as u64,
+            0,
+            chisel::DrainInsertion::LruTail,
+        );
         let txm = TransactionManager::open_existing(cache).unwrap();
         let data = txm.read(handle).unwrap();
         assert_eq!(data, b"persistent");

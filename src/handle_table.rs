@@ -669,7 +669,12 @@ mod tests {
     fn make_cache() -> PageCache {
         let file = NamedTempFile::new().unwrap();
         let io = PageIo::open(file.path(), false).unwrap();
-        let mut cache = PageCache::new(io, 1024);
+        let mut cache = PageCache::new(
+            io,
+            1024 * crate::page::PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+        );
         // Reserve pages 0 and 1 (the superblock slots in a real DB).
         // Without this, the first allocation hands out page id 0,
         // which collides with the I8 "zero child pointer" sentinel

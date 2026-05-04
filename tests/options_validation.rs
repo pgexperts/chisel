@@ -34,7 +34,9 @@ fn expect_err(r: Result<Chisel>) -> ChiselError {
 
 fn opts(superblock_count: u32) -> Options {
     Options {
-        cache_size: 16,
+        cache_max_bytes: 16 * chisel::page::PAGE_SIZE as u64,
+        spillway_max_bytes: 0,
+        drain_insertion: chisel::DrainInsertion::LruTail,
         create_if_missing: true,
         read_only: false,
         superblock_count,
@@ -258,7 +260,9 @@ fn test_read_only_open_rejects_begin() {
     let mut db = Chisel::open(
         &path,
         Options {
-            cache_size: 16,
+            cache_max_bytes: 16 * chisel::page::PAGE_SIZE as u64,
+            spillway_max_bytes: 0,
+            drain_insertion: chisel::DrainInsertion::LruTail,
             create_if_missing: false,
             read_only: true,
             superblock_count: DEFAULT_SUPERBLOCK_COUNT,
