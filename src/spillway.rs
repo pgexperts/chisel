@@ -29,31 +29,31 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::error::Result;
+use crate::error::{ChiselError, Result};
 use crate::page::PAGE_SIZE;
 
 /// Per-slot header: u64 page_id + u64 XXH3 checksum.
-// Activated by Tasks 5 (spill) and 6 (rehydrate).
+// Activated by Tasks 6 (rehydrate) wiring into PageCache.
 #[allow(dead_code)]
 pub const SLOT_HEADER_SIZE: usize = 16;
 /// Total bytes a slot occupies on disk (header + page).
-// Activated by Tasks 5 (spill) and 6 (rehydrate).
+// Activated by Tasks 6-7 wiring into PageCache.
 #[allow(dead_code)]
 pub const SLOT_SIZE: usize = SLOT_HEADER_SIZE + PAGE_SIZE;
 
 /// Spillway backing storage: real file on disk, or in-memory bytes for
 /// memory-mode databases.
-// Activated by Tasks 5-7 which add spill/rehydrate/truncate.
+// Activated by Tasks 7-8 (truncate) wiring into PageCache.
 #[allow(dead_code)]
 enum Backing {
     File { file: File, path: PathBuf },
     Memory { bytes: Vec<u8> },
 }
 
-// Activated by Tasks 5-7 which add spill/rehydrate/truncate and wire
-// Spillway into PageCache.
+// Activated by Tasks 6-8 (rehydrate / truncate) wiring into PageCache.
 #[allow(dead_code)]
 pub struct Spillway {
     backing: Backing,
@@ -70,8 +70,7 @@ pub struct Spillway {
     max_bytes: u64,
 }
 
-// All methods activated by Tasks 5-7 (spill / rehydrate / truncate) and
-// by the PageCache wiring that consumes them.
+// All methods activated by Tasks 6-8 (rehydrate / truncate) wiring into PageCache.
 #[allow(dead_code)]
 impl Spillway {
     /// Open (or create + truncate) a file-backed spillway alongside the
@@ -133,6 +132,77 @@ impl Spillway {
     pub fn set_max_bytes(&mut self, bytes: u64) {
         self.max_bytes = bytes;
     }
+
+    /// Write `page_bytes` to this spillway, keyed by `page_id`. If the
+    /// page is already resident, overwrites its existing slot in place
+    /// (no slot-count growth, no max_bytes check). Otherwise allocates
+    /// a new slot at `next_slot_index` — but first checks that the
+    /// post-write logical size stays within `max_bytes`.
+    pub fn spill(&mut self, page_id: u64, page_bytes: &[u8; PAGE_SIZE]) -> Result<()> {
+        let slot_index = if let Some(&existing) = self.slots.get(&page_id) {
+            existing
+        } else {
+            // New slot would push logical size past the cap?
+            let post_write_bytes = (self.next_slot_index + 1) * PAGE_SIZE as u64;
+            if post_write_bytes > self.max_bytes {
+                return Err(ChiselError::SpillwayFull {
+                    limit_bytes: self.max_bytes,
+                });
+            }
+            let new_index = self.next_slot_index;
+            self.next_slot_index += 1;
+            self.slots.insert(page_id, new_index);
+            new_index
+        };
+
+        write_slot(&mut self.backing, slot_index, page_id, page_bytes)?;
+        Ok(())
+    }
+}
+
+/// Compute the per-slot checksum: XXH3 over (page_id || page_bytes).
+/// Distinct from the main-file page checksum because a spilled page
+/// may not yet have a stamped main-file checksum (see spec).
+// Called by write_slot (itself called from spill). No external callers yet —
+// allow silences the lint until rehydrate (Task 6) calls it directly.
+#[allow(dead_code)]
+fn slot_checksum(page_id: u64, page_bytes: &[u8; PAGE_SIZE]) -> u64 {
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    hasher.update(&page_id.to_le_bytes());
+    hasher.update(page_bytes);
+    hasher.digest()
+}
+
+// Called by spill; not yet exposed to callers outside this module.
+#[allow(dead_code)]
+fn write_slot(
+    backing: &mut Backing,
+    slot_index: u64,
+    page_id: u64,
+    page_bytes: &[u8; PAGE_SIZE],
+) -> Result<()> {
+    let checksum = slot_checksum(page_id, page_bytes);
+    let offset = slot_index * SLOT_SIZE as u64;
+    let mut header = [0u8; SLOT_HEADER_SIZE];
+    header[..8].copy_from_slice(&page_id.to_le_bytes());
+    header[8..16].copy_from_slice(&checksum.to_le_bytes());
+    match backing {
+        Backing::File { file, .. } => {
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(&header)?;
+            file.write_all(page_bytes)?;
+        }
+        Backing::Memory { bytes } => {
+            let needed = (offset + SLOT_SIZE as u64) as usize;
+            if bytes.len() < needed {
+                bytes.resize(needed, 0);
+            }
+            let off = offset as usize;
+            bytes[off..off + SLOT_HEADER_SIZE].copy_from_slice(&header);
+            bytes[off + SLOT_HEADER_SIZE..off + SLOT_SIZE].copy_from_slice(page_bytes);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -183,5 +253,42 @@ mod tests {
         let mut spw = Spillway::open_memory(1024);
         spw.set_max_bytes(2048);
         assert_eq!(spw.max_bytes(), 2048);
+    }
+
+    fn page(byte: u8) -> [u8; PAGE_SIZE] {
+        [byte; PAGE_SIZE]
+    }
+
+    #[test]
+    fn spill_inserts_new_slot() {
+        let mut spw = Spillway::open_memory(SLOT_SIZE as u64 * 4);
+        spw.spill(100, &page(0xAA)).unwrap();
+        assert!(spw.is_resident(100));
+        assert_eq!(spw.slot_count(), 1);
+        assert_eq!(spw.logical_bytes(), PAGE_SIZE as u64);
+    }
+
+    #[test]
+    fn re_spill_of_resident_page_reuses_slot() {
+        let mut spw = Spillway::open_memory(SLOT_SIZE as u64 * 4);
+        spw.spill(100, &page(0xAA)).unwrap();
+        spw.spill(100, &page(0xBB)).unwrap(); // overwrite
+        assert_eq!(spw.slot_count(), 1, "slot count must not grow on re-spill");
+    }
+
+    #[test]
+    fn spill_full_returns_spillway_full_error() {
+        // max_bytes accommodates exactly 2 page payloads (excluding header).
+        let max_bytes = (PAGE_SIZE * 2) as u64;
+        let mut spw = Spillway::open_memory(max_bytes);
+        spw.spill(100, &page(0xAA)).unwrap();
+        spw.spill(101, &page(0xBB)).unwrap();
+        let err = spw.spill(102, &page(0xCC)).unwrap_err();
+        match err {
+            ChiselError::SpillwayFull { limit_bytes } => {
+                assert_eq!(limit_bytes, max_bytes);
+            }
+            other => panic!("expected SpillwayFull, got {other:?}"),
+        }
     }
 }
