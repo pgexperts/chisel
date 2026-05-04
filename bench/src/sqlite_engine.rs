@@ -47,6 +47,20 @@ impl SqliteEngine {
         };
         conn.execute_batch(&format!("PRAGMA synchronous = {synchronous};"))?;
 
+        // PR 8 fairness fix: on macOS, plain fsync() flushes to OS write
+        // buffer but not to the disk's write cache. Chisel's sync_all uses
+        // fcntl(F_FULLFSYNC) which is durable through the disk cache;
+        // without the equivalent in SQLite, sqlite-strict on macOS is
+        // ~3 orders of magnitude faster than chisel-strict, which is a
+        // measurement artifact, not a real performance difference.
+        // PRAGMA fullfsync=ON makes SQLite call F_FULLFSYNC on every
+        // sync. Linux ignores the pragma (its fsync() already flushes
+        // through). Strict mode only — Unsafe is the speed-over-safety
+        // dial; pulling it back via fullfsync would defeat its purpose.
+        if matches!(durability, DurabilityMode::Strict) {
+            conn.execute_batch("PRAGMA fullfsync = ON;")?;
+        }
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chisel_bench ( \
                 id    INTEGER PRIMARY KEY AUTOINCREMENT, \
@@ -260,5 +274,35 @@ impl Engine for SqliteEngine {
             .into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn strict_mode_sets_fullfsync_pragma() {
+        let tmp = NamedTempFile::new().unwrap();
+        let engine = SqliteEngine::open_file(tmp.path(), 64, DurabilityMode::Strict).unwrap();
+        // Query the pragma value back. SQLite returns it as an integer:
+        // 1 = ON, 0 = OFF.
+        let value: i64 = engine
+            .conn
+            .query_row("PRAGMA fullfsync;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 1, "Strict mode must enable fullfsync");
+    }
+
+    #[test]
+    fn unsafe_mode_does_not_set_fullfsync_pragma() {
+        let tmp = NamedTempFile::new().unwrap();
+        let engine = SqliteEngine::open_file(tmp.path(), 64, DurabilityMode::Unsafe).unwrap();
+        let value: i64 = engine
+            .conn
+            .query_row("PRAGMA fullfsync;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 0, "Unsafe mode must NOT enable fullfsync");
     }
 }
