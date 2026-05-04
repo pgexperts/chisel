@@ -43,7 +43,10 @@ impl std::fmt::Display for ParseError {
             ParseError::Io(e) => write!(f, "I/O error reading results.json: {e}"),
             ParseError::Json(e) => write!(f, "JSON parse error in results.json: {e}"),
             ParseError::MissingScenariosKey => {
-                write!(f, "results.json missing top-level `scenarios` key")
+                write!(
+                    f,
+                    "results.json `scenarios` key is missing or not an object"
+                )
             }
             ParseError::MalformedScenarioEntry(key) => {
                 write!(f, "results.json scenario entry `{key}` is malformed")
@@ -174,5 +177,25 @@ mod tests {
         let f = write_temp(json);
         let err = parse_results_json(f.path()).unwrap_err();
         assert!(matches!(err, ParseError::MissingScenariosKey));
+    }
+
+    #[test]
+    fn parse_malformed_scenario_entry_missing_field() {
+        // Entry present but missing throughput_ops_per_sec.
+        let json = r#"{
+          "scenarios": {
+            "ycsb-a/chisel-strict": {
+              "p50_ns": 120000.0,
+              "p95_ns": 180000.0,
+              "p99_ns": 250000.0
+            }
+          }
+        }"#;
+        let f = write_temp(json);
+        let err = parse_results_json(f.path()).unwrap_err();
+        assert!(matches!(
+            err,
+            ParseError::MalformedScenarioEntry(ref k) if k == "ycsb-a/chisel-strict"
+        ));
     }
 }
