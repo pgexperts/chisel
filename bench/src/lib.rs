@@ -14,6 +14,7 @@
 // the Runner + 270-cell registration. PRs 5–7 follow.
 
 pub mod chisel_engine;
+pub mod diff;
 pub mod engine;
 pub mod redb_engine;
 pub mod runner;

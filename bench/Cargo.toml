@@ -23,6 +23,7 @@ hostname = "0.4"
 [dev-dependencies]
 criterion = "0.5"
 assert_cmd = "2"
+regex = "1"
 
 [[bench]]
 name = "micro_grid"
@@ -35,3 +36,7 @@ harness = false
 [[bin]]
 name = "summarize"
 path = "src/bin/summarize.rs"
+
+[[bin]]
+name = "chisel-bench-diff"
+path = "src/bin/diff.rs"
