@@ -163,7 +163,7 @@ impl fmt::Display for ChiselError {
             ),
             ChiselError::SpillwayFull { limit_bytes } => write!(
                 f,
-                "spillway full: {limit_bytes} bytes used; commit or roll back to free cache and spillway"
+                "spillway full: {limit_bytes}-byte limit reached; commit or roll back to free cache and spillway"
             ),
             ChiselError::TransactionInProgress => write!(
                 f,
