@@ -92,4 +92,30 @@ fn summarize_smoke_runs_against_fixtures() {
         chisel_raw.join("estimates.json").exists(),
         "raw chisel-strict estimates.json missing"
     );
+
+    // PR 8: cross-engine.md is unconditionally produced alongside the others.
+    let cross_engine_path = out_dir.join("cross-engine.md");
+    assert!(
+        cross_engine_path.exists(),
+        "cross-engine.md should be written to {}",
+        out_dir.display()
+    );
+    let cross_engine_content = std::fs::read_to_string(&cross_engine_path).unwrap();
+    assert!(
+        cross_engine_content.starts_with("# Chisel Bench: Cross-engine comparison\n"),
+        "cross-engine.md first line wrong:\n{cross_engine_content}"
+    );
+    // All three engine column labels and all four scenario names should appear.
+    for label in ["Chisel", "redb", "SQLite"] {
+        assert!(
+            cross_engine_content.contains(label),
+            "cross-engine.md missing engine label {label}"
+        );
+    }
+    for scenario in ["ycsb-a", "ycsb-b", "mutation-log", "document-store"] {
+        assert!(
+            cross_engine_content.contains(scenario),
+            "cross-engine.md missing scenario {scenario}"
+        );
+    }
 }
