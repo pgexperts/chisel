@@ -196,7 +196,12 @@ fn test_page_io_file_len() {
 fn test_cache_write_and_read() {
     let file = NamedTempFile::new().unwrap();
     let io = PageIo::open(file.path(), false).unwrap();
-    let mut cache = PageCache::new(io, 16);
+    let mut cache = PageCache::new(
+        io,
+        16 * chisel::page::PAGE_SIZE as u64,
+        0,
+        chisel::DrainInsertion::LruTail,
+    );
 
     let page_id = cache.new_page().unwrap();
     {
@@ -217,7 +222,12 @@ fn test_cache_flush_persists_to_disk() {
 
     {
         let io = PageIo::open(&path, false).unwrap();
-        let mut cache = PageCache::new(io, 16);
+        let mut cache = PageCache::new(
+            io,
+            16 * chisel::page::PAGE_SIZE as u64,
+            0,
+            chisel::DrainInsertion::LruTail,
+        );
         let page_id = cache.new_page().unwrap();
         {
             let buf = cache.get_mut(page_id).unwrap();
@@ -239,7 +249,12 @@ fn test_cache_flush_persists_to_disk() {
 fn test_cache_eviction_does_not_evict_dirty() {
     let file = NamedTempFile::new().unwrap();
     let io = PageIo::open(file.path(), false).unwrap();
-    let mut cache = PageCache::new(io, 2);
+    let mut cache = PageCache::new(
+        io,
+        2 * chisel::page::PAGE_SIZE as u64,
+        0,
+        chisel::DrainInsertion::LruTail,
+    );
 
     let p0 = cache.new_page().unwrap();
     let p1 = cache.new_page().unwrap();
@@ -390,7 +405,12 @@ fn test_data_page_max_value() {
 fn ht_cache(max_pages: usize) -> PageCache {
     let file = NamedTempFile::new().unwrap();
     let io = PageIo::open(file.path(), false).unwrap();
-    let mut cache = PageCache::new(io, max_pages);
+    let mut cache = PageCache::new(
+        io,
+        max_pages as u64 * chisel::page::PAGE_SIZE as u64,
+        0,
+        chisel::DrainInsertion::LruTail,
+    );
     cache.set_next_page_id(2);
     cache
 }
