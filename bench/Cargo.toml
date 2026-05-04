@@ -35,3 +35,7 @@ harness = false
 [[bin]]
 name = "summarize"
 path = "src/bin/summarize.rs"
+
+[[bin]]
+name = "chisel-bench-diff"
+path = "src/bin/diff.rs"
