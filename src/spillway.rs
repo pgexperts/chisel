@@ -29,31 +29,31 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{ChiselError, Result};
 use crate::page::PAGE_SIZE;
 
 /// Per-slot header: u64 page_id + u64 XXH3 checksum.
-// Activated by Tasks 6 (rehydrate) wiring into PageCache.
+// Suppressed until spillway is wired into PageCache (Tasks 7-8).
 #[allow(dead_code)]
 pub const SLOT_HEADER_SIZE: usize = 16;
 /// Total bytes a slot occupies on disk (header + page).
-// Activated by Tasks 6-7 wiring into PageCache.
+// Suppressed until spillway is wired into PageCache (Tasks 7-8).
 #[allow(dead_code)]
 pub const SLOT_SIZE: usize = SLOT_HEADER_SIZE + PAGE_SIZE;
 
 /// Spillway backing storage: real file on disk, or in-memory bytes for
 /// memory-mode databases.
-// Activated by Tasks 7-8 (truncate) wiring into PageCache.
+// Suppressed until spillway is wired into PageCache (Tasks 7-8).
 #[allow(dead_code)]
 enum Backing {
     File { file: File, path: PathBuf },
     Memory { bytes: Vec<u8> },
 }
 
-// Activated by Tasks 6-8 (rehydrate / truncate) wiring into PageCache.
+// Suppressed until spillway is wired into PageCache (Tasks 7-8).
 #[allow(dead_code)]
 pub struct Spillway {
     backing: Backing,
@@ -70,7 +70,7 @@ pub struct Spillway {
     max_bytes: u64,
 }
 
-// All methods activated by Tasks 6-8 (rehydrate / truncate) wiring into PageCache.
+// Suppressed until spillway is wired into PageCache (Tasks 7-8).
 #[allow(dead_code)]
 impl Spillway {
     /// Open (or create + truncate) a file-backed spillway alongside the
@@ -158,13 +158,39 @@ impl Spillway {
         write_slot(&mut self.backing, slot_index, page_id, page_bytes)?;
         Ok(())
     }
+
+    /// Read the slot for `page_id`, verify the per-slot checksum, return
+    /// the bytes. Returns `ChecksumMismatch { page_id }` (fatal) on a
+    /// torn write — caller poisons the transaction. Returns
+    /// `InvalidPageId { page_id }` if the page is not resident
+    /// (programming error in the caller, not a torn-write).
+    pub fn rehydrate(&mut self, page_id: u64) -> Result<[u8; PAGE_SIZE]> {
+        let slot_index = match self.slots.get(&page_id) {
+            Some(&i) => i,
+            None => return Err(ChiselError::InvalidPageId { page_id }),
+        };
+        let (stored_page_id, stored_checksum, page_bytes) =
+            read_slot(&mut self.backing, slot_index)?;
+
+        // Sanity check: the slot's stored page_id must match what the
+        // resident-set says it should be. A mismatch implies in-memory
+        // corruption (slots map drifted from disk) and is treated as
+        // checksum failure.
+        if stored_page_id != page_id {
+            return Err(ChiselError::ChecksumMismatch { page_id });
+        }
+        let computed = slot_checksum(page_id, &page_bytes);
+        if computed != stored_checksum {
+            return Err(ChiselError::ChecksumMismatch { page_id });
+        }
+        Ok(page_bytes)
+    }
 }
 
 /// Compute the per-slot checksum: XXH3 over (page_id || page_bytes).
 /// Distinct from the main-file page checksum because a spilled page
 /// may not yet have a stamped main-file checksum (see spec).
-// Called by write_slot (itself called from spill). No external callers yet —
-// allow silences the lint until rehydrate (Task 6) calls it directly.
+// Suppressed until spillway is wired into PageCache (Tasks 7-8).
 #[allow(dead_code)]
 fn slot_checksum(page_id: u64, page_bytes: &[u8; PAGE_SIZE]) -> u64 {
     let mut hasher = xxhash_rust::xxh3::Xxh3::new();
@@ -173,7 +199,7 @@ fn slot_checksum(page_id: u64, page_bytes: &[u8; PAGE_SIZE]) -> u64 {
     hasher.digest()
 }
 
-// Called by spill; not yet exposed to callers outside this module.
+// Suppressed until spillway is wired into PageCache (Tasks 7-8).
 #[allow(dead_code)]
 fn write_slot(
     backing: &mut Backing,
@@ -203,6 +229,39 @@ fn write_slot(
         }
     }
     Ok(())
+}
+
+/// Read the (page_id, checksum, page_bytes) triple from the given slot.
+/// Symmetric counterpart to write_slot — same offset arithmetic, same
+/// backing dispatch. Returns IoError on short read (underlying I/O
+/// failure) rather than ChecksumMismatch; callers distinguish the two.
+// Suppressed until spillway is wired into PageCache (Tasks 7-8).
+#[allow(dead_code)]
+fn read_slot(backing: &mut Backing, slot_index: u64) -> Result<(u64, u64, [u8; PAGE_SIZE])> {
+    let offset = slot_index * SLOT_SIZE as u64;
+    let mut header = [0u8; SLOT_HEADER_SIZE];
+    let mut page_bytes = [0u8; PAGE_SIZE];
+    match backing {
+        Backing::File { file, .. } => {
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut header)?;
+            file.read_exact(&mut page_bytes)?;
+        }
+        Backing::Memory { bytes } => {
+            let off = offset as usize;
+            if bytes.len() < off + SLOT_SIZE {
+                return Err(ChiselError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("spillway memory backing too short for slot {slot_index}"),
+                )));
+            }
+            header.copy_from_slice(&bytes[off..off + SLOT_HEADER_SIZE]);
+            page_bytes.copy_from_slice(&bytes[off + SLOT_HEADER_SIZE..off + SLOT_SIZE]);
+        }
+    }
+    let stored_page_id = u64::from_le_bytes(header[..8].try_into().unwrap());
+    let stored_checksum = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    Ok((stored_page_id, stored_checksum, page_bytes))
 }
 
 #[cfg(test)]
@@ -290,5 +349,46 @@ mod tests {
             }
             other => panic!("expected SpillwayFull, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rehydrate_round_trips_bytes() {
+        let mut spw = Spillway::open_memory(SLOT_SIZE as u64 * 4);
+        let original = page(0xAB);
+        spw.spill(100, &original).unwrap();
+        let restored = spw.rehydrate(100).unwrap();
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn rehydrate_after_overwrite_returns_latest_bytes() {
+        let mut spw = Spillway::open_memory(SLOT_SIZE as u64 * 4);
+        spw.spill(100, &page(0xAA)).unwrap();
+        spw.spill(100, &page(0xBB)).unwrap();
+        let restored = spw.rehydrate(100).unwrap();
+        assert_eq!(restored, page(0xBB));
+    }
+
+    #[test]
+    fn rehydrate_missing_page_returns_invalid_page_id() {
+        let mut spw = Spillway::open_memory(SLOT_SIZE as u64 * 4);
+        let err = spw.rehydrate(999).unwrap_err();
+        assert!(matches!(err, ChiselError::InvalidPageId { page_id: 999 }));
+    }
+
+    #[test]
+    fn rehydrate_with_corrupted_byte_returns_checksum_mismatch() {
+        let mut spw = Spillway::open_memory(SLOT_SIZE as u64 * 4);
+        spw.spill(100, &page(0xAA)).unwrap();
+        // Corrupt the page bytes directly (simulating a torn write).
+        if let Backing::Memory { ref mut bytes } = spw.backing {
+            // Skip the 16-byte header, flip a bit in the page bytes.
+            bytes[SLOT_HEADER_SIZE] ^= 0x01;
+        }
+        let err = spw.rehydrate(100).unwrap_err();
+        assert!(matches!(
+            err,
+            ChiselError::ChecksumMismatch { page_id: 100 }
+        ));
     }
 }
