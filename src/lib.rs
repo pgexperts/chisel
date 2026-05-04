@@ -29,6 +29,7 @@ pub mod overflow;
 pub mod page;
 pub mod page_cache;
 pub mod page_io;
+mod spillway;
 pub mod stats;
 pub mod superblock;
 pub mod transaction;
