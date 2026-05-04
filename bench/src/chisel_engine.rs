@@ -24,15 +24,18 @@ impl ChiselEngine {
     /// Open or create a file-backed Chisel database.
     ///
     /// `cache_size` is the page-cache budget in 8 KB pages. Converted to
-    /// bytes at the Options boundary via `cache_size * PAGE_SIZE`. Setting
-    /// `spillway_max_bytes = 0` disables the spillway (legacy pre-spillway
-    /// behavior: cache full → `CacheFull` error rather than spilling to disk).
+    /// bytes at the Options boundary via `cache_size * PAGE_SIZE`. The
+    /// spillway is enabled at the production-default scale (1024 × cache
+    /// budget in bytes), matching what a real Chisel deployment would use
+    /// and putting Chisel on parity with SQLite's temp-file overflow and
+    /// redb's on-disk B-tree pages for large-transaction handling.
     pub fn open_file(path: &Path, cache_size: usize) -> EngineResult<Self> {
+        let cache_max_bytes = cache_size as u64 * chisel::page::PAGE_SIZE as u64;
         let db = Chisel::open(
             path,
             Options {
-                cache_max_bytes: cache_size as u64 * chisel::page::PAGE_SIZE as u64,
-                spillway_max_bytes: 0,
+                cache_max_bytes,
+                spillway_max_bytes: cache_max_bytes * 1024,
                 drain_insertion: chisel::DrainInsertion::LruTail,
                 ..Options::default()
             },
@@ -44,11 +47,13 @@ impl ChiselEngine {
     /// for smoke tests and any benchmark that doesn't need a real file.
     ///
     /// `cache_size` semantics match `open_file`: pages, converted to bytes
-    /// at the Options boundary.
+    /// at the Options boundary. The spillway is enabled at the same
+    /// production-default scale as `open_file` (1024 × cache budget).
     pub fn open_in_memory(cache_size: usize) -> EngineResult<Self> {
+        let cache_max_bytes = cache_size as u64 * chisel::page::PAGE_SIZE as u64;
         let db = Chisel::open_in_memory_with_options(Options {
-            cache_max_bytes: cache_size as u64 * chisel::page::PAGE_SIZE as u64,
-            spillway_max_bytes: 0,
+            cache_max_bytes,
+            spillway_max_bytes: cache_max_bytes * 1024,
             drain_insertion: chisel::DrainInsertion::LruTail,
             ..Options::default()
         })?;

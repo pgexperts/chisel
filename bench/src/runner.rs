@@ -299,21 +299,18 @@ impl PopulatedSnapshot {
 }
 
 /// Per-tx byte budget for snapshot population. Chunked at this size to
-/// keep each populate transaction under Chisel's strict cache cap.
-/// Bench engines run with `spillway_max_bytes = 0` (spillway disabled)
-/// so each engine is measured under its own cache discipline without
-/// Chisel getting a spillway escape hatch that SQLite and redb lack.
-/// The effective cap is `CACHE_SIZE_PAGES × PAGE_SIZE` = 256 × 8 KiB
-/// = 2 MiB. Large records (size > 8 KiB) need ceil(size/8152)
-/// overflow pages each plus handle-table radix COW pages (2 per
-/// insert at tree depth 1) plus freemap pages — all dirty within
-/// the tx and pinned against eviction — pushing actual cache
-/// footprint to roughly 5× raw-byte count for large overflow records.
-/// 128 KiB keeps the per-chunk page pressure well under the 256-page
-/// cap even at maximum record size (16 KiB → ~10 records → ~50 pages).
+/// amortize fsync cost during prepop (one commit per chunk rather than
+/// one per record). Bench engines now run with the spillway enabled at
+/// the production-default scale (1024 × cache budget), matching
+/// SQLite's temp-file overflow and redb's on-disk B-tree pages, so
+/// there is no strict cache-page ceiling on transaction size. 1 MiB
+/// sits between the original 4 MiB (excessive, heavy allocation
+/// churn per chunk) and the former 128 KiB (tuned for the now-removed
+/// strict cap), giving a good fsync amortization ratio without
+/// burdening the handle-table COW pressure per chunk.
 /// Internal to `populate_snapshot`; the row-bench skip threshold in
 /// micro_grid.rs is a different concern (workload-time, not setup).
-const POPULATE_TX_BUDGET_BYTES: usize = 128 * 1024;
+const POPULATE_TX_BUDGET_BYTES: usize = 1024 * 1024;
 
 /// Per-tx record-count cap for snapshot population, applied alongside
 /// the byte budget. Each Chisel allocate() COWs a fresh root page for
@@ -329,14 +326,12 @@ const POPULATE_TX_MAX_RECORDS: usize = 500;
 /// each, capturing the engine-assigned identifiers in allocation order.
 ///
 /// Pre-population is chunked into multiple `begin/.../commit` blocks of at
-/// most `POPULATE_TX_BUDGET_BYTES` worth of payload each. Bench engines
-/// run with `spillway_max_bytes = 0` so the cache is a strict 2 MiB cap
-/// (256 pages × 8 KiB) with no spillway relief. A single tx for large
-/// sizes (e.g. 16 KiB × 1500 records = 24 MB) exceeds that cap and
-/// panics with `CacheFull`; chunking keeps each populate tx safely under
-/// the budget while preserving the snapshot content (same records, same
-/// ids in the same allocation order — only the internal tx granularity
-/// changes).
+/// most `POPULATE_TX_BUDGET_BYTES` worth of payload each to amortize fsync
+/// cost. With the spillway enabled (production-default: 1024 × cache budget),
+/// there is no hard cache-page ceiling on transaction size — chunking here
+/// is purely for fsync amortization, not cache survival. The snapshot
+/// content is identical regardless of chunk size (same records, same ids
+/// in the same allocation order — only internal tx granularity changes).
 ///
 /// The returned `PopulatedSnapshot` owns the file via `NamedTempFile`;
 /// callers must keep it alive until all cells using its `path()` are
@@ -354,9 +349,9 @@ pub fn populate_snapshot(
     let payload = vec![0u8; size_bytes];
 
     // Chunk so each tx stays under both per-tx caps: byte budget
-    // (large overflow records, where each record costs multiple
-    // cache pages) and record count (tiny records that fit many per
-    // chunk by bytes but blow the cache by handle count).
+    // (amortizes fsync cost for any record size) and record count
+    // (tiny records that fit many per chunk by bytes but accumulate
+    // handle-table COW pressure by count).
     let chunk_size =
         (POPULATE_TX_BUDGET_BYTES / size_bytes.max(1)).clamp(1, POPULATE_TX_MAX_RECORDS);
     let mut remaining = prepop_count;
@@ -515,7 +510,8 @@ pub fn run_scenario_cell(
     // running byte accumulator since scenario prepop has heterogeneous op
     // sizes (mutation-log uses uniform [64, 4096]; document-store uses
     // lognormal). Reads/Deletes accumulate zero bytes since they don't
-    // dirty new payload pages.
+    // dirty new payload pages. With the spillway enabled, chunking here
+    // is purely for fsync amortization — no strict cache ceiling applies.
     let mut snapshot_ids: Vec<u64> = Vec::with_capacity(prepopulate_workload.ops.len());
     let mut new_ids_during_prepop: Vec<Identifier> = Vec::new();
     let mut i = 0;
@@ -665,9 +661,9 @@ mod tests {
 
     #[test]
     fn populate_snapshot_chisel_large_size_chunks() {
-        // 1500 × 16 KiB = 24 MiB raw payload — far exceeds the 2 MiB
-        // strict cache cap (256 pages, no spillway) if done in one tx.
-        // Chunked populate must succeed.
+        // 1500 × 16 KiB = 24 MiB raw payload. Chunked populate must
+        // succeed regardless of cache size; with the spillway enabled
+        // overflow spills to disk rather than returning CacheFull.
         let snap = populate_snapshot(EngineMode::ChiselStrict, 16_384, 1500).unwrap();
         assert_eq!(snap.ids().len(), 1500);
     }
