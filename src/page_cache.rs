@@ -101,6 +101,16 @@ pub struct PageCache {
     /// (Activated in Task 11; until then, dead_code is suppressed.)
     #[allow(dead_code)]
     drain_insertion: crate::DrainInsertion,
+    /// How to lazily open the spillway when a first spill happens. Held
+    /// here rather than opening eagerly because no-spill workloads
+    /// shouldn't pay any filesystem cost for a feature they never use.
+    /// (Activated with the spillway in Task 9.)
+    #[allow(dead_code)]
+    spillway_location: crate::SpillwayLocation,
+    /// Lazily-initialized spillway. None until the first spill needs it.
+    /// (Activated in Task 9.)
+    #[allow(dead_code)]
+    spillway: Option<crate::spillway::Spillway>,
     // Monotonically increasing allocator for shadow-paged new pages. Never
     // reused within a process lifetime except via `truncate()`.
     next_page_id: u64,
@@ -145,6 +155,7 @@ impl PageCache {
         cache_max_bytes: u64,
         spillway_max_bytes: u64,
         drain_insertion: crate::DrainInsertion,
+        spillway_location: crate::SpillwayLocation,
     ) -> PageCache {
         let max_pages = (cache_max_bytes / PAGE_SIZE as u64).max(1) as usize;
         let next_page_id = io.page_count().unwrap_or(0);
@@ -156,6 +167,8 @@ impl PageCache {
             max_pages,
             spillway_max_bytes,
             drain_insertion,
+            spillway_location,
+            spillway: None,
             next_page_id,
             cache_hits: Cell::new(0),
             cache_misses: Cell::new(0),
@@ -683,6 +696,30 @@ impl PageCache {
         }
         Ok(())
     }
+
+    /// Lazy-open the spillway on first spill. Subsequent calls reuse
+    /// the existing one. Returns SpillwayFull if `spillway_max_bytes`
+    /// is 0 (spillway disabled by configuration); the caller must
+    /// fall back to the legacy CacheFull path in that case.
+    /// (First caller arrives in Task 9.)
+    #[allow(dead_code)]
+    fn ensure_spillway(&mut self) -> Result<&mut crate::spillway::Spillway> {
+        if self.spillway_max_bytes == 0 {
+            return Err(ChiselError::SpillwayFull { limit_bytes: 0 });
+        }
+        if self.spillway.is_none() {
+            let spw = match &self.spillway_location {
+                crate::SpillwayLocation::Path(p) => {
+                    crate::spillway::Spillway::open_file(p, self.spillway_max_bytes)?
+                }
+                crate::SpillwayLocation::InMemory => {
+                    crate::spillway::Spillway::open_memory(self.spillway_max_bytes)
+                }
+            };
+            self.spillway = Some(spw);
+        }
+        Ok(self.spillway.as_mut().unwrap())
+    }
 }
 
 #[cfg(test)]
@@ -701,7 +738,13 @@ mod tests {
         // spillway_max_bytes=0 preserves the legacy "fail fast on cache
         // pressure" contract for all existing page_cache tests.
         let cache_max_bytes = max_pages as u64 * PAGE_SIZE as u64;
-        PageCache::new(io, cache_max_bytes, 0, crate::DrainInsertion::LruTail)
+        PageCache::new(
+            io,
+            cache_max_bytes,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        )
     }
 
     // Regression test for ISSUES.md I19. The cache is a SOFT limit by
@@ -798,8 +841,13 @@ mod tests {
         // Setup: open an in-memory PageIo, populate page 0 with a checksummed
         // buffer (writing through the cache so the file actually grows).
         let io = PageIo::open_in_memory().unwrap();
-        let mut cache =
-            PageCache::new(io, 16 * PAGE_SIZE as u64, 0, crate::DrainInsertion::LruTail);
+        let mut cache = PageCache::new(
+            io,
+            16 * PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
 
         // Allocate page 0, stamp a valid checksum, flush so the next read
         // actually exercises the load path rather than a dirty-cache hit.
@@ -840,8 +888,13 @@ mod tests {
     #[test]
     fn pages_allocated_counter_increments_per_new_page() {
         let io = PageIo::open_in_memory().unwrap();
-        let mut cache =
-            PageCache::new(io, 16 * PAGE_SIZE as u64, 0, crate::DrainInsertion::LruTail);
+        let mut cache = PageCache::new(
+            io,
+            16 * PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
         assert_eq!(cache.pages_allocated_count(), 0);
         cache.new_page().unwrap();
         cache.new_page().unwrap();
@@ -854,8 +907,13 @@ mod tests {
         use crate::stats::ChiselCounters;
 
         let io = PageIo::open_in_memory().unwrap();
-        let mut cache =
-            PageCache::new(io, 16 * PAGE_SIZE as u64, 0, crate::DrainInsertion::LruTail);
+        let mut cache = PageCache::new(
+            io,
+            16 * PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
 
         // Fresh cache: every counter is zero.
         assert_eq!(cache.counters(), ChiselCounters::default());

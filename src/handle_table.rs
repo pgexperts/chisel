@@ -674,6 +674,7 @@ mod tests {
             1024 * crate::page::PAGE_SIZE as u64,
             0,
             crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
         );
         // Reserve pages 0 and 1 (the superblock slots in a real DB).
         // Without this, the first allocation hands out page id 0,

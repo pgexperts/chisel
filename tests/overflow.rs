@@ -26,6 +26,7 @@ fn make_cache(b: &common::Backing) -> PageCache {
         64 * chisel::page::PAGE_SIZE as u64,
         0,
         chisel::DrainInsertion::LruTail,
+        chisel::SpillwayLocation::InMemory,
     )
 }
 

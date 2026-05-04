@@ -258,6 +258,7 @@ mod tests {
             64 * crate::page::PAGE_SIZE as u64,
             0,
             crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
         );
         // Reserve page ids 0 and 1 the way a real database does
         // (they're superblock slots). This matters for cycle tests:
