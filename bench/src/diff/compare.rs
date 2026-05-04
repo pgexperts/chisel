@@ -371,4 +371,47 @@ mod tests {
             other => panic!("expected Regressed, got {other:?}"),
         }
     }
+
+    #[test]
+    fn cell_missing_on_pr_yields_pr_missing() {
+        let baseline = one_scenario("ycsb-a/chisel-strict", fixed_metrics());
+        let pr = ParsedResults::default(); // empty
+        let report = compare(
+            &baseline,
+            &pr,
+            PathBuf::from("b"),
+            PathBuf::from("p"),
+            now(),
+        );
+        // Not counted as regression: missing-cell is its own category.
+        assert_eq!(report.regression_count, 0);
+        assert_eq!(report.scenarios.len(), 1);
+        let s = &report.scenarios[0];
+        for md in &s.metrics {
+            assert!(matches!(md.status, DeltaStatus::PrMissing));
+            assert!(md.baseline.is_some());
+            assert!(md.pr.is_none());
+        }
+    }
+
+    #[test]
+    fn cell_missing_on_baseline_yields_baseline_missing() {
+        let baseline = ParsedResults::default(); // empty
+        let pr = one_scenario("ycsb-c/chisel-strict", fixed_metrics());
+        let report = compare(
+            &baseline,
+            &pr,
+            PathBuf::from("b"),
+            PathBuf::from("p"),
+            now(),
+        );
+        assert_eq!(report.regression_count, 0);
+        assert_eq!(report.scenarios.len(), 1);
+        let s = &report.scenarios[0];
+        for md in &s.metrics {
+            assert!(matches!(md.status, DeltaStatus::BaselineMissing));
+            assert!(md.baseline.is_none());
+            assert!(md.pr.is_some());
+        }
+    }
 }
