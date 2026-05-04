@@ -829,9 +829,11 @@ impl TransactionManager {
 
         // I28: drain the page cache BEFORE persist_freemap runs. Without
         // this, `persist_freemap`'s own `allocate_data_page` can trip
-        // `maybe_evict`'s hard-ceiling check (every existing entry dirty,
-        // nothing evictable) and return `ChiselError::CacheFull`. That
-        // error is operational-by-design (I19 docs: "caller recovers by
+        // `maybe_evict`'s spill-or-CacheFull decision (every existing entry
+        // dirty, nothing evictable, and either spillway disabled or full)
+        // and return `ChiselError::CacheFull` or `ChiselError::SpillwayFull`.
+        // The CacheFull variant is operational-by-design (I19 docs: "caller
+        // recovers by
         // committing or rolling back"), but commit's poison wrapper fires
         // on any error once the protocol has started — demoting an
         // operational signal to fatal for a caller who has no legal
@@ -1845,7 +1847,7 @@ mod tests {
         // Match Options::default()'s cache_max_bytes of 8 MiB (1024 pages)
         // so tests that intentionally allocate many pages in a single
         // transaction (e.g. the I3+I7 handle-table-growth test allocates
-        // 510+) stay well under the I19 hard ceiling. spillway_max_bytes=0
+        // 510+) stay well under the strict cache cap. spillway_max_bytes=0
         // preserves the legacy CacheFull-at-cap behavior in tests.
         let cache = PageCache::new(
             io,
