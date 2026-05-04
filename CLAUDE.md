@@ -196,6 +196,25 @@ covers PRs 1–7; PR 8 is an addendum captured in its own
 spec/plan pair. Per-PR plans alongside in
 `docs/superpowers/plans/`.
 
+A small followup landed alongside PR 8 (commit `de8a74e`):
+`bench.yml` now uploads the PR-side `summarize` output
+(`cross-engine.md`, `summary.md`, `results.json`) as a
+workflow artifact named `bench-results-pr-<N>` with the
+default 90-day retention. Retrieve the most recent run's
+artifact for any open PR with:
+
+```
+gh run download <run-id> --repo Xof/chisel --name bench-results-pr-<N>
+```
+
+Get `<run-id>` from `gh run list --branch <branch>` or the PR
+checks page. The `raw/` Criterion archive is intentionally
+absent from the scenario-tier output — scenarios use
+`Instant::now()` timing rather than Criterion (per PR 6).
+Main-side output is not uploaded; for absolute README/release-
+notes numbers, run on dedicated hardware rather than the
+shared CI runner.
+
 PR 8's first-run bench-diff signal is worth remembering as a
 calibration point for GitHub-runner variance on the scenario
 tier: two `document-store` p50 cells flagged as "regressed"
