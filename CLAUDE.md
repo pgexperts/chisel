@@ -69,6 +69,52 @@ times via numpy-style linear interpolation (consistent p50/p95/p99
 semantics rather than mixing Criterion's bootstrap median with a CI
 proxy). Run with `cd bench && cargo run --bin summarize`.
 
+PR 6 (scenario tier — four YCSB-style end-to-end workloads in
+`bench/src/scenarios.rs` + `bench/benches/scenarios.rs`, driven by
+new `run_scenario_cell` in `bench/src/runner.rs`, post-processed
+into the same `summary.md` / `results.json` artifacts) landed on
+`main` as of 2026-05-03. Scenarios are YCSB-A (50/50 read/update,
+Zipfian θ=0.99), YCSB-B (95/5), Mutation Log (25/25/25/25
+allocate/read/update/delete uniform), Document Store (70/20/10
+read/allocate/update with lognormal sizes, Zipfian θ=0.7). Each
+runs once per strict durability mode → 12 cells. Inline
+`Instant::now()` timing rather than Criterion (the master-spec
+budget of 1–6 minutes per full tier rules out Criterion's
+many-samples-per-bench model).
+
+Three latent bugs surfaced at PR 6's end-to-end acceptance gate
+that no per-task unit test caught — none of the unit tests run
+the scenarios bench against a real engine: (1) `run_scenario_cell`
+originally did one-allocate-per-tx during prepop (100K fsyncs on
+chisel-strict ≈ 12 min/cell on macOS APFS); fixed by mirroring
+PR 4b's `populate_snapshot` byte-accumulator chunking, generalized
+for heterogeneous op sizes. (2) `gen_mutation_log` generated
+Read/Update/Delete on indices without tracking which had been
+deleted; replaced with a state-aware walk maintaining a live-set
+`Vec<usize>` (Allocate extends with `next_alloc_index`,
+Read/Update sample without removal, Delete swap-removes), plus a
+`mutation_log_op_sequence_is_engine_applicable` test that
+simulates `apply_op`'s resolve view to catch the bug class.
+(3) `discover_cells` errored `NoCellsFound` when criterion dir
+was empty even with scenarios present; `summarize.rs` now catches
+that and `CriterionDirNotFound` and lets the unified
+`cells.is_empty() && scenarios.is_empty()` gate decide.
+
+PR 6's runtime: spec said 1–6 minutes target / 10 minutes ceiling.
+On macOS that ceiling is unreachable — chisel uses Rust's
+`sync_all` which calls `fcntl(F_FULLFSYNC)` (durable through the
+disk cache), while SQLite by default uses plain `fsync()` (which
+on macOS only flushes to the disk's write cache without
+F_FULLFSYNC). Result: chisel-strict cells are fsync-bound at
+~5–10 ms per commit while sqlite-strict cells run ~3 orders of
+magnitude faster. Full 12-cell grid takes ~70–90 minutes on
+macOS APFS at the spec's workload sizes; Linux CI runners (no
+F_FULLFSYNC overhead) will be much faster. The cross-engine
+fairness gap is pre-existing from PR 3's `SqliteEngine` wrapper
+and is deferred to PR 8 (cross-engine relative-performance
+tests), which will need `PRAGMA fullfsync=ON` to be apples-to-
+apples on macOS.
+
 The 4b grid is 6 rows, not the 9 the master spec called for: three
 1000-per-tx variants (update, delete, delete_many) were dropped during
 implementation because 1000 random ops over the prepopulated DB pin a
@@ -81,12 +127,18 @@ WAL mode leaves committed data in the `-wal` sibling between explicit
 checkpoints — `std::fs::copy` of the main `.db` alone otherwise yields
 "database disk image is malformed" on reopen.
 
-PRs 5–8 of the bench-suite series will add output post-processing (5),
-scenarios (6), CI integration (7), and cross-engine relative-performance
-tests (8 — Chisel vs redb vs SQLite). Design spec at
+PRs 7–8 of the bench-suite series remain: PR 7 (CI integration —
+runs `cargo bench --bench scenarios` on each PR, captures
+`results.json`, diffs against `main`'s baseline, posts a regression
+report) and PR 8 (cross-engine relative-performance tests, Chisel
+vs redb vs SQLite, with the macOS-fsync fairness fix noted above).
+Design spec at
 `docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md`
 covers PRs 1–7; PR 8 is an addendum tracked here pending its own
-spec/plan. Per-PR plans alongside in `docs/superpowers/plans/`.
+spec/plan. PR 6's spec/plan at
+`docs/superpowers/specs/2026-05-03-chisel-bench-scenario-tier-design.md`
++ `docs/superpowers/plans/2026-05-03-chisel-bench-scenario-tier.md`.
+Per-PR plans alongside in `docs/superpowers/plans/`.
 
 ## Architecture
 
@@ -127,10 +179,11 @@ Concurrent in-progress work (tracked outside `ISSUES.md` via spec+plan
 docs): the benchmark-suite series. PRs 1 (counter instrumentation
 exposing `Chisel::counters()`), 2 (`bench/` subcrate + `Engine` trait
 + `ChiselEngine`), and 3 (`RedbEngine` + `SqliteEngine` + cross-engine
-equivalence tests) have landed on `main` as of 2026-04-30; PRs 4–8
-are pending. PR 8 (cross-engine relative-performance tests, Chisel vs
-redb vs SQLite) is an addendum to the original design — it will get
-its own spec/plan pair when brainstormed. See
+equivalence tests) have landed on `main` as of 2026-04-30; PRs 4a, 4b,
+5, and 6 have landed as of 2026-05-03. PRs 7 (CI integration) and 8
+(cross-engine relative-performance tests, Chisel vs redb vs SQLite)
+remain pending. PR 8 is an addendum to the original design — it will
+get its own spec/plan pair when brainstormed. See
 `docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md`.
 
 ## Conventions
