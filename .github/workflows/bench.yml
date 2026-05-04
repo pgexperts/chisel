@@ -104,3 +104,25 @@ jobs:
           issue-number: ${{ github.event.pull_request.number }}
           body-path: /tmp/diff-comment.md
           edit-mode: replace
+
+      # Upload the PR-side summarize output (cross-engine.md, summary.md,
+      # results.json, raw/) so reviewers can grab the full per-cell detail
+      # and the cross-engine comparison table without rerunning the
+      # ~10–25 minute bench locally. `if: always()` ensures the artifact
+      # is uploaded even when the diff/post steps fail — those failures
+      # are exactly when you most want the underlying data to debug.
+      # Main-side output is intentionally not uploaded; the comparison is
+      # already encoded in the PR comment, and rerunning the diff
+      # locally requires only the PR-side file plus a fresh main run.
+      #
+      # `pull_request.number` is GitHub-generated (numeric, not user
+      # input) and is used here in a `with:` parameter, not a `run:`
+      # shell expansion — same usage pattern as the find-comment and
+      # create-or-update-comment steps above. No injection surface.
+      - name: Upload PR-side bench artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-pr-${{ github.event.pull_request.number }}
+          path: /tmp/pr-out/
+          if-no-files-found: warn
