@@ -700,9 +700,15 @@ impl PageCache {
     /// is 0 (spillway disabled by configuration); the caller must
     /// fall back to the legacy CacheFull path in that case.
     fn ensure_spillway(&mut self) -> Result<&mut crate::spillway::Spillway> {
-        if self.spillway_max_bytes == 0 {
-            return Err(ChiselError::SpillwayFull { limit_bytes: 0 });
-        }
+        // Caller contract: ensure_spillway is only called when
+        // spillway_max_bytes > 0. The single caller (maybe_evict's
+        // Phase B) guards on this and routes to CacheFull when the
+        // spillway is disabled. This debug_assert documents the
+        // invariant — release builds rely on the caller's guard.
+        debug_assert!(
+            self.spillway_max_bytes != 0,
+            "ensure_spillway called with spillway disabled — caller missed the guard"
+        );
         // Invariant: ensure_spillway is only called from spill paths
         // (maybe_evict's dirty-overflow branch in Task 9 onward). Read-
         // only databases raise ReadOnlyMode at begin() before any page
@@ -856,6 +862,12 @@ mod tests {
             matches!(err, ChiselError::SpillwayFull { limit_bytes } if limit_bytes == spillway_bytes),
             "expected SpillwayFull {{ limit_bytes: {spillway_bytes} }}, got {err:?}"
         );
+        // After SpillwayFull, the cache must still be at exactly
+        // max_pages — the failed-allocation's bytes are dropped from
+        // both cache and spillway, but the prior dirty entries are
+        // unchanged.
+        assert_eq!(cache.entries.len(), max_pages);
+        assert_eq!(cache.dirty_count, max_pages);
     }
 
     // Regression test for ISSUES.md I20. claim_page previously silently
