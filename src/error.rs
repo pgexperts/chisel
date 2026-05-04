@@ -36,13 +36,29 @@ pub enum ChiselError {
     // < MIN_SUPERBLOCKS (2) or > MAX_SUPERBLOCKS (16). Operational —
     // the caller fixes their Options and tries again.
     InvalidSuperblockCount { value: u32 },
-    // The page cache has grown past its hard ceiling
-    // (`max_pages * HARD_CEILING_MULTIPLIER`) with every cached entry
-    // dirty, so there is no clean page available for eviction.
-    // Operational: the DB on disk is still fine. Recovery is to commit
-    // (which flushes dirty pages and clears the backlog) or roll back
-    // (which discards the in-flight work entirely). See ISSUES.md I19.
+    // The page cache has reached its strict cap (`max_pages`) with
+    // every cached entry dirty and the spillway disabled
+    // (`spillway_max_bytes == 0`), so there is no clean page available
+    // for eviction and no spillway to absorb the overflow. Operational:
+    // the DB on disk is still fine. Recovery is to commit (which flushes
+    // dirty pages and clears the backlog) or roll back (which discards
+    // the in-flight work entirely). The pre-spillway 8x
+    // HARD_CEILING_MULTIPLIER design is gone — see spec
+    // 2026-05-03-chisel-spillway-design.md.
     CacheFull { limit: usize },
+    // The spillway file has reached its `spillway_max_bytes` cap with
+    // every cached entry dirty, so there is neither room in the cache
+    // nor room in the spillway. Operational: the DB on disk is still
+    // intact. Recovery is to commit (which drains the spillway and
+    // resets it) or roll back. Spec 2026-05-03-chisel-spillway-design.md.
+    SpillwayFull { limit_bytes: u64 },
+    // Raised when a configuration mutator (e.g. set_cache_max_bytes,
+    // set_spillway_max_bytes, set_drain_insertion) is called while a
+    // transaction is in flight. Operational: caller commits or rolls
+    // back, then retries. The mutators only operate on between-
+    // transactions state; mid-transaction shrink would either reject
+    // or silently spill, neither of which is a clean story.
+    TransactionInProgress,
 
     // Fatal — database integrity is in question. Close and re-open
     // before attempting further work. The reopen will re-run superblock
@@ -147,6 +163,23 @@ impl fmt::Display for ChiselError {
             ChiselError::CacheFull { limit } => write!(
                 f,
                 "page cache full: {limit} dirty pages held; commit or roll back to free cache"
+            ),
+            ChiselError::SpillwayFull { limit_bytes } => {
+                if *limit_bytes == 0 {
+                    write!(
+                        f,
+                        "spillway is disabled (spillway_max_bytes=0); commit or roll back to free cache"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "spillway full: {limit_bytes}-byte limit reached; commit or roll back to free cache and spillway"
+                    )
+                }
+            },
+            ChiselError::TransactionInProgress => write!(
+                f,
+                "configuration changes are only allowed between transactions; commit or roll back first"
             ),
             ChiselError::IoError(e) => write!(f, "I/O error: {e}"),
             ChiselError::ChecksumMismatch { page_id } => {

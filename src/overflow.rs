@@ -253,7 +253,13 @@ mod tests {
     fn make_cache() -> PageCache {
         let file = NamedTempFile::new().unwrap();
         let io = PageIo::open(file.path(), false).unwrap();
-        let mut cache = PageCache::new(io, 64);
+        let mut cache = PageCache::new(
+            io,
+            64 * crate::page::PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
         // Reserve page ids 0 and 1 the way a real database does
         // (they're superblock slots). This matters for cycle tests:
         // 0 is the end-of-chain sentinel, so if an overflow page

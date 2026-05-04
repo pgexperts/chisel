@@ -28,6 +28,8 @@
 //         RootNameTableFullError
 //         InvalidSuperblockCountError
 //         CacheFullError
+//         SpillwayFullError
+//         TransactionInProgressError
 //         ClosedError              (I25: db.close() raced a live txn/sp)
 //         AlreadyFinishedError     (I22/I24: double-drive a finished txn/sp)
 //       FatalError                       (drop-and-reopen recovery only)
@@ -63,6 +65,14 @@ create_exception!(_chisel, InvalidRootNameError, OperationalError);
 create_exception!(_chisel, RootNameTableFullError, OperationalError);
 create_exception!(_chisel, InvalidSuperblockCountError, OperationalError);
 create_exception!(_chisel, CacheFullError, OperationalError);
+// Byte-budget analogue of CacheFull: raised when the spillway sidecar's
+// byte limit is reached during a transaction. Database intact; commit or
+// roll back to drain the spillway and resume normal operation.
+create_exception!(_chisel, SpillwayFullError, OperationalError);
+// Raised when a configuration mutator is called while a transaction is
+// active. Analogous to TransactionAlreadyActiveError — both are
+// operational "wrong state" errors; the database is unharmed.
+create_exception!(_chisel, TransactionInProgressError, OperationalError);
 // ISSUES.md I25: raised by PyChisel's with_inner_io/with_inner_mut_io
 // helpers when `inner` has been cleared by a prior close(). Distinct
 // from PoisonedError because close() is a user action — the DB file
@@ -142,6 +152,14 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         py.get_type_bound::<InvalidSuperblockCountError>(),
     )?;
     m.add("CacheFullError", py.get_type_bound::<CacheFullError>())?;
+    m.add(
+        "SpillwayFullError",
+        py.get_type_bound::<SpillwayFullError>(),
+    )?;
+    m.add(
+        "TransactionInProgressError",
+        py.get_type_bound::<TransactionInProgressError>(),
+    )?;
     m.add("ClosedError", py.get_type_bound::<ClosedError>())?;
     m.add(
         "AlreadyFinishedError",
@@ -207,6 +225,14 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
         RustChiselError::RootNameTableFull => RootNameTableFullError::new_err(msg),
         RustChiselError::InvalidSuperblockCount { .. } => InvalidSuperblockCountError::new_err(msg),
         RustChiselError::CacheFull { .. } => CacheFullError::new_err(msg),
+        // SpillwayFull is the byte-budget analogue of CacheFull: both are
+        // operational "buffer full, commit or roll back to free space"
+        // conditions; the database is intact and can continue after draining.
+        RustChiselError::SpillwayFull { .. } => SpillwayFullError::new_err(msg),
+        // TransactionInProgress is the configuration-mutator analogue of
+        // TransactionAlreadyActive: both are operational "wrong state for
+        // this call" errors that the database recovers from without harm.
+        RustChiselError::TransactionInProgress => TransactionInProgressError::new_err(msg),
         // Fatal
         RustChiselError::IoError(_) => IoError::new_err(msg),
         RustChiselError::ChecksumMismatch { .. } => ChecksumMismatchError::new_err(msg),

@@ -21,7 +21,13 @@ fn make_cache(b: &common::Backing) -> PageCache {
         common::Backing::File(f) => PageIo::open(f.path(), false).unwrap(),
         common::Backing::Memory => PageIo::open_in_memory().unwrap(),
     };
-    PageCache::new(io, 64)
+    PageCache::new(
+        io,
+        64 * chisel::page::PAGE_SIZE as u64,
+        0,
+        chisel::DrainInsertion::LruTail,
+        chisel::SpillwayLocation::InMemory,
+    )
 }
 
 fn test_overflow_write_and_read_single_page_body(b: &common::Backing) {
