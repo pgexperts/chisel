@@ -327,4 +327,51 @@ mod tests {
             "no-regression output contains -0.0% — sign-flip-on-zero bug:\n{out}"
         );
     }
+
+    #[test]
+    fn regression_renders_warning_with_worst_column_populated() {
+        // Set up two scenarios; one with a 12% p99 regression, one clean.
+        let mut bs = BTreeMap::new();
+        bs.insert("ycsb-a/chisel-strict".to_string(), fixed_metrics());
+        bs.insert("ycsb-b/chisel-strict".to_string(), fixed_metrics());
+        let baseline = ParsedResults { scenarios: bs };
+
+        let mut ps = BTreeMap::new();
+        ps.insert(
+            "ycsb-a/chisel-strict".to_string(),
+            ScenarioMetrics {
+                p99_ns: 560_000.0, // 12% over 500_000
+                ..fixed_metrics()
+            },
+        );
+        ps.insert("ycsb-b/chisel-strict".to_string(), fixed_metrics());
+        let pr = ParsedResults { scenarios: ps };
+
+        let report = compare(
+            &baseline,
+            &pr,
+            PathBuf::from("b"),
+            PathBuf::from("p"),
+            now(),
+        );
+        assert_eq!(report.regression_count, 1);
+        let out = render_markdown(&report);
+
+        assert!(
+            out.contains("⚠️ 1 regression(s) detected across 1 scenario/mode pair(s)"),
+            "warning header missing or wrong:\n{out}"
+        );
+        assert!(
+            out.contains("p99 +12.0% ⚠️"),
+            "worst-Δ column wrong:\n{out}"
+        );
+        // ycsb-a (the regressed row) should appear before ycsb-b in the
+        // summary table when sort-by-worst-first is applied.
+        let ya_pos = out.find("| ycsb-a").unwrap();
+        let yb_pos = out.find("| ycsb-b").unwrap();
+        assert!(
+            ya_pos < yb_pos,
+            "ycsb-a (regressed) should sort before ycsb-b (clean):\nya_pos={ya_pos} yb_pos={yb_pos}\n{out}"
+        );
+    }
 }
