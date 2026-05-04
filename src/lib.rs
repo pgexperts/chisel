@@ -29,6 +29,7 @@ pub mod overflow;
 pub mod page;
 pub mod page_cache;
 pub mod page_io;
+mod spillway;
 pub mod stats;
 pub mod superblock;
 pub mod transaction;
@@ -44,9 +45,30 @@ use transaction::TransactionManager;
 /// Open-time options. These are consumed once during `Chisel::open` and not
 /// retained on the live handle; changing them later requires reopening.
 ///
-/// `cache_size` is a count of pages (not bytes), passed directly to the LRU
-/// `PageCache`. `read_only` still takes an exclusive `flock` — it only
-/// suppresses writes at the application layer.
+/// `cache_max_bytes` is a strict upper bound on the in-memory page cache, in
+/// bytes. Internally converted to a page count via `bytes / PAGE_SIZE`
+/// (rounded down, clamped to at least one page). Replaces the previous
+/// `cache_size: usize` (page count) field; bytes are user-friendly because
+/// callers think in MB/GB, not 8KB units. Default 8 MiB = 1024 pages
+/// (matches the previous default).
+///
+/// `spillway_max_bytes` is a strict upper bound on the spillway sidecar
+/// file, in bytes (excluding per-slot 16-byte headers). When the cache
+/// is full and dirty, overflow dirty pages are written to the spillway
+/// rather than aborting; exceeding this limit trips
+/// `ChiselError::SpillwayFull`. Default `1024 * cache_max_bytes` (8 GiB
+/// at the default cache size). Setting to 0 disables the spillway
+/// entirely — overflow then trips `ChiselError::CacheFull` at the
+/// strict cache cap, with no 8× elasticity (the previous
+/// `HARD_CEILING_MULTIPLIER` is removed).
+///
+/// `drain_insertion` controls where commit-drain rehydrated pages land
+/// in the LRU. `LruTail` (default) makes them first eviction candidates
+/// after commit, preserving the pre-transaction warm working set;
+/// `Mru` treats them as just-touched. See spec §"Drain insertion policy".
+///
+/// `read_only` still takes an exclusive `flock` — it only suppresses
+/// writes at the application layer.
 ///
 /// `superblock_count` (ISSUES.md R4) controls how many superblock slots a
 /// freshly-created database uses. Default 2 (matches the original layout);
@@ -57,16 +79,44 @@ use transaction::TransactionManager;
 /// existing file discovers N from the on-disk superblock itself.
 #[derive(Debug, Clone)]
 pub struct Options {
-    pub cache_size: usize,
+    pub cache_max_bytes: u64,
+    pub spillway_max_bytes: u64,
+    pub drain_insertion: DrainInsertion,
     pub create_if_missing: bool,
     pub read_only: bool,
     pub superblock_count: u32,
 }
 
+/// Where commit-drain rehydrated pages are inserted into the LRU.
+///
+/// `LruTail` makes the just-drained pages the first eviction candidates
+/// after commit; preserves any pre-transaction warm pages. The default,
+/// per spec §"Drain insertion policy".
+///
+/// `Mru` treats drained pages as recently touched. Useful when the
+/// caller expects to read them again next transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainInsertion {
+    LruTail,
+    Mru,
+}
+
+/// How to open a spillway sidecar. `Path` for file-backed databases
+/// (path is the main db path; spillway will be at `<path>.spillway`),
+/// `InMemory` for memory-backed.
+#[derive(Debug, Clone)]
+pub enum SpillwayLocation {
+    Path(std::path::PathBuf),
+    InMemory,
+}
+
 impl Default for Options {
     fn default() -> Options {
+        let cache_max_bytes = 8 * 1024 * 1024; // 8 MiB = 1024 × 8 KiB pages
         Options {
-            cache_size: 1024,
+            cache_max_bytes,
+            spillway_max_bytes: cache_max_bytes.saturating_mul(1024),
+            drain_insertion: DrainInsertion::LruTail,
             create_if_missing: true,
             read_only: false,
             superblock_count: superblock::DEFAULT_SUPERBLOCK_COUNT,
@@ -140,7 +190,13 @@ impl Chisel {
         }
 
         let io = PageIo::open(path, options.read_only)?;
-        let cache = PageCache::new(io, options.cache_size);
+        let cache = PageCache::new(
+            io,
+            options.cache_max_bytes,
+            options.spillway_max_bytes,
+            options.drain_insertion,
+            SpillwayLocation::Path(path.to_path_buf()),
+        );
 
         let txm = if file_exists {
             // Existing database: N is discovered from the on-disk
@@ -170,7 +226,8 @@ impl Chisel {
     /// be writable for the initial superblock bootstrap, and there is no
     /// prior file to reopen read-only. `options.create_if_missing` is
     /// ignored — memory mode always creates a fresh database. All other
-    /// options (cache_size, superblock_count) flow through normally.
+    /// options (cache_max_bytes, spillway_max_bytes, drain_insertion,
+    /// superblock_count) flow through normally.
     pub fn open_in_memory_with_options(options: Options) -> Result<Chisel> {
         if options.read_only {
             // Fail fast rather than bootstrapping and then blocking the
@@ -187,7 +244,13 @@ impl Chisel {
         }
 
         let io = PageIo::open_in_memory()?;
-        let cache = PageCache::new(io, options.cache_size);
+        let cache = PageCache::new(
+            io,
+            options.cache_max_bytes,
+            options.spillway_max_bytes,
+            options.drain_insertion,
+            SpillwayLocation::InMemory,
+        );
         let txm = TransactionManager::create_new(cache, options.superblock_count)?;
         Ok(Chisel { txm })
     }
@@ -375,5 +438,30 @@ impl Chisel {
     /// work in the same transaction and atomic with it on commit.
     pub fn defrag(&mut self, options: defrag::DefragOptions) -> Result<defrag::DefragStats> {
         defrag::defrag(&mut self.txm, &options)
+    }
+
+    /// Resize the in-memory cache cap. Returns
+    /// `ChiselError::TransactionInProgress` if a transaction is
+    /// active. Shrinking evicts clean LRU-tail entries to fit;
+    /// growing takes effect on the next allocation. See spec
+    /// §"Runtime mutability".
+    pub fn set_cache_max_bytes(&mut self, bytes: u64) -> Result<()> {
+        self.txm.set_cache_max_bytes(bytes)
+    }
+
+    /// Resize the spillway cap. Setting to 0 disables the spillway
+    /// (subsequent overflow trips CacheFull at the cache cap).
+    /// Returns `ChiselError::TransactionInProgress` if a transaction
+    /// is active. The spillway is empty between transactions, so
+    /// resize is state-free.
+    pub fn set_spillway_max_bytes(&mut self, bytes: u64) -> Result<()> {
+        self.txm.set_spillway_max_bytes(bytes)
+    }
+
+    /// Update the drain insertion policy used at the next commit.
+    /// Returns `ChiselError::TransactionInProgress` if a transaction
+    /// is active.
+    pub fn set_drain_insertion(&mut self, policy: DrainInsertion) -> Result<()> {
+        self.txm.set_drain_insertion(policy)
     }
 }

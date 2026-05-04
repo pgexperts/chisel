@@ -829,9 +829,11 @@ impl TransactionManager {
 
         // I28: drain the page cache BEFORE persist_freemap runs. Without
         // this, `persist_freemap`'s own `allocate_data_page` can trip
-        // `maybe_evict`'s hard-ceiling check (every existing entry dirty,
-        // nothing evictable) and return `ChiselError::CacheFull`. That
-        // error is operational-by-design (I19 docs: "caller recovers by
+        // `maybe_evict`'s spill-or-CacheFull decision (every existing entry
+        // dirty, nothing evictable, and either spillway disabled or full)
+        // and return `ChiselError::CacheFull` or `ChiselError::SpillwayFull`.
+        // The CacheFull variant is operational-by-design (I19 docs: "caller
+        // recovers by
         // committing or rolling back"), but commit's poison wrapper fires
         // on any error once the protocol has started — demoting an
         // operational signal to fatal for a caller who has no legal
@@ -1700,6 +1702,30 @@ impl TransactionManager {
         self.active_txn
     }
 
+    pub fn set_cache_max_bytes(&mut self, bytes: u64) -> Result<()> {
+        self.check_alive()?;
+        if self.active_txn {
+            return Err(ChiselError::TransactionInProgress);
+        }
+        self.cache.borrow_mut().set_cache_max_bytes(bytes)
+    }
+
+    pub fn set_spillway_max_bytes(&mut self, bytes: u64) -> Result<()> {
+        self.check_alive()?;
+        if self.active_txn {
+            return Err(ChiselError::TransactionInProgress);
+        }
+        self.cache.borrow_mut().set_spillway_max_bytes(bytes)
+    }
+
+    pub fn set_drain_insertion(&mut self, policy: crate::DrainInsertion) -> Result<()> {
+        self.check_alive()?;
+        if self.active_txn {
+            return Err(ChiselError::TransactionInProgress);
+        }
+        self.cache.borrow_mut().set_drain_insertion(policy)
+    }
+
     // --- Private helpers ---
 
     /// Release one slot from a data page (ISSUES.md R1). Decrements
@@ -1842,13 +1868,18 @@ mod tests {
     fn fresh_manager() -> TransactionManager {
         let file = NamedTempFile::new().unwrap();
         let io = PageIo::open(file.path(), false).unwrap();
-        // Match Options::default()'s cache_size of 1024 so tests that
-        // intentionally allocate many pages in a single transaction
-        // (e.g. the I3+I7 handle-table-growth test allocates 510+) stay
-        // well under the I19 hard ceiling of `cache_size *
-        // HARD_CEILING_MULTIPLIER`. Tiny test caches were fine before
-        // I19 because the cache had no upper bound.
-        let cache = PageCache::new(io, 1024);
+        // Match Options::default()'s cache_max_bytes of 8 MiB (1024 pages)
+        // so tests that intentionally allocate many pages in a single
+        // transaction (e.g. the I3+I7 handle-table-growth test allocates
+        // 510+) stay well under the strict cache cap. spillway_max_bytes=0
+        // preserves the legacy CacheFull-at-cap behavior in tests.
+        let cache = PageCache::new(
+            io,
+            1024 * PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
         let mut tm = TransactionManager::create_new(cache, 2).unwrap();
         // Commit once so there's a real baseline to read/write against.
         tm.begin().unwrap();
@@ -2158,7 +2189,7 @@ mod tests {
     // an **operational** error (documented as "commit or rollback to
     // recover"), but `commit_inner` runs `persist_freemap` BEFORE
     // `cache.flush()` — and `persist_freemap` itself calls
-    // `allocate_data_page`, which may trip `maybe_evict`'s hard-ceiling
+    // `allocate_data_page`, which may trip `maybe_evict`'s ceiling
     // check when every existing cache entry is dirty. Pre-fix the
     // resulting `CacheFull` propagated out of commit_inner and
     // commit()'s poison wrapper poisoned the manager unconditionally.
@@ -2166,24 +2197,29 @@ mod tests {
     // follow because commit itself failed.
     //
     // Post-fix: commit drains the cache BEFORE persist_freemap, so the
-    // ceiling is always reachable via eviction when persist_freemap
+    // cap is always reachable via eviction when persist_freemap
     // itself allocates. CacheFull cannot arise on the commit path.
     //
-    // Setup note: we deliberately use a small `max_pages` so the hard
-    // ceiling (max_pages * HARD_CEILING_MULTIPLIER = 8) is cheap to
-    // saturate. `fresh_manager`'s default of 1024 exists to keep
-    // existing tests well under the ceiling; this test is the opposite
-    // — it *needs* to cross the ceiling.
+    // Setup note: we deliberately use a small `max_pages` so the
+    // strict cap is cheap to saturate with a few allocations.
+    // spillway_max_bytes=0 keeps CacheFull reachable (no spillway
+    // escape hatch), matching the pre-spillway path this test exercises.
     #[test]
-    fn commit_does_not_poison_when_cache_is_past_hard_ceiling() {
+    fn commit_does_not_poison_when_cache_is_at_strict_cap() {
         let file = NamedTempFile::new().unwrap();
         let io = PageIo::open(file.path(), false).unwrap();
         std::mem::forget(file);
-        // max_pages=4 → hard ceiling = 32. Big enough for baseline
-        // operations (handle-table root + superblocks + freemap) to
-        // coexist, small enough that a few dozen big allocations
-        // saturate it.
-        let cache = PageCache::new(io, 4);
+        // max_pages=16 — big enough for baseline operations (handle-table
+        // root + superblocks + freemap) to coexist, small enough that a
+        // handful of big allocations saturate the strict cap quickly.
+        // spillway_max_bytes=0 means CacheFull fires at max_pages itself.
+        let cache = PageCache::new(
+            io,
+            16 * PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
         let mut tm = TransactionManager::create_new(cache, 2).unwrap();
         tm.begin().unwrap();
         tm.commit().unwrap();
@@ -2200,7 +2236,7 @@ mod tests {
         tm.commit().unwrap();
 
         // Victim transaction: delete to populate txn_freed_pages, then
-        // allocate until the cache saturates past the hard ceiling.
+        // allocate until the cache saturates at the strict cap.
         // CacheFull from an allocate() is operational — we catch it and
         // proceed to commit, which is what we actually want to stress.
         tm.begin().unwrap();
@@ -2226,7 +2262,7 @@ mod tests {
         );
 
         // The actual I28 check. Pre-fix, `persist_freemap`'s internal
-        // `allocate_data_page` trips the hard ceiling and propagates
+        // `allocate_data_page` trips the ceiling and propagates
         // CacheFull out of commit_inner; commit()'s poison wrapper
         // then sets the poison flag. Post-fix commit drains first.
         let result = tm.commit();
@@ -2263,7 +2299,13 @@ mod tests {
         // patch pages 0 AND 1.
         {
             let io = PageIo::open(&path, false).unwrap();
-            let cache = PageCache::new(io, 1024);
+            let cache = PageCache::new(
+                io,
+                1024 * PAGE_SIZE as u64,
+                0,
+                crate::DrainInsertion::LruTail,
+                crate::SpillwayLocation::InMemory,
+            );
             let _ = TransactionManager::create_new(cache, 2).unwrap();
             // drop() releases the flock so the test can read+write the
             // file directly below.
@@ -2295,7 +2337,13 @@ mod tests {
         patch_all_slots(minor_bump, 2);
         {
             let io = PageIo::open(&path, false).unwrap();
-            let cache = PageCache::new(io, 1024);
+            let cache = PageCache::new(
+                io,
+                1024 * PAGE_SIZE as u64,
+                0,
+                crate::DrainInsertion::LruTail,
+                crate::SpillwayLocation::InMemory,
+            );
             let tm = TransactionManager::open_existing(cache);
             assert!(
                 tm.is_ok(),
@@ -2310,7 +2358,13 @@ mod tests {
         patch_all_slots(major_bump, 2);
         {
             let io = PageIo::open(&path, false).unwrap();
-            let cache = PageCache::new(io, 1024);
+            let cache = PageCache::new(
+                io,
+                1024 * PAGE_SIZE as u64,
+                0,
+                crate::DrainInsertion::LruTail,
+                crate::SpillwayLocation::InMemory,
+            );
             match TransactionManager::open_existing(cache) {
                 Err(ChiselError::UnsupportedFormatVersion { .. }) => {}
                 Err(e) => panic!("expected UnsupportedFormatVersion, got {e:?}"),

@@ -44,7 +44,7 @@ use pyo3::types::PyString;
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use chisel::{Chisel, Options};
+use chisel::Chisel;
 
 use crate::errors::to_py_err;
 
@@ -57,18 +57,19 @@ pub struct PyChisel {
 }
 
 // Keyword-only args after `path` (note the `*`) so users can't
-// positionally supply cache_size by accident; the defaults mirror
+// positionally supply cache_max_bytes by accident; the defaults mirror
 // `chisel::Options::default()` so `open(None)` and `open("f.db")`
 // behave the same as the Rust API with default options.
 //
 // Defaults MUST stay in sync with chisel::Options::default() — both
 // sides hard-code them rather than sharing a constant because the Rust
 // side's constants are not exposed through the PyO3 signature syntax.
+// 8_388_608 = 8 MiB = 1024 × 8 KiB pages, matching Options::default().
 #[pyfunction]
 #[pyo3(signature = (
     path = None,
     *,
-    cache_size = 1024,
+    cache_max_bytes = 8_388_608,
     create_if_missing = true,
     read_only = false,
     superblock_count = 2
@@ -76,7 +77,7 @@ pub struct PyChisel {
 pub fn open(
     py: Python<'_>,
     path: Option<PyObject>,
-    cache_size: usize,
+    cache_max_bytes: u64,
     create_if_missing: bool,
     read_only: bool,
     superblock_count: u32,
@@ -102,8 +103,13 @@ pub fn open(
         }
     };
 
-    let options = Options {
-        cache_size,
+    // Spillway is disabled for v1 of the Python binding (spillway_max_bytes=0);
+    // exposing spillway controls via Python is deferred until the Rust side
+    // has shipped and stabilized. drain_insertion uses the Rust default.
+    let options = chisel::Options {
+        cache_max_bytes,
+        spillway_max_bytes: 0,
+        drain_insertion: chisel::DrainInsertion::LruTail,
         create_if_missing,
         read_only,
         superblock_count,
