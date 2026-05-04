@@ -1,7 +1,7 @@
 // page_io.rs — Raw page I/O with two backings: file (durable) and memory
 // (ephemeral).
 //
-// Architecture layer 2 (per CLAUDE.md): the ONLY module in the engine that
+// Architecture layer 2 (per ARCHITECTURE.md): the ONLY module in the engine that
 // touches the filesystem directly. Every other layer (page_cache, freemap,
 // data_page, handle_table, transaction) funnels its I/O through here, which
 // keeps platform-specific syscalls (flock, fsync, set_len) confined to one

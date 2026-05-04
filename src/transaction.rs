@@ -1,5 +1,5 @@
 // transaction.rs — Transaction lifecycle, savepoints, commit protocol, and data operations.
-// This is the orchestration layer (layer 6 in the module graph per CLAUDE.md) that ties
+// This is the orchestration layer (layer 6 in the module graph per ARCHITECTURE.md) that ties
 // together the handle table, data pages, overflow pages, freemap, superblock, and page
 // cache into a coherent transactional API.
 //
@@ -121,7 +121,7 @@ pub struct TransactionManager {
     // RefCell lets `read()` / `handles()` / `stats()` take `&self` so
     // callers don't need an external RefCell<Chisel> wrapper. RefCell (not
     // Mutex) because Chisel is deliberately single-threaded — see
-    // lib.rs and CLAUDE.md. Every access through this field uses
+    // lib.rs and ARCHITECTURE.md. Every access through this field uses
     // `borrow_mut()`; reborrowing for downstream `&mut PageCache` parameters
     // (e.g., handle_table methods) is done via `&mut *cache` on a single
     // RefMut held for the duration of the operation.

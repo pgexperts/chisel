@@ -66,6 +66,50 @@ fn main() -> chisel::Result<()> {
 }
 ```
 
+## Building from source
+
+Rust workspace with three crates: the root `chisel` engine, the `python/` PyO3 binding, and the `bench/` benchmark suite. Each is built independently — running `cargo test` from the repo root does **not** run the bench subcrate's tests, since `bench/` is a sibling crate, not a workspace member.
+
+### Root crate
+
+```bash
+cargo build
+cargo test
+cargo clippy -- -D warnings
+cargo fmt -- --check
+```
+
+CI runs the Rust checks above plus a Python matrix (CPython 3.11 and 3.13 × Linux/macOS) that builds the PyO3 binding via `maturin develop` and runs `pytest` in `python/tests`. A separate workflow builds abi3 wheels on tagged releases.
+
+### Python binding
+
+The `python/` subcrate is a PyO3 wrapper (`chisel-py` → `_chisel.abi3.so`) with its own `Cargo.toml` and `pyproject.toml`:
+
+```bash
+cd python
+python -m venv .venv && source .venv/bin/activate
+pip install maturin pytest
+maturin develop
+pytest
+```
+
+See [`python/README.md`](python/README.md) for usage.
+
+### Benchmark suite
+
+The `bench/` subcrate provides Criterion micro-grid + YCSB-style scenario benchmarks comparing Chisel against redb and SQLite:
+
+```bash
+cd bench
+cargo test                              # equivalence tests (5 scenarios × 3 engines)
+cargo bench --bench micro_grid          # ~1-3 min on Linux, longer on macOS APFS
+cargo bench --bench scenarios           # ~10-25 min on Linux, ~70-90 min on macOS APFS
+cargo run --bin summarize               # produces summary.md, results.json, cross-engine.md
+                                        # under bench/results/<UTC>/
+```
+
+The macOS APFS runtime gap is real: Chisel uses `fcntl(F_FULLFSYNC)` (durable through the disk write cache) and `SqliteEngine` matches it via `PRAGMA fullfsync=ON`. Linux `fsync()` already syncs through the cache, so the costs are comparable there.
+
 ## Concepts
 
 ### Handles
@@ -276,14 +320,7 @@ The Python API mirrors the Rust one but adds context managers for transactions a
 ## Design documents
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — living architecture overview: layer model, commit protocol, recovery, full on-disk format byte-by-byte, and cross-cutting concepts. Start here if you're reading the codebase for the first time.
-
-Deeper notes frozen at decision time in [`docs/superpowers/specs/`](docs/superpowers/specs/):
-
-- [`2026-04-09-chisel-storage-engine-design.md`](docs/superpowers/specs/2026-04-09-chisel-storage-engine-design.md) — shadow paging, handle table, page layouts.
-- [`2026-04-13-chisel-in-memory-mode-design.md`](docs/superpowers/specs/2026-04-13-chisel-in-memory-mode-design.md) — the `Vec<u8>`-backed `PageIo`.
-- [`2026-04-14-chisel-python-interface-design.md`](docs/superpowers/specs/2026-04-14-chisel-python-interface-design.md) — the PyO3 API surface and error hierarchy.
-
-Open issues, closed issues, and the decision log live in [`ISSUES.md`](ISSUES.md).
+- [`ISSUES.md`](ISSUES.md) — running decision log: open issues, closed issues, and every design tradeoff with date-stamped rationale.
 
 ## License
 

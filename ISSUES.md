@@ -339,8 +339,8 @@ When every cached entry was dirty, the eviction loop broke out and the cache sil
 
 **Fix:** added a `HARD_CEILING_MULTIPLIER` constant (currently 8×) and a check at the end of `maybe_evict` that returns the new operational `ChiselError::CacheFull { limit }` once `entries.len()` exceeds `max_pages * HARD_CEILING_MULTIPLIER`. The soft-limit semantics for `max_pages` are unchanged — write-heavy transactions can still grow past it — but runaway growth now trips a recoverable error. Caller recovery is to commit (which flushes, freeing the dirty pin) or roll back. The Python binding gets a parallel `CacheFullError` in the OperationalError tier. Tests `cache_full_fires_when_all_pages_dirty_past_hard_ceiling` and `cache_full_is_recoverable_via_flush` in `page_cache.rs` cover trigger and recovery; `fresh_manager`'s test cache size in `transaction.rs` was bumped from 64 to 1024 so existing high-allocation tests stay well under the new ceiling.
 
-**SUPERSEDED 2026-05-04** by the spillway design (spec
-`docs/superpowers/specs/2026-05-03-chisel-spillway-design.md`). The
+**SUPERSEDED 2026-05-04** by the spillway design (see
+`ARCHITECTURE.md` Cross-cutting concepts → Spillway). The
 `HARD_CEILING_MULTIPLIER` constant is removed; the cache is now a
 strict bound (`Options::cache_max_bytes`); overflow dirty pages
 spill to a sidecar `Spillway` file capped at

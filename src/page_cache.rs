@@ -1,6 +1,6 @@
 // page_cache.rs — LRU page cache with dirty tracking and checksum validation.
 //
-// Architecture layer 3 (per CLAUDE.md): the choke point through which every
+// Architecture layer 3 (per ARCHITECTURE.md): the choke point through which every
 // other module (freemap, data_page, overflow, handle_table, transaction)
 // accesses pages. It owns the sole `PageIo` instance. Modules above it never
 // see raw file I/O.
@@ -279,7 +279,7 @@ impl PageCache {
     /// buffer and the on-disk bytes (if any) become orphaned garbage that
     /// the next `truncate()` or freemap reclaim can recover.
     ///
-    /// Known v1 simplification (per CLAUDE.md): this allocator never
+    /// Known v1 simplification (per ARCHITECTURE.md): this allocator never
     /// consults the freemap. It always extends past EOF, so freed pages
     /// from previous transactions remain unreclaimed until a defrag pass.
     ///
@@ -746,7 +746,7 @@ impl PageCache {
     /// cache, so a retry could (in principle) succeed if the caller
     /// repaired the file externally.
     ///
-    /// A checksum mismatch is a fatal corruption error per CLAUDE.md —
+    /// A checksum mismatch is a fatal corruption error per ARCHITECTURE.md —
     /// `ChecksumMismatch` signals the database is broken, not merely that
     /// the operation failed.
     fn load_page(&mut self, page_id: u64) -> Result<()> {

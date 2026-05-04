@@ -11,15 +11,12 @@ use crate::summary::discover::ScenarioMetrics;
 use crate::summary::format::{format_bytes_iec, format_duration_ns};
 use crate::summary::metadata::Metadata;
 
-/// Render the cross-engine comparison markdown document. See spec
-/// `docs/superpowers/specs/2026-05-04-chisel-bench-cross-engine-design.md`
-/// for the document structure.
+/// Render the cross-engine comparison markdown document.
 ///
 /// `scenarios` is filtered for the three strict-mode engines:
 /// chisel-strict, redb-strict, sqlite-strict. Other modes (e.g.
 /// future *-unsafe variants if they're ever added to the scenario
-/// tier) are ignored — the cross-engine report is strict-only per
-/// the master spec.
+/// tier) are ignored — the cross-engine report is strict-only.
 pub fn render_cross_engine_markdown(scenarios: &[ScenarioMetrics], metadata: &Metadata) -> String {
     let mut out = String::new();
     out.push_str("# Chisel Bench: Cross-engine comparison\n\n");
@@ -136,19 +133,19 @@ fn render_file_size_table(scenarios: &[ScenarioMetrics]) -> String {
 }
 
 fn render_methodology_footer() -> &'static str {
-    // Path from bench/results/<UTC>/cross-engine.md to the master spec
-    // is three hops: out of UTC dir → bench/results → bench/ → repo root,
-    // then docs/superpowers/specs/...
+    // Path from bench/results/<UTC>/cross-engine.md to ARCHITECTURE.md
+    // is three hops: out of UTC dir → bench/results → bench/ → repo root.
     "---\n\
      \n\
      Methodology: each cell is the result of a single end-to-end run of the\n\
      named scenario against the engine in strict durability mode. See\n\
      [`summary.md`](summary.md) in the same directory for the full per-cell\n\
      detail (p50, p95, total wall clock, file-size delta, and Chisel-internal\n\
-     counter snapshots) and [the master bench spec](../../../docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md)\n\
-     for workload definitions. Each engine takes a single fsync per commit\n\
-     through the disk write cache; numbers depend on the platform's storage\n\
-     stack and are not portable across machine classes.\n"
+     counter snapshots) and [the architecture doc](../../../ARCHITECTURE.md#benchmark-infrastructure)\n\
+     for the bench-suite layout and workload definitions. Each engine takes\n\
+     a single fsync per commit through the disk write cache; numbers depend\n\
+     on the platform's storage stack and are not portable across machine\n\
+     classes.\n"
 }
 
 fn lookup_scenario<'a>(
@@ -378,14 +375,12 @@ mod tests {
             "summary.md cross-link missing:\n{out}"
         );
         assert!(
-            out.contains("master bench spec"),
-            "master spec link missing:\n{out}"
+            out.contains("the architecture doc"),
+            "architecture link missing:\n{out}"
         );
         assert!(
-            out.contains(
-                "../../../docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md"
-            ),
-            "master spec relative path wrong:\n{out}"
+            out.contains("../../../ARCHITECTURE.md#benchmark-infrastructure"),
+            "architecture relative path wrong:\n{out}"
         );
     }
 }

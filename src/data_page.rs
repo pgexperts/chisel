@@ -160,7 +160,7 @@ impl DataPage {
     // indices monotonically increasing and stable for the page's lifetime
     // (until compact() renumbers them).
     //
-    // Note (v1 simplification per CLAUDE.md): the transaction layer calls
+    // Note (v1 simplification per ARCHITECTURE.md): the transaction layer calls
     // PageCache::new_page() for every insert rather than scanning existing
     // pages for free slots. Intentional, not a bug — this function itself is
     // correct; it's just underutilized.

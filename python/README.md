@@ -299,4 +299,4 @@ Files written by prior development builds (pre-1.0 flat `format_version`, which 
 
 ## Design
 
-See the [Python interface design spec](../docs/superpowers/specs/2026-04-14-chisel-python-interface-design.md) for the full rationale behind the API surface, error hierarchy, and Transaction / Savepoint lifecycle. The underlying Rust engine is documented in [`../README.md`](../README.md) and [`../docs/superpowers/specs/2026-04-09-chisel-storage-engine-design.md`](../docs/superpowers/specs/2026-04-09-chisel-storage-engine-design.md).
+The underlying Rust engine is documented in [`../README.md`](../README.md) and [`../ARCHITECTURE.md`](../ARCHITECTURE.md). The Python binding mirrors the Rust API but adds context managers for transactions and savepoints; the error hierarchy mirrors `ChiselError` directly with operational vs fatal tiers.

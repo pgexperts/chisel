@@ -1,6 +1,6 @@
 # Chisel — Architecture and On-Disk Format
 
-This document is for someone (human or AI) reading the Chisel codebase for the first time. It explains *how* Chisel is laid out, *why* the layers stack the way they do, and what every byte on disk means. For *what Chisel does* and how to use it, see [`README.md`](README.md). For the running decision log — open issues, closed issues, every design tradeoff with date-stamped rationale — see [`ISSUES.md`](ISSUES.md). For deeper write-ups frozen at decision time, see [`docs/superpowers/specs/`](docs/superpowers/specs/).
+This document is for someone (human or AI) reading the Chisel codebase for the first time. It explains *how* Chisel is laid out, *why* the layers stack the way they do, and what every byte on disk means. For *what Chisel does* and how to use it, see [`README.md`](README.md). For the running decision log — open issues, closed issues, every design tradeoff with date-stamped rationale — see [`ISSUES.md`](ISSUES.md).
 
 This is a living document; update it when the architecture changes. Decisions documented here should be supportable by the code at the time you read it — if a claim and the code disagree, trust the code and update the doc.
 
@@ -30,7 +30,7 @@ These three together explain most of Chisel's other choices (poison model, per-m
 
 ## Layer model
 
-Chisel's modules form a strict bottom-up dependency graph: each layer only depends on layers below it, never sideways or upward. The diagram is the same one in [`CLAUDE.md`](CLAUDE.md), expanded with the responsibility of each module.
+Chisel's modules form a strict bottom-up dependency graph: each layer only depends on layers below it, never sideways or upward. The diagram below is annotated with the responsibility of each module.
 
 ```mermaid
 flowchart BT
@@ -429,7 +429,15 @@ The radix-tree indirection means values can move freely on disk — `update()` t
 
 Chisel does not have a centralized COW abstraction. Each layer-4 / layer-5 module that mutates pages (handle_table, freemap during persist) implements COW by allocating fresh pages via `PageCache::new_page`, writing the new state into the new pages, and returning the new root id to the caller. The previously-committed page is left untouched on disk; it remains valid and reachable through the previously-committed superblock for the entire duration of the new transaction.
 
-This per-module pattern is deliberate (see CLAUDE.md). A monolithic COW abstraction was considered and rejected — it would have forced every page-type module to express its mutations through a uniform interface, and the modules' actual COW shapes are different enough (handle table walks a tree; freemap rewrites one page; data pages reuse the same page across multiple commits via `claim_page`) that a generic interface would have leaked detail.
+This per-module pattern is deliberate. A monolithic COW abstraction was considered and rejected — it would have forced every page-type module to express its mutations through a uniform interface, and the modules' actual COW shapes are different enough (handle table walks a tree; freemap rewrites one page; data pages reuse the same page across multiple commits via `claim_page`) that a generic interface would have leaked detail.
+
+### Spillway
+
+The page cache enforces a strict cap (`Options::cache_max_bytes`). When the cache is full and every entry is dirty (so nothing is evictable), overflow dirty pages spill to a sidecar file `<db_path>.spillway` rather than returning `CacheFull`. The spillway is bounded by `Options::spillway_max_bytes` (default `1024 × cache_max_bytes` = 8 GiB at the 8 MiB cache default); `SpillwayFull { limit_bytes }` fires when both the cache and the spillway are exhausted. Setting `spillway_max_bytes = 0` disables the spillway and restores `CacheFull`-at-cap semantics.
+
+Spillway slots carry their own per-slot XXH3 checksum over `page_id || page_bytes`, distinct from the main-file page checksum, so a corrupt spillway slot is detected on rehydrate. The spillway is never `fsync`ed — its content does not need to survive a crash; it's truncated at open and at every commit/rollback. A crash with a non-empty spillway just discards its contents on the next open, which is correct because anything in the spillway was uncommitted dirty state.
+
+The no-spill commit cost is **3 fsyncs**: pre-drain flush (I28) + main-pages flush + superblock. The pre-drain handles a subtle interaction in the commit protocol (see [Commit protocol](#commit-protocol) step 1).
 
 ### Slot packing and overflow
 
@@ -483,6 +491,30 @@ Chisel versions its on-disk format at two levels.
 - **Page level** (I31): each non-superblock page carries a one-byte `page_format_version` in its header (byte 1 for Data/Overflow/FreeMap; byte 2 for HandleTable, where byte 1 holds the FLAG byte). This lets individual page layouts evolve within a major without a file-wide bump. The current value is `0` everywhere. The post-1.0 upgrade plan is lazy migration: reads dispatch on the version byte, writes always produce the latest version, and an opt-in eager upgrader (deferred) sweeps remaining old pages.
 
 Both schemes leave reserved space for forward compatibility — the superblock has bytes 312..8184 reserved (a lot of headroom), and every non-superblock page has bytes 8..16 reserved (8 bytes / 64 bits) for future common-header fields.
+
+---
+
+## Benchmark infrastructure
+
+The `bench/` subcrate is a sibling to `python/`, not a workspace member of the root `chisel` crate. It provides three measurement layers comparing Chisel against [redb](https://github.com/cberner/redb) and SQLite:
+
+1. **Cross-engine equivalence tests** — five scenarios × three engines × snapshot/restore checks, asserting that all three engines produce identical observable state for the same workload. Catches semantic divergence in the workload-replay machinery before it contaminates measurement.
+2. **Criterion micro-grid** — six rows of small-scoped operations (single-tx allocate, point-read, single-tx update at small batch sizes), 165 cells of wall-clock + file-size + Chisel-internal-counter metrics. Drives the `Engine` trait through tight loops.
+3. **YCSB-style scenario tier** — four end-to-end workloads (YCSB-A 50/50 read/update Zipfian; YCSB-B 95/5 read-heavy Zipfian; Mutation Log 25/25/25/25 alloc/read/update/delete uniform; Document Store 70/20/10 read/alloc/update with log-normal sizes). Timed with `Instant::now()` rather than Criterion — Criterion's many-samples-per-bench model exceeds the 1-6 minute scenario budget.
+
+A post-processor (`chisel-bench-summarize`) reads scenario metrics + Criterion archive data and emits three artifacts: per-cell `summary.md`, flat `results.json` (composite-key schema for the CI diff binary), and `cross-engine.md` (a per-metric Chisel/redb/SQLite comparison: throughput, p99 latency, file size). A diff binary (`chisel-bench-diff`) consumes two `results.json` files and posts a sticky regression-report comment on each PR.
+
+### macOS fsync semantics
+
+On macOS, Chisel calls `fcntl(F_FULLFSYNC)` via Rust's `sync_all` — durable through the disk's write cache. SQLite's default `fsync()` on macOS only flushes to the disk's write cache without `F_FULLFSYNC`, so unmodified `SqliteEngine` runs ~3 orders of magnitude faster than `ChiselEngine` on `Strict` durability. The bench harness closes this gap by issuing `PRAGMA fullfsync=ON` in `SqliteEngine::open_file` for `Strict` mode (no `#[cfg(target_os)]` gate — Linux ignores the pragma). With the fix, both engines pay the same per-commit `F_FULLFSYNC` cost on macOS, and Linux runs are unchanged.
+
+Without the fix, comparing chisel-strict vs sqlite-strict on macOS measures Apple-vs-Apple disk-cache semantics, not engine performance. With the fix, the comparison reflects the engines themselves.
+
+### Counter-driven measurement
+
+Engine activity is observable via `Chisel::counters()` (cumulative-from-open: cache hits/misses, pages allocated, fsyncs). The micro-grid records counter snapshots before/after each cell so the post-processor can attribute throughput differences to fsync count, cache pressure, or page-allocation rate. This is why `ChiselCounters` is `#[non_exhaustive]` — the bench harness reads these via the public API, but additional counters can be added without a breaking change.
+
+The asymmetry "fsync_calls counts only successes; everything else counts attempts" matters here: a `CacheFull` allocation still bumps `pages_allocated`, but a failed fsync poisons the engine and stops counter increments. The bench harness handles poisoning by aborting that cell rather than fudging the numbers.
 
 ---
 
