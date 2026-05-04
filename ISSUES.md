@@ -339,6 +339,17 @@ When every cached entry was dirty, the eviction loop broke out and the cache sil
 
 **Fix:** added a `HARD_CEILING_MULTIPLIER` constant (currently 8×) and a check at the end of `maybe_evict` that returns the new operational `ChiselError::CacheFull { limit }` once `entries.len()` exceeds `max_pages * HARD_CEILING_MULTIPLIER`. The soft-limit semantics for `max_pages` are unchanged — write-heavy transactions can still grow past it — but runaway growth now trips a recoverable error. Caller recovery is to commit (which flushes, freeing the dirty pin) or roll back. The Python binding gets a parallel `CacheFullError` in the OperationalError tier. Tests `cache_full_fires_when_all_pages_dirty_past_hard_ceiling` and `cache_full_is_recoverable_via_flush` in `page_cache.rs` cover trigger and recovery; `fresh_manager`'s test cache size in `transaction.rs` was bumped from 64 to 1024 so existing high-allocation tests stay well under the new ceiling.
 
+**SUPERSEDED 2026-05-04** by the spillway design (spec
+`docs/superpowers/specs/2026-05-03-chisel-spillway-design.md`). The
+`HARD_CEILING_MULTIPLIER` constant is removed; the cache is now a
+strict bound (`Options::cache_max_bytes`); overflow dirty pages
+spill to a sidecar `Spillway` file capped at
+`Options::spillway_max_bytes`. The pre-existing `CacheFull` variant
+remains operational and now fires only when the spillway is
+disabled (`spillway_max_bytes = 0`) at the strict cache cap. New
+operational error `SpillwayFull { limit_bytes }` fires when both
+cache and spillway are exhausted.
+
 ### I20. `PageCache::claim_page` silently discards dirty writes on re-insertion [comment-pass 2026-04-17] — **P3** ✅ FIXED 2026-04-17
 **Where:** `page_cache.rs` `claim_page`
 
@@ -364,7 +375,7 @@ In practice the window is narrow: the transaction has to be at the hard ceiling 
 ### I34. mmap-backed shadow page cache region [client 2026-04-30] — **P3** (deferred design)
 **Where:** `page_cache.rs` (cache storage backing)
 
-**Problem:** Today's `PageCache` stores pages as `Box<[u8; PAGE_SIZE]>` heap allocations indexed by `HashMap<u64, CacheEntry>`. Memory is process RSS, capped by the soft `max_pages` limit and the `max_pages × HARD_CEILING_MULTIPLIER` hard ceiling (default 64 MB at `cache_size=1024`). Workloads with working sets larger than the hard ceiling either need the user to crank `cache_size` up (consuming proportional RSS) or accept high cache-miss rates against the database file.
+**Problem:** Today's `PageCache` stores pages as `Box<[u8; PAGE_SIZE]>` heap allocations indexed by `HashMap<u64, CacheEntry>`. Memory is process RSS, capped by `Options::cache_max_bytes` (default 8 MiB). Workloads with working sets larger than the cache cap either need the user to raise `cache_max_bytes` (consuming proportional RSS) or accept high cache-miss rates against the database file. (Note: as of 2026-05-04 the cache is no longer elastic — `cache_max_bytes` is a strict cap; the spillway sidecar handles overflow dirty pages via `Options::spillway_max_bytes`. The deferred mmap design replaces the cache storage backing itself, not the spillway, so the design here remains valid; only the per-`PageCache` memory ceiling math needs adjustment to reference `cache_max_bytes` instead of the removed `max_pages × HARD_CEILING_MULTIPLIER`.)
 
 **Proposed design:** Keep the cache logic unchanged — `HashMap<u64, CacheEntry>`, `LruIndex`, `dirty_count`, hit/miss counters. Replace the `Box<[u8; PAGE_SIZE]>` storage with offsets into an mmap'd region backed by a separate ephemeral file:
 

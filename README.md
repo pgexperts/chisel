@@ -179,14 +179,16 @@ For tuned options (cache size, superblock count), use `Chisel::open_in_memory_wi
 use chisel::Options;
 
 let options = Options {
-    cache_size: 1024,        // pages in the LRU, 8 KB each → 8 MB default
+    cache_max_bytes: 8 * 1024 * 1024,           // in-memory LRU cap, default 8 MiB
+    spillway_max_bytes: 1024 * 8 * 1024 * 1024, // sidecar overflow file cap, default 8 GiB
+    drain_insertion: chisel::DrainInsertion::LruTail, // default; use Mru to drain at insertion
     create_if_missing: true,
     read_only: false,
-    superblock_count: 2,     // 2..=16; only consulted on create
+    superblock_count: 2,                         // 2..=16; only consulted on create
 };
 ```
 
-`cache_size` is a count of pages, not bytes. The cache is a soft limit: a single transaction can grow past it while dirty pages pin eviction. A hard ceiling of `cache_size × 8` protects against runaway growth by returning `CacheFull` (operational; caller recovers via commit or rollback).
+`cache_max_bytes` is a strict cap on the in-memory LRU cache. When the cache is full and a dirty page cannot be evicted, overflow dirty pages spill to a sidecar `Spillway` file rather than returning an error. The spillway file is bounded by `spillway_max_bytes` (default 8 GiB). Setting `spillway_max_bytes = 0` disables the spillway entirely, restoring the pre-spillway `CacheFull` semantics at the strict cache cap: the operational error `CacheFull` fires when the cache is full and no eviction is possible. With the spillway enabled, exhausting both the cache and the spillway returns `SpillwayFull { limit_bytes }` (also operational; caller recovers by committing or rolling back).
 
 `read_only = true` still acquires an exclusive `flock` — it only suppresses writes at the application layer. Two read-only opens cannot coexist on the same file. This is a deliberate choice: even a reader must block concurrent writers to keep the shadow-paging invariants intact.
 
@@ -198,7 +200,7 @@ let options = Options {
 
 **Operational errors** — the database is healthy; the caller made a mistake. Catch and continue.
 
-`InvalidHandle`, `NoActiveTransaction`, `TransactionAlreadyActive`, `SavepointNotFound`, `DuplicateSavepoint`, `ReadOnlyMode`, `FileNotFound`, `InvalidRootName`, `RootNameTableFull`, `InvalidSuperblockCount`, `CacheFull`.
+`InvalidHandle`, `NoActiveTransaction`, `TransactionAlreadyActive`, `SavepointNotFound`, `DuplicateSavepoint`, `ReadOnlyMode`, `FileNotFound`, `InvalidRootName`, `RootNameTableFull`, `InvalidSuperblockCount`, `CacheFull`, `SpillwayFull`.
 
 **Fatal errors** — storage integrity is in question. Drop the handle and reopen.
 
