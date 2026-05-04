@@ -179,26 +179,20 @@ fn compare_metric(
         }
     };
     match (baseline, pr) {
-        (None, None) => MetricDelta {
+        (None, None) => unreachable!(
+            "compare_metric: both sides None; key came from the union so at least one must be Some"
+        ),
+        (Some(b), None) => MetricDelta {
             metric,
-            baseline: None,
-            pr: None,
-            delta_pct: None,
-            // Both sides missing — shouldn't happen since the union of
-            // keys is non-empty for every iteration. Treat as unchanged.
-            status: DeltaStatus::Unchanged,
-        },
-        (Some(_), None) => MetricDelta {
-            metric,
-            baseline: baseline.map(extract),
+            baseline: Some(extract(b)),
             pr: None,
             delta_pct: None,
             status: DeltaStatus::PrMissing,
         },
-        (None, Some(_)) => MetricDelta {
+        (None, Some(p)) => MetricDelta {
             metric,
             baseline: None,
-            pr: pr.map(extract),
+            pr: Some(extract(p)),
             delta_pct: None,
             status: DeltaStatus::BaselineMissing,
         },
