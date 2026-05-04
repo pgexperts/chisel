@@ -216,6 +216,15 @@ impl Spillway {
         self.slots.remove(&page_id);
     }
 
+    /// Drop every resident page id >= `n` from the spillway. Matches
+    /// `PageCache::truncate(n)` semantics: anything past the watermark
+    /// is gone. Slot indices are NOT reused mid-transaction, so this
+    /// just removes from the resident-set; the corresponding bytes in
+    /// the file become garbage that the next `truncate()` reclaims.
+    pub fn forget_above(&mut self, n: u64) {
+        self.slots.retain(|&page_id, _| page_id < n);
+    }
+
     /// Read the slot for `page_id`, verify the per-slot checksum, return
     /// the bytes. Returns `ChecksumMismatch { page_id }` (fatal) on a
     /// torn write — caller poisons the transaction. Returns
@@ -477,6 +486,21 @@ mod tests {
         assert_eq!(batch.len(), 3);
         for id in &batch {
             assert!((100..105).contains(id), "unexpected id {id} in batch");
+        }
+    }
+
+    #[test]
+    fn forget_above_drops_high_ids_only() {
+        let mut spw = Spillway::open_memory(SLOT_SIZE as u64 * 8);
+        for id in 0..6 {
+            spw.spill(id, &page(id as u8)).unwrap();
+        }
+        spw.forget_above(3);
+        for id in 0..3 {
+            assert!(spw.is_resident(id), "low id {id} should still be resident");
+        }
+        for id in 3..6 {
+            assert!(!spw.is_resident(id), "high id {id} should be gone");
         }
     }
 
