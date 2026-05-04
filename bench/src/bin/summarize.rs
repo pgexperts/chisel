@@ -8,7 +8,7 @@
 
 use chisel_bench::summary::{
     copy_raw_archive, discover_cells, gather_metadata, load_scenarios_jsonl, render_json,
-    render_markdown,
+    render_markdown, DiscoverError,
 };
 use clap::Parser;
 use std::path::PathBuf;
@@ -47,7 +47,21 @@ fn main() -> std::process::ExitCode {
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Discover cells (micro grid) and load scenarios (PR 6).
-    let cells = discover_cells(&cli.criterion, &cli.aux)?;
+    //
+    // discover_cells errors when the Criterion directory is missing or
+    // empty. When the user has scenarios but hasn't run the micro grid
+    // (a legitimate workflow once the tiers diverged), absorb those two
+    // error variants as "no cells" and let the unified empty-check
+    // below decide whether to bail. Other errors (I/O, parse) still
+    // propagate.
+    // DiscoverError has only the CriterionDirNotFound / NoCellsFound
+    // variants today; if a new variant is added later, this match will
+    // fail to compile and force an explicit decision rather than
+    // silently swallowing it.
+    let cells = match discover_cells(&cli.criterion, &cli.aux) {
+        Ok(cells) => cells,
+        Err(DiscoverError::CriterionDirNotFound(_) | DiscoverError::NoCellsFound(_)) => Vec::new(),
+    };
     let scenarios = load_scenarios_jsonl(&cli.scenarios);
     if cells.is_empty() && scenarios.is_empty() {
         return Err("no cells or scenarios discovered — did you run cargo bench?".into());
