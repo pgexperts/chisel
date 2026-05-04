@@ -26,16 +26,16 @@
 //   does NOT rewind it (see the note in `discard`); orphaned page IDs are
 //   acceptable because they are reclaimed by the freemap after commit or
 //   simply re-truncated.
-// - The cache is a SOFT limit with a HARD ceiling. `load_page` evicts
-//   before insertion; `new_page` evicts after insertion, so a single
-//   allocation can transiently push the map to `max_pages + 1`. When
-//   every page in the cache is dirty, `maybe_evict` cannot evict anyone
-//   and the cache legitimately grows past `max_pages` — but only up to
-//   `max_pages * HARD_CEILING_MULTIPLIER` (default 8×), after which it
-//   returns `ChiselError::CacheFull` rather than exhaust memory. See
-//   I19 for the design. Recovery from `CacheFull` is to commit or roll
-//   back the transaction; commit itself pre-drains the cache (I28) so
-//   `CacheFull` cannot arise on the commit path.
+// - The cache is a STRICT bound with sidecar overflow. `load_page` evicts
+//   before insertion; `new_page` evicts after insertion. When every page
+//   in the cache is dirty, `maybe_evict` spills the LRU-tail dirty page
+//   to the `Spillway` sidecar file rather than growing the cache.
+//   `spillway_max_bytes` caps the spillway file; `SpillwayFull` is the
+//   operational error if both cache and spillway are exhausted. With
+//   `spillway_max_bytes = 0`, the spillway is disabled and `CacheFull`
+//   fires at the strict cache cap (no elasticity, no spilling). The
+//   pre-spillway 8× HARD_CEILING_MULTIPLIER design is gone — see spec
+//   2026-05-03-chisel-spillway-design.md.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -46,19 +46,13 @@ use crate::page::{self, PAGE_SIZE};
 use crate::page_io::PageIo;
 use crate::stats::ChiselCounters;
 
-// Hard-ceiling multiplier on `max_pages` (ISSUES.md I19). The cache's
-// soft limit — `max_pages` — is the working-set target; dirty pages
-// pin themselves against eviction, so a single transaction can
-// legitimately push the cache over the soft limit. But unbounded
-// growth is an OOM hazard; this multiplier caps how far over the soft
-// limit the cache may grow with every entry dirty before `maybe_evict`
-// surfaces `ChiselError::CacheFull` and forces the caller to commit
-// or roll back. 8× is a defensive default: generous enough that
-// normal write-heavy workloads never see it, small enough that a
-// pathological or runaway transaction trips the brake within seconds
-// rather than megabytes of memory. Not currently configurable; expose
-// via `Options` if a real workload needs to tune it.
-const HARD_CEILING_MULTIPLIER: usize = 8;
+// Cache size discipline (replaces the pre-spillway HARD_CEILING_MULTIPLIER):
+// `max_pages` is now a strict upper bound. Overflow dirty pages are spilled
+// to a sidecar `Spillway` file rather than growing the cache. Workloads
+// that explicitly want the legacy "fail fast at the cache ceiling" semantics
+// can set Options::spillway_max_bytes = 0; CacheFull then fires at
+// max_pages itself, with no elasticity. See spec
+// 2026-05-03-chisel-spillway-design.md.
 
 struct CacheEntry {
     buf: Box<[u8; PAGE_SIZE]>,
@@ -92,8 +86,6 @@ pub struct PageCache {
     /// (excluding per-slot headers). 0 means spillway disabled —
     /// overflow trips CacheFull at the cache cap. Set via Options;
     /// runtime-mutable between transactions via set_spillway_max_bytes.
-    /// (Activated in Task 9; until then, dead_code is suppressed.)
-    #[allow(dead_code)]
     spillway_max_bytes: u64,
     /// LRU position policy for commit-drain rehydrated pages. Captured
     /// from Options at construction; runtime-mutable between
@@ -104,13 +96,9 @@ pub struct PageCache {
     /// How to lazily open the spillway when a first spill happens. Held
     /// here rather than opening eagerly because no-spill workloads
     /// shouldn't pay any filesystem cost for a feature they never use.
-    /// (Activated with the spillway in Task 9.)
-    #[allow(dead_code)]
     spillway_location: crate::SpillwayLocation,
     /// Lazily-initialized spillway. None until the first spill needs it.
-    /// (Activated in Task 9.)
-    #[allow(dead_code)]
-    spillway: Option<crate::spillway::Spillway>,
+    pub(crate) spillway: Option<crate::spillway::Spillway>,
     // Monotonically increasing allocator for shadow-paged new pages. Never
     // reused within a process lifetime except via `truncate()`.
     next_page_id: u64,
@@ -633,45 +621,31 @@ impl PageCache {
         self.lru.push_front(page_id);
     }
 
-    /// Evict clean pages from the LRU tail until we're under `max_pages`.
+    /// Enforce the strict `max_pages` cap, evicting or spilling as needed.
     ///
-    /// Walks the LRU deque from back (least recent) toward front looking
-    /// for the first CLEAN entry. Dirty pages are skipped entirely: they
-    /// are pinned until the next `flush()`, which is the cache's
-    /// contribution to shadow-paging correctness — a dirty page written
-    /// out early would not have a committed superblock pointing at it, so
-    /// losing it to eviction would lose the transaction's work.
+    /// Phase A: evict clean LRU-tail entries until we are within the cap.
+    /// Dirty pages are skipped — they are pinned until `flush()` writes
+    /// them as part of commit. The `dirty_count` short-circuit avoids an
+    /// O(n) LRU walk on every allocation in a write-heavy transaction
+    /// where all entries are dirty and no victim exists.
     ///
-    /// Termination: if every cached page is dirty we break out of the
-    /// loop and deliberately exceed `max_pages`. This is a SOFT limit
-    /// on the working-set size, not a hard cap on memory. Write-heavy
-    /// transactions can legitimately push the cache well past
-    /// `max_pages` between flushes.
+    /// Phase B: if we are still over the cap and every entry is dirty,
+    /// spill the LRU-tail dirty page to the spillway sidecar file. This
+    /// keeps the cache at exactly `max_pages` rather than letting it grow
+    /// without bound. With `spillway_max_bytes == 0` (spillway disabled),
+    /// `CacheFull` fires immediately at the strict cap — the pre-spillway
+    /// 8× HARD_CEILING_MULTIPLIER elasticity is gone.
     ///
-    /// Hard ceiling (ISSUES.md I19): after the eviction loop settles,
-    /// if we are still above `max_pages * HARD_CEILING_MULTIPLIER`,
-    /// we raise `ChiselError::CacheFull`. This caps runaway growth in
-    /// pathological workloads (a long transaction that allocates
-    /// pages in a loop without committing) while preserving the
-    /// soft-limit semantics for normal use. The caller recovers by
-    /// committing (flushes → pages become evictable) or rolling back
-    /// (discards all dirty pages).
-    ///
-    /// The `is_none_or(|e| e.dirty)` is awkward: it returns true if the
-    /// entry is missing OR dirty, so `!` flips to "entry exists AND is
-    /// clean". The missing-entry branch should never fire in practice
-    /// (the LRU and the map are meant to stay in sync) but guards against
-    /// a stale LRU id.
+    /// `is_none_or(|e| e.dirty)` is awkward: it returns true when the
+    /// entry is missing OR dirty, so `!` means "entry exists AND is clean".
+    /// The missing-entry branch guards against a stale LRU id; it should
+    /// never fire in practice because the LRU and the map stay in sync.
     fn maybe_evict(&mut self) -> Result<()> {
+        // Phase A: evict clean LRU-tail entries until we fit, exactly
+        // as before.
         while self.entries.len() > self.max_pages {
-            // Short-circuit: if every cached entry is dirty there can be
-            // no eviction victim, so don't bother walking the LRU. This
-            // is the common case during write-heavy transactions, where
-            // the unconditional walk was an O(n) cost on every
-            // page allocation. With `dirty_count` maintained on every
-            // dirty-flag transition we can decide in O(1).
             if self.dirty_count == self.entries.len() {
-                break;
+                break; // Phase B handles this — every entry is dirty.
             }
             let victim = self
                 .lru
@@ -682,17 +656,41 @@ impl PageCache {
                     self.entries.remove(&id);
                     self.lru.remove(id);
                 }
-                None => break, // Should be unreachable given the short-circuit
-                               // above, but kept defensively in case dirty_count
-                               // ever drifts from the truth (debug_assert in
-                               // tests catches drift; release falls back here).
+                None => break,
             }
         }
-        let hard_ceiling = self.max_pages.saturating_mul(HARD_CEILING_MULTIPLIER);
-        if self.entries.len() > hard_ceiling {
-            return Err(ChiselError::CacheFull {
-                limit: hard_ceiling,
-            });
+
+        // Phase B: still over the cap and every entry is dirty? Spill
+        // the LRU-tail dirty page to the spillway. If the spillway is
+        // disabled (spillway_max_bytes == 0), surface CacheFull at the
+        // strict cache cap (no 8× elasticity).
+        while self.entries.len() > self.max_pages {
+            if self.spillway_max_bytes == 0 {
+                return Err(ChiselError::CacheFull {
+                    limit: self.max_pages,
+                });
+            }
+            // Find the LRU-tail dirty page (every entry is dirty here,
+            // so iter_lru_to_mru's first item is the right victim).
+            let victim_id = match self.lru.iter_lru_to_mru().next() {
+                Some(id) => id,
+                None => break, // Should be unreachable when entries.len() > 0.
+            };
+            // Lift the page bytes out of the cache before calling into
+            // ensure_spillway (which borrows &mut self).
+            let entry = self
+                .entries
+                .remove(&victim_id)
+                .expect("LRU referenced page id not in entries");
+            self.lru.remove(victim_id);
+            // entry was dirty; preserve dirty_count's invariant.
+            self.dirty_count -= 1;
+
+            // Spill (may return SpillwayFull, in which case we DO NOT
+            // re-insert — the entry is dropped and the caller will
+            // observe SpillwayFull on this allocation).
+            let spw = self.ensure_spillway()?;
+            spw.spill(victim_id, &entry.buf)?;
         }
         Ok(())
     }
@@ -701,8 +699,6 @@ impl PageCache {
     /// the existing one. Returns SpillwayFull if `spillway_max_bytes`
     /// is 0 (spillway disabled by configuration); the caller must
     /// fall back to the legacy CacheFull path in that case.
-    /// (First caller arrives in Task 9.)
-    #[allow(dead_code)]
     fn ensure_spillway(&mut self) -> Result<&mut crate::spillway::Spillway> {
         if self.spillway_max_bytes == 0 {
             return Err(ChiselError::SpillwayFull { limit_bytes: 0 });
@@ -763,38 +759,26 @@ mod tests {
         )
     }
 
-    // Regression test for ISSUES.md I19. The cache is a SOFT limit by
-    // design: when every cached entry is dirty, `maybe_evict` is forced
-    // to break out of its eviction loop and let the cache grow past
-    // `max_pages`. Pre-I19 there was no upper bound at all, so a
-    // long-running transaction that allocated many `new_page()`s
-    // without flushing could exhaust memory silently. I19 adds a hard
-    // ceiling — currently `max_pages * HARD_CEILING_MULTIPLIER` — that
-    // trips `ChiselError::CacheFull` once exceeded, forcing the caller
-    // to commit (which flushes, enabling eviction) or roll back. This
-    // is an OPERATIONAL error, not fatal: the cache state is internally
-    // consistent and the caller can recover by splitting their work
-    // into smaller transactions.
+    // Regression test for spec §"Failure surface" — when spillway is
+    // disabled (max_bytes = 0), CacheFull fires at the strict cache
+    // cap, with no elasticity. (Replaces the pre-spillway test that
+    // exercised the 8× HARD_CEILING_MULTIPLIER.)
     #[test]
-    fn cache_full_fires_when_all_pages_dirty_past_hard_ceiling() {
+    fn cache_full_fires_at_strict_cap_when_spillway_disabled() {
         let max_pages = 4;
         let mut cache = fresh_cache(max_pages);
-        let hard_ceiling = max_pages * HARD_CEILING_MULTIPLIER;
-
-        // Allocate up to the ceiling. Every `new_page()` produces a
-        // DIRTY entry, so the LRU eviction loop can never evict.
-        for _ in 0..hard_ceiling {
+        // fresh_cache sets spillway_max_bytes = 0, so we should hit
+        // CacheFull at max_pages exactly, not 8 × max_pages.
+        for _ in 0..max_pages {
             cache
                 .new_page()
-                .expect("allocations up to the ceiling must succeed");
+                .expect("allocations up to the strict cap must succeed");
         }
-        assert_eq!(cache.entries.len(), hard_ceiling);
-
-        // The next new_page must trip CacheFull.
+        assert_eq!(cache.entries.len(), max_pages);
         let err = cache.new_page().unwrap_err();
         assert!(
-            matches!(err, ChiselError::CacheFull { limit } if limit == hard_ceiling),
-            "expected CacheFull {{ limit: {hard_ceiling} }}, got {err:?}"
+            matches!(err, ChiselError::CacheFull { limit } if limit == max_pages),
+            "expected CacheFull {{ limit: {max_pages} }}, got {err:?}"
         );
     }
 
@@ -806,25 +790,72 @@ mod tests {
     fn cache_full_is_recoverable_via_flush() {
         let max_pages = 4;
         let mut cache = fresh_cache(max_pages);
-        let hard_ceiling = max_pages * HARD_CEILING_MULTIPLIER;
-
-        for _ in 0..hard_ceiling {
+        for _ in 0..max_pages {
             cache.new_page().unwrap();
         }
         assert!(matches!(
             cache.new_page(),
             Err(ChiselError::CacheFull { .. })
         ));
-
-        // Flush clears every dirty flag. The next maybe_evict can then
-        // reclaim capacity by evicting clean pages from the LRU tail.
         cache.flush().unwrap();
-        // After flush, the cache is still at hard_ceiling entries but
-        // all clean; the next new_page evicts one and succeeds.
         cache
             .new_page()
             .expect("post-flush allocation should succeed");
-        assert!(cache.entries.len() <= hard_ceiling);
+        assert!(cache.entries.len() <= max_pages);
+    }
+
+    /// New cache helper that ENABLES the spillway. Used by spillway-
+    /// path tests; existing tests use fresh_cache (spillway disabled)
+    /// to preserve their CacheFull semantics.
+    fn fresh_cache_with_spillway(max_pages: usize, spillway_max_bytes: u64) -> PageCache {
+        let file = NamedTempFile::new().unwrap();
+        let io = PageIo::open(file.path(), false).unwrap();
+        std::mem::forget(file);
+        let cache_max_bytes = max_pages as u64 * PAGE_SIZE as u64;
+        PageCache::new(
+            io,
+            cache_max_bytes,
+            spillway_max_bytes,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        )
+    }
+
+    #[test]
+    fn dirty_overflow_spills_when_spillway_enabled() {
+        let max_pages = 4;
+        // Spillway has room for 8 spilled pages.
+        let spillway_bytes = 8 * PAGE_SIZE as u64;
+        let mut cache = fresh_cache_with_spillway(max_pages, spillway_bytes);
+        // Allocate 8 dirty pages — 4 in cache, 4 spilled.
+        for _ in 0..8 {
+            cache
+                .new_page()
+                .expect("allocations should spill, not fail");
+        }
+        // Cache is at its strict cap.
+        assert_eq!(cache.entries.len(), max_pages);
+        // Spillway holds the overflow.
+        let spw = cache.spillway.as_ref().unwrap();
+        assert_eq!(spw.slot_count(), 4);
+    }
+
+    #[test]
+    fn spillway_full_fires_when_both_cache_and_spillway_exhausted() {
+        let max_pages = 4;
+        // Spillway has room for 4 spilled pages — 8 total dirty pages
+        // possible before SpillwayFull.
+        let spillway_bytes = 4 * PAGE_SIZE as u64;
+        let mut cache = fresh_cache_with_spillway(max_pages, spillway_bytes);
+        for _ in 0..(max_pages + 4) {
+            cache.new_page().unwrap();
+        }
+        // The 9th allocation must trip SpillwayFull.
+        let err = cache.new_page().unwrap_err();
+        assert!(
+            matches!(err, ChiselError::SpillwayFull { limit_bytes } if limit_bytes == spillway_bytes),
+            "expected SpillwayFull {{ limit_bytes: {spillway_bytes} }}, got {err:?}"
+        );
     }
 
     // Regression test for ISSUES.md I20. claim_page previously silently
