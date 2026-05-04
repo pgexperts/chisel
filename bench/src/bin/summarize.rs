@@ -57,7 +57,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // DiscoverError has only the CriterionDirNotFound / NoCellsFound
     // variants today; if a new variant is added later, this match will
     // fail to compile and force an explicit decision rather than
-    // silently swallowing it.
+    // silently swallowing it. unwrap_or_default() would silently swallow
+    // any future new variant, so we suppress the lint here.
+    #[allow(clippy::manual_unwrap_or_default)]
     let cells = match discover_cells(&cli.criterion, &cli.aux) {
         Ok(cells) => cells,
         Err(DiscoverError::CriterionDirNotFound(_) | DiscoverError::NoCellsFound(_)) => Vec::new(),

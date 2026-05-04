@@ -182,6 +182,7 @@ dependencies = [
  "rand_chacha",
  "rand_distr",
  "redb",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
