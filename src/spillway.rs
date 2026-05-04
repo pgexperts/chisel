@@ -111,9 +111,14 @@ impl Spillway {
         self.slots.contains_key(&page_id)
     }
 
-    /// Number of slots currently allocated (residents).
+    /// Number of resident pages (page_ids currently mapped to a slot).
+    /// On re-spill of an already-resident page, this stays unchanged
+    /// (the slot is overwritten in place); on truncate, this drops to 0.
+    /// Distinct from `next_slot_index` which is the high-water mark for
+    /// slot allocation in the on-disk file (used internally for
+    /// `logical_bytes` accounting).
     pub fn slot_count(&self) -> u64 {
-        self.next_slot_index
+        self.slots.len() as u64
     }
 
     /// Logical size in bytes (excludes per-slot headers).

@@ -161,10 +161,19 @@ impl fmt::Display for ChiselError {
                 f,
                 "page cache full: {limit} dirty pages held; commit or roll back to free cache"
             ),
-            ChiselError::SpillwayFull { limit_bytes } => write!(
-                f,
-                "spillway full: {limit_bytes}-byte limit reached; commit or roll back to free cache and spillway"
-            ),
+            ChiselError::SpillwayFull { limit_bytes } => {
+                if *limit_bytes == 0 {
+                    write!(
+                        f,
+                        "spillway is disabled (spillway_max_bytes=0); commit or roll back to free cache"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "spillway full: {limit_bytes}-byte limit reached; commit or roll back to free cache and spillway"
+                    )
+                }
+            },
             ChiselError::TransactionInProgress => write!(
                 f,
                 "configuration changes are only allowed between transactions; commit or roll back first"
