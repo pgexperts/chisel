@@ -159,6 +159,58 @@ impl Spillway {
         Ok(())
     }
 
+    /// Clear all slots, reset the resident-set, and shrink the backing
+    /// to zero bytes. Called at every commit (after drain) and every
+    /// rollback. The spillway holds no live content between
+    /// transactions.
+    // Task 11 activates this at commit-drain; Task 12 at rollback.
+    #[allow(dead_code)]
+    pub fn truncate(&mut self) -> Result<()> {
+        self.slots.clear();
+        self.next_slot_index = 0;
+        match &mut self.backing {
+            Backing::File { file, .. } => {
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
+            }
+            Backing::Memory { bytes } => {
+                bytes.clear();
+            }
+        }
+        Ok(())
+    }
+
+    /// Pop a batch of up to `batch_size` page_ids out of the resident
+    /// set without dropping the file content. The PageCache drain reads
+    /// each pair, rehydrates the page, then flushes it to the main
+    /// file. After all batches are processed, `truncate()` is called
+    /// to shrink the spillway.
+    ///
+    /// Order is unspecified — HashMap iteration order is not stable.
+    /// The drain doesn't need a particular order; one batch's
+    /// rehydrates all flush together with later batches under a
+    /// single fsync.
+    // Task 11 activates this in the commit-drain loop.
+    #[allow(dead_code)]
+    pub fn drain_batch(&mut self, batch_size: usize) -> Vec<u64> {
+        let mut ids = Vec::with_capacity(batch_size.min(self.slots.len()));
+        for &id in self.slots.keys().take(batch_size) {
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// Drop a single page_id from the resident-set after its bytes have
+    /// been rehydrated into the cache. The slot is NOT reused for new
+    /// allocations until the next `truncate` (mid-drain growth would
+    /// be a re-entrancy hazard); the file's tail bytes simply become
+    /// garbage and are reclaimed by `truncate`.
+    // Task 11 activates this in the commit-drain loop (after each rehydrate).
+    #[allow(dead_code)]
+    pub fn forget(&mut self, page_id: u64) {
+        self.slots.remove(&page_id);
+    }
+
     /// Read the slot for `page_id`, verify the per-slot checksum, return
     /// the bytes. Returns `ChecksumMismatch { page_id }` (fatal) on a
     /// torn write — caller poisons the transaction. Returns
@@ -390,5 +442,45 @@ mod tests {
             err,
             ChiselError::ChecksumMismatch { page_id: 100 }
         ));
+    }
+
+    #[test]
+    fn truncate_clears_residents_and_resets_index() {
+        let mut spw = Spillway::open_memory(SLOT_SIZE as u64 * 4);
+        spw.spill(100, &page(0xAA)).unwrap();
+        spw.spill(101, &page(0xBB)).unwrap();
+        assert_eq!(spw.slot_count(), 2);
+
+        spw.truncate().unwrap();
+        assert_eq!(spw.slot_count(), 0);
+        assert_eq!(spw.logical_bytes(), 0);
+        assert!(!spw.is_resident(100));
+        assert!(!spw.is_resident(101));
+
+        // After truncate, fresh spills allocate from index 0 again.
+        spw.spill(200, &page(0xCC)).unwrap();
+        assert_eq!(spw.slot_count(), 1);
+    }
+
+    #[test]
+    fn drain_batch_returns_resident_ids_up_to_batch_size() {
+        let mut spw = Spillway::open_memory(SLOT_SIZE as u64 * 8);
+        for id in 100..105 {
+            spw.spill(id, &page(id as u8)).unwrap();
+        }
+        let batch = spw.drain_batch(3);
+        assert_eq!(batch.len(), 3);
+        for id in &batch {
+            assert!((100..105).contains(id), "unexpected id {id} in batch");
+        }
+    }
+
+    #[test]
+    fn forget_drops_from_resident_set() {
+        let mut spw = Spillway::open_memory(SLOT_SIZE as u64 * 4);
+        spw.spill(100, &page(0xAA)).unwrap();
+        assert!(spw.is_resident(100));
+        spw.forget(100);
+        assert!(!spw.is_resident(100));
     }
 }
