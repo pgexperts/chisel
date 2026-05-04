@@ -374,4 +374,52 @@ mod tests {
             "ycsb-a (regressed) should sort before ycsb-b (clean):\nya_pos={ya_pos} yb_pos={yb_pos}\n{out}"
         );
     }
+
+    #[test]
+    fn missing_cell_renders_with_red_x_and_diff_incomplete_header() {
+        // Baseline has a scenario that PR doesn't (e.g. PR removed it).
+        let baseline = one_scenario("ycsb-a/chisel-strict", fixed_metrics());
+        let pr = ParsedResults::default();
+        let report = compare(
+            &baseline,
+            &pr,
+            PathBuf::from("b"),
+            PathBuf::from("p"),
+            now(),
+        );
+        let out = render_markdown(&report);
+
+        assert!(
+            out.contains("❗ Diff incomplete — see details below"),
+            "diff-incomplete header missing:\n{out}"
+        );
+        assert!(
+            out.contains("❌ ycsb-a / chisel-strict — missing on PR side"),
+            "missing-row marker missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn new_scenario_renders_with_question_mark_marker() {
+        // PR adds a scenario that baseline doesn't have.
+        let baseline = ParsedResults::default();
+        let pr = one_scenario("ycsb-c/chisel-strict", fixed_metrics());
+        let report = compare(
+            &baseline,
+            &pr,
+            PathBuf::from("b"),
+            PathBuf::from("p"),
+            now(),
+        );
+        let out = render_markdown(&report);
+
+        assert!(
+            out.contains("❗ Diff incomplete — see details below"),
+            "diff-incomplete header missing:\n{out}"
+        );
+        assert!(
+            out.contains("❓ ycsb-c / chisel-strict — new scenario, no baseline"),
+            "new-scenario marker missing:\n{out}"
+        );
+    }
 }
