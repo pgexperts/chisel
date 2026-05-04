@@ -1278,10 +1278,10 @@ mod tests {
         // fsync covering both in-cache and drained writes.
         cache.flush().unwrap();
 
-        // Spillway is now empty (truncated).
-        match cache.spillway.as_ref() {
-            Some(spw) => assert_eq!(spw.slot_count(), 0, "spillway must be empty after flush"),
-            None => {} // Acceptable if spillway was never opened.
+        // Spillway is now empty (truncated). None is also acceptable if
+        // the spillway was never opened (no spill occurred).
+        if let Some(spw) = cache.spillway.as_ref() {
+            assert_eq!(spw.slot_count(), 0, "spillway must be empty after flush");
         }
 
         // Each page can be read back from the cache (or, if evicted, from disk)
