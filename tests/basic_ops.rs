@@ -247,13 +247,20 @@ fn test_cache_flush_persists_to_disk() {
     }
 }
 
+// Test that dirty pages are never silently evicted. Three pages are
+// allocated into a cache with max_pages=3 — all three stay in memory,
+// and their writes are visible without a flush (dirty-pin invariant).
+// Using max_pages=3 rather than 2 because the cache is now a STRICT
+// bound: with spillway_max_bytes=0 and max_pages=2, allocating a 3rd
+// dirty page trips CacheFull at the cap rather than growing past it.
+// The test intent (dirty pages are retained until flush) is preserved.
 #[test]
 fn test_cache_eviction_does_not_evict_dirty() {
     let file = NamedTempFile::new().unwrap();
     let io = PageIo::open(file.path(), false).unwrap();
     let mut cache = PageCache::new(
         io,
-        2 * chisel::page::PAGE_SIZE as u64,
+        3 * chisel::page::PAGE_SIZE as u64,
         0,
         chisel::DrainInsertion::LruTail,
         chisel::SpillwayLocation::InMemory,
@@ -469,9 +476,14 @@ fn test_handle_table_cow_returns_new_root() {
     assert_ne!(root1, root2);
 }
 
+// The handle table's two-level growth requires COW-copying the path on
+// every insert, so 520 inserts allocate significantly more than 520
+// pages. max_pages=2048 gives comfortable room (was 256×8=2048 under
+// the old 8× HARD_CEILING_MULTIPLIER). With spillway_max_bytes=0 the
+// cap is now strict, so the helper needs the full 2048 budget.
 #[test]
 fn test_handle_table_grows_to_two_levels() {
-    let mut cache = ht_cache(256);
+    let mut cache = ht_cache(2048);
     let mut ht = HandleTable::new();
     let mut root = ht.create_root(&mut cache).unwrap();
     for i in 0..(ENTRIES_PER_LEAF as u64 + 10) {

@@ -2163,7 +2163,7 @@ mod tests {
     // an **operational** error (documented as "commit or rollback to
     // recover"), but `commit_inner` runs `persist_freemap` BEFORE
     // `cache.flush()` — and `persist_freemap` itself calls
-    // `allocate_data_page`, which may trip `maybe_evict`'s hard-ceiling
+    // `allocate_data_page`, which may trip `maybe_evict`'s ceiling
     // check when every existing cache entry is dirty. Pre-fix the
     // resulting `CacheFull` propagated out of commit_inner and
     // commit()'s poison wrapper poisoned the manager unconditionally.
@@ -2171,26 +2171,25 @@ mod tests {
     // follow because commit itself failed.
     //
     // Post-fix: commit drains the cache BEFORE persist_freemap, so the
-    // ceiling is always reachable via eviction when persist_freemap
+    // cap is always reachable via eviction when persist_freemap
     // itself allocates. CacheFull cannot arise on the commit path.
     //
-    // Setup note: we deliberately use a small `max_pages` so the hard
-    // ceiling (max_pages * HARD_CEILING_MULTIPLIER = 8) is cheap to
-    // saturate. `fresh_manager`'s default of 1024 exists to keep
-    // existing tests well under the ceiling; this test is the opposite
-    // — it *needs* to cross the ceiling.
+    // Setup note: we deliberately use a small `max_pages` so the
+    // strict cap is cheap to saturate with a few allocations.
+    // spillway_max_bytes=0 keeps CacheFull reachable (no spillway
+    // escape hatch), matching the pre-spillway path this test exercises.
     #[test]
-    fn commit_does_not_poison_when_cache_is_past_hard_ceiling() {
+    fn commit_does_not_poison_when_cache_is_at_strict_cap() {
         let file = NamedTempFile::new().unwrap();
         let io = PageIo::open(file.path(), false).unwrap();
         std::mem::forget(file);
-        // max_pages=4 → hard ceiling = 32. Big enough for baseline
-        // operations (handle-table root + superblocks + freemap) to
-        // coexist, small enough that a few dozen big allocations
-        // saturate it. spillway_max_bytes=0 preserves CacheFull-at-cap.
+        // max_pages=16 — big enough for baseline operations (handle-table
+        // root + superblocks + freemap) to coexist, small enough that a
+        // handful of big allocations saturate the strict cap quickly.
+        // spillway_max_bytes=0 means CacheFull fires at max_pages itself.
         let cache = PageCache::new(
             io,
-            4 * PAGE_SIZE as u64,
+            16 * PAGE_SIZE as u64,
             0,
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
@@ -2211,7 +2210,7 @@ mod tests {
         tm.commit().unwrap();
 
         // Victim transaction: delete to populate txn_freed_pages, then
-        // allocate until the cache saturates past the hard ceiling.
+        // allocate until the cache saturates at the strict cap.
         // CacheFull from an allocate() is operational — we catch it and
         // proceed to commit, which is what we actually want to stress.
         tm.begin().unwrap();
@@ -2237,7 +2236,7 @@ mod tests {
         );
 
         // The actual I28 check. Pre-fix, `persist_freemap`'s internal
-        // `allocate_data_page` trips the hard ceiling and propagates
+        // `allocate_data_page` trips the ceiling and propagates
         // CacheFull out of commit_inner; commit()'s poison wrapper
         // then sets the poison flag. Post-fix commit drains first.
         let result = tm.commit();
