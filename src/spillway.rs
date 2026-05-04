@@ -138,12 +138,14 @@ impl Spillway {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
 
     #[test]
     fn open_file_truncates_existing_content() {
-        let tmp = NamedTempFile::new().unwrap();
-        let db_path = tmp.path().to_path_buf();
+        // Use TempDir rather than NamedTempFile so RAII cleanup also
+        // covers the .spillway sidecar file even if an assertion below
+        // panics. NamedTempFile only manages its own path.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("test.chisel");
         let spillway_path = {
             let mut p = db_path.as_os_str().to_owned();
             p.push(".spillway");
@@ -164,8 +166,7 @@ mod tests {
         let on_disk = std::fs::read(&spillway_path).unwrap();
         assert_eq!(on_disk.len(), 0);
 
-        // Cleanup — Spillway has no Drop; manually delete the spillway file.
-        let _ = std::fs::remove_file(&spillway_path);
+        // No manual cleanup — TempDir's Drop handles it.
     }
 
     #[test]
