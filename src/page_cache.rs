@@ -707,6 +707,16 @@ impl PageCache {
         if self.spillway_max_bytes == 0 {
             return Err(ChiselError::SpillwayFull { limit_bytes: 0 });
         }
+        // Invariant: ensure_spillway is only called from spill paths
+        // (maybe_evict's dirty-overflow branch in Task 9 onward). Read-
+        // only databases raise ReadOnlyMode at begin() before any page
+        // mutation, so dirty pages cannot exist on a read-only db, and
+        // this method is therefore unreachable on a read-only db. If a
+        // future task changes that invariant, add an explicit
+        // self.io.is_read_only() guard here that returns
+        // ChiselError::ReadOnlyMode — Spillway::open_file would
+        // otherwise create a sidecar file for what is supposed to be a
+        // read-only open.
         if self.spillway.is_none() {
             let spw = match &self.spillway_location {
                 crate::SpillwayLocation::Path(p) => {
@@ -738,6 +748,12 @@ mod tests {
         // spillway_max_bytes=0 preserves the legacy "fail fast on cache
         // pressure" contract for all existing page_cache tests.
         let cache_max_bytes = max_pages as u64 * PAGE_SIZE as u64;
+        // Spillway is intentionally InMemory even though PageIo is file-
+        // backed: tests that exercise the spillway will set spillway_max_bytes
+        // > 0, but those tests don't care about on-disk spillway artifacts —
+        // the InMemory backing keeps them filesystem-independent. Tests that
+        // DO want a file-backed spillway should construct PageCache::new
+        // directly with SpillwayLocation::Path(...).
         PageCache::new(
             io,
             cache_max_bytes,
