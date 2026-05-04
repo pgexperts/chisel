@@ -92,11 +92,13 @@ pub struct PageCache {
     /// (excluding per-slot headers). 0 means spillway disabled —
     /// overflow trips CacheFull at the cache cap. Set via Options;
     /// runtime-mutable between transactions via set_spillway_max_bytes.
+    /// (Activated in Task 9; until then, dead_code is suppressed.)
     #[allow(dead_code)]
     spillway_max_bytes: u64,
     /// LRU position policy for commit-drain rehydrated pages. Captured
     /// from Options at construction; runtime-mutable between
     /// transactions via set_drain_insertion.
+    /// (Activated in Task 11; until then, dead_code is suppressed.)
     #[allow(dead_code)]
     drain_insertion: crate::DrainInsertion,
     // Monotonically increasing allocator for shadow-paged new pages. Never

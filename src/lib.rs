@@ -105,7 +105,7 @@ impl Default for Options {
         let cache_max_bytes = 8 * 1024 * 1024; // 8 MiB = 1024 × 8 KiB pages
         Options {
             cache_max_bytes,
-            spillway_max_bytes: 1024 * cache_max_bytes,
+            spillway_max_bytes: cache_max_bytes.saturating_mul(1024),
             drain_insertion: DrainInsertion::LruTail,
             create_if_missing: true,
             read_only: false,
