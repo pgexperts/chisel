@@ -1,0 +1,58 @@
+{
+  "metadata": {
+    "timestamp": "2026-05-04T12:30:00Z",
+    "chisel_commit": "def456",
+    "machine": {"os": "linux", "arch": "x86_64", "hostname": "ci-runner"},
+    "post_processor_version": "0.1.0",
+    "criterion_dir": "target/criterion",
+    "aux_metrics_path": "bench/results/aux_metrics.jsonl",
+    "cell_count": 0
+  },
+  "cells": {},
+  "scenarios": {
+    "ycsb-a/chisel-strict": {
+      "total_wall_clock_ns": 15075000000,
+      "op_count": 100000,
+      "throughput_ops_per_sec": 6633.4,
+      "p50_ns": 120600.0,
+      "p95_ns": 180900.0,
+      "p99_ns": 251250.0,
+      "final_file_size_bytes": 100000000,
+      "file_size_delta_bytes": 4194304,
+      "counters": null
+    },
+    "ycsb-a/redb-strict": {
+      "total_wall_clock_ns": 19095000000,
+      "op_count": 100000,
+      "throughput_ops_per_sec": 5236.9,
+      "p50_ns": 145725.0,
+      "p95_ns": 201000.0,
+      "p99_ns": 321600.0,
+      "final_file_size_bytes": 110000000,
+      "file_size_delta_bytes": 5000000,
+      "counters": null
+    },
+    "ycsb-b/chisel-strict": {
+      "total_wall_clock_ns": 12060000000,
+      "op_count": 100000,
+      "throughput_ops_per_sec": 8291.6,
+      "p50_ns": 100500.0,
+      "p95_ns": 150750.0,
+      "p99_ns": 221100.0,
+      "final_file_size_bytes": 100000000,
+      "file_size_delta_bytes": 1048576,
+      "counters": null
+    },
+    "ycsb-b/redb-strict": {
+      "total_wall_clock_ns": 14070000000,
+      "op_count": 100000,
+      "throughput_ops_per_sec": 7107.2,
+      "p50_ns": 115575.0,
+      "p95_ns": 170850.0,
+      "p99_ns": 281400.0,
+      "final_file_size_bytes": 110000000,
+      "file_size_delta_bytes": 1500000,
+      "counters": null
+    }
+  }
+}
