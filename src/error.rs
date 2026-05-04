@@ -36,12 +36,15 @@ pub enum ChiselError {
     // < MIN_SUPERBLOCKS (2) or > MAX_SUPERBLOCKS (16). Operational —
     // the caller fixes their Options and tries again.
     InvalidSuperblockCount { value: u32 },
-    // The page cache has grown past its hard ceiling
-    // (`max_pages * HARD_CEILING_MULTIPLIER`) with every cached entry
-    // dirty, so there is no clean page available for eviction.
-    // Operational: the DB on disk is still fine. Recovery is to commit
-    // (which flushes dirty pages and clears the backlog) or roll back
-    // (which discards the in-flight work entirely). See ISSUES.md I19.
+    // The page cache has reached its strict cap (`max_pages`) with
+    // every cached entry dirty and the spillway disabled
+    // (`spillway_max_bytes == 0`), so there is no clean page available
+    // for eviction and no spillway to absorb the overflow. Operational:
+    // the DB on disk is still fine. Recovery is to commit (which flushes
+    // dirty pages and clears the backlog) or roll back (which discards
+    // the in-flight work entirely). The pre-spillway 8x
+    // HARD_CEILING_MULTIPLIER design is gone — see spec
+    // 2026-05-03-chisel-spillway-design.md.
     CacheFull { limit: usize },
     // The spillway file has reached its `spillway_max_bytes` cap with
     // every cached entry dirty, so there is neither room in the cache
