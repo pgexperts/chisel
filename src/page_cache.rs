@@ -486,6 +486,18 @@ impl PageCache {
         }
         // Every removed entry was dirty; the counter resets.
         self.dirty_count = 0;
+
+        // Spillway holds in-flight bytes for the current transaction
+        // only. Rollback drops them all. truncate() also resets
+        // next_slot_index so the next transaction allocates from 0.
+        if let Some(spw) = self.spillway.as_mut() {
+            // Errors on rollback are swallowed: rollback is a recovery
+            // path; if the spillway file can't be truncated, we still
+            // need to drop the dirty cache entries to maintain
+            // engine consistency. The next open will re-truncate any
+            // stale spillway content.
+            let _ = spw.truncate();
+        }
     }
 
     /// Return the number of whole pages the underlying file can hold.
@@ -539,6 +551,15 @@ impl PageCache {
             }
             self.lru.remove(id);
         }
+        // Drop spillway entries with id >= n. This matches the main
+        // file's truncate semantics: anything past the watermark is
+        // gone. Matters for rollback_to_inner where we shrink to a
+        // savepoint's watermark — the spilled pages with id >= that
+        // watermark are pages allocated AFTER the savepoint.
+        if let Some(spw) = self.spillway.as_mut() {
+            spw.forget_above(n);
+        }
+
         self.io.set_page_count(n)?;
         if self.next_page_id > n {
             self.next_page_id = n;
@@ -1134,6 +1155,48 @@ mod tests {
         // get_mut(id) on a freshly-allocated page is a hit (page is in-cache).
         assert_eq!(c.cache_hits, 2);
         assert_eq!(c.cache_misses, 0);
+    }
+
+    #[test]
+    fn discard_all_dirty_truncates_spillway() {
+        let max_pages = 2;
+        let spillway_bytes = 8 * PAGE_SIZE as u64;
+        let mut cache = fresh_cache_with_spillway(max_pages, spillway_bytes);
+        for _ in 0..4 {
+            cache.new_page().unwrap(); // 2 spilled
+        }
+        assert_eq!(cache.spillway.as_ref().unwrap().slot_count(), 2);
+        cache.discard_all_dirty();
+        assert_eq!(cache.spillway.as_ref().unwrap().slot_count(), 0);
+    }
+
+    #[test]
+    fn truncate_drops_spillway_entries_above_watermark() {
+        let max_pages = 2;
+        let spillway_bytes = 8 * PAGE_SIZE as u64;
+        let mut cache = fresh_cache_with_spillway(max_pages, spillway_bytes);
+        // Allocate page 0..5; some end up spilled.
+        for _ in 0..6 {
+            cache.new_page().unwrap();
+        }
+        let pre_count = cache.spillway.as_ref().unwrap().slot_count();
+        // Truncate to 3 — pages 3, 4, 5 are gone (whichever of those
+        // are spilled disappear from the resident-set).
+        cache.truncate(3).unwrap();
+        let post_count = cache.spillway.as_ref().unwrap().slot_count();
+        // Some entries removed (exact count depends on which pages spilled).
+        assert!(
+            post_count <= pre_count,
+            "truncate should not grow the spillway"
+        );
+        // Verify by checking individual residency:
+        let spw = cache.spillway.as_ref().unwrap();
+        for id in 3..6 {
+            assert!(
+                !spw.is_resident(id),
+                "page {id} should be gone after truncate(3)"
+            );
+        }
     }
 
     #[test]
