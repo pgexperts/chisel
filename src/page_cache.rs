@@ -150,6 +150,11 @@ impl PageCache {
     /// `get_mut`, which marks it dirty (and therefore eligible for a fresh
     /// checksum stamp at flush time by the page-type module).
     pub fn get(&mut self, page_id: u64) -> Result<&[u8; PAGE_SIZE]> {
+        // PR 7 verification injection: deliberate 10µs sleep on every cache
+        // access. Verifies that the bench workflow's regression detection
+        // fires the ⚠️ flag. To be reverted before merge — this PR is
+        // marked DO NOT MERGE.
+        std::thread::sleep(std::time::Duration::from_micros(10));
         if self.entries.contains_key(&page_id) {
             self.cache_hits.set(self.cache_hits.get() + 1);
         } else {
