@@ -594,6 +594,30 @@ impl PageCache {
     /// the operation failed.
     fn load_page(&mut self, page_id: u64) -> Result<()> {
         self.maybe_evict()?;
+
+        // Check spillway first — a resident page is by definition dirty
+        // (it was dirty when spilled). Disk read would return the stale
+        // pre-transaction bytes.
+        if let Some(spw) = self.spillway.as_mut() {
+            if spw.is_resident(page_id) {
+                let buf = spw.rehydrate(page_id)?;
+                spw.forget(page_id);
+                self.entries.insert(
+                    page_id,
+                    CacheEntry {
+                        buf: Box::new(buf),
+                        dirty: true, // re-loaded spilled page is dirty
+                    },
+                );
+                self.dirty_count += 1;
+                self.lru.push_front(page_id);
+                return Ok(());
+            }
+        }
+
+        // Fall through to disk: the page is not spilled, so its
+        // last-committed bytes live in the main file (or the page id
+        // is bogus, in which case PageIo will surface it).
         let buf = self.io.read_page(page_id)?;
         if !page::verify_checksum(&buf) {
             return Err(ChiselError::ChecksumMismatch { page_id });
@@ -868,6 +892,36 @@ mod tests {
         // unchanged.
         assert_eq!(cache.entries.len(), max_pages);
         assert_eq!(cache.dirty_count, max_pages);
+    }
+
+    #[test]
+    fn rehydrate_after_spill_returns_in_flight_bytes_not_disk() {
+        let max_pages = 2;
+        let spillway_bytes = 4 * PAGE_SIZE as u64;
+        let mut cache = fresh_cache_with_spillway(max_pages, spillway_bytes);
+
+        // Allocate page A, write a sentinel pattern, but DON'T flush.
+        let id_a = cache.new_page().unwrap();
+        {
+            let buf = cache.get_mut(id_a).unwrap();
+            buf[0] = 0xAA;
+        }
+
+        // Force overflow: allocate enough new pages that page A spills.
+        // After max_pages + 1 allocations, the LRU-tail dirty page (id_a)
+        // will be spilled by Phase B of maybe_evict.
+        for _ in 0..max_pages {
+            cache.new_page().unwrap();
+        }
+
+        // page A is now resident in the spillway, NOT in the cache.
+        assert!(!cache.entries.contains_key(&id_a));
+        assert!(cache.spillway.as_ref().unwrap().is_resident(id_a));
+
+        // get_mut(id_a) must rehydrate from spillway (the in-flight
+        // bytes), not read the all-zero disk content.
+        let buf = cache.get_mut(id_a).unwrap();
+        assert_eq!(buf[0], 0xAA, "rehydrated page must hold in-flight write");
     }
 
     // Regression test for ISSUES.md I20. claim_page previously silently
