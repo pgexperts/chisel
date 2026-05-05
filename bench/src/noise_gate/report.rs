@@ -57,7 +57,10 @@ pub fn render_report(result: &GateResult) -> String {
     out.push_str("| Scenario | Engine | Mode | Throughput COV | p99 COV | Verdict |\n");
     out.push_str("|---|---|---|---|---|---|\n");
     for cell in &result.cells {
-        let verdict_marker = if cell.passes { "✓" } else { "✗" };
+        // Plain ASCII PASS/FAIL — matches the verdict word at the top
+        // of the report and avoids Unicode-display dependencies in
+        // terminal/email/CI viewers.
+        let verdict_marker = if cell.passes { "PASS" } else { "FAIL" };
         out.push_str(&format!(
             "| {} | {} | {} | {:.1}% | {:.1}% | {} |\n",
             cell.scenario,
@@ -167,5 +170,21 @@ mod tests {
             r.contains("0.5%"),
             "missing throughput cov as percentage: {r}"
         );
+    }
+
+    #[test]
+    fn report_failing_section_lists_failing_cells_with_thresholds() {
+        // Force a cell over the throughput threshold to exercise the
+        // ## Failing cells branch — covers the per-failure detail
+        // line that the all-pass-path tests above never touch.
+        let mut result = sample_result_pass();
+        result.cells[0].throughput.cov = 0.05;
+        result.cells[0].passes = false;
+        let r = render_report(&result);
+        assert!(
+            r.contains("## Failing cells"),
+            "missing failing cells section: {r}"
+        );
+        assert!(r.contains("threshold 2.0%"), "missing threshold value: {r}");
     }
 }

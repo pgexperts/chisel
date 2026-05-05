@@ -73,15 +73,25 @@ fn run(cli: &Cli) -> Result<bool, Box<dyn std::error::Error>> {
         eprintln!("Run {} of {} ...", run_idx + 1, cli.runs);
 
         // Truncate scenarios_metrics.jsonl before each run so we read
-        // only this run's results. The path is fixed by the bench
-        // harness — see bench/src/runner.rs.
-        let metrics_path = PathBuf::from("results/scenarios_metrics.jsonl");
+        // only this run's results. Path is anchored at the bench
+        // crate's manifest dir (resolved at compile time) so the
+        // binary works regardless of the caller's cwd. The matching
+        // write path is in bench/benches/scenarios.rs (also rooted at
+        // CARGO_MANIFEST_DIR).
+        let metrics_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("results")
+            .join("scenarios_metrics.jsonl");
         if metrics_path.exists() {
             fs::remove_file(&metrics_path)?;
         }
 
+        // Pin the cargo subprocess's cwd to the bench crate so it
+        // finds the right Cargo.toml; otherwise `cargo bench --bench
+        // scenarios` would fail when this binary is invoked from
+        // outside bench/.
         let status = Command::new("cargo")
             .args(["bench", "--bench", "scenarios"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
             .status()?;
         if !status.success() {
             return Err(
@@ -89,15 +99,36 @@ fn run(cli: &Cli) -> Result<bool, Box<dyn std::error::Error>> {
             );
         }
 
-        // Parse the JSONL written by this run.
+        // Parse the JSONL written by this run. Field names mirror
+        // ScenarioResult's serde-serialized layout in
+        // bench/src/runner.rs (`scenario`, `mode`,
+        // `throughput_ops_per_sec`, `p99_ns`). `mode` is the combined
+        // EngineMode::label() — `<engine>-<durability>` — so we split
+        // on the first hyphen to recover the per-cell key
+        // (scenario, engine, durability). Errors propagate with the
+        // offending line number to surface schema regressions loudly
+        // rather than silently averaging zeros.
         let contents = fs::read_to_string(&metrics_path)?;
-        for line in contents.lines() {
-            let entry: serde_json::Value = serde_json::from_str(line)?;
-            let scenario = entry["scenario"].as_str().unwrap_or("").to_string();
-            let engine = entry["engine"].as_str().unwrap_or("").to_string();
-            let mode = entry["mode"].as_str().unwrap_or("").to_string();
-            let throughput = entry["throughput_ops_per_sec"].as_f64().unwrap_or(0.0);
-            let p99_ns = entry["p99_latency_ns"].as_f64().unwrap_or(0.0);
+        for (lineno, line) in contents.lines().enumerate() {
+            let entry: serde_json::Value = serde_json::from_str(line)
+                .map_err(|e| format!("line {} in metrics jsonl: {}", lineno + 1, e))?;
+            let scenario = entry["scenario"]
+                .as_str()
+                .ok_or("missing 'scenario' field")?
+                .to_string();
+            let mode_label = entry["mode"].as_str().ok_or("missing 'mode' field")?;
+            let (engine, mode) = mode_label.split_once('-').ok_or_else(|| {
+                format!(
+                    "malformed mode label '{}': expected '<engine>-<durability>'",
+                    mode_label
+                )
+            })?;
+            let engine = engine.to_string();
+            let mode = mode.to_string();
+            let throughput = entry["throughput_ops_per_sec"]
+                .as_f64()
+                .ok_or("missing 'throughput_ops_per_sec' field")?;
+            let p99_ns = entry["p99_ns"].as_f64().ok_or("missing 'p99_ns' field")?;
             samples
                 .entry((scenario, engine, mode))
                 .or_default()
