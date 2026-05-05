@@ -9,6 +9,7 @@
 pub mod chisel_engine;
 pub mod diff;
 pub mod engine;
+pub mod noise_gate;
 pub mod redb_engine;
 pub mod runner;
 pub mod scenarios;
