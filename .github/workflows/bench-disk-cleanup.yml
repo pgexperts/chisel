@@ -35,7 +35,10 @@ jobs:
       - name: cargo clean if free disk < 30 GiB
         working-directory: ${{ github.workspace }}/bench
         run: |
-          AVAIL_GIB=$(df -BG / | tail -1 | awk '{print $4}' | tr -d 'G')
+          # --output=avail gives a single available-bytes column, robust
+          # against df's wrap behavior on long filesystem names (otherwise
+          # `tail -1 | awk '{print $4}'` can read the wrong field).
+          AVAIL_GIB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
           echo "Available: ${AVAIL_GIB} GiB"
           if [ "$AVAIL_GIB" -lt 30 ]; then
             echo "Below 30 GiB — running cargo clean"
