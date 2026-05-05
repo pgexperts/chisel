@@ -12,7 +12,5 @@
 pub mod cov;
 pub mod report;
 
-// `pub use cov::{compute_cov, Cov}` and `pub use report::render_report`
-// are intentionally deferred until those items exist — they are added
-// once the implementations land in tasks 4.3 / 4.5. Adding them here
-// in the skeleton phase would block the crate from compiling.
+pub use cov::{compute_cov, Cov};
+pub use report::render_report;

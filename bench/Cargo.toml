@@ -40,3 +40,7 @@ path = "src/bin/summarize.rs"
 [[bin]]
 name = "chisel-bench-diff"
 path = "src/bin/diff.rs"
+
+[[bin]]
+name = "chisel-bench-noise-gate"
+path = "src/bin/noise_gate.rs"
