@@ -765,6 +765,18 @@ mod tests {
         // Throughput cov = 0.005 = 0.5%; should render as percentage with one decimal place.
         assert!(r.contains("0.5%"), "missing throughput cov as percentage: {r}");
     }
+
+    #[test]
+    fn report_failing_section_lists_failing_cells_with_thresholds() {
+        // Without this test, the `if !result.all_pass()` branch in
+        // render_report (the "Failing cells" detail section) is uncovered.
+        let mut result = sample_result_pass();
+        result.cells[0].throughput.cov = 0.05;
+        result.cells[0].passes = false;
+        let r = render_report(&result);
+        assert!(r.contains("## Failing cells"), "missing failing cells section: {r}");
+        assert!(r.contains("threshold 2.0%"), "missing threshold value: {r}");
+    }
 }
 ```
 
@@ -774,7 +786,7 @@ mod tests {
 cd bench && cargo test --lib noise_gate::report::tests 2>&1 | tail -10
 ```
 
-Expected: 4 tests fail (panic with "not yet implemented").
+Expected: 5 tests fail (panic with "not yet implemented").
 
 ### Task 4.5: Implement render_report
 
@@ -812,7 +824,10 @@ pub fn render_report(result: &GateResult) -> String {
     out.push_str("| Scenario | Engine | Mode | Throughput COV | p99 COV | Verdict |\n");
     out.push_str("|---|---|---|---|---|---|\n");
     for cell in &result.cells {
-        let verdict_marker = if cell.passes { "✓" } else { "✗" };
+        // ASCII PASS/FAIL (not Unicode ✓/✗) for terminal/email/CI viewer
+        // consistency. Project convention: no emojis or Unicode glyphs in
+        // rendered output.
+        let verdict_marker = if cell.passes { "PASS" } else { "FAIL" };
         out.push_str(&format!(
             "| {} | {} | {} | {:.1}% | {:.1}% | {} |\n",
             cell.scenario,
@@ -851,7 +866,7 @@ pub fn render_report(result: &GateResult) -> String {
 cd bench && cargo test --lib noise_gate::report::tests 2>&1 | tail -10
 ```
 
-Expected: 4/4 pass.
+Expected: 5/5 pass.
 
 - [ ] **Step 3: Run full bench tests**
 
@@ -859,7 +874,7 @@ Expected: 4/4 pass.
 cd bench && cargo test 2>&1 | tail -5
 ```
 
-Expected: 106/106 passing.
+Expected: 107/107 passing.
 
 - [ ] **Step 4: Commit**
 
@@ -874,15 +889,17 @@ git commit -m "bench: implement noise-gate markdown report rendering"
 - Create: `bench/src/bin/noise_gate.rs`
 - Modify: `bench/Cargo.toml` (add `[[bin]]` section if not auto-discovered)
 
-- [ ] **Step 1: Verify Cargo auto-discovers the binary**
+- [ ] **Step 1: Add an explicit [[bin]] block to bench/Cargo.toml**
 
-The bench subcrate already has `[[bin]] name = "chisel-bench-summarize", path = "src/bin/summarize.rs"` style entries. Adding `bench/src/bin/noise_gate.rs` should be auto-discovered as `noise_gate`. Confirm by checking:
+The bench subcrate uses explicit `[[bin]]` declarations (currently `name = "summarize"` and `name = "chisel-bench-diff"`). Auto-discovery would name the new binary `noise_gate` based on filename, but we want the long form for consistency with `chisel-bench-diff`. Add a new block:
 
-```bash
-cd bench && grep -A3 "\[\[bin\]\]" Cargo.toml
+```toml
+[[bin]]
+name = "chisel-bench-noise-gate"
+path = "src/bin/noise_gate.rs"
 ```
 
-If the existing binaries are explicitly declared, add a parallel entry for the new one. If auto-discovery is in use, no Cargo.toml change needed.
+(Existing-binary naming is inconsistent — `summarize` vs `chisel-bench-diff` — for historical reasons. Don't try to fix the inconsistency in this plan; that's a separate decision.)
 
 - [ ] **Step 2: Create bench/src/bin/noise_gate.rs**
 
@@ -898,7 +915,10 @@ If the existing binaries are explicitly declared, add a parallel entry for the n
 // here; the COV computation and report rendering are in the
 // chisel_bench::noise_gate library module.
 
-use chisel_bench::noise_gate::{compute_cov, render_report, Cov};
+// Cov is intentionally NOT imported — it's part of compute_cov's return
+// type but never referenced by name in this binary, and clippy fails
+// unused imports under -D warnings.
+use chisel_bench::noise_gate::{compute_cov, render_report};
 use chisel_bench::noise_gate::report::{CellResult, GateResult};
 use clap::Parser;
 use std::collections::BTreeMap;
@@ -961,30 +981,66 @@ fn run(cli: &Cli) -> Result<bool, Box<dyn std::error::Error>> {
     for run_idx in 0..cli.runs {
         eprintln!("Run {} of {} ...", run_idx + 1, cli.runs);
 
-        // Truncate scenarios_metrics.jsonl before each run so we read
-        // only this run's results. The path is fixed by the bench
-        // harness — see bench/src/runner.rs.
-        let metrics_path = PathBuf::from("results/scenarios_metrics.jsonl");
+        // Truncate scenarios_metrics.jsonl before each run so we read only
+        // this run's results. Path uses env!("CARGO_MANIFEST_DIR") so it's
+        // cwd-independent — bench/benches/scenarios.rs writes to the same
+        // {manifest_dir}/results/ path regardless of where the binary is
+        // invoked from.
+        let metrics_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("results")
+            .join("scenarios_metrics.jsonl");
         if metrics_path.exists() {
             fs::remove_file(&metrics_path)?;
         }
 
+        // current_dir on the cargo subprocess is required because the
+        // bench/ subcrate is NOT a workspace member of the root chisel
+        // crate — `cargo bench --bench scenarios` only resolves from
+        // bench/ itself.
         let status = Command::new("cargo")
             .args(["bench", "--bench", "scenarios"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
             .status()?;
         if !status.success() {
             return Err(format!("Run {} failed: cargo bench exited {}", run_idx + 1, status).into());
         }
 
         // Parse the JSONL written by this run.
+        //
+        // ScenarioResult (bench/src/runner.rs) emits {scenario, mode,
+        // total_wall_clock_ns, p99_ns, ...}. There is NO separate `engine`
+        // field — `mode` is the combined EngineMode::label() string like
+        // "chisel-strict", "redb-strict", "sqlite-strict". Split on the
+        // first hyphen to recover (engine, durability).
+        //
+        // All field reads use .ok_or(...) (not .unwrap_or(...)) so a
+        // schema regression fails loudly rather than silently averaging
+        // zeros into the cells.
         let contents = fs::read_to_string(&metrics_path)?;
-        for line in contents.lines() {
-            let entry: serde_json::Value = serde_json::from_str(line)?;
-            let scenario = entry["scenario"].as_str().unwrap_or("").to_string();
-            let engine = entry["engine"].as_str().unwrap_or("").to_string();
-            let mode = entry["mode"].as_str().unwrap_or("").to_string();
-            let throughput = entry["throughput_ops_per_sec"].as_f64().unwrap_or(0.0);
-            let p99_ns = entry["p99_latency_ns"].as_f64().unwrap_or(0.0);
+        for (lineno, line) in contents.lines().enumerate() {
+            let entry: serde_json::Value = serde_json::from_str(line)
+                .map_err(|e| format!("line {} in metrics jsonl: {}", lineno + 1, e))?;
+            let scenario = entry["scenario"]
+                .as_str()
+                .ok_or("missing 'scenario' field")?
+                .to_string();
+            let mode_label = entry["mode"]
+                .as_str()
+                .ok_or("missing 'mode' field")?;
+            let (engine, mode) = mode_label
+                .split_once('-')
+                .ok_or_else(|| format!(
+                    "malformed mode label '{}': expected '<engine>-<durability>'",
+                    mode_label
+                ))?;
+            let engine = engine.to_string();
+            let mode = mode.to_string();
+            let throughput = entry["throughput_ops_per_sec"]
+                .as_f64()
+                .ok_or("missing 'throughput_ops_per_sec' field")?;
+            let p99_ns = entry["p99_ns"]
+                .as_f64()
+                .ok_or("missing 'p99_ns' field")?;
             samples
                 .entry((scenario, engine, mode))
                 .or_default()
@@ -1052,7 +1108,7 @@ Expected: clap-rendered help text showing all the CLI options.
 cd bench && cargo test 2>&1 | tail -5
 ```
 
-Expected: 106/106 still passing. (No new tests — this binary is exercised by Phase 4's Task 4.7 below.)
+Expected: 107/107 still passing. (No new tests in Task 4.6 — this binary is exercised by Phase 4's Task 4.7 below.)
 
 - [ ] **Step 6: Commit**
 
@@ -1910,22 +1966,27 @@ cd ~/work/chisel
 git fetch origin pull/<PR-NUMBER>/head:debug-pr
 git checkout debug-pr
 cd bench
-cargo build --release --bench scenarios --bin chisel-bench-summarize --bin chisel-bench-diff
+# Note: the summarize binary is registered as `summarize` (not
+# `chisel-bench-summarize`) for historical reasons — see bench/Cargo.toml.
+# The diff and noise-gate binaries use the long `chisel-bench-*` form.
+cargo build --release --bench scenarios --bin summarize --bin chisel-bench-diff
 cargo bench --bench scenarios
-cargo run --release --bin chisel-bench-summarize -- \
-  --scenarios bench/results/scenarios_metrics.jsonl \
+# Paths below are relative to the current directory (bench/), so just
+# `results/...` rather than `bench/results/...`.
+cargo run --release --bin summarize -- \
+  --scenarios results/scenarios_metrics.jsonl \
   --out /tmp/pr-out
 # Switch to main and rerun:
 git checkout main && git pull
 cargo bench --bench scenarios
-cargo run --release --bin chisel-bench-summarize -- \
-  --scenarios bench/results/scenarios_metrics.jsonl \
+cargo run --release --bin summarize -- \
+  --scenarios results/scenarios_metrics.jsonl \
   --out /tmp/main-out
-# Diff:
+# Diff: chisel-bench-diff writes the rendered markdown to stdout — redirect.
 cargo run --release --bin chisel-bench-diff -- \
   --baseline /tmp/main-out/results.json \
   --pr /tmp/pr-out/results.json \
-  --out /tmp/diff.md
+  > /tmp/diff.md
 cat /tmp/diff.md
 ```
 
