@@ -64,16 +64,21 @@ cd ~/work/chisel
 git fetch origin pull/<PR-NUMBER>/head:debug-pr
 git checkout debug-pr
 cd bench
-cargo build --release --bench scenarios --bin chisel-bench-summarize --bin chisel-bench-diff
+# Note: the summarize binary is registered as `summarize` (not
+# `chisel-bench-summarize`) for historical reasons — see bench/Cargo.toml.
+# The diff and noise-gate binaries use the long `chisel-bench-*` form.
+cargo build --release --bench scenarios --bin summarize --bin chisel-bench-diff
 cargo bench --bench scenarios
-cargo run --release --bin chisel-bench-summarize -- \
-  --scenarios bench/results/scenarios_metrics.jsonl \
+# Paths below are relative to the current directory (bench/), so just
+# `results/...` rather than `bench/results/...`.
+cargo run --release --bin summarize -- \
+  --scenarios results/scenarios_metrics.jsonl \
   --out /tmp/pr-out
 # Switch to main and rerun:
 git checkout main && git pull
 cargo bench --bench scenarios
-cargo run --release --bin chisel-bench-summarize -- \
-  --scenarios bench/results/scenarios_metrics.jsonl \
+cargo run --release --bin summarize -- \
+  --scenarios results/scenarios_metrics.jsonl \
   --out /tmp/main-out
 # Diff:
 cargo run --release --bin chisel-bench-diff -- \
