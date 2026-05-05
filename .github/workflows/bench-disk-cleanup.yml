@@ -1,0 +1,61 @@
+name: Bench Disk Cleanup
+
+# Nightly maintenance on the dedicated bench machine: prune old bench
+# results, optionally cargo clean if disk is tight, drop apt caches.
+# Emits a small disk-status.txt artifact for operator-visible trend.
+#
+# Spec: docs/specs/2026-05-04-dedicated-bench-machine-foundation-design.md
+# § "Disk management"
+
+on:
+  schedule:
+    - cron: '0 4 * * *' # nightly 04:00 UTC
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: [self-hosted, linux, dedicated-bench, bench-v1]
+    timeout-minutes: 30
+    concurrency:
+      group: dedicated-machine
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - name: Show pre-cleanup disk state
+        run: df -h /
+
+      - name: Prune bench/results/<UTC>/ directories older than 14 days
+        working-directory: ${{ github.workspace }}/bench
+        run: |
+          if [ -d results ]; then
+            find results -mindepth 1 -maxdepth 1 -type d -mtime +14 -exec rm -rf {} +
+          fi
+
+      - name: cargo clean if free disk < 30 GiB
+        working-directory: ${{ github.workspace }}/bench
+        run: |
+          AVAIL_GIB=$(df -BG / | tail -1 | awk '{print $4}' | tr -d 'G')
+          echo "Available: ${AVAIL_GIB} GiB"
+          if [ "$AVAIL_GIB" -lt 30 ]; then
+            echo "Below 30 GiB — running cargo clean"
+            cargo clean
+          else
+            echo "Above 30 GiB — keeping incremental cache"
+          fi
+
+      - name: apt-get clean
+        run: sudo apt-get clean
+
+      - name: Capture post-cleanup disk state
+        run: |
+          echo "Post-cleanup disk status (chisel-bench-1):" > /tmp/disk-status.txt
+          echo "  Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> /tmp/disk-status.txt
+          df -h / >> /tmp/disk-status.txt
+
+      - name: Upload disk-status artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: disk-status-${{ github.run_id }}
+          path: /tmp/disk-status.txt
+          retention-days: 30
