@@ -80,11 +80,11 @@ cargo bench --bench scenarios
 cargo run --release --bin summarize -- \
   --scenarios results/scenarios_metrics.jsonl \
   --out /tmp/main-out
-# Diff:
+# Diff: chisel-bench-diff writes the rendered markdown to stdout — redirect.
 cargo run --release --bin chisel-bench-diff -- \
   --baseline /tmp/main-out/results.json \
   --pr /tmp/pr-out/results.json \
-  --out /tmp/diff.md
+  > /tmp/diff.md
 cat /tmp/diff.md
 ```
 
