@@ -69,7 +69,8 @@ class Counters:
         cache_hits: PageCache.get returned a cached page without disk I/O.
         cache_misses: PageCache.get had to load from disk.
         pages_allocated: PageCache.new_page invocations.
-        fsync_calls: PageIo.fsync invocations (two per commit).
+        fsync_calls: PageIo.fsync invocations (three per commit: pre-drain
+            flush + main pages flush + superblock).
     """
     cache_hits: int
     cache_misses: int

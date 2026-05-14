@@ -169,8 +169,8 @@ The four fields:
 
 - `cache_hits` — `PageCache.get` returned a cached page without disk I/O.
 - `cache_misses` — `PageCache.get` had to load from disk (and validate the page's XXH3 checksum).
-- `pages_allocated` — `PageCache.new_page` invocations; counts attempted allocations even when the cache subsequently hits its hard ceiling.
-- `fsync_calls` — successful `PageIo.fsync` invocations; two per commit (data pages, then superblock).
+- `pages_allocated` — `PageCache.new_page` invocations; counts attempted allocations even when the cache subsequently rejects with `CacheFullError` at the strict `cache_max_bytes` cap.
+- `fsync_calls` — successful `PageIo.fsync` invocations; three per commit (pre-drain flush + main pages flush + superblock).
 
 The counters are point-in-time snapshots; they do not update after the call. Read them again to observe new totals. They reset implicitly on `close()` + reopen because the underlying engine state is rebuilt; nothing is persisted to disk.
 
@@ -181,7 +181,7 @@ before = db.counters()
 with db.transaction() as tx:
     tx.allocate(b"...")
 after = db.counters()
-print(after.fsync_calls - before.fsync_calls)   # commit cost: 2 (data + superblock)
+print(after.fsync_calls - before.fsync_calls)   # commit cost: 3 (pre-drain + data + superblock)
 print(after.pages_allocated - before.pages_allocated)
 ```
 
@@ -190,7 +190,7 @@ print(after.pages_allocated - before.pages_allocated)
 ```python
 chisel.open(
     path,                      # str, os.PathLike, or None for in-memory
-    cache_size=1024,           # pages in the LRU, 8 KB each → 8 MB default
+    cache_max_bytes=8_388_608, # bytes; default 8 MiB (= 1024 × 8 KiB pages)
     create_if_missing=True,
     read_only=False,
     superblock_count=2,        # 2..=16, only consulted on create
@@ -216,6 +216,7 @@ Catch and continue.
 | `InvalidHandleError` | Unknown or deleted handle passed to `read` / `update` / `delete` |
 | `NoActiveTransactionError` | Mutation attempted outside a transaction |
 | `TransactionAlreadyActiveError` | `begin()` called while one is already running |
+| `TransactionInProgressError` | Configuration mutator called while a transaction is active (reserved for future use; not raised by the v1 binding because the runtime config setters are not exposed) |
 | `SavepointNotFoundError` | `rollback_to` / `release` on an unknown savepoint name |
 | `DuplicateSavepointError` | `savepoint(name)` reused an active name |
 | `ReadOnlyModeError` | Write attempted on a read-only handle |
@@ -223,7 +224,8 @@ Catch and continue.
 | `InvalidRootNameError` | Named-root name is empty, too long, or not valid UTF-8 |
 | `RootNameTableFullError` | All named-root slots are in use |
 | `InvalidSuperblockCountError` | `superblock_count` outside `2..=16` |
-| `CacheFullError` | Page cache hit its hard ceiling; commit or rollback to recover |
+| `CacheFullError` | Page cache hit its strict `cache_max_bytes` cap with every cached page dirty (no clean page available for eviction); commit or rollback to drain. The Python binding currently disables the spillway sidecar, so this is the only buffer-full path you'll see. |
+| `SpillwayFullError` | Spillway sidecar's `spillway_max_bytes` cap was reached (reserved for future use; not raised by the v1 binding because the spillway is disabled — `spillway_max_bytes` is hard-coded to 0) |
 | `ClosedError` | Call through a `Transaction` / `Savepoint` after `db.close()` |
 | `AlreadyFinishedError` | Second explicit drive on a transaction or savepoint |
 
