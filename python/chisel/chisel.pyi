@@ -88,10 +88,22 @@ class DefragStats:
     values_moved: int = 0
 
 
+class DrainInsertion:
+    # PyO3 pyclass enum mirroring chisel::DrainInsertion. Users reach for
+    # `chisel.DrainInsertion.LruTail` / `chisel.DrainInsertion.Mru`; the
+    # class-level attributes ARE the singleton instances. Variant names
+    # match the Rust spelling so cross-referencing ARCHITECTURE.md
+    # ADR-5 stays mechanical.
+    LruTail: DrainInsertion
+    Mru: DrainInsertion
+
+
 def open(
     path: str | os.PathLike[str] | None = None,
     *,
     cache_max_bytes: int = 8_388_608,
+    spillway_max_bytes: int | None = None,
+    drain_insertion: DrainInsertion = ...,
     create_if_missing: bool = True,
     read_only: bool = False,
     superblock_count: int = 2,
@@ -130,6 +142,12 @@ class Chisel:
     def clear_root_name(self, name: str) -> None: ...
 
     def defrag(self, options: DefragOptions | None = None) -> DefragStats: ...
+
+    # Between-transaction config mutators. Each raises
+    # TransactionInProgressError if called mid-transaction.
+    def set_cache_max_bytes(self, bytes: int) -> None: ...
+    def set_spillway_max_bytes(self, bytes: int) -> None: ...
+    def set_drain_insertion(self, policy: DrainInsertion) -> None: ...
 
 
 class Transaction:

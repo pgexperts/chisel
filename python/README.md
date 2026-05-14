@@ -189,11 +189,13 @@ print(after.pages_allocated - before.pages_allocated)
 
 ```python
 chisel.open(
-    path,                      # str, os.PathLike, or None for in-memory
-    cache_max_bytes=8_388_608, # bytes; default 8 MiB (= 1024 × 8 KiB pages)
+    path,                                        # str, os.PathLike, or None for in-memory
+    cache_max_bytes=8_388_608,                   # bytes; default 8 MiB (= 1024 × 8 KiB pages)
+    spillway_max_bytes=None,                     # None → 1024 × cache_max_bytes (8 GiB default); 0 disables
+    drain_insertion=chisel.DrainInsertion.LruTail,
     create_if_missing=True,
     read_only=False,
-    superblock_count=2,        # 2..=16, only consulted on create
+    superblock_count=2,                          # 2..=16, only consulted on create
 )
 ```
 
@@ -202,6 +204,38 @@ chisel.open(
 `superblock_count` is stored at create time and discovered on reopen; it controls how many superblock slots the engine rotates through on commit. Higher N trades disk space (N × 8 KB) for durability against consecutive torn writes.
 
 `chisel.open(None)` produces an in-memory database (same engine, `Vec<u8>`-backed I/O, no file, no lock, lost on close).
+
+### Cache and spillway
+
+The page cache is bounded strictly by `cache_max_bytes`. When the cache is full of dirty pages (nothing evictable), overflow spills into a sidecar file `<path>.spillway` rather than failing. The spillway is bounded by `spillway_max_bytes` and is truncated at every commit and rollback. It is never `fsync`ed — its contents are uncommitted by definition, so a crash with a non-empty spillway is recovered by discarding it.
+
+- `spillway_max_bytes=None` (default) scales the spillway cap to `1024 × cache_max_bytes` — 8 GiB at the 8 MiB cache default. This matches the Rust API's default and is the recommended setting for normal workloads.
+- `spillway_max_bytes=0` disables the spillway entirely and restores `CacheFullError`-at-cap semantics. Useful for tests that want deterministic "cache is full" failures, or for memory-constrained deployments where you'd rather error than spill to disk.
+- Any positive integer caps the spillway in bytes. When both the cache and the spillway are exhausted, the engine raises `SpillwayFullError`; commit or roll back to drain.
+
+`drain_insertion` controls where rehydrated spillway pages re-enter the cache when the spillway drains at commit:
+
+- `chisel.DrainInsertion.LruTail` (default) places them at the LRU end, so they're the next pages evicted under normal use. Right for workloads that don't re-read pages they just wrote.
+- `chisel.DrainInsertion.Mru` places them at the MRU end. Right for workloads that re-read recently-written pages — the rehydrated cache entries stay warm.
+
+In-memory mode (`chisel.open(None)`) uses an in-memory spillway buffer instead of a sidecar file; everything else behaves the same.
+
+### Runtime configuration
+
+All three options above can also be changed *between* transactions on a live `Chisel` handle:
+
+```python
+with chisel.open("db.chisel") as db:
+    db.set_cache_max_bytes(4 * 1024 * 1024)              # halve to 4 MiB
+    db.set_spillway_max_bytes(0)                          # disable spillway
+    db.set_drain_insertion(chisel.DrainInsertion.Mru)
+    with db.transaction() as tx:
+        ...  # uses the new config
+```
+
+Each setter operates ONLY on between-transactions state: calling any of them while a transaction is active raises `TransactionInProgressError`. The engine guards this because shrinking the cache or spillway mid-transaction would either need to reject pinned dirty pages or silently overflow them, neither of which is a clean story — commit or roll back first.
+
+The setters take effect immediately after they return. A subsequent `db.transaction()` uses the new caps and policy; the previous transaction (already committed or rolled back) was unaffected.
 
 ## Errors
 
@@ -216,7 +250,7 @@ Catch and continue.
 | `InvalidHandleError` | Unknown or deleted handle passed to `read` / `update` / `delete` |
 | `NoActiveTransactionError` | Mutation attempted outside a transaction |
 | `TransactionAlreadyActiveError` | `begin()` called while one is already running |
-| `TransactionInProgressError` | Configuration mutator called while a transaction is active (reserved for future use; not raised by the v1 binding because the runtime config setters are not exposed) |
+| `TransactionInProgressError` | `set_cache_max_bytes` / `set_spillway_max_bytes` / `set_drain_insertion` called while a transaction is active; commit or roll back first |
 | `SavepointNotFoundError` | `rollback_to` / `release` on an unknown savepoint name |
 | `DuplicateSavepointError` | `savepoint(name)` reused an active name |
 | `ReadOnlyModeError` | Write attempted on a read-only handle |
@@ -224,8 +258,8 @@ Catch and continue.
 | `InvalidRootNameError` | Named-root name is empty, too long, or not valid UTF-8 |
 | `RootNameTableFullError` | All named-root slots are in use |
 | `InvalidSuperblockCountError` | `superblock_count` outside `2..=16` |
-| `CacheFullError` | Page cache hit its strict `cache_max_bytes` cap with every cached page dirty (no clean page available for eviction); commit or rollback to drain. The Python binding currently disables the spillway sidecar, so this is the only buffer-full path you'll see. |
-| `SpillwayFullError` | Spillway sidecar's `spillway_max_bytes` cap was reached (reserved for future use; not raised by the v1 binding because the spillway is disabled — `spillway_max_bytes` is hard-coded to 0) |
+| `CacheFullError` | Page cache hit its strict `cache_max_bytes` cap with every cached page dirty (no clean page available for eviction) AND the spillway is disabled (`spillway_max_bytes=0`); commit or roll back to drain. When the spillway is enabled (default), the cache overflows into it instead and you'll see `SpillwayFullError` only if the spillway also fills. |
+| `SpillwayFullError` | Spillway sidecar's `spillway_max_bytes` cap was reached during a transaction; commit or roll back to drain the spillway. Database is intact. |
 | `ClosedError` | Call through a `Transaction` / `Savepoint` after `db.close()` |
 | `AlreadyFinishedError` | Second explicit drive on a transaction or savepoint |
 
