@@ -349,6 +349,31 @@ impl PyChisel {
         kwargs.set_item("values_moved", stats.values_moved)?;
         Ok(cls.call((), Some(&kwargs))?.unbind())
     }
+
+    // ── Between-transaction configuration mutators ──────────────────
+    //
+    // The three setters below mirror the same-named methods on
+    // chisel::Chisel. They operate ONLY on between-transactions state:
+    // calling any of them while a transaction is active raises
+    // TransactionInProgressError, because shrinking the cache or
+    // spillway mid-transaction would either reject pinned dirty pages
+    // or silently spill them — neither is a clean story (see
+    // ARCHITECTURE.md ADR-5 + ISSUES.md for the spillway design).
+    //
+    // All three flow through with_inner_mut_io, so a closed handle
+    // raises ClosedError uniformly with every other mutating method.
+
+    fn set_cache_max_bytes(&self, py: Python<'_>, bytes: u64) -> PyResult<()> {
+        self.with_inner_mut_io(py, |c| c.set_cache_max_bytes(bytes))
+    }
+
+    fn set_spillway_max_bytes(&self, py: Python<'_>, bytes: u64) -> PyResult<()> {
+        self.with_inner_mut_io(py, |c| c.set_spillway_max_bytes(bytes))
+    }
+
+    fn set_drain_insertion(&self, py: Python<'_>, policy: PyDrainInsertion) -> PyResult<()> {
+        self.with_inner_mut_io(py, |c| c.set_drain_insertion(policy.into()))
+    }
 }
 
 // Internal helpers — NOT exposed to Python. PyTransaction reaches into
