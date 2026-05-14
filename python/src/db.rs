@@ -56,6 +56,33 @@ pub struct PyChisel {
     inner: RefCell<Option<Chisel>>,
 }
 
+// `DrainInsertion` mirrors `chisel::DrainInsertion` one-to-one. We use a
+// dedicated PyO3 pyclass enum rather than re-using the Rust enum so the
+// Python type is owned by this binding (its module path, repr, and any
+// future Python-side methods are ours to evolve) and so we don't depend
+// on the Rust enum implementing the PyO3 conversion traits.
+//
+// Variant names match the Rust spelling (`LruTail`, `Mru`) rather than
+// PEP-8 `LRU_TAIL` / `MRU` so cross-referencing ARCHITECTURE.md ADR-5
+// and the Rust source stays mechanical. `eq` / `eq_int` give Python users
+// `chisel.DrainInsertion.LruTail == chisel.DrainInsertion.LruTail` and
+// efficient int-based comparison under the hood.
+#[pyclass(eq, eq_int, module = "chisel._chisel", name = "DrainInsertion")]
+#[derive(Clone, Copy, PartialEq)]
+pub enum PyDrainInsertion {
+    LruTail,
+    Mru,
+}
+
+impl From<PyDrainInsertion> for chisel::DrainInsertion {
+    fn from(v: PyDrainInsertion) -> Self {
+        match v {
+            PyDrainInsertion::LruTail => chisel::DrainInsertion::LruTail,
+            PyDrainInsertion::Mru => chisel::DrainInsertion::Mru,
+        }
+    }
+}
+
 // Keyword-only args after `path` (note the `*`) so users can't
 // positionally supply cache_max_bytes by accident; the defaults mirror
 // `chisel::Options::default()` so `open(None)` and `open("f.db")`
@@ -65,19 +92,37 @@ pub struct PyChisel {
 // sides hard-code them rather than sharing a constant because the Rust
 // side's constants are not exposed through the PyO3 signature syntax.
 // 8_388_608 = 8 MiB = 1024 × 8 KiB pages, matching Options::default().
+//
+// `spillway_max_bytes = None` is the sentinel for "use Rust's computed
+// default of 1024 × cache_max_bytes" (8 GiB at the 8 MiB cache default).
+// Explicit 0 disables the spillway and restores CacheFull-at-cap
+// semantics; any positive integer is the cap in bytes. We resolve None
+// at runtime rather than via the signature literal because the literal
+// would not scale with a user-overridden cache_max_bytes.
 #[pyfunction]
 #[pyo3(signature = (
     path = None,
     *,
     cache_max_bytes = 8_388_608,
+    spillway_max_bytes = None,
+    drain_insertion = PyDrainInsertion::LruTail,
     create_if_missing = true,
     read_only = false,
     superblock_count = 2
 ))]
+// open() has 8 args; clippy warns at 7. All but `path` are keyword-only
+// (note the `*` in the pyo3(signature) above), so the user can never
+// pass them positionally and confuse argument order. Each arg maps to
+// a distinct field of chisel::Options that we want to expose; bundling
+// them into a struct would require Python users to construct one,
+// which is less ergonomic than kwargs.
+#[allow(clippy::too_many_arguments)]
 pub fn open(
     py: Python<'_>,
     path: Option<PyObject>,
     cache_max_bytes: u64,
+    spillway_max_bytes: Option<u64>,
+    drain_insertion: PyDrainInsertion,
     create_if_missing: bool,
     read_only: bool,
     superblock_count: u32,
@@ -103,13 +148,16 @@ pub fn open(
         }
     };
 
-    // Spillway is disabled for v1 of the Python binding (spillway_max_bytes=0);
-    // exposing spillway controls via Python is deferred until the Rust side
-    // has shipped and stabilized. drain_insertion uses the Rust default.
+    // Resolve the spillway cap. None → Rust's 1024 × cache_max_bytes
+    // default (8 GiB at the 8 MiB cache default); explicit 0 disables
+    // and falls back to CacheFull-at-cap. The 1024 multiplier matches
+    // chisel::Options::default() exactly.
+    let resolved_spillway_max_bytes = spillway_max_bytes.unwrap_or(1024 * cache_max_bytes);
+
     let options = chisel::Options {
         cache_max_bytes,
-        spillway_max_bytes: 0,
-        drain_insertion: chisel::DrainInsertion::LruTail,
+        spillway_max_bytes: resolved_spillway_max_bytes,
+        drain_insertion: drain_insertion.into(),
         create_if_missing,
         read_only,
         superblock_count,
@@ -445,6 +493,7 @@ fn closed_err() -> PyErr {
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyChisel>()?;
+    m.add_class::<PyDrainInsertion>()?;
     m.add_function(wrap_pyfunction!(open, m)?)?;
     Ok(())
 }

@@ -88,10 +88,22 @@ class DefragStats:
     values_moved: int = 0
 
 
+class DrainInsertion:
+    # PyO3 pyclass enum mirroring chisel::DrainInsertion. Users reach for
+    # `chisel.DrainInsertion.LruTail` / `chisel.DrainInsertion.Mru`; the
+    # class-level attributes ARE the singleton instances. Variant names
+    # match the Rust spelling so cross-referencing ARCHITECTURE.md
+    # ADR-5 stays mechanical.
+    LruTail: DrainInsertion
+    Mru: DrainInsertion
+
+
 def open(
     path: str | os.PathLike[str] | None = None,
     *,
     cache_max_bytes: int = 8_388_608,
+    spillway_max_bytes: int | None = None,
+    drain_insertion: DrainInsertion = ...,
     create_if_missing: bool = True,
     read_only: bool = False,
     superblock_count: int = 2,
