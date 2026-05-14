@@ -220,6 +220,23 @@ The page cache is bounded strictly by `cache_max_bytes`. When the cache is full 
 
 In-memory mode (`chisel.open(None)`) uses an in-memory spillway buffer instead of a sidecar file; everything else behaves the same.
 
+### Runtime configuration
+
+All three options above can also be changed *between* transactions on a live `Chisel` handle:
+
+```python
+with chisel.open("db.chisel") as db:
+    db.set_cache_max_bytes(4 * 1024 * 1024)              # halve to 4 MiB
+    db.set_spillway_max_bytes(0)                          # disable spillway
+    db.set_drain_insertion(chisel.DrainInsertion.Mru)
+    with db.transaction() as tx:
+        ...  # uses the new config
+```
+
+Each setter operates ONLY on between-transactions state: calling any of them while a transaction is active raises `TransactionInProgressError`. The engine guards this because shrinking the cache or spillway mid-transaction would either need to reject pinned dirty pages or silently overflow them, neither of which is a clean story — commit or roll back first.
+
+The setters take effect immediately after they return. A subsequent `db.transaction()` uses the new caps and policy; the previous transaction (already committed or rolled back) was unaffected.
+
 ## Errors
 
 All Chisel errors inherit from `chisel.ChiselError`, which splits into two tiers.
@@ -233,7 +250,7 @@ Catch and continue.
 | `InvalidHandleError` | Unknown or deleted handle passed to `read` / `update` / `delete` |
 | `NoActiveTransactionError` | Mutation attempted outside a transaction |
 | `TransactionAlreadyActiveError` | `begin()` called while one is already running |
-| `TransactionInProgressError` | Configuration mutator called while a transaction is active (reserved for future use; not raised by the v1 binding because the runtime config setters are not exposed) |
+| `TransactionInProgressError` | `set_cache_max_bytes` / `set_spillway_max_bytes` / `set_drain_insertion` called while a transaction is active; commit or roll back first |
 | `SavepointNotFoundError` | `rollback_to` / `release` on an unknown savepoint name |
 | `DuplicateSavepointError` | `savepoint(name)` reused an active name |
 | `ReadOnlyModeError` | Write attempted on a read-only handle |
