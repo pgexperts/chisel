@@ -764,7 +764,7 @@ A stronger fix is to refactor `get` / `get_mut` to return the borrow from inside
 
 `page_count()` returns the cached HWM. Initial seed at open via the existing `seek(End(0))`. Two write paths to update; zero seeks on the read path. Saves one syscall per cache miss.
 
-#### I52. `flush()` allocates a transient `Vec<u64>` per commit [deepdive 2026-05-22] — **P3**
+#### I52. `flush()` allocates a transient `Vec<u64>` per commit [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `src/page_cache.rs:340-358`
 
 **Problem:** `flush()` collects dirty IDs into `Vec<u64>` for every flush. Sized to `dirty_count`, so for a 10K-page transaction that's 80 KB transient allocation per commit, repeated on every commit. The collect-first idiom is a borrow-checker dodge (the loop needs `&mut self.entries` while iterating).
@@ -921,14 +921,14 @@ Trade-off: workspace members share an `edition` / `rust-version` / unified featu
 let resolved_spillway_max_bytes = spillway_max_bytes.unwrap_or_else(|| cache_max_bytes.saturating_mul(1024));
 ```
 
-#### I65. `src/spillway.rs` carries stale `#[allow(dead_code)]` on every exported item [deepdive 2026-05-22] — **P3**
+#### I65. `src/spillway.rs` carries stale `#[allow(dead_code)]` on every exported item [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `src/spillway.rs:39-74` (and similar repeated attributes throughout the file)
 
 **Problem:** every `pub` item — `SLOT_HEADER_SIZE`, `SLOT_SIZE`, `Backing`, `Spillway`, every `impl` method, `slot_checksum`, `write_slot`, `read_slot` — carries `#[allow(dead_code)]` with the comment "Suppressed until spillway is wired into PageCache (Tasks 7-8)". Tasks 7-8 landed (see `page_cache.rs:824` and surrounding); the spillway IS wired in. The attributes now suppress nothing real, and if any of these items genuinely becomes dead in a future refactor, the attribute will hide that.
 
 **Direction of fix:** remove every `#[allow(dead_code)]` in `src/spillway.rs` along with the explanatory comments that go with them. A `cargo build` after the removal will fail on anything that was legitimately dead; that's the signal worth surfacing.
 
-#### I66. Tests use `std::mem::forget(file)` to bypass `NamedTempFile` cleanup [deepdive 2026-05-22] — **P3**
+#### I66. Tests use `std::mem::forget(file)` to bypass `NamedTempFile` cleanup [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `src/transaction.rs:2211`, `src/page_cache.rs:930, 1000`, possibly others
 
 **Problem:** `NamedTempFile` cleans up its path via `Drop`; tests that need the file to outlive the `NamedTempFile` value (because they re-open the path) leak the temp file deliberately with `std::mem::forget(file)`. This is fragile: the leaked path stays in `/tmp` after the test exits. Over many CI runs this can fill disk on a long-lived runner.
@@ -937,7 +937,7 @@ let resolved_spillway_max_bytes = spillway_max_bytes.unwrap_or_else(|| cache_max
 
 ### Idiomaticity
 
-#### I67. Three sites use awkward `!self.entries.get(&id).is_none_or(|e| e.dirty)` pattern [deepdive 2026-05-22] — **P3**
+#### I67. Three sites use awkward `!self.entries.get(&id).is_none_or(|e| e.dirty)` pattern [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `src/page_cache.rs:419, 702, 834`
 
 **Problem:** the double negative ("not none-or-dirty" = "some and clean") is acknowledged as awkward in the comment at line 820. Used at three sites for the same eviction-victim search.
@@ -1017,3 +1017,27 @@ CI keeps passing today, but the warning is on every run and there is a hard cuto
 **Direction of fix:** bump each `uses:` line to a version whose action manifest declares `node24` once those versions are GA. As of 2026-05-22, the v5 line of `actions/checkout` is the natural target; the other actions cited above need a one-shot audit of their action.yml `runs.using` field. Until then, the temporary opt-in is the `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true` env var on the runner — but that's worse than just bumping the pin once. Single-PR scope: edit `.github/workflows/ci.yml`, push, verify one CI run goes green.
 
 Low priority because runners auto-upgrade on the cutoff date anyway; medium-low because if `actions/checkout@v5` is GA before then, this is a five-minute PR that closes the warning noise immediately.
+
+#### I74. Expose `Spillway::logical_bytes` and `max_bytes` via `Chisel::stats` / `ChiselCounters` [I65 follow-up 2026-05-22] — **P3**
+**Where:** `src/spillway.rs` (`logical_bytes`, `max_bytes` — currently `#[cfg(test)]`); `src/stats.rs` (`Stats` / `ChiselCounters`); `src/lib.rs` (`Chisel::stats`).
+
+**Problem:** when I65 stripped every `#[allow(dead_code)]` from `src/spillway.rs`, `Spillway::logical_bytes()` and `Spillway::max_bytes()` surfaced as legitimately unused — they had no production caller. Gating them as `#[cfg(test)]` keeps the lib build clean and preserves the methods for the test module, but throws away the chance for operators to read spillway capacity utilisation through the public stats API.
+
+Spillway capacity is exactly the kind of metric operators want for capacity planning: "how full is the spillway right now, and what's the cap?" Knowing `logical_bytes / max_bytes` answers "are we one transaction away from `SpillwayFull`?"
+
+**Direction of fix:** add two fields to the `Stats` (or `ChiselCounters`) struct:
+
+```rust
+#[non_exhaustive]
+pub struct Stats {
+    // ...existing fields...
+    /// Spillway logical bytes in flight (None if spillway never opened).
+    pub spillway_logical_bytes: Option<u64>,
+    /// Spillway max-bytes cap (None if spillway never opened).
+    pub spillway_max_bytes: Option<u64>,
+}
+```
+
+Wire them into `Chisel::stats` by inspecting `PageCache::spillway` (which is already `pub(crate)`). Then remove the `#[cfg(test)]` from the two `Spillway` methods. The `Option` shape is because the spillway is lazily opened on first spill — `None` distinguishes "no spillway yet" from "spillway has zero bytes in flight."
+
+Low priority because spillway exhaustion currently surfaces as `SpillwayFull` (a typed error) rather than a silent slowdown; operators can hook on that. But adding observability is the difference between "see the wall coming" and "hit the wall."

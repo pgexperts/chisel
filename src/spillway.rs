@@ -30,31 +30,25 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use crate::error::{ChiselError, Result};
 use crate::page::PAGE_SIZE;
 
 /// Per-slot header: u64 page_id + u64 XXH3 checksum.
-// Suppressed until spillway is wired into PageCache (Tasks 7-8).
-#[allow(dead_code)]
 pub const SLOT_HEADER_SIZE: usize = 16;
 /// Total bytes a slot occupies on disk (header + page).
-// Suppressed until spillway is wired into PageCache (Tasks 7-8).
-#[allow(dead_code)]
 pub const SLOT_SIZE: usize = SLOT_HEADER_SIZE + PAGE_SIZE;
 
 /// Spillway backing storage: real file on disk, or in-memory bytes for
 /// memory-mode databases.
-// Suppressed until spillway is wired into PageCache (Tasks 7-8).
-#[allow(dead_code)]
 enum Backing {
-    File { file: File, path: PathBuf },
+    File { file: File },
     Memory { bytes: Vec<u8> },
 }
 
-// Suppressed until spillway is wired into PageCache (Tasks 7-8).
-#[allow(dead_code)]
 pub struct Spillway {
     backing: Backing,
     /// page_id -> slot index. Built up by `spill`; consulted by
@@ -70,17 +64,20 @@ pub struct Spillway {
     max_bytes: u64,
 }
 
-// Suppressed until spillway is wired into PageCache (Tasks 7-8).
-#[allow(dead_code)]
 impl Spillway {
     /// Open (or create + truncate) a file-backed spillway alongside the
     /// main database. The path is `<db_path>.spillway`. Any pre-existing
     /// content is discarded — no superblock can possibly point at
     /// spillway bytes, so this is always safe.
     pub fn open_file(db_path: &Path, max_bytes: u64) -> Result<Spillway> {
+        // I65: build the spillway path as an OsString and pass it to
+        // OpenOptions directly — OsString impls AsRef<Path>, so we
+        // don't need a PathBuf round-trip. The path is not retained
+        // anywhere (Backing::File holds only the open File handle);
+        // if a future error message needs to mention the spillway
+        // path, reconstruct from db_path.
         let mut path = db_path.as_os_str().to_owned();
         path.push(".spillway");
-        let path: PathBuf = path.into();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -88,7 +85,7 @@ impl Spillway {
             .truncate(true)
             .open(&path)?;
         Ok(Spillway {
-            backing: Backing::File { file, path },
+            backing: Backing::File { file },
             slots: HashMap::new(),
             next_slot_index: 0,
             max_bytes,
@@ -122,12 +119,25 @@ impl Spillway {
     }
 
     /// Logical size in bytes (excludes per-slot headers).
+    ///
+    /// I74 (ISSUES.md, 2026-05-22): `#[cfg(test)]` because there is no
+    /// production caller today. Worth exposing via `Chisel::stats` /
+    /// `ChiselCounters` so operators can monitor spillway capacity
+    /// use — file I74 tracks that as a follow-up. Until then,
+    /// gating to test-only keeps the lib build clean.
+    #[cfg(test)]
     pub fn logical_bytes(&self) -> u64 {
         self.next_slot_index * PAGE_SIZE as u64
     }
 
     /// Strict upper bound on logical size, settable at construction or
     /// via PageCache::set_spillway_max_bytes between transactions.
+    ///
+    /// I74 (ISSUES.md, 2026-05-22): `#[cfg(test)]` for the same reason
+    /// as `logical_bytes` above — useful for stats exposure, no
+    /// production caller today. The setter (`set_max_bytes`) IS used
+    /// in production via `PageCache::set_spillway_max_bytes`.
+    #[cfg(test)]
     pub fn max_bytes(&self) -> u64 {
         self.max_bytes
     }
@@ -168,8 +178,6 @@ impl Spillway {
     /// to zero bytes. Called at every commit (after drain) and every
     /// rollback. The spillway holds no live content between
     /// transactions.
-    // Task 11 activates this at commit-drain; Task 12 at rollback.
-    #[allow(dead_code)]
     pub fn truncate(&mut self) -> Result<()> {
         self.slots.clear();
         self.next_slot_index = 0;
@@ -195,8 +203,6 @@ impl Spillway {
     /// The drain doesn't need a particular order; one batch's
     /// rehydrates all flush together with later batches under a
     /// single fsync.
-    // Task 11 activates this in the commit-drain loop.
-    #[allow(dead_code)]
     pub fn drain_batch(&mut self, batch_size: usize) -> Vec<u64> {
         let mut ids = Vec::with_capacity(batch_size.min(self.slots.len()));
         for &id in self.slots.keys().take(batch_size) {
@@ -210,8 +216,6 @@ impl Spillway {
     /// allocations until the next `truncate` (mid-drain growth would
     /// be a re-entrancy hazard); the file's tail bytes simply become
     /// garbage and are reclaimed by `truncate`.
-    // Task 11 activates this in the commit-drain loop (after each rehydrate).
-    #[allow(dead_code)]
     pub fn forget(&mut self, page_id: u64) {
         self.slots.remove(&page_id);
     }
@@ -256,8 +260,6 @@ impl Spillway {
 /// Compute the per-slot checksum: XXH3 over (page_id || page_bytes).
 /// Distinct from the main-file page checksum because a spilled page
 /// may not yet have a stamped main-file checksum (see spec).
-// Suppressed until spillway is wired into PageCache (Tasks 7-8).
-#[allow(dead_code)]
 fn slot_checksum(page_id: u64, page_bytes: &[u8; PAGE_SIZE]) -> u64 {
     let mut hasher = xxhash_rust::xxh3::Xxh3::new();
     hasher.update(&page_id.to_le_bytes());
@@ -265,8 +267,6 @@ fn slot_checksum(page_id: u64, page_bytes: &[u8; PAGE_SIZE]) -> u64 {
     hasher.digest()
 }
 
-// Suppressed until spillway is wired into PageCache (Tasks 7-8).
-#[allow(dead_code)]
 fn write_slot(
     backing: &mut Backing,
     slot_index: u64,
@@ -301,8 +301,6 @@ fn write_slot(
 /// Symmetric counterpart to write_slot — same offset arithmetic, same
 /// backing dispatch. Returns IoError on short read (underlying I/O
 /// failure) rather than ChecksumMismatch; callers distinguish the two.
-// Suppressed until spillway is wired into PageCache (Tasks 7-8).
-#[allow(dead_code)]
 fn read_slot(backing: &mut Backing, slot_index: u64) -> Result<(u64, u64, [u8; PAGE_SIZE])> {
     let offset = slot_index * SLOT_SIZE as u64;
     let mut header = [0u8; SLOT_HEADER_SIZE];
