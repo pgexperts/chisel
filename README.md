@@ -68,7 +68,7 @@ fn main() -> chisel::Result<()> {
 
 ## Building from source
 
-Rust workspace with three crates: the root `chisel` engine, the `python/` PyO3 binding, and the `bench/` benchmark suite. Each is built independently — running `cargo test` from the repo root does **not** run the bench subcrate's tests, since `bench/` is a sibling crate, not a workspace member.
+Three sibling Cargo crates: the root `chisel` engine, the `python/` PyO3 binding, and the `bench/` benchmark suite. They share a repository but are not a Cargo workspace — each has its own `Cargo.lock` and `target/` and is built independently. Running `cargo test` from the repo root does **not** run the bench subcrate's tests; CI runs them in a separate `bench-tests` job (see I58 in ISSUES.md).
 
 ### Root crate
 
@@ -304,6 +304,8 @@ Every page carries an XXH3 checksum validated on load; cache hits skip revalidat
 ## Platform support
 
 Chisel runs on macOS and Linux. File locking uses `flock(2)` via `libc`. Windows is not currently supported and would require a different locking primitive.
+
+`flock` is **advisory**, not mandatory. Cooperating processes (any other Chisel instance, or any tool that honours advisory locks) will respect the exclusive lock and block. A tool that bypasses advisory locking — `cp` while a transaction is in flight, some sync utilities, naive backup scripts that read the raw file — can still scribble on or read a torn view of the database. The shadow-paging invariants assume an exclusive owner; respect the lock from outside Chisel as well as inside it.
 
 Rust stable, edition 2021. Minimum supported Rust version (MSRV): 1.82 — the version that stabilized `Option::is_none_or`, used in `src/page_cache.rs`. A future MSRV bump will appear in `Cargo.toml`'s `rust-version` field and be called out in release notes.
 

@@ -152,7 +152,15 @@ pub fn open(
     // default (8 GiB at the 8 MiB cache default); explicit 0 disables
     // and falls back to CacheFull-at-cap. The 1024 multiplier matches
     // chisel::Options::default() exactly.
-    let resolved_spillway_max_bytes = spillway_max_bytes.unwrap_or(1024 * cache_max_bytes);
+    // I64 (ISSUES.md, 2026-05-22): `saturating_mul` mirrors the Rust
+    // side (`Options::default` in src/lib.rs). For the default
+    // cache_max_bytes = 8 MiB the product fits in u64 with plenty of
+    // headroom; a Python caller passing cache_max_bytes = 1 << 54
+    // (16 PiB) would silently overflow plain `*` to a small spillway
+    // cap, falling back to CacheFull-at-cap behaviour rather than
+    // saturating to u64::MAX as intended.
+    let resolved_spillway_max_bytes =
+        spillway_max_bytes.unwrap_or_else(|| cache_max_bytes.saturating_mul(1024));
 
     // I36: chisel::Options is #[non_exhaustive] so external callers
     // (including this binding, which is a separate crate even though

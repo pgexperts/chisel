@@ -185,6 +185,10 @@ impl PageCache {
             self.load_page(page_id)?;
         }
         self.touch_lru(page_id);
+        // I48 INVARIANT: entry is guaranteed present — either the hit
+        // branch (contains_key was true and no mutation has happened
+        // since) or the miss branch just succeeded at load_page, which
+        // inserts page_id into self.entries before returning Ok.
         Ok(&self.entries.get(&page_id).unwrap().buf)
     }
 
@@ -208,6 +212,9 @@ impl PageCache {
             self.load_page(page_id)?;
         }
         self.touch_lru(page_id);
+        // I48 INVARIANT: same as get() above — entry is present on the
+        // hit branch (contains_key was true) and on the miss branch
+        // because load_page inserts before returning Ok.
         let entry = self.entries.get_mut(&page_id).unwrap();
         // Track clean→dirty transitions for the dirty_count counter.
         // No-op on dirty→dirty (entry was already counted).
@@ -350,6 +357,10 @@ impl PageCache {
             .map(|(&id, _)| id)
             .collect();
         for page_id in dirty_ids {
+            // I48 INVARIANT: dirty_ids was collected from self.entries
+            // immediately above (filtered by dirty=true). Nothing between
+            // the collect and this loop touches self.entries, so each id
+            // is still present and still dirty.
             let entry = self.entries.get_mut(&page_id).unwrap();
             self.io.write_page(page_id, &entry.buf)?;
             entry.dirty = false;
@@ -380,6 +391,11 @@ impl PageCache {
             for page_id in batch {
                 // Rehydrate into a local buffer, then drop the spillway borrow
                 // before touching self.entries or self.lru (both need &mut self).
+                // I48 INVARIANT: the outer loop's `match self.spillway.as_mut()`
+                // matched `Some(_)` to populate `batch`. Nothing between that
+                // match and here can drop the spillway — there is no mutating
+                // call to self that could call `self.spillway = None`, and
+                // drain_spillway holds &mut self exclusively.
                 let buf = {
                     let spw = self.spillway.as_mut().unwrap();
                     let b = spw.rehydrate(page_id)?;
@@ -434,9 +450,13 @@ impl PageCache {
         }
 
         // Phase 2: single fsync covers in-cache writes (Phase 1a) and every
-        // drained-batch write (Phase 1b). This is the first of the two fsyncs
-        // in the commit protocol; TransactionManager::commit_inner issues the
-        // second after writing the superblock.
+        // drained-batch write (Phase 1b). This is the SECOND of three
+        // fsyncs in the commit protocol — see Chisel::commit's docstring
+        // for the full enumeration. The first is TransactionManager's
+        // I28 pre-drain flush (which calls flush() once before this one,
+        // to keep CacheFull off the persist_freemap path); the third is
+        // the superblock fsync issued by TransactionManager::commit_inner
+        // after writing the alternate slot.
         self.io.fsync()?;
         Ok(())
     }
@@ -919,6 +939,9 @@ impl PageCache {
             };
             self.spillway = Some(spw);
         }
+        // I48 INVARIANT: the `if self.spillway.is_none()` block above
+        // just set self.spillway = Some(spw); if it didn't run, the
+        // spillway was already Some on entry. Either way, unwrap is safe.
         Ok(self.spillway.as_mut().unwrap())
     }
 }

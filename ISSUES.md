@@ -700,7 +700,7 @@ fn try_lock(file: &File) -> Result<()> {
 
 **Direction of fix:** convert to `Err(ChiselError::CorruptPage { page_id: entry.page_id })` with a comment noting that reaching this arm would mean the handle table returned a Deleted entry that ok_or didn't catch — i.e., the in-memory state contradicts itself, which is genuinely a corruption signal worth surfacing typed.
 
-#### I46. `DataPage::insert(...).expect("value fits in empty page")` needs an `// INVARIANT:` comment [deepdive 2026-05-22] — **P3**
+#### I46. `DataPage::insert(...).expect("value fits in empty page")` needs an `// INVARIANT:` comment [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `src/transaction.rs:1846`
 
 **Problem:** the `expect` is reachable if `DataPage::insert` ever returns `None` for any reason besides "no room" (e.g., a future size-overflow check on a misuse). The invariant is currently sound — the data page was just allocated and initialized, so insert can't fail for size reasons against a value that was already length-checked against `MAX_INLINE_VALUE` — but it's not asserted at a type level.
@@ -722,7 +722,7 @@ let slot = DataPage::insert(buf, value).expect("value fits in empty page");
 
 **Direction of fix:** `page_count.saturating_mul(page::PAGE_SIZE as u64)` is one character of armor.
 
-#### I48. Five invariant-backed `.unwrap()` sites in `page_cache.rs` need `// INVARIANT:` annotations [deepdive 2026-05-22] — **P3**
+#### I48. Five invariant-backed `.unwrap()` sites in `page_cache.rs` need `// INVARIANT:` annotations [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `src/page_cache.rs:188, 211, 353, 384, 914`
 
 **Problem:** five `.unwrap()` sites on hashmap `get` / `Option<Spillway>` access immediately after the cache was populated or the spillway was just constructed. Each is invariant-backed but unannotated; in aggregate they're a "trust the local code" pattern that a maintenance read can't verify quickly.
@@ -744,7 +744,7 @@ A stronger fix is to refactor `get` / `get_mut` to return the borrow from inside
 
 **Direction of fix:** translate to `Err(ChiselError::CorruptPage { page_id: victim_id })` and document that reaching this branch indicates the cache's two-data-structure invariant broke, which is genuinely a corruption signal worth surfacing typed.
 
-#### I50. Hex literal `0x02` used instead of `FLAG_INTERIOR` constant in `open_existing` [deepdive 2026-05-22] — **P3**
+#### I50. Hex literal `0x02` used instead of `FLAG_INTERIOR` constant in `open_existing` [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `src/transaction.rs:417, 423`
 
 **Problem:** `if root_buf[1] == 0x02 { ... }` reaches for a raw hex literal rather than `handle_table::FLAG_INTERIOR`. The constant exists; using the literal defeats the single-source-of-truth promise for the on-disk format and makes a grep for "interior" miss this site.
@@ -896,21 +896,21 @@ Trade-off: workspace members share an `edition` / `rust-version` / unified featu
 
 ### Doc fixes
 
-#### I62. `README.md:71` claims "Rust workspace with three crates" but the repo is not a workspace [deepdive 2026-05-22] — **P3**
+#### I62. `README.md:71` claims "Rust workspace with three crates" but the repo is not a workspace [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `README.md:71` ("Building from source" intro)
 
 **Problem:** the README opens "Rust workspace with three crates: the root `chisel` engine, the `python/` PyO3 binding, and the `bench/` benchmark suite." There is no workspace `Cargo.toml`. The same paragraph later acknowledges the truth ("running `cargo test` from the repo root does **not** run the bench subcrate's tests, since `bench/` is a sibling crate, not a workspace member") — those two sentences contradict each other.
 
 **Direction of fix:** either change the opening sentence to "three sibling crates" (the truth today, and aligns with the existing CLAUDE.md→ARCHITECTURE.md migration), or do I61 first and update the README to reflect the new workspace structure.
 
-#### I63. `Chisel::commit` docstring says "two fsyncs"; protocol does three [deepdive 2026-05-22] — **P3**
+#### I63. `Chisel::commit` docstring says "two fsyncs"; protocol does three [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `src/lib.rs:278-280`
 
 **Problem:** `Chisel::commit`'s docstring reads "Performs two fsyncs (dirty data pages, then the alternate superblock)". `ARCHITECTURE.md`'s commit-protocol section (and the I28 fix) document three: pre-drain flush + main-pages flush + superblock. The `no_spill_workload_preserves_two_fsync_commit` test (despite its name) pins to `== 3` per spillway-rollout lesson #3.
 
 **Direction of fix:** update the docstring to "Performs three fsyncs (pre-drain flush, main pages flush, then the alternate superblock)". Also consider renaming the test to drop the "two_fsync" misnomer; the test's body already documents the three.
 
-#### I64. `python/src/db.rs:155` uses plain `*` where Rust side uses `saturating_mul` [deepdive 2026-05-22] — **P3**
+#### I64. `python/src/db.rs:155` uses plain `*` where Rust side uses `saturating_mul` [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `python/src/db.rs:155`
 
 **Problem:** `let resolved_spillway_max_bytes = spillway_max_bytes.unwrap_or(1024 * cache_max_bytes);` uses plain `*`. `src/lib.rs:118` (`Options::default`) uses `cache_max_bytes.saturating_mul(1024)`. For the default `cache_max_bytes = 8_388_608`, the result fits comfortably in `u64`. A user passing `cache_max_bytes = 1 << 54` (16 PiB) from Python would silently overflow to a small spillway cap rather than saturate to `u64::MAX`.
@@ -944,14 +944,14 @@ let resolved_spillway_max_bytes = spillway_max_bytes.unwrap_or_else(|| cache_max
 
 **Direction of fix:** replace with `self.entries.get(&id).is_some_and(|e| !e.dirty)` — reads as "some and clean" and matches the intent directly. Fixes all three sites the same way; no semantic change.
 
-#### I68. `Chisel::Drop` doesn't fsync (correct, but worth a one-line annotation) [deepdive 2026-05-22] — **P3**
+#### I68. `Chisel::Drop` doesn't fsync (correct, but worth a one-line annotation) [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `src/lib.rs` (no explicit `Drop` impl on `Chisel`)
 
 **Problem:** if a user forgets to `commit()`, shadow paging guarantees the on-disk state is the last committed state — so dropping without committing is correct, not a data-loss bug. The type-level doc at `src/lib.rs:139-141` documents this. But a reader coming from other ecosystems (Postgres, RocksDB) expects an explicit "close discards uncommitted work" callout at the `Drop` site too.
 
 **Direction of fix:** add a `// Drop intentionally omitted — shadow paging guarantees the on-disk state is the last committed state regardless of how the value goes out of scope. See type-level doc for the full semantics.` block at the top of `impl Chisel` or just below the struct declaration. No behaviour change; documentation for the next reader.
 
-#### I69. `flock` is advisory, not mandatory — worth annotating in an ops/recovery doc [deepdive 2026-05-22] — **P3**
+#### I69. `flock` is advisory, not mandatory — worth annotating in an ops/recovery doc [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** README + `ARCHITECTURE.md` (cross-cutting)
 
 **Problem:** the README and ARCHITECTURE.md both mention that Chisel uses `flock` for single-process exclusion, but neither explicitly states that `flock` is advisory — an external tool that doesn't respect advisory locks (some text editors with "lock files", filesystem dump tools, naive sync utilities) can scribble on the file. This is a Linux/macOS POSIX limitation, not a Chisel bug, but it deserves a sentence so users don't trip over it.
