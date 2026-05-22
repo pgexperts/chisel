@@ -220,7 +220,20 @@ impl fmt::Display for ChiselError {
     }
 }
 
-impl std::error::Error for ChiselError {}
+impl std::error::Error for ChiselError {
+    /// I41 (ISSUES.md, 2026-05-22): expose the wrapped `io::Error` from the
+    /// `IoError` variant so error-chain walkers (`anyhow::Error::root_cause`,
+    /// structured-logging adapters, `eyre` reports, `std::error::Error::chain`)
+    /// can see the underlying cause. Returns `None` for every other variant
+    /// because no other variant carries an inner error today. If a future
+    /// variant grows an inner cause, extend this match.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ChiselError::IoError(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 // Blanket conversion so `?` works on std::io calls in page_io.rs and friends.
 // Note: every io::Error becomes a *fatal* IoError — callers that want to
@@ -234,3 +247,48 @@ impl From<io::Error> for ChiselError {
 
 /// Crate-wide Result alias. All fallible Chisel APIs return this.
 pub type Result<T> = std::result::Result<T, ChiselError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    // I41 regression: ChiselError::IoError(inner) must expose `inner` via
+    // source() so error-chain walkers can recover the io::Error and inspect
+    // its kind/raw_os_error. Pre-I41 the trait impl was empty (`{}`) so
+    // source() returned None and the inner cause was unreachable from
+    // callers that didn't pattern-match on the variant.
+    #[test]
+    fn ioerror_source_returns_inner_io_error() {
+        let inner = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let e: ChiselError = inner.into();
+        let src = e
+            .source()
+            .expect("IoError must expose its inner error via source()");
+        let downcast: &io::Error = src
+            .downcast_ref()
+            .expect("source() should downcast back to io::Error");
+        assert_eq!(downcast.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    // I41 corollary: every variant that does NOT wrap an inner error must
+    // return None from source(). Sampling a few representative ones is
+    // enough; a future variant that grows an inner cause will need the
+    // source() match arm extended.
+    #[test]
+    fn non_io_variants_have_no_source() {
+        let cases: [ChiselError; 5] = [
+            ChiselError::InvalidHandle(0),
+            ChiselError::NoActiveTransaction,
+            ChiselError::ChecksumMismatch { page_id: 0 },
+            ChiselError::CorruptSuperblock,
+            ChiselError::Poisoned,
+        ];
+        for e in &cases {
+            assert!(
+                e.source().is_none(),
+                "expected source() == None for {e:?}, got Some(...)"
+            );
+        }
+    }
+}
