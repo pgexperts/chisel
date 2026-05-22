@@ -50,7 +50,7 @@ use std::collections::HashMap;
 use crate::data_page::DataPage;
 use crate::error::{ChiselError, Result};
 use crate::freemap::FreeMap;
-use crate::handle_table::{HandleEntry, HandleFlags, HandleTable};
+use crate::handle_table::{HandleEntry, HandleFlags, HandleTable, FLAG_INTERIOR};
 use crate::overflow::Overflow;
 use crate::page::{self, PAGE_ID_NONE, PAGE_SIZE};
 use crate::page_cache::PageCache;
@@ -414,13 +414,13 @@ impl TransactionManager {
         if sb.root_handle_table_page != PAGE_ID_NONE {
             // Determine depth by walking down the left spine.
             let root_buf = cache.get(sb.root_handle_table_page)?;
-            if root_buf[1] == 0x02 {
+            if root_buf[1] == FLAG_INTERIOR {
                 // Interior node — walk down to find depth.
                 let mut depth = 0u32;
                 let mut current = sb.root_handle_table_page;
                 loop {
                     let buf = cache.get(current)?;
-                    if buf[1] != 0x02 {
+                    if buf[1] != FLAG_INTERIOR {
                         break;
                     }
                     depth += 1;
@@ -1851,6 +1851,13 @@ impl TransactionManager {
             let mut cache = self.cache.borrow_mut();
             let buf = cache.get_mut(page_id)?;
             DataPage::init_page(buf);
+            // I46 INVARIANT: DataPage::insert can only return None for
+            // "no room"; the page was just init'd via DataPage::init_page
+            // (empty), and the value's length was already checked against
+            // MAX_INLINE_VALUE upstream (the overflow path catches anything
+            // larger before we get here). If DataPage::insert ever grows
+            // other failure modes, this expect needs to translate them to
+            // typed errors instead of panicking.
             let slot = DataPage::insert(buf, value).expect("value fits in empty page");
             page::stamp_checksum(buf);
             slot

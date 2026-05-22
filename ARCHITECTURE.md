@@ -217,7 +217,9 @@ A Chisel file is a sequence of fixed-size 8 KB pages. The first N pages (where `
 +-----------------------------------+
 ```
 
-Every page ends with an 8-byte XXH3 checksum over bytes `0..CHECKSUM_OFFSET` (= bytes `0..8184`). `PageCache` validates the checksum on every cache miss; cache hits skip revalidation because the in-memory bytes are trusted between writes (the exclusive `flock` keeps any other process from scribbling on the file). A checksum mismatch on load is fatal (`ChecksumMismatch`).
+Every page ends with an 8-byte XXH3 checksum over bytes `0..CHECKSUM_OFFSET` (= bytes `0..8184`). `PageCache` validates the checksum on every cache miss; cache hits skip revalidation because the in-memory bytes are trusted between writes (the exclusive `flock` keeps any other Chisel-or-cooperating process from scribbling on the file). A checksum mismatch on load is fatal (`ChecksumMismatch`).
+
+`flock` is POSIX-advisory: cooperating processes (any other Chisel instance, or any tool that honours advisory locks) respect it; a tool that bypasses advisory locking — `cp` during a transaction, naive backup scripts, some sync utilities — can still corrupt the file even with Chisel holding the lock. The single-writer model assumes external respect for the lock; see README's "Platform support" section for the user-facing version of this caveat.
 
 ### Common page header
 

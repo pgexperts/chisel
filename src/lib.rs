@@ -237,6 +237,14 @@ impl Options {
 /// necessary because Linux `fsync` semantics (fsyncgate, 2018) do not
 /// permit safely retrying a failed fsync — the kernel may have discarded
 /// the dirty pages before reporting the error.
+// I68 (ISSUES.md, 2026-05-22): `Chisel` has no explicit `Drop` impl
+// because shadow paging guarantees the on-disk state is always the
+// last successfully committed state — whether the value goes out of
+// scope via an explicit `close()`, a panic unwind, or a forgotten
+// `_db` binding at the end of `main`. A reader coming from Postgres
+// or RocksDB might expect `Drop` to fsync or to discard uncommitted
+// work explicitly; here, the COW protocol makes both redundant. The
+// type-level doc below documents the user-facing semantics.
 pub struct Chisel {
     txm: TransactionManager,
 }
@@ -361,10 +369,28 @@ impl Chisel {
         self.txm.begin()
     }
 
-    /// Commit the active transaction. Performs two fsyncs (dirty data pages,
-    /// then the alternate superblock) before returning — this is the point
-    /// at which changes become durable. A crash before the superblock fsync
-    /// leaves the previous committed state intact.
+    /// Commit the active transaction. Performs three fsyncs before
+    /// returning — this is the point at which changes become durable:
+    ///
+    /// 1. **I28 pre-drain flush.** `TransactionManager::commit_inner`
+    ///    pre-drains the cache before `persist_freemap` to keep
+    ///    `CacheFull` off the commit path (see ISSUES.md I28).
+    /// 2. **Main data-pages flush.** `PageCache::flush` phase 2 issues
+    ///    one fsync that covers every in-cache write plus every
+    ///    drained-batch write.
+    /// 3. **Superblock fsync.** The alternate-slot superblock is
+    ///    written and fsynced; this is the linearization point.
+    ///
+    /// A crash before the superblock fsync leaves the previous
+    /// committed state intact — recovery picks the older superblock
+    /// via `Superblock::select` and the partially-written shadow
+    /// pages become unreachable garbage.
+    ///
+    /// The spillway, when engaged, adds zero additional fsyncs to
+    /// this protocol (its content does not need to survive a crash).
+    /// `tests/spillway_integration.rs::no_spill_workload_preserves_two_fsync_commit`
+    /// pins the count to `== 3`; the test name retains the older
+    /// "two_fsync" label from the original spec.
     pub fn commit(&mut self) -> Result<()> {
         self.txm.commit()
     }

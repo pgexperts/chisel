@@ -73,7 +73,11 @@ const PTRS_PER_INTERIOR: usize = (CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE) / CHI
 // page type puts its version at byte 1; `page::page_format_version`
 // dispatches on PageType to read from the right offset.
 const FLAG_LEAF: u8 = 0x01;
-const FLAG_INTERIOR: u8 = 0x02;
+// I50 (ISSUES.md, 2026-05-22): `pub(crate)` so transaction.rs's
+// open_existing depth-walk can match against the named constant
+// instead of a raw `0x02` literal. The on-disk flag value is part of
+// the format and must stay in lockstep with FLAG_LEAF.
+pub(crate) const FLAG_INTERIOR: u8 = 0x02;
 
 /// Per-entry state tag. `Deleted` functions as a tombstone — the slot stays
 /// allocated in the leaf, so the corresponding handle value is permanently
