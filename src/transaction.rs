@@ -1878,7 +1878,7 @@ impl TransactionManager {
 mod tests {
     use super::*;
     use crate::page_io::PageIo;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
     fn fresh_manager() -> TransactionManager {
         let file = NamedTempFile::new().unwrap();
@@ -2221,9 +2221,12 @@ mod tests {
     // escape hatch), matching the pre-spillway path this test exercises.
     #[test]
     fn commit_does_not_poison_when_cache_is_at_strict_cap() {
-        let file = NamedTempFile::new().unwrap();
-        let io = PageIo::open(file.path(), false).unwrap();
-        std::mem::forget(file);
+        // I66 (ISSUES.md, 2026-05-22): TempDir for RAII cleanup —
+        // replaces the pre-I66 NamedTempFile + std::mem::forget(file)
+        // pattern that leaked the temp path on every test run.
+        let _dir = TempDir::new().unwrap();
+        let db_path = _dir.path().join("test.chisel");
+        let io = PageIo::open(&db_path, false).unwrap();
         // max_pages=16 — big enough for baseline operations (handle-table
         // root + superblocks + freemap) to coexist, small enough that a
         // handful of big allocations saturate the strict cap quickly.

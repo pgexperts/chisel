@@ -81,6 +81,19 @@ pub struct PageCache {
     /// dirty and no victim exists), trivially making page-allocation
     /// O(n) per call. With this counter the early-out is O(1).
     dirty_count: usize,
+    /// I52 (ISSUES.md, 2026-05-22): reusable scratch buffer for
+    /// `flush()` and `discard_all_dirty()`. Both functions iterate
+    /// `self.entries` to collect dirty page ids, then iterate that
+    /// collection while mutating `self.entries` — a borrow-checker
+    /// situation that demands an intermediate `Vec`. Holding the Vec
+    /// on `self` lets us reuse its allocation across commits/rollbacks.
+    /// For a 10K-page transaction this saves 80 KB of transient
+    /// allocation per commit. The std::mem::take/restore dance below
+    /// keeps the borrow checker happy: we take the empty vec out,
+    /// fill it, drain it, then put it back. On the error path we drop
+    /// the vec — acceptable since errors are rare and one realloc on
+    /// the next commit is cheap.
+    dirty_scratch: Vec<u64>,
     max_pages: usize,
     /// Strict upper bound on the spillway sidecar file in bytes
     /// (excluding per-slot headers). 0 means spillway disabled —
@@ -154,6 +167,7 @@ impl PageCache {
             entries: HashMap::new(),
             lru: LruIndex::new(),
             dirty_count: 0,
+            dirty_scratch: Vec::new(),
             max_pages,
             spillway_max_bytes,
             drain_insertion,
@@ -350,21 +364,31 @@ impl PageCache {
         // relies on flush() being idempotent between commits — dirty_count
         // is reset to zero here, not decremented per page, to survive any
         // future reordering of the loop body.
-        let dirty_ids: Vec<u64> = self
-            .entries
-            .iter()
-            .filter(|(_, e)| e.dirty)
-            .map(|(&id, _)| id)
-            .collect();
-        for page_id in dirty_ids {
-            // I48 INVARIANT: dirty_ids was collected from self.entries
-            // immediately above (filtered by dirty=true). Nothing between
-            // the collect and this loop touches self.entries, so each id
-            // is still present and still dirty.
+        //
+        // I52: reuse self.dirty_scratch across calls. We take it out
+        // (now self.dirty_scratch is empty but PageCache still owns it
+        // via the destination of the assignment at function end), fill
+        // it, drain it, then restore. The take/restore pattern avoids
+        // the disjoint-borrow ambiguity of iterating &self.dirty_scratch
+        // while calling self.entries.get_mut.
+        let mut dirty_scratch = std::mem::take(&mut self.dirty_scratch);
+        dirty_scratch.extend(
+            self.entries
+                .iter()
+                .filter(|(_, e)| e.dirty)
+                .map(|(&id, _)| id),
+        );
+        for &page_id in &dirty_scratch {
+            // I48 INVARIANT: dirty_scratch was just populated from
+            // self.entries (filtered by dirty=true). Nothing between
+            // the extend and this loop touches self.entries, so each
+            // id is still present and still dirty.
             let entry = self.entries.get_mut(&page_id).unwrap();
             self.io.write_page(page_id, &entry.buf)?;
             entry.dirty = false;
         }
+        dirty_scratch.clear();
+        self.dirty_scratch = dirty_scratch;
         self.dirty_count = 0;
 
         // Phase 1b: drain the spillway in batches. For each batch:
@@ -432,7 +456,7 @@ impl PageCache {
                 let victim = self
                     .lru
                     .iter_lru_to_mru()
-                    .find(|&id| !self.entries.get(&id).is_none_or(|e| e.dirty));
+                    .find(|&id| self.entries.get(&id).is_some_and(|e| !e.dirty));
                 match victim {
                     Some(id) => {
                         self.entries.remove(&id);
@@ -502,16 +526,23 @@ impl PageCache {
     /// Clean entries are preserved — they are read-through caches of
     /// committed disk content and remain correct across rollback.
     pub fn discard_all_dirty(&mut self) {
-        let dirty_ids: Vec<u64> = self
-            .entries
-            .iter()
-            .filter(|(_, e)| e.dirty)
-            .map(|(&id, _)| id)
-            .collect();
-        for id in dirty_ids {
+        // I52: same scratch-reuse pattern as flush() — see the comment
+        // on the `dirty_scratch` field. Rollback is the rarer call site
+        // but uses the same shape so the buffer's peak capacity tracks
+        // the larger of the two transactions seen so far.
+        let mut dirty_scratch = std::mem::take(&mut self.dirty_scratch);
+        dirty_scratch.extend(
+            self.entries
+                .iter()
+                .filter(|(_, e)| e.dirty)
+                .map(|(&id, _)| id),
+        );
+        for &id in &dirty_scratch {
             self.entries.remove(&id);
             self.lru.remove(id);
         }
+        dirty_scratch.clear();
+        self.dirty_scratch = dirty_scratch;
         // Every removed entry was dirty; the counter resets.
         self.dirty_count = 0;
 
@@ -727,7 +758,7 @@ impl PageCache {
             let victim = self
                 .lru
                 .iter_lru_to_mru()
-                .find(|&id| !self.entries.get(&id).is_none_or(|e| e.dirty));
+                .find(|&id| self.entries.get(&id).is_some_and(|e| !e.dirty));
             match victim {
                 Some(id) => {
                     self.entries.remove(&id);
@@ -845,10 +876,10 @@ impl PageCache {
     /// `CacheFull` fires immediately at the strict cap — the pre-spillway
     /// 8× HARD_CEILING_MULTIPLIER elasticity is gone.
     ///
-    /// `is_none_or(|e| e.dirty)` is awkward: it returns true when the
-    /// entry is missing OR dirty, so `!` means "entry exists AND is clean".
-    /// The missing-entry branch guards against a stale LRU id; it should
-    /// never fire in practice because the LRU and the map stay in sync.
+    /// `is_some_and(|e| !e.dirty)` reads as "entry exists AND is clean"
+    /// — exactly the eviction predicate. The missing-entry branch
+    /// (`None`) guards against a stale LRU id; it should never fire
+    /// in practice because the LRU and the entries map stay in sync.
     fn maybe_evict(&mut self) -> Result<()> {
         // Phase A: evict clean LRU-tail entries until we fit, exactly
         // as before.
@@ -859,7 +890,7 @@ impl PageCache {
             let victim = self
                 .lru
                 .iter_lru_to_mru()
-                .find(|&id| !self.entries.get(&id).is_none_or(|e| e.dirty));
+                .find(|&id| self.entries.get(&id).is_some_and(|e| !e.dirty));
             match victim {
                 Some(id) => {
                     self.entries.remove(&id);
@@ -950,15 +981,19 @@ impl PageCache {
 mod tests {
     use super::*;
     use crate::page_io::PageIo;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
-    fn fresh_cache(max_pages: usize) -> PageCache {
-        let file = NamedTempFile::new().unwrap();
-        let io = PageIo::open(file.path(), false).unwrap();
-        // Leak the tempfile so the PageIo's file handle outlives this
-        // function; tests drop the cache at end of scope, which closes
-        // the fd and releases the flock cleanly.
-        std::mem::forget(file);
+    fn fresh_cache(max_pages: usize) -> (TempDir, PageCache) {
+        // I66 (ISSUES.md, 2026-05-22): use TempDir over NamedTempFile +
+        // std::mem::forget(file). The pre-I66 helper leaked the file
+        // path on every call so the PageIo's fd would outlive the
+        // helper; with TempDir, the dir (and everything in it) is
+        // RAII-cleaned at end of the test scope when the caller drops
+        // the returned `_dir`. spillway.rs:open_file_truncates_existing_content
+        // is the in-tree model for this pattern.
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.chisel");
+        let io = PageIo::open(&db_path, false).unwrap();
         // spillway_max_bytes=0 preserves the legacy "fail fast on cache
         // pressure" contract for all existing page_cache tests.
         let cache_max_bytes = max_pages as u64 * PAGE_SIZE as u64;
@@ -968,13 +1003,14 @@ mod tests {
         // the InMemory backing keeps them filesystem-independent. Tests that
         // DO want a file-backed spillway should construct PageCache::new
         // directly with SpillwayLocation::Path(...).
-        PageCache::new(
+        let cache = PageCache::new(
             io,
             cache_max_bytes,
             0,
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
-        )
+        );
+        (dir, cache)
     }
 
     // Regression test for spec §"Failure surface" — when spillway is
@@ -984,7 +1020,7 @@ mod tests {
     #[test]
     fn cache_full_fires_at_strict_cap_when_spillway_disabled() {
         let max_pages = 4;
-        let mut cache = fresh_cache(max_pages);
+        let (_dir, mut cache) = fresh_cache(max_pages);
         // fresh_cache sets spillway_max_bytes = 0, so we should hit
         // CacheFull at max_pages exactly, not 8 × max_pages.
         for _ in 0..max_pages {
@@ -1007,7 +1043,7 @@ mod tests {
     #[test]
     fn cache_full_is_recoverable_via_flush() {
         let max_pages = 4;
-        let mut cache = fresh_cache(max_pages);
+        let (_dir, mut cache) = fresh_cache(max_pages);
         for _ in 0..max_pages {
             cache.new_page().unwrap();
         }
@@ -1025,18 +1061,23 @@ mod tests {
     /// New cache helper that ENABLES the spillway. Used by spillway-
     /// path tests; existing tests use fresh_cache (spillway disabled)
     /// to preserve their CacheFull semantics.
-    fn fresh_cache_with_spillway(max_pages: usize, spillway_max_bytes: u64) -> PageCache {
-        let file = NamedTempFile::new().unwrap();
-        let io = PageIo::open(file.path(), false).unwrap();
-        std::mem::forget(file);
+    fn fresh_cache_with_spillway(
+        max_pages: usize,
+        spillway_max_bytes: u64,
+    ) -> (TempDir, PageCache) {
+        // I66: TempDir for RAII cleanup (see comment on fresh_cache above).
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.chisel");
+        let io = PageIo::open(&db_path, false).unwrap();
         let cache_max_bytes = max_pages as u64 * PAGE_SIZE as u64;
-        PageCache::new(
+        let cache = PageCache::new(
             io,
             cache_max_bytes,
             spillway_max_bytes,
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
-        )
+        );
+        (dir, cache)
     }
 
     #[test]
@@ -1044,7 +1085,7 @@ mod tests {
         let max_pages = 4;
         // Spillway has room for 8 spilled pages.
         let spillway_bytes = 8 * PAGE_SIZE as u64;
-        let mut cache = fresh_cache_with_spillway(max_pages, spillway_bytes);
+        let (_dir, mut cache) = fresh_cache_with_spillway(max_pages, spillway_bytes);
         // Allocate 8 dirty pages — 4 in cache, 4 spilled.
         for _ in 0..8 {
             cache
@@ -1064,7 +1105,7 @@ mod tests {
         // Spillway has room for 4 spilled pages — 8 total dirty pages
         // possible before SpillwayFull.
         let spillway_bytes = 4 * PAGE_SIZE as u64;
-        let mut cache = fresh_cache_with_spillway(max_pages, spillway_bytes);
+        let (_dir, mut cache) = fresh_cache_with_spillway(max_pages, spillway_bytes);
         for _ in 0..(max_pages + 4) {
             cache.new_page().unwrap();
         }
@@ -1086,7 +1127,7 @@ mod tests {
     fn rehydrate_after_spill_returns_in_flight_bytes_not_disk() {
         let max_pages = 2;
         let spillway_bytes = 4 * PAGE_SIZE as u64;
-        let mut cache = fresh_cache_with_spillway(max_pages, spillway_bytes);
+        let (_dir, mut cache) = fresh_cache_with_spillway(max_pages, spillway_bytes);
 
         // Allocate page A, write a sentinel pattern, but DON'T flush.
         let id_a = cache.new_page().unwrap();
@@ -1128,7 +1169,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "claim_page called on a dirty page")]
     fn claim_page_asserts_on_dirty_page() {
-        let mut cache = fresh_cache(64);
+        let (_dir, mut cache) = fresh_cache(64);
 
         // new_page produces a fresh dirty entry. claim_page'ing that
         // same id is exactly the forbidden path the I20 assert guards.
@@ -1240,7 +1281,7 @@ mod tests {
     fn discard_all_dirty_truncates_spillway() {
         let max_pages = 2;
         let spillway_bytes = 8 * PAGE_SIZE as u64;
-        let mut cache = fresh_cache_with_spillway(max_pages, spillway_bytes);
+        let (_dir, mut cache) = fresh_cache_with_spillway(max_pages, spillway_bytes);
         for _ in 0..4 {
             cache.new_page().unwrap(); // 2 spilled
         }
@@ -1253,7 +1294,7 @@ mod tests {
     fn truncate_drops_spillway_entries_above_watermark() {
         let max_pages = 2;
         let spillway_bytes = 8 * PAGE_SIZE as u64;
-        let mut cache = fresh_cache_with_spillway(max_pages, spillway_bytes);
+        let (_dir, mut cache) = fresh_cache_with_spillway(max_pages, spillway_bytes);
         // Allocate page 0..5; some end up spilled.
         for _ in 0..6 {
             cache.new_page().unwrap();
@@ -1286,7 +1327,7 @@ mod tests {
         // pages forces 2 into the spillway.
         let max_pages = 2;
         let spillway_bytes = 8 * PAGE_SIZE as u64;
-        let mut cache = fresh_cache_with_spillway(max_pages, spillway_bytes);
+        let (_dir, mut cache) = fresh_cache_with_spillway(max_pages, spillway_bytes);
 
         // Allocate 4 pages — 2 in cache, 2 overflow to spillway.
         let mut ids = Vec::new();
