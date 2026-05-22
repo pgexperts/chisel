@@ -2,7 +2,17 @@
 name = "chisel-bench"
 version = "0.1.0"
 edition = "2021"
+# MSRV mirrors the root crate (1.82). The path-dep on chisel inherits its
+# floor; bench-specific deps (criterion, rusqlite, clap) all support older
+# Rust, so bench is never the constraining factor.
+rust-version = "1.82"
+authors = ["Christophe Pettus <cpettus@pgexperts.com>"]
 description = "Benchmark harness for Chisel — Engine trait abstraction, workload generators, and cross-engine comparison runners. Internal use only; not published."
+license = "MIT"
+repository = "https://github.com/Xof/chisel"
+# publish = false because this crate is internal-only (no PyPI/crates.io
+# distribution surface). The license + repository are still set so the
+# subcrate's Cargo.toml is internally consistent with the root.
 publish = false
 
 [dependencies]
