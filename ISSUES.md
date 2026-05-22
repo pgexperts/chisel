@@ -1041,3 +1041,27 @@ pub struct Stats {
 Wire them into `Chisel::stats` by inspecting `PageCache::spillway` (which is already `pub(crate)`). Then remove the `#[cfg(test)]` from the two `Spillway` methods. The `Option` shape is because the spillway is lazily opened on first spill — `None` distinguishes "no spillway yet" from "spillway has zero bytes in flight."
 
 Low priority because spillway exhaustion currently surfaces as `SpillwayFull` (a typed error) rather than a silent slowdown; operators can hook on that. But adding observability is the difference between "see the wall coming" and "hit the wall."
+
+#### I75. Bump `pyo3` from 0.22 to 0.24+ to clear RUSTSEC-2025-0020 [I61 follow-up 2026-05-22] — **P2**
+**Where:** `python/Cargo.toml` (`pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }`); call sites throughout `python/src/`.
+
+**Problem:** `pyo3 0.22.x` (we're pinned at 0.22.6 in Cargo.lock) ships `PyString::from_object` with a "Risk of buffer overflow" — `from_object` takes `&str` arguments and forwards them directly to the Python C API without checking for terminating NUL bytes, so the Python interpreter can read beyond the end of the `&str` data and potentially leak the contents of the OOB read by raising a Python exception containing a copy of the data including the overflow.
+
+RustSec advisory: RUSTSEC-2025-0020. Patched in pyo3 0.24.1+. Our binding may or may not call `PyString::from_object` directly; either way, the vulnerable function ships in our `.so` and gets exposed to any code that links against it (including future internal code).
+
+Surfaced when I61 unified all three subcrates' lockfiles under a workspace `Cargo.lock` — pre-I61, only the root crate's deps (no pyo3) were audited. Worked around in the I61 PR by adding `ignore: RUSTSEC-2025-0020` to the audit job; this entry documents the proper fix.
+
+**Direction of fix:** bump `pyo3` from 0.22 → 0.24 (or whatever's current as of the fix). The migration is non-trivial because PyO3 has breaking API changes between majors — notable changes in 0.23/0.24 include:
+- `Bound<T>` is the standard reference type now (most APIs that returned `&PyAny` now return `Bound<PyAny>`).
+- `value_bound` / `extract_bound` style was made the default.
+- Some attribute-setting paths changed.
+
+Plan:
+1. Read PyO3 0.23 and 0.24 migration guides.
+2. Bump `pyo3` to the target version in `python/Cargo.toml`.
+3. Iterate on `python/src/db.rs`, `transaction.rs`, `savepoint.rs`, `errors.rs` to fix breakage. The errno/kind setattr code (added in I42) and the `_chisel.create_exception!`-style code in `errors.rs` are the most likely friction points.
+4. Run `cd python && maturin develop --release && pytest` until green.
+5. Remove `ignore: RUSTSEC-2025-0020` from `.github/workflows/ci.yml`.
+6. Mark I75 as ✅ FIXED here.
+
+Higher priority than most other P3s because (a) it's a real (not informational) security advisory and (b) the `ignore:` workaround is a temporary measure that should be cleared promptly.
