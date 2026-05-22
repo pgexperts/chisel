@@ -8,6 +8,12 @@
 
 /// Read-only summary of database size/usage. Populated by the transaction
 /// manager; no methods here because there are no invariants to enforce.
+///
+/// I36 (ISSUES.md, 2026-05-22): `#[non_exhaustive]` so adding a fifth
+/// summary field (e.g. live-handle/total-handle ratio for retirement
+/// pressure) is not a breaking change. The companion `ChiselCounters`
+/// has carried the same attribute since the bench-suite series landed.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct Stats {
     /// Number of live handles (u64 ids currently mapped in the handle table).

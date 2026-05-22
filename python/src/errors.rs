@@ -246,5 +246,16 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
         RustChiselError::CorruptPage { .. } => CorruptPageError::new_err(msg),
         RustChiselError::InvalidPageId { .. } => InvalidPageIdError::new_err(msg),
         RustChiselError::Poisoned => PoisonedError::new_err(msg),
+        // I36: ChiselError is #[non_exhaustive], so even a path-deps
+        // crate has to keep a catchall arm. Any variant not enumerated
+        // above routes to the abstract `ChiselError` base class with
+        // the Rust-side Display message. The internal compile-time
+        // exhaustiveness check (this match used to enforce it via no `_`
+        // arm) is gone, but the Display impl in src/error.rs is itself
+        // exhaustive, so a new variant is still caught there at compile
+        // time inside the chisel crate. A new ChiselError variant
+        // landed without updating this match will still get a sensible
+        // (if generic) Python exception class.
+        _ => ChiselError::new_err(msg),
     }
 }

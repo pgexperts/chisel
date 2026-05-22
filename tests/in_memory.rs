@@ -34,16 +34,10 @@ fn open_in_memory_with_options_respects_superblock_count() {
     // We cannot inspect the superblock count from the public API directly,
     // but an invalid value must still be rejected by the same validation
     // path used for file-backed open.
-    let bad = Options {
-        superblock_count: 1, // below MIN_SUPERBLOCKS (2)
-        ..Options::default()
-    };
+    let bad = Options::default().superblock_count(1); // below MIN_SUPERBLOCKS (2)
     assert!(Chisel::open_in_memory_with_options(bad).is_err());
 
-    let good = Options {
-        superblock_count: 4,
-        ..Options::default()
-    };
+    let good = Options::default().superblock_count(4);
     let mut db = Chisel::open_in_memory_with_options(good).unwrap();
     db.begin().unwrap();
     db.allocate(b"payload").unwrap();
@@ -56,10 +50,7 @@ fn open_in_memory_rejects_read_only_option() {
     // (nothing to read, and the superblock-write step is blocked).
     // We surface this early as an explicit InvalidArgument-style error
     // rather than letting the bootstrap fail obliquely.
-    let opts = Options {
-        read_only: true,
-        ..Options::default()
-    };
+    let opts = Options::default().read_only(true);
     assert!(Chisel::open_in_memory_with_options(opts).is_err());
 }
 

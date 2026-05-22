@@ -13,6 +13,14 @@
 use std::fmt;
 use std::io;
 
+/// I36 (ISSUES.md, 2026-05-22): `#[non_exhaustive]` so adding a new
+/// error variant (a future operational signal, a new fatal-corruption
+/// flavor) is not a breaking change. External `match` arms over
+/// `ChiselError` need a `_ => …` catchall; the conventional path is
+/// `if e.is_fatal() { … } else { … }` which never enumerates
+/// variants and is therefore unaffected. The `Display` impl below is
+/// exhaustive — adding a variant still requires updating its prose.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum ChiselError {
     // Operational — recoverable; database file is intact.

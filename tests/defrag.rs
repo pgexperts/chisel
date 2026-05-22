@@ -188,10 +188,7 @@ fn test_defrag_respects_max_pages_body(b: &Backing) {
 
     db.begin().unwrap();
     let result = db
-        .defrag(DefragOptions {
-            sparse_threshold: 0.25,
-            max_pages: 2,
-        })
+        .defrag(DefragOptions::default().sparse_threshold(0.25).max_pages(2))
         .unwrap();
     db.commit().unwrap();
 

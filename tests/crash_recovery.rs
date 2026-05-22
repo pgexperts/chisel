@@ -1024,14 +1024,7 @@ fn test_r4_create_with_custom_superblock_count() {
     let path = file.path().to_owned();
 
     {
-        let mut db = Chisel::open(
-            &path,
-            Options {
-                superblock_count: 4,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let mut db = Chisel::open(&path, Options::default().superblock_count(4)).unwrap();
         db.begin().unwrap();
         let h = db.allocate(b"r4 payload").unwrap();
         db.commit().unwrap();
@@ -1048,13 +1041,7 @@ fn test_r4_create_with_custom_superblock_count() {
 fn test_r4_invalid_superblock_count_rejected() {
     // N=1 is disqualified (no redundancy).
     let file = NamedTempFile::new().unwrap();
-    let result = Chisel::open(
-        file.path(),
-        Options {
-            superblock_count: 1,
-            ..Default::default()
-        },
-    );
+    let result = Chisel::open(file.path(), Options::default().superblock_count(1));
     assert!(matches!(
         result,
         Err(ChiselError::InvalidSuperblockCount { value: 1 })
@@ -1062,13 +1049,7 @@ fn test_r4_invalid_superblock_count_rejected() {
 
     // N=17 exceeds MAX_SUPERBLOCKS (16).
     let file2 = NamedTempFile::new().unwrap();
-    let result = Chisel::open(
-        file2.path(),
-        Options {
-            superblock_count: 17,
-            ..Default::default()
-        },
-    );
+    let result = Chisel::open(file2.path(), Options::default().superblock_count(17));
     assert!(matches!(
         result,
         Err(ChiselError::InvalidSuperblockCount { value: 17 })
@@ -1088,14 +1069,7 @@ fn test_r4_n3_survives_two_consecutive_torn_writes() {
 
     let handle;
     {
-        let mut db = Chisel::open(
-            &path,
-            Options {
-                superblock_count: 3,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let mut db = Chisel::open(&path, Options::default().superblock_count(3)).unwrap();
         // Do enough commits that each of the 3 slots has been
         // written at least once, so all three carry real data.
         db.begin().unwrap();
@@ -1137,14 +1111,7 @@ fn test_r4_commits_rotate_through_all_slots() {
     let file = NamedTempFile::new().unwrap();
     let path = file.path().to_owned();
 
-    let mut db = Chisel::open(
-        &path,
-        Options {
-            superblock_count: 3,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut db = Chisel::open(&path, Options::default().superblock_count(3)).unwrap();
 
     // First commit: adds handle-table + data + freemap pages.
     db.begin().unwrap();
@@ -1190,12 +1157,6 @@ fn test_r4_default_is_two_slots() {
 fn test_file_not_found_without_create() {
     let path = std::path::PathBuf::from("/tmp/chisel_nonexistent_test.db");
     let _ = fs::remove_file(&path);
-    let result = Chisel::open(
-        &path,
-        Options {
-            create_if_missing: false,
-            ..Default::default()
-        },
-    );
+    let result = Chisel::open(&path, Options::default().create_if_missing(false));
     assert!(result.is_err());
 }

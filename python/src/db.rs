@@ -154,14 +154,19 @@ pub fn open(
     // chisel::Options::default() exactly.
     let resolved_spillway_max_bytes = spillway_max_bytes.unwrap_or(1024 * cache_max_bytes);
 
-    let options = chisel::Options {
-        cache_max_bytes,
-        spillway_max_bytes: resolved_spillway_max_bytes,
-        drain_insertion: drain_insertion.into(),
-        create_if_missing,
-        read_only,
-        superblock_count,
-    };
+    // I36: chisel::Options is #[non_exhaustive] so external callers
+    // (including this binding, which is a separate crate even though
+    // it's path-deps on chisel) must build via the chained-setter
+    // builder. Every field is set explicitly because Python kwargs
+    // already encode the caller's intent — there are no
+    // "leave at default" cases at this boundary.
+    let options = chisel::Options::default()
+        .cache_max_bytes(cache_max_bytes)
+        .spillway_max_bytes(resolved_spillway_max_bytes)
+        .drain_insertion(drain_insertion.into())
+        .create_if_missing(create_if_missing)
+        .read_only(read_only)
+        .superblock_count(superblock_count);
 
     // Engine calls can block on I/O (flock, fsync, file creation), so
     // release the GIL while they run. Chisel is Send (single-threaded
@@ -328,14 +333,15 @@ impl PyChisel {
     #[pyo3(signature = (options=None))]
     fn defrag(&self, py: Python<'_>, options: Option<&Bound<'_, PyAny>>) -> PyResult<PyObject> {
         let rust_opts = match options {
-            None => chisel::defrag::DefragOptions::default(),
+            None => chisel::DefragOptions::default(),
             Some(obj) => {
                 let sparse_threshold: f64 = obj.getattr("sparse_threshold")?.extract()?;
                 let max_pages: usize = obj.getattr("max_pages")?.extract()?;
-                chisel::defrag::DefragOptions {
-                    sparse_threshold,
-                    max_pages,
-                }
+                // I36: DefragOptions is #[non_exhaustive]; build via the
+                // chained-setter builder.
+                chisel::DefragOptions::default()
+                    .sparse_threshold(sparse_threshold)
+                    .max_pages(max_pages)
             }
         };
 

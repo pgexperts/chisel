@@ -31,14 +31,14 @@ impl ChiselEngine {
     /// redb's on-disk B-tree pages for large-transaction handling.
     pub fn open_file(path: &Path, cache_size: usize) -> EngineResult<Self> {
         let cache_max_bytes = cache_size as u64 * chisel::page::PAGE_SIZE as u64;
+        // I36: Options is #[non_exhaustive] so external callers must
+        // build via the chained-setter builder; drain_insertion stays
+        // at the LruTail default so it's not chained here.
         let db = Chisel::open(
             path,
-            Options {
-                cache_max_bytes,
-                spillway_max_bytes: cache_max_bytes * 1024,
-                drain_insertion: chisel::DrainInsertion::LruTail,
-                ..Options::default()
-            },
+            Options::default()
+                .cache_max_bytes(cache_max_bytes)
+                .spillway_max_bytes(cache_max_bytes * 1024),
         )?;
         Ok(Self { db })
     }
@@ -51,12 +51,11 @@ impl ChiselEngine {
     /// production-default scale as `open_file` (1024 × cache budget).
     pub fn open_in_memory(cache_size: usize) -> EngineResult<Self> {
         let cache_max_bytes = cache_size as u64 * chisel::page::PAGE_SIZE as u64;
-        let db = Chisel::open_in_memory_with_options(Options {
-            cache_max_bytes,
-            spillway_max_bytes: cache_max_bytes * 1024,
-            drain_insertion: chisel::DrainInsertion::LruTail,
-            ..Options::default()
-        })?;
+        let db = Chisel::open_in_memory_with_options(
+            Options::default()
+                .cache_max_bytes(cache_max_bytes)
+                .spillway_max_bytes(cache_max_bytes * 1024),
+        )?;
         Ok(Self { db })
     }
 }
