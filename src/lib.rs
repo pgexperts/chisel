@@ -36,6 +36,18 @@ pub mod transaction;
 
 pub use error::{ChiselError, Result};
 
+// Re-exports of the curated public surface. The internal modules these
+// items live in will be locked down to `pub(crate)` in a follow-up commit
+// (ISSUES.md I35); these re-exports define the supported access paths and
+// keep the documented API at the crate root.
+pub use defrag::{DefragOptions, DefragStats};
+pub use page::PAGE_SIZE;
+pub use stats::{ChiselCounters, Stats};
+pub use superblock::{
+    DEFAULT_SUPERBLOCK_COUNT, MAX_SUPERBLOCKS, MIN_SUPERBLOCKS, NAMED_ROOT_COUNT,
+    NAMED_ROOT_NAME_LEN,
+};
+
 use std::path::Path;
 
 use page_cache::PageCache;
@@ -398,17 +410,17 @@ impl Chisel {
     /// from `page_count * PAGE_SIZE` rather than `stat(2)` so it reflects
     /// the page-aligned view the engine has, not any trailing partial page
     /// that might exist mid-extend.
-    pub fn stats(&self) -> Result<stats::Stats> {
+    pub fn stats(&self) -> Result<Stats> {
         // Both calls below route through the poison-aware wrappers on
         // TransactionManager, so a fatal I/O error in either one will
         // poison the manager just as if it had come from `read()` or
         // `commit()`. Takes `&self` (F3) — `stats` is semantically a read.
         let handles = self.txm.handles()?;
         let page_count = self.txm.file_page_count()?;
-        Ok(stats::Stats {
+        Ok(Stats {
             handle_count: handles.len() as u64,
             total_pages: page_count,
-            file_size_bytes: page_count * page::PAGE_SIZE as u64,
+            file_size_bytes: page_count * PAGE_SIZE as u64,
         })
     }
 
@@ -419,7 +431,7 @@ impl Chisel {
     ///
     /// Same `&self` semantic-read shape as `stats()`. Returns
     /// `ChiselError::Poisoned` if the engine is poisoned.
-    pub fn counters(&self) -> Result<stats::ChiselCounters> {
+    pub fn counters(&self) -> Result<ChiselCounters> {
         self.txm.counters()
     }
 
@@ -436,7 +448,7 @@ impl Chisel {
     /// transaction (see `defrag.rs` for why). This method does NOT begin or
     /// commit one on the caller's behalf — defrag is composable with other
     /// work in the same transaction and atomic with it on commit.
-    pub fn defrag(&mut self, options: defrag::DefragOptions) -> Result<defrag::DefragStats> {
+    pub fn defrag(&mut self, options: DefragOptions) -> Result<DefragStats> {
         defrag::defrag(&mut self.txm, &options)
     }
 

@@ -328,11 +328,11 @@ impl PyChisel {
     #[pyo3(signature = (options=None))]
     fn defrag(&self, py: Python<'_>, options: Option<&Bound<'_, PyAny>>) -> PyResult<PyObject> {
         let rust_opts = match options {
-            None => chisel::defrag::DefragOptions::default(),
+            None => chisel::DefragOptions::default(),
             Some(obj) => {
                 let sparse_threshold: f64 = obj.getattr("sparse_threshold")?.extract()?;
                 let max_pages: usize = obj.getattr("max_pages")?.extract()?;
-                chisel::defrag::DefragOptions {
+                chisel::DefragOptions {
                     sparse_threshold,
                     max_pages,
                 }

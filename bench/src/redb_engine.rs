@@ -13,7 +13,7 @@
 // gymnastics.
 
 use crate::engine::{DurabilityMode, Engine, EngineResult, Identifier};
-use chisel::stats::ChiselCounters;
+use chisel::ChiselCounters;
 use redb::{Database, Durability, ReadableTable, TableDefinition};
 use std::path::{Path, PathBuf};
 
