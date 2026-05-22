@@ -94,3 +94,59 @@ def test_closed_db_reports_poisoned():
     db = chisel.open(None)
     db.close()
     assert db.is_poisoned is True
+
+
+# I42 (ISSUES.md, 2026-05-22): IoError instances carry the inner
+# io::Error's `errno` (raw OS error code) and `kind` (string form of
+# std::io::ErrorKind) so callers can branch on them without parsing
+# the message. The two tests below construct a real I/O failure (open
+# a directory as if it were a database file) and inspect the resulting
+# exception.
+
+def test_io_error_carries_errno_attribute(tmp_path):
+    # Opening a *directory* as a database triggers EISDIR at the
+    # OpenOptions::open call inside PageIo::open. The kernel error
+    # surfaces as io::Error → ChiselError::IoError → chisel.IoError
+    # with the OS errno stashed as `.errno`. We don't pin to a
+    # specific numeric value because Linux (21) and macOS (21) agree
+    # but other platforms could differ; the contract is "errno is
+    # populated and is an int".
+    target = tmp_path  # tmp_path is a directory by definition
+    with pytest.raises(chisel.IoError) as exc_info:
+        chisel.open(str(target))
+    e = exc_info.value
+    assert hasattr(e, "errno"), "IoError instances should carry .errno"
+    assert isinstance(e.errno, int), f"errno should be an int, got {type(e.errno).__name__}"
+    assert e.errno > 0, f"errno should be a positive OS error code, got {e.errno}"
+
+
+def test_io_error_carries_kind_attribute(tmp_path):
+    # Companion test for `.kind`. The kind string is the Debug-format
+    # of std::io::ErrorKind (e.g., "IsADirectory", "PermissionDenied",
+    # "NotFound"). We pin only "is a non-empty string" — the exact
+    # variant text changes across Rust versions (IsADirectory was
+    # stabilized in 1.83; older toolchains may say "Other") and we
+    # don't want this test to fail on a Rust upgrade.
+    with pytest.raises(chisel.IoError) as exc_info:
+        chisel.open(str(tmp_path))
+    e = exc_info.value
+    assert hasattr(e, "kind"), "IoError instances should carry .kind"
+    assert isinstance(e.kind, str), f"kind should be a str, got {type(e.kind).__name__}"
+    assert e.kind != "", "kind should not be empty"
+
+
+def test_non_io_error_does_not_carry_errno(tmp_db):
+    # Sanity: errno/kind are IoError-specific. Other ChiselError
+    # subclasses do NOT get them attached — to_py_err's match is
+    # arm-specific. Verifies by triggering LockFailedError (open the
+    # same file twice in this process), which routes through a
+    # different match arm.
+    with chisel.open(str(tmp_db)):
+        with pytest.raises(chisel.LockFailedError) as exc_info:
+            chisel.open(str(tmp_db))
+    e = exc_info.value
+    assert not hasattr(e, "errno") or e.errno is None
+    # `kind` may exist as a Python-defined attribute on the base
+    # class in future, but today it should be absent from non-IoError.
+    assert not hasattr(e, "kind"), \
+        f"unexpected .kind attribute on {type(e).__name__}"
