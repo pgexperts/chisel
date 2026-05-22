@@ -6,10 +6,19 @@ name: Bench Disk Cleanup
 #
 # Spec: docs/specs/2026-05-04-dedicated-bench-machine-foundation-design.md
 # § "Disk management"
+#
+# I60 (ISSUES.md, 2026-05-22): DISABLED — the [self-hosted, linux,
+# dedicated-bench, bench-v1] runner this workflow targets has not yet
+# been provisioned. Until it is, queued scheduled runs just expire in
+# the Actions UI and clutter the run history. The `schedule:` trigger
+# is commented out so only `workflow_dispatch:` remains — operators
+# can still fire the workflow by hand once the runner is online (or to
+# preview behaviour against a temporary runner). Restore the
+# `schedule:` block when the dedicated-bench-machine spec ships.
 
 on:
-  schedule:
-    - cron: '0 4 * * *' # nightly 04:00 UTC
+  # schedule:
+  #   - cron: '0 4 * * *' # nightly 04:00 UTC — re-enable when runner is online
   workflow_dispatch:
 
 jobs:

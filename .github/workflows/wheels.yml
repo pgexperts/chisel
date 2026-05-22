@@ -6,14 +6,31 @@ on:
   workflow_dispatch:
 
 jobs:
+  # I59 (ISSUES.md, 2026-05-22): early cargo test gate. Without this,
+  # a tagged commit that's broken would still build wheels (cibuildwheel
+  # only runs pytest after the long wheel-build step) and fail very late.
+  # This job runs first, blocks both `wheels` and `sdist` via `needs:`,
+  # and adds ~30s of latency to a tag build in exchange for failing fast
+  # if the underlying Rust is broken. Bench-test the bench subcrate is
+  # already covered on every push by ci.yml's bench-tests job; we only
+  # gate the root crate here.
+  cargo-test-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release
+
   wheels:
+    needs: cargo-test-gate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions/setup-python@v5
         with:
@@ -41,9 +58,10 @@ jobs:
           path: wheelhouse/*.whl
 
   sdist:
+    needs: cargo-test-gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions/setup-python@v5
         with:

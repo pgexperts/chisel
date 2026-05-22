@@ -861,14 +861,14 @@ bench-tests:
 
 ~2 minutes added; closes the real coverage hole. Distinct from `bench.yml` (which runs the scenario tier on PRs for regression-comment purposes and does not run `cargo test`).
 
-#### I59. `wheels.yml` has no early `cargo test` gate [deepdive 2026-05-22] — **P3**
+#### I59. `wheels.yml` has no early `cargo test` gate [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `.github/workflows/wheels.yml`
 
 **Problem:** the wheels workflow builds and tests wheels at tag time. The CI matrix runs Rust tests on push/PR, and wheels.yml runs `pytest` after building wheels, so underlying Rust correctness is covered transitively. But a wheels build on a tag whose underlying commit is broken still runs pytest against broken bindings and fails there — slower feedback than a pre-wheel `cargo test`.
 
 **Direction of fix:** either add an early `cargo test` step in wheels.yml, or make the wheels job `needs:` the test job (cross-workflow `needs` is supported via a reusable workflow or by re-running tests inline). Less urgent than I54/I55/I56 because wheels.yml is tag-triggered and the underlying problem only manifests if someone tags a broken commit.
 
-#### I60. Orphaned `bench-disk-cleanup.yml` and `bench-os-update.yml` workflows [deepdive 2026-05-22] — **P3**
+#### I60. Orphaned `bench-disk-cleanup.yml` and `bench-os-update.yml` workflows [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22 (option b — schedule disabled, dispatch retained)
 **Where:** `.github/workflows/bench-disk-cleanup.yml`, `.github/workflows/bench-os-update.yml`
 
 **Problem:** both workflows are queued waiting for a self-hosted runner that hasn't been provisioned. While they're queueing/expiring, GitHub may surface them as "stuck workflows" in the Actions UI.
@@ -1005,7 +1005,7 @@ Verify `cargo test` still produces both `_file` and `_memory` test variants via 
 
 Low priority because the warning is informational and only affects a dev-dep; high enough to fix in a small PR before the `ignore` list accumulates more entries.
 
-#### I73. GitHub Actions Node.js 20 deprecation (every job uses `actions/checkout@v4`) [post-P2 CI run 2026-05-22] — **P3**
+#### I73. GitHub Actions Node.js 20 deprecation (every job uses `actions/checkout@v4`) [post-P2 CI run 2026-05-22] — **P3** ✅ FIXED 2026-05-22 (checkout v4 → v5 across all four workflows; other actions already Node 22+)
 **Where:** every job in `.github/workflows/ci.yml` (test, clippy, fmt, audit, msrv, bench-tests, python matrix) — currently 7 distinct jobs all pinned to `actions/checkout@v4`. The `dtolnay/rust-toolchain`, `Swatinem/rust-cache@v2`, `actions/setup-python@v5`, and `rustsec/audit-check@v1.4.1` actions should also be re-checked for Node 24 readiness.
 
 **Problem:** GitHub is forcing Node.js 24 as the default on hosted runners on **June 2nd, 2026** (~10 days from today). Node.js 20 will be removed entirely on **September 16th, 2026**. Surfaced as warning annotations on the first green post-P2 audit run on main:
