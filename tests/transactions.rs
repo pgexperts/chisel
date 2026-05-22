@@ -1,8 +1,3 @@
-use chisel::page_cache::PageCache;
-use chisel::page_io::PageIo;
-use chisel::transaction::TransactionManager;
-use tempfile::NamedTempFile;
-
 mod common;
 use common::{open_chisel, Backing};
 
@@ -124,37 +119,9 @@ fn test_nested_savepoints_body(b: &Backing) {
 
 dual_backing_test!(test_nested_savepoints, test_nested_savepoints_body);
 
-// Kept file-only: reopens the same path to verify on-disk persistence.
-#[test]
-fn test_reopen_preserves_data() {
-    let file = NamedTempFile::new().unwrap();
-    let path = file.path().to_owned();
-    let handle;
-    {
-        let io = PageIo::open(&path, false).unwrap();
-        let cache = PageCache::new(
-            io,
-            64 * chisel::page::PAGE_SIZE as u64,
-            0,
-            chisel::DrainInsertion::LruTail,
-            chisel::SpillwayLocation::InMemory,
-        );
-        let mut txm = TransactionManager::create_new(cache, 2).unwrap();
-        txm.begin().unwrap();
-        handle = txm.allocate(b"persistent").unwrap();
-        txm.commit().unwrap();
-    }
-    {
-        let io = PageIo::open(&path, false).unwrap();
-        let cache = PageCache::new(
-            io,
-            64 * chisel::page::PAGE_SIZE as u64,
-            0,
-            chisel::DrainInsertion::LruTail,
-            chisel::SpillwayLocation::InMemory,
-        );
-        let txm = TransactionManager::open_existing(cache).unwrap();
-        let data = txm.read(handle).unwrap();
-        assert_eq!(data, b"persistent");
-    }
-}
+// Note: test_reopen_preserves_data (which exercised TransactionManager /
+// PageCache / PageIo directly to verify the open_existing path)
+// migrated 2026-05-22 to src/transaction.rs as `reopen_preserves_committed_data`
+// under the I35 pub→pub(crate) reshape. The Chisel-public-API equivalent
+// (open path + commit + reopen + read) is covered by `test_chisel_reopen`
+// in tests/basic_ops.rs.

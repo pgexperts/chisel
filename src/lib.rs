@@ -19,22 +19,52 @@
 // Durability model: see `transaction.rs`. Commits are shadow-paged and
 // finalized by a superblock swap; there is no WAL and no background writer.
 
-pub mod data_page;
-pub mod defrag;
-pub mod error;
-pub mod freemap;
-pub mod handle_table;
+// I35 (ISSUES.md, 2026-05-22): every storage-internals module is
+// pub(crate). The supported public surface is the curated re-export
+// list further down (Chisel, Options, DrainInsertion, ChiselError,
+// Result, Stats, ChiselCounters, DefragOptions, DefragStats, PAGE_SIZE,
+// plus the superblock layout constants). Internal types like
+// TransactionManager / PageCache / HandleEntry / Superblock /
+// PageType are NOT part of the API stability contract; reaching for
+// them from a downstream crate requires either a path-dep with
+// #[cfg(test)] access (the bench subcrate does this implicitly
+// through the public API) or copying the relevant logic out.
+pub(crate) mod data_page;
+pub(crate) mod defrag;
+pub(crate) mod error;
+pub(crate) mod freemap;
+pub(crate) mod handle_table;
 mod lru;
-pub mod overflow;
-pub mod page;
-pub mod page_cache;
-pub mod page_io;
+pub(crate) mod overflow;
+pub(crate) mod page;
+pub(crate) mod page_cache;
+pub(crate) mod page_io;
 mod spillway;
-pub mod stats;
-pub mod superblock;
-pub mod transaction;
+pub(crate) mod stats;
+pub(crate) mod superblock;
+pub(crate) mod transaction;
+
+// I35: crash-recovery integration tests need direct access to internal
+// types (Superblock, PageType, page format constants) for corruption
+// injection. The I35 pub→pub(crate) reshape locks these down, so the
+// suite moved from tests/crash_recovery.rs into src/. cfg(test)-only so
+// it adds nothing to release builds.
+#[cfg(test)]
+mod recovery_tests;
 
 pub use error::{ChiselError, Result};
+
+// Re-exports of the curated public surface. The internal modules these
+// items live in will be locked down to `pub(crate)` in a follow-up commit
+// (ISSUES.md I35); these re-exports define the supported access paths and
+// keep the documented API at the crate root.
+pub use defrag::{DefragOptions, DefragStats};
+pub use page::PAGE_SIZE;
+pub use stats::{ChiselCounters, Stats};
+pub use superblock::{
+    DEFAULT_SUPERBLOCK_COUNT, MAX_SUPERBLOCKS, MIN_SUPERBLOCKS, NAMED_ROOT_COUNT,
+    NAMED_ROOT_NAME_LEN,
+};
 
 use std::path::Path;
 
@@ -104,8 +134,14 @@ pub enum DrainInsertion {
 /// How to open a spillway sidecar. `Path` for file-backed databases
 /// (path is the main db path; spillway will be at `<path>.spillway`),
 /// `InMemory` for memory-backed.
+///
+/// I37 (ISSUES.md, 2026-05-22): pub(crate) because the only legitimate
+/// constructors are inside `Chisel::open` and
+/// `Chisel::open_in_memory_with_options`. External callers route
+/// through those — there's no API path that needs them to construct
+/// a `SpillwayLocation` directly.
 #[derive(Debug, Clone)]
-pub enum SpillwayLocation {
+pub(crate) enum SpillwayLocation {
     Path(std::path::PathBuf),
     InMemory,
 }
@@ -398,17 +434,17 @@ impl Chisel {
     /// from `page_count * PAGE_SIZE` rather than `stat(2)` so it reflects
     /// the page-aligned view the engine has, not any trailing partial page
     /// that might exist mid-extend.
-    pub fn stats(&self) -> Result<stats::Stats> {
+    pub fn stats(&self) -> Result<Stats> {
         // Both calls below route through the poison-aware wrappers on
         // TransactionManager, so a fatal I/O error in either one will
         // poison the manager just as if it had come from `read()` or
         // `commit()`. Takes `&self` (F3) — `stats` is semantically a read.
         let handles = self.txm.handles()?;
         let page_count = self.txm.file_page_count()?;
-        Ok(stats::Stats {
+        Ok(Stats {
             handle_count: handles.len() as u64,
             total_pages: page_count,
-            file_size_bytes: page_count * page::PAGE_SIZE as u64,
+            file_size_bytes: page_count * PAGE_SIZE as u64,
         })
     }
 
@@ -419,7 +455,7 @@ impl Chisel {
     ///
     /// Same `&self` semantic-read shape as `stats()`. Returns
     /// `ChiselError::Poisoned` if the engine is poisoned.
-    pub fn counters(&self) -> Result<stats::ChiselCounters> {
+    pub fn counters(&self) -> Result<ChiselCounters> {
         self.txm.counters()
     }
 
@@ -436,7 +472,7 @@ impl Chisel {
     /// transaction (see `defrag.rs` for why). This method does NOT begin or
     /// commit one on the caller's behalf — defrag is composable with other
     /// work in the same transaction and atomic with it on commit.
-    pub fn defrag(&mut self, options: defrag::DefragOptions) -> Result<defrag::DefragStats> {
+    pub fn defrag(&mut self, options: DefragOptions) -> Result<DefragStats> {
         defrag::defrag(&mut self.txm, &options)
     }
 

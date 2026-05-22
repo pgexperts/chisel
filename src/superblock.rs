@@ -104,6 +104,14 @@ impl NamedRoot {
     /// None if the stored bytes are not valid UTF-8 (should never happen
     /// for names written through the public API, since set_root_name
     /// rejects non-UTF-8 input).
+    ///
+    /// `#[allow(dead_code)]`: the production read path
+    /// (`get_root_name_inner`) compares the requested name byte-for-byte
+    /// against the stored padded form without ever decoding it as a
+    /// str. `name_str` is the convenience for forensic / debug-print
+    /// callers — kept so any future "list all named roots" tool has the
+    /// canonical decode in one spot.
+    #[allow(dead_code)]
     pub fn name_str(&self) -> Option<&str> {
         let end = self
             .name
@@ -377,5 +385,110 @@ mod tests {
 
         let picked = Superblock::select(&[bad_buf, good_buf]).expect("no slot picked");
         assert_eq!(picked.superblock_count, DEFAULT_SUPERBLOCK_COUNT);
+    }
+
+    // ── Migrated 2026-05-22 from tests/basic_ops.rs (I35 reshape) ──
+    //
+    // The originals used the bare `MAGIC`/`FORMAT_VERSION`/`PAGE_ID_NONE`
+    // page-module constants via `use chisel::page::...`; from inside src/
+    // they are reached through `crate::page::*`, which `use super::*` and
+    // the existing `use crate::page::{self, MAGIC, PAGE_SIZE};` at file
+    // scope make available without further imports.
+
+    #[test]
+    fn test_superblock_roundtrip() {
+        let sb = Superblock {
+            magic: MAGIC,
+            format_version: crate::page::FORMAT_VERSION,
+            txn_counter: 42,
+            root_handle_table_page: 5,
+            root_freemap_page: 8,
+            total_pages: 100,
+            next_handle: 50,
+            page_size: PAGE_SIZE as u32,
+            named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
+            superblock_count: DEFAULT_SUPERBLOCK_COUNT,
+        };
+        let buf = sb.serialize();
+        let sb2 = Superblock::deserialize(&buf).unwrap();
+        assert_eq!(sb, sb2);
+    }
+
+    #[test]
+    fn test_superblock_checksum_validation() {
+        let sb = Superblock {
+            magic: MAGIC,
+            format_version: crate::page::FORMAT_VERSION,
+            txn_counter: 1,
+            root_handle_table_page: crate::page::PAGE_ID_NONE,
+            root_freemap_page: crate::page::PAGE_ID_NONE,
+            total_pages: 2,
+            next_handle: 0,
+            page_size: PAGE_SIZE as u32,
+            named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
+            superblock_count: DEFAULT_SUPERBLOCK_COUNT,
+        };
+        let mut buf = sb.serialize();
+        buf[10] ^= 0xFF;
+        assert!(Superblock::deserialize(&buf).is_none());
+    }
+
+    #[test]
+    fn test_superblock_selection() {
+        let sb1 = Superblock {
+            magic: MAGIC,
+            format_version: crate::page::FORMAT_VERSION,
+            txn_counter: 5,
+            root_handle_table_page: 2,
+            root_freemap_page: 3,
+            total_pages: 10,
+            next_handle: 3,
+            page_size: PAGE_SIZE as u32,
+            named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
+            superblock_count: DEFAULT_SUPERBLOCK_COUNT,
+        };
+        let sb2 = Superblock {
+            magic: MAGIC,
+            format_version: crate::page::FORMAT_VERSION,
+            txn_counter: 7,
+            root_handle_table_page: 4,
+            root_freemap_page: 5,
+            total_pages: 12,
+            next_handle: 5,
+            page_size: PAGE_SIZE as u32,
+            named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
+            superblock_count: DEFAULT_SUPERBLOCK_COUNT,
+        };
+        let buf1 = sb1.serialize();
+        let buf2 = sb2.serialize();
+        let selected = Superblock::select(&[buf1, buf2]).unwrap();
+        assert_eq!(selected.txn_counter, 7);
+    }
+
+    #[test]
+    fn test_superblock_selection_with_one_corrupt() {
+        let sb1 = Superblock {
+            magic: MAGIC,
+            format_version: crate::page::FORMAT_VERSION,
+            txn_counter: 5,
+            root_handle_table_page: 2,
+            root_freemap_page: 3,
+            total_pages: 10,
+            next_handle: 3,
+            page_size: PAGE_SIZE as u32,
+            named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
+            superblock_count: DEFAULT_SUPERBLOCK_COUNT,
+        };
+        let sb2_buf = [0u8; PAGE_SIZE];
+        let buf1 = sb1.serialize();
+        let selected = Superblock::select(&[buf1, sb2_buf]).unwrap();
+        assert_eq!(selected.txn_counter, 5);
+    }
+
+    #[test]
+    fn test_superblock_selection_both_corrupt() {
+        let buf1 = [0u8; PAGE_SIZE];
+        let buf2 = [0u8; PAGE_SIZE];
+        assert!(Superblock::select(&[buf1, buf2]).is_none());
     }
 }

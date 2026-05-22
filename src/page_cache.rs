@@ -452,6 +452,14 @@ impl PageCache {
     /// IDs back to the allocator, two concurrent savepoint rollbacks could
     /// hand the same ID to two different allocations. Leaving `next_page_id`
     /// monotonic sacrifices a tiny amount of address space for correctness.
+    ///
+    /// `#[allow(dead_code)]`: the original rollback path called this
+    /// per-page. Post-I3 (watermark rollback) the production path uses
+    /// `discard_all_dirty` + `truncate` instead. Kept here because a
+    /// targeted per-page discard might come back when partial-rollback
+    /// machinery grows up; the single-id shape is harder to recover
+    /// than to delete.
+    #[allow(dead_code)]
     pub fn discard(&mut self, page_id: u64) {
         if let Some(entry) = self.entries.remove(&page_id) {
             if entry.dirty {
@@ -1294,5 +1302,113 @@ mod tests {
                 "page {id} lost its sentinel after flush drain"
             );
         }
+    }
+
+    // ── Migrated 2026-05-22 from tests/basic_ops.rs (I35 reshape) ──
+    //
+    // The originals constructed a PageCache directly via the constructor
+    // arguments the integration test relied on (cache_max_bytes,
+    // spillway_max_bytes, DrainInsertion, SpillwayLocation). Spelling
+    // those out here rather than calling `fresh_cache` preserves the
+    // original test intent (file-backed, in-memory spillway, distinct
+    // cache caps) verbatim.
+
+    #[test]
+    fn test_cache_write_and_read() {
+        let file = NamedTempFile::new().unwrap();
+        let io = PageIo::open(file.path(), false).unwrap();
+        let mut cache = PageCache::new(
+            io,
+            16 * PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
+
+        let page_id = cache.new_page().unwrap();
+        {
+            let buf = cache.get_mut(page_id).unwrap();
+            buf[0] = 0x42;
+            buf[100] = 0xFF;
+            crate::page::stamp_checksum(buf);
+        }
+        let buf = cache.get(page_id).unwrap();
+        assert_eq!(buf[0], 0x42);
+        assert_eq!(buf[100], 0xFF);
+    }
+
+    #[test]
+    fn test_cache_flush_persists_to_disk() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_owned();
+
+        {
+            let io = PageIo::open(&path, false).unwrap();
+            let mut cache = PageCache::new(
+                io,
+                16 * PAGE_SIZE as u64,
+                0,
+                crate::DrainInsertion::LruTail,
+                crate::SpillwayLocation::InMemory,
+            );
+            let page_id = cache.new_page().unwrap();
+            {
+                let buf = cache.get_mut(page_id).unwrap();
+                buf[0] = 0xAB;
+                crate::page::stamp_checksum(buf);
+            }
+            cache.flush().unwrap();
+        }
+
+        {
+            let mut io = PageIo::open(&path, false).unwrap();
+            let buf = io.read_page(0).unwrap();
+            assert_eq!(buf[0], 0xAB);
+            assert!(crate::page::verify_checksum(&buf));
+        }
+    }
+
+    // Test that dirty pages are never silently evicted. Three pages are
+    // allocated into a cache with max_pages=3 — all three stay in memory,
+    // and their writes are visible without a flush (dirty-pin invariant).
+    // Using max_pages=3 rather than 2 because the cache is now a STRICT
+    // bound: with spillway_max_bytes=0 and max_pages=2, allocating a 3rd
+    // dirty page trips CacheFull at the cap rather than growing past it.
+    // The test intent (dirty pages are retained until flush) is preserved.
+    #[test]
+    fn test_cache_eviction_does_not_evict_dirty() {
+        let file = NamedTempFile::new().unwrap();
+        let io = PageIo::open(file.path(), false).unwrap();
+        let mut cache = PageCache::new(
+            io,
+            3 * PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
+
+        let p0 = cache.new_page().unwrap();
+        let p1 = cache.new_page().unwrap();
+        {
+            let buf = cache.get_mut(p0).unwrap();
+            buf[0] = 0x01;
+            crate::page::stamp_checksum(buf);
+        }
+        {
+            let buf = cache.get_mut(p1).unwrap();
+            buf[0] = 0x02;
+            crate::page::stamp_checksum(buf);
+        }
+
+        let p2 = cache.new_page().unwrap();
+        {
+            let buf = cache.get_mut(p2).unwrap();
+            buf[0] = 0x03;
+            crate::page::stamp_checksum(buf);
+        }
+
+        assert_eq!(cache.get(p0).unwrap()[0], 0x01);
+        assert_eq!(cache.get(p1).unwrap()[0], 0x02);
+        assert_eq!(cache.get(p2).unwrap()[0], 0x03);
     }
 }

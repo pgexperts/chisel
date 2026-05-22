@@ -32,6 +32,12 @@ pub const CHECKSUM_OFFSET: usize = PAGE_SIZE - CHECKSUM_SIZE; // 8184
 // Common page header (first 12 bytes) is shared by non-superblock pages so
 // that PageCache can identify a page's type without knowing its concrete
 // module. The superblock uses its own layout and does not carry this header.
+//
+// `#[allow(dead_code)]`: documents the layout commitment that every
+// page-type module's `init_page` agrees with — the constant is the
+// single source of truth even though no current call site reads it
+// (each page module knows its own concrete header size).
+#[allow(dead_code)]
 pub const COMMON_HEADER_SIZE: usize = 12;
 // Data pages carry an extended 16-byte header (common header + slot-array
 // metadata). PAGE_BODY_SIZE is the space available to slot payloads after
@@ -57,7 +63,14 @@ pub const PAGE_BODY_SIZE: usize = PAGE_SIZE - DATA_PAGE_HEADER_SIZE - CHECKSUM_S
 // the relevant page type's per-page version, not the superblock's
 // MAJOR.
 pub const PAGE_FORMAT_VERSION_CURRENT: u8 = 0;
+// I31 (ISSUES.md): reserved-region constants describe the 8-byte
+// common-header headroom every non-superblock page leaves for future
+// fields. No live code reads them today; they exist so that whenever a
+// new common field IS added (bumping the relevant per-page version),
+// the offset comes from one authoritative spot, not a fresh literal.
+#[allow(dead_code)]
 pub const COMMON_RESERVED_OFFSET: usize = 8;
+#[allow(dead_code)]
 pub const COMMON_RESERVED_LEN: usize = 8;
 
 /// Read the per-page format version from a page buffer. Dispatches on
@@ -72,6 +85,13 @@ pub const COMMON_RESERVED_LEN: usize = 8;
 /// them before looking at PageType. Feeding a superblock buffer to
 /// this function would read the superblock's own magic byte and
 /// return an arbitrary-looking value — don't.
+///
+/// I31 phase 1 (`#[allow(dead_code)]`): no production reader dispatches
+/// on the per-page version yet because no non-zero versions exist. The
+/// function is exercised by the cross-cutting `page_format_version_dispatches_by_page_type`
+/// test below so the dispatch contract is pinned ahead of phase 2 (the
+/// eager upgrader).
+#[allow(dead_code)]
 pub fn page_format_version(buf: &[u8; PAGE_SIZE]) -> u8 {
     if buf[0] == PageType::HandleTable as u8 {
         buf[2]
@@ -112,6 +132,13 @@ pub const fn format_major(version: u32) -> u16 {
 }
 
 /// Extract the minor-version byte pair from a packed format_version.
+///
+/// I29 phase 2 placeholder (`#[allow(dead_code)]`): the open-time gate
+/// in `transaction.rs::open_existing` compares MAJOR only today. The
+/// companion `format_minor` becomes live when the deferred
+/// "refuse writes if file MINOR > binary MINOR" arm lands at the
+/// first 1.1 release.
+#[allow(dead_code)]
 pub const fn format_minor(version: u32) -> u16 {
     (version & 0xFFFF) as u16
 }
@@ -140,6 +167,14 @@ impl PageType {
     /// Parse a type byte. Returns None for unknown/reserved values; callers
     /// should treat that as corruption since the checksum has typically
     /// already been validated by the time we look at the type tag.
+    ///
+    /// `#[allow(dead_code)]`: no production reader uses this today
+    /// (each page-type module reads its own type byte and matches
+    /// against its own discriminant). Kept as the symbolic parser so
+    /// future generic-page-walking code (e.g. an eager upgrader, a
+    /// dump-pages debug tool) has the canonical place to convert.
+    /// Exercised by the `test_page_type_from_u8_*` tests below.
+    #[allow(dead_code)]
     pub fn from_u8(v: u8) -> Option<PageType> {
         match v {
             0x01 => Some(PageType::HandleTable),
@@ -254,5 +289,119 @@ mod tests {
         // not a free-standing helper, so exercising them here would pull
         // PageCache into a pure-byte test. They are covered end-to-end
         // by the existing integration tests instead.
+    }
+
+    // ── Migrated 2026-05-22 from tests/basic_ops.rs (I35 reshape) ──
+
+    #[test]
+    fn test_checksum_roundtrip() {
+        let mut buf = [0u8; PAGE_SIZE];
+        buf[0] = 0x42;
+        buf[100] = 0xFF;
+        stamp_checksum(&mut buf);
+        assert!(verify_checksum(&buf));
+    }
+
+    #[test]
+    fn test_checksum_detects_corruption() {
+        let mut buf = [0u8; PAGE_SIZE];
+        buf[0] = 0x42;
+        stamp_checksum(&mut buf);
+        buf[50] = 0xAA;
+        assert!(!verify_checksum(&buf));
+    }
+
+    #[test]
+    fn test_checksum_detects_torn_write() {
+        let mut buf = [0u8; PAGE_SIZE];
+        buf[0] = 0x42;
+        stamp_checksum(&mut buf);
+        buf[PAGE_SIZE - 2] = 0;
+        buf[PAGE_SIZE - 1] = 0;
+        assert!(!verify_checksum(&buf));
+    }
+
+    // ── Migrated 2026-05-22 from tests/error_and_format.rs (I35 reshape) ──
+
+    #[test]
+    fn test_checksum_stamp_is_deterministic() {
+        let mut a = [0u8; PAGE_SIZE];
+        let mut b = [0u8; PAGE_SIZE];
+        a[42] = 0xAB;
+        b[42] = 0xAB;
+        stamp_checksum(&mut a);
+        stamp_checksum(&mut b);
+        assert_eq!(a[CHECKSUM_OFFSET..], b[CHECKSUM_OFFSET..]);
+    }
+
+    #[test]
+    fn test_checksum_detects_every_single_byte_flip_at_sampled_offsets() {
+        // Full 8192-byte sweep is overkill in unit tests; sample a handful
+        // of offsets including the very first and last non-checksum bytes.
+        let mut base = [0u8; PAGE_SIZE];
+        for (i, b) in base.iter_mut().enumerate().take(CHECKSUM_OFFSET) {
+            *b = (i & 0xFF) as u8;
+        }
+        stamp_checksum(&mut base);
+        assert!(verify_checksum(&base));
+
+        let offsets = [0usize, 1, 127, 4096, CHECKSUM_OFFSET - 1];
+        for &off in &offsets {
+            let mut buf = base;
+            buf[off] ^= 0x01;
+            assert!(
+                !verify_checksum(&buf),
+                "bit flip at offset {off} undetected",
+            );
+        }
+    }
+
+    #[test]
+    fn test_checksum_detects_flip_in_checksum_region() {
+        // Flipping a bit in the stored checksum itself must also fail
+        // verification — the check is "computed == stored", not just
+        // "hash(body) stable".
+        let mut buf = [0u8; PAGE_SIZE];
+        buf[0] = 0xFF;
+        stamp_checksum(&mut buf);
+        buf[CHECKSUM_OFFSET] ^= 0x80;
+        assert!(!verify_checksum(&buf));
+    }
+
+    #[test]
+    fn test_compute_checksum_ignores_trailing_bytes() {
+        // compute_checksum hashes 0..CHECKSUM_OFFSET only; the last 8 bytes
+        // must not affect the result.
+        let mut a = [0u8; PAGE_SIZE];
+        let mut b = [0u8; PAGE_SIZE];
+        a[5] = 0x11;
+        b[5] = 0x11;
+        b[PAGE_SIZE - 1] = 0xFF;
+        assert_eq!(compute_checksum(&a), compute_checksum(&b));
+    }
+
+    #[test]
+    fn test_page_type_from_u8_known_variants() {
+        assert_eq!(PageType::from_u8(0x01), Some(PageType::HandleTable));
+        assert_eq!(PageType::from_u8(0x02), Some(PageType::Data));
+        assert_eq!(PageType::from_u8(0x03), Some(PageType::Overflow));
+        assert_eq!(PageType::from_u8(0x04), Some(PageType::FreeMap));
+    }
+
+    #[test]
+    fn test_page_type_from_u8_rejects_zero_and_unknown() {
+        // 0x00 is reserved so a zeroed page cannot impersonate a valid type.
+        assert_eq!(PageType::from_u8(0x00), None);
+        assert_eq!(PageType::from_u8(0x05), None);
+        assert_eq!(PageType::from_u8(0xFF), None);
+    }
+
+    #[test]
+    fn test_page_layout_constants_are_self_consistent() {
+        // Pin the relationships between constants so a refactor of one
+        // doesn't silently desync the others.
+        assert_eq!(CHECKSUM_OFFSET + 8, PAGE_SIZE);
+        assert_eq!(PAGE_BODY_SIZE + 16 + 8, PAGE_SIZE); // header + body + checksum
+        assert_eq!(MAGIC, 0x4348534C);
     }
 }

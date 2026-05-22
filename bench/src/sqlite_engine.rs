@@ -11,7 +11,7 @@
 // as raw SQL via execute_batch; transaction state is a simple bool.
 
 use crate::engine::{DurabilityMode, Engine, EngineResult, Identifier};
-use chisel::stats::ChiselCounters;
+use chisel::ChiselCounters;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
