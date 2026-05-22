@@ -356,6 +356,13 @@ impl Chisel {
     /// `Drop`. The `Result` return is currently always `Ok`, but is kept so
     /// future implementations can surface fsync/close errors without a
     /// breaking change.
+    ///
+    /// I38 (ISSUES.md, 2026-05-22): `#[must_use]` with a custom message
+    /// so callers who drop the result without explicit `let _ = …` get
+    /// a lint warning. `Result` is already `#[must_use]` by default;
+    /// the custom message adds the human-readable rationale.
+    #[must_use = "Chisel::close may surface fsync/close errors in a future release; \
+                  ignore explicitly with `let _ = db.close();` if intentional"]
     pub fn close(self) -> Result<()> {
         drop(self);
         Ok(())
@@ -521,7 +528,15 @@ impl Chisel {
         Ok(Stats {
             handle_count: handles.len() as u64,
             total_pages: page_count,
-            file_size_bytes: page_count * PAGE_SIZE as u64,
+            // I47 (ISSUES.md, 2026-05-22): saturating_mul guards against
+            // u64 overflow at the absurd-extreme. The product overflows
+            // at page_count > u64::MAX / 8192 ≈ 2.25 × 10^15 pages (18
+            // EiB), unreachable for any real database — but unannotated
+            // multiplication is a smell. The saturate-to-u64::MAX
+            // behaviour is the right semantic here: "as big as a u64
+            // can represent" is closer to truth than "wrapped to a
+            // small number".
+            file_size_bytes: page_count.saturating_mul(PAGE_SIZE as u64),
         })
     }
 

@@ -165,8 +165,10 @@ pub fn defrag(txm: &mut TransactionManager, options: &DefragOptions) -> Result<D
     };
 
     // Step 1: empty-database fast path.
-    let (ht_root, _, _) = txm.current_roots();
-    if ht_root == PAGE_ID_NONE {
+    // I39: single-field accessor replaces the pre-I39 positional
+    // `(u64, u64, u64)` tuple return; only the handle-table root is
+    // consulted here.
+    if txm.current_handle_table_root_page() == PAGE_ID_NONE {
         return Ok(stats);
     }
 
