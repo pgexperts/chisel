@@ -234,7 +234,26 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
         // this call" errors that the database recovers from without harm.
         RustChiselError::TransactionInProgress => TransactionInProgressError::new_err(msg),
         // Fatal
-        RustChiselError::IoError(_) => IoError::new_err(msg),
+        //
+        // I42 (ISSUES.md, 2026-05-22): expose the inner io::Error's errno
+        // and kind on the resulting Python IoError instance so callers can
+        // programmatically distinguish ENOSPC vs EACCES vs EIO without
+        // string-parsing the message. The metadata is attached as ordinary
+        // Python attributes via setattr; the .pyi stub declares them so
+        // type-checkers see them. setattr failures are swallowed because
+        // the message-only PyErr is still a valid exception and we don't
+        // want a setattr fluke to mask the real I/O error.
+        RustChiselError::IoError(io_err) => {
+            let errno = io_err.raw_os_error();
+            let kind = format!("{:?}", io_err.kind());
+            let py_err = IoError::new_err(msg);
+            Python::with_gil(|py| {
+                let val = py_err.value_bound(py);
+                let _ = val.setattr("errno", errno);
+                let _ = val.setattr("kind", kind);
+            });
+            py_err
+        }
         RustChiselError::ChecksumMismatch { .. } => ChecksumMismatchError::new_err(msg),
         RustChiselError::CorruptSuperblock => CorruptSuperblockError::new_err(msg),
         RustChiselError::FileSizeMismatch { .. } => FileSizeMismatchError::new_err(msg),

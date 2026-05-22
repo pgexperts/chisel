@@ -48,7 +48,18 @@ class AlreadyFinishedError(OperationalError): ...
 
 
 # Fatal errors — database is poisoned or on-disk state is suspect.
-class IoError(FatalError): ...
+class IoError(FatalError):
+    # I42 (ISSUES.md, 2026-05-22): set by to_py_err when the underlying
+    # ChiselError::IoError wraps a real std::io::Error. `errno` is the
+    # platform's raw_os_error (e.g., 28 = ENOSPC on Linux); None if the
+    # io::Error was synthesized without a real OS error code. `kind` is
+    # the string form of std::io::ErrorKind (e.g., "PermissionDenied",
+    # "NotFound"). Both are best-effort: a setattr failure during
+    # exception construction is swallowed, so callers should check for
+    # attribute existence (`hasattr(e, "errno")`) if they rely on them
+    # for branching.
+    errno: int | None
+    kind: str
 class ChecksumMismatchError(FatalError): ...
 class CorruptSuperblockError(FatalError): ...
 class FileSizeMismatchError(FatalError): ...
