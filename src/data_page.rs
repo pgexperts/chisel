@@ -53,10 +53,31 @@ use crate::page::{self, PageType, CHECKSUM_OFFSET, DATA_PAGE_HEADER_SIZE, PAGE_S
 // Changing this is an on-disk format break.
 const SLOT_ENTRY_SIZE: usize = 6; // offset(2) + length(2) + flags(2)
 const SLOT_FLAG_LIVE: u16 = 0x0001;
+// `SLOT_FLAG_DEAD` documents the symbolic value for a cleared slot
+// entry. It's mathematically equivalent to "absence of SLOT_FLAG_LIVE",
+// so the production tombstone path can just write 0; the named
+// constant exists for the in-cfg(test) `DataPage::delete` path and as
+// the canonical name for forensic readers. `#[allow(dead_code)]`
+// because the I35 pub→pub(crate) reshape surfaced that the only
+// non-test caller (DataPage::delete) is itself only reached from
+// tests.
+#[allow(dead_code)]
 const SLOT_FLAG_DEAD: u16 = 0x0000;
 
 pub struct DataPage;
 
+// I35 reshape note: several DataPage methods (update, delete, compact,
+// free_space, used_space, iter_live, plus the write_slot_* helpers) are
+// reached only from src-tests after the integration tests migrated in
+// from tests/basic_ops.rs. The transaction layer's data-page lifecycle
+// uses insert → slot tombstone via the in-memory live-slot map → whole-
+// page free via txn_freed_pages; it never calls DataPage::delete/update/
+// compact directly. The methods are kept (rather than deleted) because
+// they're useful for any future direct-mutation API (a hypothetical
+// "shrink in place" or eager-defrag worker) and the test coverage they
+// already have is a real asset; #[allow(dead_code)] suppresses the
+// lib-build warning until a real caller materializes.
+#[allow(dead_code)]
 impl DataPage {
     /// Initialize a page buffer as an empty data page.
     //

@@ -19,20 +19,30 @@
 // Durability model: see `transaction.rs`. Commits are shadow-paged and
 // finalized by a superblock swap; there is no WAL and no background writer.
 
-pub mod data_page;
-pub mod defrag;
-pub mod error;
-pub mod freemap;
-pub mod handle_table;
+// I35 (ISSUES.md, 2026-05-22): every storage-internals module is
+// pub(crate). The supported public surface is the curated re-export
+// list further down (Chisel, Options, DrainInsertion, ChiselError,
+// Result, Stats, ChiselCounters, DefragOptions, DefragStats, PAGE_SIZE,
+// plus the superblock layout constants). Internal types like
+// TransactionManager / PageCache / HandleEntry / Superblock /
+// PageType are NOT part of the API stability contract; reaching for
+// them from a downstream crate requires either a path-dep with
+// #[cfg(test)] access (the bench subcrate does this implicitly
+// through the public API) or copying the relevant logic out.
+pub(crate) mod data_page;
+pub(crate) mod defrag;
+pub(crate) mod error;
+pub(crate) mod freemap;
+pub(crate) mod handle_table;
 mod lru;
-pub mod overflow;
-pub mod page;
-pub mod page_cache;
-pub mod page_io;
+pub(crate) mod overflow;
+pub(crate) mod page;
+pub(crate) mod page_cache;
+pub(crate) mod page_io;
 mod spillway;
-pub mod stats;
-pub mod superblock;
-pub mod transaction;
+pub(crate) mod stats;
+pub(crate) mod superblock;
+pub(crate) mod transaction;
 
 // I35: crash-recovery integration tests need direct access to internal
 // types (Superblock, PageType, page format constants) for corruption
@@ -124,8 +134,14 @@ pub enum DrainInsertion {
 /// How to open a spillway sidecar. `Path` for file-backed databases
 /// (path is the main db path; spillway will be at `<path>.spillway`),
 /// `InMemory` for memory-backed.
+///
+/// I37 (ISSUES.md, 2026-05-22): pub(crate) because the only legitimate
+/// constructors are inside `Chisel::open` and
+/// `Chisel::open_in_memory_with_options`. External callers route
+/// through those — there's no API path that needs them to construct
+/// a `SpillwayLocation` directly.
 #[derive(Debug, Clone)]
-pub enum SpillwayLocation {
+pub(crate) enum SpillwayLocation {
     Path(std::path::PathBuf),
     InMemory,
 }

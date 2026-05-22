@@ -32,6 +32,12 @@ pub const CHECKSUM_OFFSET: usize = PAGE_SIZE - CHECKSUM_SIZE; // 8184
 // Common page header (first 12 bytes) is shared by non-superblock pages so
 // that PageCache can identify a page's type without knowing its concrete
 // module. The superblock uses its own layout and does not carry this header.
+//
+// `#[allow(dead_code)]`: documents the layout commitment that every
+// page-type module's `init_page` agrees with — the constant is the
+// single source of truth even though no current call site reads it
+// (each page module knows its own concrete header size).
+#[allow(dead_code)]
 pub const COMMON_HEADER_SIZE: usize = 12;
 // Data pages carry an extended 16-byte header (common header + slot-array
 // metadata). PAGE_BODY_SIZE is the space available to slot payloads after
@@ -57,7 +63,14 @@ pub const PAGE_BODY_SIZE: usize = PAGE_SIZE - DATA_PAGE_HEADER_SIZE - CHECKSUM_S
 // the relevant page type's per-page version, not the superblock's
 // MAJOR.
 pub const PAGE_FORMAT_VERSION_CURRENT: u8 = 0;
+// I31 (ISSUES.md): reserved-region constants describe the 8-byte
+// common-header headroom every non-superblock page leaves for future
+// fields. No live code reads them today; they exist so that whenever a
+// new common field IS added (bumping the relevant per-page version),
+// the offset comes from one authoritative spot, not a fresh literal.
+#[allow(dead_code)]
 pub const COMMON_RESERVED_OFFSET: usize = 8;
+#[allow(dead_code)]
 pub const COMMON_RESERVED_LEN: usize = 8;
 
 /// Read the per-page format version from a page buffer. Dispatches on
@@ -72,6 +85,13 @@ pub const COMMON_RESERVED_LEN: usize = 8;
 /// them before looking at PageType. Feeding a superblock buffer to
 /// this function would read the superblock's own magic byte and
 /// return an arbitrary-looking value — don't.
+///
+/// I31 phase 1 (`#[allow(dead_code)]`): no production reader dispatches
+/// on the per-page version yet because no non-zero versions exist. The
+/// function is exercised by the cross-cutting `page_format_version_dispatches_by_page_type`
+/// test below so the dispatch contract is pinned ahead of phase 2 (the
+/// eager upgrader).
+#[allow(dead_code)]
 pub fn page_format_version(buf: &[u8; PAGE_SIZE]) -> u8 {
     if buf[0] == PageType::HandleTable as u8 {
         buf[2]
@@ -112,6 +132,13 @@ pub const fn format_major(version: u32) -> u16 {
 }
 
 /// Extract the minor-version byte pair from a packed format_version.
+///
+/// I29 phase 2 placeholder (`#[allow(dead_code)]`): the open-time gate
+/// in `transaction.rs::open_existing` compares MAJOR only today. The
+/// companion `format_minor` becomes live when the deferred
+/// "refuse writes if file MINOR > binary MINOR" arm lands at the
+/// first 1.1 release.
+#[allow(dead_code)]
 pub const fn format_minor(version: u32) -> u16 {
     (version & 0xFFFF) as u16
 }
@@ -140,6 +167,14 @@ impl PageType {
     /// Parse a type byte. Returns None for unknown/reserved values; callers
     /// should treat that as corruption since the checksum has typically
     /// already been validated by the time we look at the type tag.
+    ///
+    /// `#[allow(dead_code)]`: no production reader uses this today
+    /// (each page-type module reads its own type byte and matches
+    /// against its own discriminant). Kept as the symbolic parser so
+    /// future generic-page-walking code (e.g. an eager upgrader, a
+    /// dump-pages debug tool) has the canonical place to convert.
+    /// Exercised by the `test_page_type_from_u8_*` tests below.
+    #[allow(dead_code)]
     pub fn from_u8(v: u8) -> Option<PageType> {
         match v {
             0x01 => Some(PageType::HandleTable),

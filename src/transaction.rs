@@ -1638,6 +1638,14 @@ impl TransactionManager {
 
     /// Number of data pages currently tracked in the in-transaction
     /// view.
+    ///
+    /// `#[allow(dead_code)]`: referenced in `defrag.rs` and this
+    /// module's own doc comments as the wrong-metric example (the I17
+    /// fix uses `data_page_ids_snapshot` instead). Kept as the named
+    /// counter to make the contrast explicit; any future caller
+    /// wanting a coarse "how many data pages are in play" number has
+    /// the obvious accessor.
+    #[allow(dead_code)]
     pub fn data_page_count(&self) -> usize {
         self.current_live_slots.len()
     }

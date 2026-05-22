@@ -452,6 +452,14 @@ impl PageCache {
     /// IDs back to the allocator, two concurrent savepoint rollbacks could
     /// hand the same ID to two different allocations. Leaving `next_page_id`
     /// monotonic sacrifices a tiny amount of address space for correctness.
+    ///
+    /// `#[allow(dead_code)]`: the original rollback path called this
+    /// per-page. Post-I3 (watermark rollback) the production path uses
+    /// `discard_all_dirty` + `truncate` instead. Kept here because a
+    /// targeted per-page discard might come back when partial-rollback
+    /// machinery grows up; the single-id shape is harder to recover
+    /// than to delete.
+    #[allow(dead_code)]
     pub fn discard(&mut self, page_id: u64) {
         if let Some(entry) = self.entries.remove(&page_id) {
             if entry.dirty {

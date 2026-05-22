@@ -23,7 +23,6 @@
 mod common;
 use common::{open_chisel, Backing};
 
-use chisel::page::FORMAT_VERSION;
 use chisel::{Chisel, ChiselError, Options, NAMED_ROOT_COUNT, NAMED_ROOT_NAME_LEN};
 use tempfile::NamedTempFile;
 
@@ -63,8 +62,13 @@ fn test_is_fatal_storage_integrity_variants_are_fatal() {
         ChiselError::InvalidMagic,
         ChiselError::LockFailed,
         ChiselError::UnsupportedFormatVersion {
+            // Arbitrary values: the test only checks that is_fatal()
+            // classifies UnsupportedFormatVersion as fatal, not that
+            // either field has a specific value. Using literals here
+            // avoids reaching for the now-pub(crate) FORMAT_VERSION
+            // constant (I35 reshape).
             found: 1,
-            expected: FORMAT_VERSION,
+            expected: 0x0001_0000,
         },
         ChiselError::CorruptPage { page_id: 0 },
         ChiselError::InvalidPageId { page_id: 0 },

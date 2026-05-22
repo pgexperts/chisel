@@ -51,6 +51,16 @@ const BITMAP_OFFSET: usize = DATA_PAGE_HEADER_SIZE;
 
 pub struct FreeMap;
 
+// I35 reshape note: capacity, is_free, mark_used, and allocate_near are
+// reached only from src-tests today (capacity from src/freemap.rs's own
+// tests; is_free from src/transaction.rs's I27/I28 regression tests; the
+// other two from the same migrated freemap suite). The production
+// allocator path uses `allocate_first` + `mark_free`. Keeping the rest
+// behind `#[allow(dead_code)]` rather than deleting them: locality-aware
+// allocation (`allocate_near`) and the symmetric mark_used are useful
+// for any future freemap-aware placement strategy, and is_free is the
+// natural predicate any future health-check tool would call.
+#[allow(dead_code)]
 impl FreeMap {
     /// Maximum number of pages one freemap page can track.
     //
