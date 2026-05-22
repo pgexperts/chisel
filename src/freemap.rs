@@ -51,6 +51,16 @@ const BITMAP_OFFSET: usize = DATA_PAGE_HEADER_SIZE;
 
 pub struct FreeMap;
 
+// I35 reshape note: capacity, is_free, mark_used, and allocate_near are
+// reached only from src-tests today (capacity from src/freemap.rs's own
+// tests; is_free from src/transaction.rs's I27/I28 regression tests; the
+// other two from the same migrated freemap suite). The production
+// allocator path uses `allocate_first` + `mark_free`. Keeping the rest
+// behind `#[allow(dead_code)]` rather than deleting them: locality-aware
+// allocation (`allocate_near`) and the symmetric mark_used are useful
+// for any future freemap-aware placement strategy, and is_free is the
+// natural predicate any future health-check tool would call.
+#[allow(dead_code)]
 impl FreeMap {
     /// Maximum number of pages one freemap page can track.
     //
@@ -185,5 +195,55 @@ impl FreeMap {
     fn bit_position(page_id: u64) -> (usize, usize) {
         let page_id = page_id as usize;
         (page_id / 8, page_id % 8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // ── Migrated 2026-05-22 from tests/basic_ops.rs (I35 reshape) ──
+    //
+    // Freemap had no prior in-module test mod; this is a fresh one. All
+    // four tests are pure bitmap manipulation — no PageCache, no I/O.
+    use super::*;
+
+    #[test]
+    fn test_freemap_allocate_and_free() {
+        let mut buf = [0u8; PAGE_SIZE];
+        FreeMap::init_page(&mut buf);
+        FreeMap::mark_free(&mut buf, 10);
+        assert!(FreeMap::is_free(&buf, 10));
+        let alloc = FreeMap::allocate_near(&mut buf, 10);
+        assert_eq!(alloc, Some(10));
+        assert!(!FreeMap::is_free(&buf, 10));
+    }
+
+    #[test]
+    fn test_freemap_allocate_near_locality() {
+        let mut buf = [0u8; PAGE_SIZE];
+        FreeMap::init_page(&mut buf);
+        FreeMap::mark_free(&mut buf, 100);
+        FreeMap::mark_free(&mut buf, 101);
+        FreeMap::mark_free(&mut buf, 200);
+        let alloc = FreeMap::allocate_near(&mut buf, 99);
+        assert_eq!(alloc, Some(100));
+    }
+
+    #[test]
+    fn test_freemap_allocate_first_free() {
+        let mut buf = [0u8; PAGE_SIZE];
+        FreeMap::init_page(&mut buf);
+        FreeMap::mark_free(&mut buf, 50);
+        FreeMap::mark_free(&mut buf, 200);
+        let alloc = FreeMap::allocate_first(&mut buf);
+        assert_eq!(alloc, Some(50));
+        let alloc2 = FreeMap::allocate_first(&mut buf);
+        assert_eq!(alloc2, Some(200));
+        let alloc3 = FreeMap::allocate_first(&mut buf);
+        assert_eq!(alloc3, None);
+    }
+
+    #[test]
+    fn test_freemap_capacity() {
+        assert_eq!(FreeMap::capacity(), PAGE_BODY_SIZE * 8);
     }
 }

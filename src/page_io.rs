@@ -389,6 +389,60 @@ mod read_only_tests {
         io.fsync().unwrap();
         assert_eq!(io.fsync_count(), 2);
     }
+
+    // ── Migrated 2026-05-22 from tests/basic_ops.rs (I35 reshape) ──
+    //
+    // Folded into the file-backed `read_only_tests` mod since these tests
+    // open a NamedTempFile-backed PageIo. The mod name predates the
+    // migration; the additional tests below are not read-only-specific.
+
+    #[test]
+    fn test_page_io_write_and_read() {
+        let file = NamedTempFile::new().unwrap();
+        let mut io = PageIo::open(file.path(), false).unwrap();
+        let mut buf = [0u8; PAGE_SIZE];
+        buf[0] = 0xAB;
+        buf[100] = 0xCD;
+        io.write_page(0, &buf).unwrap();
+        let read_buf = io.read_page(0).unwrap();
+        assert_eq!(read_buf[0], 0xAB);
+        assert_eq!(read_buf[100], 0xCD);
+    }
+
+    #[test]
+    fn test_page_io_multiple_pages() {
+        let file = NamedTempFile::new().unwrap();
+        let mut io = PageIo::open(file.path(), false).unwrap();
+        let mut buf1 = [0u8; PAGE_SIZE];
+        let mut buf2 = [0u8; PAGE_SIZE];
+        buf1[0] = 1;
+        buf2[0] = 2;
+        io.write_page(0, &buf1).unwrap();
+        io.write_page(1, &buf2).unwrap();
+        assert_eq!(io.read_page(0).unwrap()[0], 1);
+        assert_eq!(io.read_page(1).unwrap()[0], 2);
+    }
+
+    #[test]
+    fn test_page_io_fsync() {
+        let file = NamedTempFile::new().unwrap();
+        let mut io = PageIo::open(file.path(), false).unwrap();
+        let buf = [0u8; PAGE_SIZE];
+        io.write_page(0, &buf).unwrap();
+        io.fsync().unwrap();
+    }
+
+    #[test]
+    fn test_page_io_file_len() {
+        let file = NamedTempFile::new().unwrap();
+        let mut io = PageIo::open(file.path(), false).unwrap();
+        assert_eq!(io.page_count().unwrap(), 0);
+        let buf = [0u8; PAGE_SIZE];
+        io.write_page(0, &buf).unwrap();
+        assert_eq!(io.page_count().unwrap(), 1);
+        io.write_page(2, &buf).unwrap();
+        assert_eq!(io.page_count().unwrap(), 3);
+    }
 }
 
 #[cfg(test)]

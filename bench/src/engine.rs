@@ -10,7 +10,7 @@
 // Read takes `&self`; mutating methods take `&mut self`. This matches
 // Chisel's post-F3 shape and fits redb / SQLite naturally.
 
-use chisel::stats::ChiselCounters;
+use chisel::ChiselCounters;
 use std::error::Error;
 
 /// Opaque identifier returned by an engine's `allocate` and consumed by

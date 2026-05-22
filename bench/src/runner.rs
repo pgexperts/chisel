@@ -97,7 +97,7 @@ impl EngineMode {
     }
 }
 
-use chisel::stats::ChiselCounters;
+use chisel::ChiselCounters;
 
 /// Per-cell deltas of the four Chisel internal counters (master spec
 /// §6.1). Reported in the JSONL aux-metrics file for cells where the

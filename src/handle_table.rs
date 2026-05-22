@@ -365,6 +365,12 @@ impl HandleTable {
         self.depth = depth;
     }
 
+    /// `#[allow(dead_code)]`: companion to `set_depth`. Production
+    /// `open_existing` reconstructs depth from the on-disk spine walk
+    /// and stores it via `set_depth`, but no current reader queries it
+    /// back. Kept for forensic / debug-print use and so the
+    /// set_depth/depth pair stays symmetric.
+    #[allow(dead_code)]
     pub fn depth(&self) -> u32 {
         self.depth
     }
@@ -926,5 +932,121 @@ mod tests {
             None,
             "u64::MAX handle must not panic nor read past the page"
         );
+    }
+
+    // ── Migrated 2026-05-22 from tests/basic_ops.rs (I35 reshape) ──
+    //
+    // Helper: handle-table tests need pages 0/1 reserved (the real
+    // database puts the superblock there) so that new_page() never
+    // returns 0, which would collide with the "no child allocated" zero
+    // sentinel inside interior nodes (ISSUES.md I8).
+    //
+    // Distinct from `make_cache` above (1024-page fixed cap) because
+    // the migrated tests need a parameterised cap — one of them uses a
+    // 2048-page cache to fit the COW path of a two-level grow.
+    fn ht_cache(max_pages: usize) -> PageCache {
+        let file = NamedTempFile::new().unwrap();
+        let io = PageIo::open(file.path(), false).unwrap();
+        let mut cache = PageCache::new(
+            io,
+            max_pages as u64 * crate::page::PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
+        cache.set_next_page_id(2);
+        cache
+    }
+
+    #[test]
+    fn test_handle_table_insert_and_lookup() {
+        let mut cache = ht_cache(64);
+        let mut ht = HandleTable::new();
+        let root = ht.create_root(&mut cache).unwrap();
+        let entry = HandleEntry {
+            page_id: 10,
+            slot_index: 3,
+            flags: HandleFlags::Live,
+        };
+        let new_root = ht.insert(&mut cache, root, 0, &entry).unwrap();
+        let found = ht.lookup(&mut cache, new_root, 0).unwrap().unwrap();
+        assert_eq!(found.page_id, 10);
+        assert_eq!(found.slot_index, 3);
+    }
+
+    #[test]
+    fn test_handle_table_multiple_entries() {
+        let mut cache = ht_cache(64);
+        let mut ht = HandleTable::new();
+        let mut root = ht.create_root(&mut cache).unwrap();
+        for i in 0..10u64 {
+            let entry = HandleEntry {
+                page_id: 100 + i,
+                slot_index: i as u16,
+                flags: HandleFlags::Live,
+            };
+            root = ht.insert(&mut cache, root, i, &entry).unwrap();
+        }
+        for i in 0..10u64 {
+            let found = ht.lookup(&mut cache, root, i).unwrap().unwrap();
+            assert_eq!(found.page_id, 100 + i);
+            assert_eq!(found.slot_index, i as u16);
+        }
+    }
+
+    #[test]
+    fn test_handle_table_cow_returns_new_root() {
+        let mut cache = ht_cache(64);
+        let mut ht = HandleTable::new();
+        let root1 = ht.create_root(&mut cache).unwrap();
+        let entry = HandleEntry {
+            page_id: 10,
+            slot_index: 0,
+            flags: HandleFlags::Live,
+        };
+        let root2 = ht.insert(&mut cache, root1, 0, &entry).unwrap();
+        assert_ne!(root1, root2);
+    }
+
+    // The handle table's two-level growth requires COW-copying the path on
+    // every insert, so 520 inserts allocate significantly more than 520
+    // pages. max_pages=2048 gives comfortable room (was 256×8=2048 under
+    // the old 8× HARD_CEILING_MULTIPLIER). With spillway_max_bytes=0 the
+    // cap is now strict, so the helper needs the full 2048 budget.
+    #[test]
+    fn test_handle_table_grows_to_two_levels() {
+        let mut cache = ht_cache(2048);
+        let mut ht = HandleTable::new();
+        let mut root = ht.create_root(&mut cache).unwrap();
+        for i in 0..(ENTRIES_PER_LEAF as u64 + 10) {
+            let entry = HandleEntry {
+                page_id: i,
+                slot_index: 0,
+                flags: HandleFlags::Live,
+            };
+            root = ht.insert(&mut cache, root, i, &entry).unwrap();
+        }
+        for i in 0..(ENTRIES_PER_LEAF as u64 + 10) {
+            let found = ht.lookup(&mut cache, root, i).unwrap().unwrap();
+            assert_eq!(found.page_id, i);
+        }
+    }
+
+    #[test]
+    fn test_handle_table_delete() {
+        let mut cache = ht_cache(64);
+        let mut ht = HandleTable::new();
+        let mut root = ht.create_root(&mut cache).unwrap();
+        let entry = HandleEntry {
+            page_id: 10,
+            slot_index: 0,
+            flags: HandleFlags::Live,
+        };
+        root = ht.insert(&mut cache, root, 0, &entry).unwrap();
+        let (new_root, prev) = ht.delete(&mut cache, root, 0).unwrap();
+        root = new_root;
+        assert!(prev.is_some(), "delete of a live entry must return Some");
+        let found = ht.lookup(&mut cache, root, 0).unwrap();
+        assert!(found.is_none());
     }
 }

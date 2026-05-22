@@ -1,6 +1,15 @@
-use chisel::page::{self, PageType, PAGE_SIZE};
-use chisel::superblock::Superblock;
-use chisel::{Chisel, ChiselError, Options};
+// recovery_tests.rs — Crash-recovery integration tests that need direct
+// access to internal types (Superblock, PageType, page format constants)
+// for corruption injection. Lives in src/ rather than tests/ because the
+// I35 pub→pub(crate) reshape locks these internals down; integration
+// tests no longer have access. The tests still exercise end-to-end
+// recovery scenarios — they're "integration tests with internals
+// access" not "unit tests of a single function".
+#![cfg(test)]
+
+use crate::page::{self, PageType, PAGE_SIZE};
+use crate::superblock::Superblock;
+use crate::{Chisel, ChiselError, Options};
 use std::fs;
 use std::io::{Read as _, Seek, SeekFrom, Write};
 use tempfile::NamedTempFile;
@@ -318,8 +327,8 @@ fn test_recovery_superblock_pointing_past_eof_is_rejected() {
         total_pages: 1_000_000,
         next_handle: 0,
         page_size: PAGE_SIZE as u32,
-        named_roots: [chisel::superblock::NamedRoot::EMPTY; chisel::superblock::NAMED_ROOT_COUNT],
-        superblock_count: chisel::superblock::DEFAULT_SUPERBLOCK_COUNT,
+        named_roots: [crate::superblock::NamedRoot::EMPTY; crate::superblock::NAMED_ROOT_COUNT],
+        superblock_count: crate::superblock::DEFAULT_SUPERBLOCK_COUNT,
     };
     let buf = sb.serialize();
     {
@@ -428,8 +437,8 @@ fn test_reject_unsupported_format_version() {
         total_pages: 2,
         next_handle: 0,
         page_size: PAGE_SIZE as u32,
-        named_roots: [chisel::superblock::NamedRoot::EMPTY; chisel::superblock::NAMED_ROOT_COUNT],
-        superblock_count: chisel::superblock::DEFAULT_SUPERBLOCK_COUNT,
+        named_roots: [crate::superblock::NamedRoot::EMPTY; crate::superblock::NAMED_ROOT_COUNT],
+        superblock_count: crate::superblock::DEFAULT_SUPERBLOCK_COUNT,
     };
     let buf_a = sb.serialize();
     sb.txn_counter = 4;

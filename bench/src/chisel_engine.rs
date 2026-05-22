@@ -12,8 +12,7 @@
 // public API.
 
 use crate::engine::{Engine, EngineResult, Identifier};
-use chisel::stats::ChiselCounters;
-use chisel::{Chisel, Options};
+use chisel::{Chisel, ChiselCounters, Options, PAGE_SIZE};
 use std::path::Path;
 
 pub struct ChiselEngine {
@@ -30,7 +29,7 @@ impl ChiselEngine {
     /// and putting Chisel on parity with SQLite's temp-file overflow and
     /// redb's on-disk B-tree pages for large-transaction handling.
     pub fn open_file(path: &Path, cache_size: usize) -> EngineResult<Self> {
-        let cache_max_bytes = cache_size as u64 * chisel::page::PAGE_SIZE as u64;
+        let cache_max_bytes = cache_size as u64 * PAGE_SIZE as u64;
         // I36: Options is #[non_exhaustive] so external callers must
         // build via the chained-setter builder; drain_insertion stays
         // at the LruTail default so it's not chained here.
@@ -50,7 +49,7 @@ impl ChiselEngine {
     /// at the Options boundary. The spillway is enabled at the same
     /// production-default scale as `open_file` (1024 × cache budget).
     pub fn open_in_memory(cache_size: usize) -> EngineResult<Self> {
-        let cache_max_bytes = cache_size as u64 * chisel::page::PAGE_SIZE as u64;
+        let cache_max_bytes = cache_size as u64 * PAGE_SIZE as u64;
         let db = Chisel::open_in_memory_with_options(
             Options::default()
                 .cache_max_bytes(cache_max_bytes)

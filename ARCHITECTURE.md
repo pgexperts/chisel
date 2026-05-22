@@ -7,12 +7,15 @@ This is a living document; update it when the architecture changes. Decisions do
 ## Table of contents
 
 1. [Design philosophy](#design-philosophy)
-2. [Layer model](#layer-model)
-3. [Commit protocol](#commit-protocol)
-4. [Recovery on open](#recovery-on-open)
-5. [On-disk format](#on-disk-format)
-6. [Cross-cutting concepts](#cross-cutting-concepts)
-7. [Glossary](#glossary)
+2. [Commenting standards](#commenting-standards)
+3. [Layer model](#layer-model)
+4. [Commit protocol](#commit-protocol)
+5. [Recovery on open](#recovery-on-open)
+6. [On-disk format](#on-disk-format)
+7. [Cross-cutting concepts](#cross-cutting-concepts)
+8. [Benchmark infrastructure](#benchmark-infrastructure)
+9. [Implementation history](#implementation-history)
+10. [Glossary](#glossary)
 
 ---
 
@@ -25,6 +28,21 @@ Three commitments shape everything else:
 - **Durability over performance.** Every commit performs two `fsync` calls (data, then superblock). Every page on disk carries an XXH3 checksum validated on load. The poison model (see below) treats any `fsync` failure as terminal because Linux fsyncgate semantics make retry unsafe.
 
 These three together explain most of Chisel's other choices (poison model, per-module COW, exclusive `flock` even for readers).
+
+---
+
+## Commenting standards
+
+Comments should explain choices, tradeoffs, higher-level algorithms, constraints, and invariants — not restate what the code does. Each file should have a brief header noting its role in the overall system. Emphasize non-obvious side effects, ordering dependencies, and intentional design decisions. The audience is a reader (human or AI) encountering this code for the first time.
+
+Concretely:
+
+- A doc comment on a public item should answer "why does this exist, and what would a caller need to know to use it correctly?" — not "what does each line of the body do?"
+- An inline comment should call out something a careful reader couldn't infer from the surrounding code: a non-obvious invariant, an ordering dependency on an earlier statement, a workaround for a known platform quirk, or a deliberate departure from the obvious idiom.
+- Module headers should state the module's role in the layer model (which layer? what does it depend on? what depends on it?) and the load-bearing invariants the rest of the module assumes.
+- `unsafe` blocks must carry a `// SAFETY:` comment naming each invariant being upheld. This is checked by convention, not by clippy — the only `unsafe` in the core engine (`page_io.rs::try_lock`) and the only `unsafe` in the bench harness (`chisel_engine.rs::delete_many`) are both small enough that a missing SAFETY comment is a real review finding.
+
+When a comment and the code disagree, the comment is stale by default. Update or remove it — silent drift between comments and behaviour is one of the most common ways a codebase becomes hard to evolve.
 
 ---
 
@@ -515,6 +533,70 @@ Without the fix, comparing chisel-strict vs sqlite-strict on macOS measures Appl
 Engine activity is observable via `Chisel::counters()` (cumulative-from-open: cache hits/misses, pages allocated, fsyncs). The micro-grid records counter snapshots before/after each cell so the post-processor can attribute throughput differences to fsync count, cache pressure, or page-allocation rate. This is why `ChiselCounters` is `#[non_exhaustive]` — the bench harness reads these via the public API, but additional counters can be added without a breaking change.
 
 The asymmetry "fsync_calls counts only successes; everything else counts attempts" matters here: a `CacheFull` allocation still bumps `pages_allocated`, but a failed fsync poisons the engine and stops counter increments. The bench harness handles poisoning by aborting that cell rather than fudging the numbers.
+
+---
+
+## Implementation history
+
+This section is a date-stamped narrative of the larger pieces of work that landed in the engine and the bench harness. The intent is to give a future reader (human or AI) the context to understand *why* the code looks the way it does — the running decision log lives in `ISSUES.md`, but the prose context for each major thrust lives here.
+
+### Benchmark suite (PRs 1–8)
+
+The bench-suite series ran from 2026-04-30 through 2026-05-04 and landed in eight PRs against `main`:
+
+- **PR 1 (2026-04-30)** — counter instrumentation. Added the four `Chisel::counters()` fields (`cache_hits`, `cache_misses`, `pages_allocated`, `fsync_calls`) as `Cell<u64>` increments at the site of each operation. `ChiselCounters` is `#[non_exhaustive]` so future counters can be added without a breaking change. Documented in [Engine-activity counters](#engine-activity-counters).
+- **PR 2 (2026-04-30)** — `bench/` subcrate + `Engine` trait + `ChiselEngine`. The `bench/` directory is a sibling subcrate, not a workspace member; it path-deps on the root `chisel` crate.
+- **PR 3 (2026-04-30)** — `RedbEngine` + `SqliteEngine` + cross-engine equivalence tests (five scenarios × three engines = 15 tests). SQLite snapshot-restore required `Engine::flush_for_snapshot()` (default no-op; SQLite override does `journal_mode=DELETE`) because WAL mode leaves committed data in the `-wal` sibling between explicit checkpoints — `std::fs::copy` of the main `.db` alone otherwise yields "database disk image is malformed" on reopen.
+- **PR 4a (2026-04-30)** — workload data layer. `Operation` / `Workload` types plus six seeded generators in `bench/src/workload.rs`, ChaCha8Rng-pinned for cross-version reproducibility.
+- **PR 4b (2026-05-01)** — Runner machinery + 6-row Criterion micro grid in `bench/src/runner.rs` + `bench/benches/micro_grid.rs`. Produces 165 cells of wall-clock + file-size + Chisel-internal-counter metrics into `target/criterion/...` and `bench/results/aux_metrics.jsonl`. The original PR 4 from the master spec was split into 4a + 4b once it became clear ~600 LOC in one PR was less reviewable than two smaller PRs.
+
+  The 4b grid is 6 rows, not the 9 the master spec called for: three 1000-per-tx variants (update, delete, delete_many) were dropped during implementation because 1000 random ops over the prepopulated DB pin a working set of dirty pages exceeding Chisel's pre-spillway 2048-page cache ceiling. The dropped row functions remain in `micro_grid.rs` (with `#[allow(dead_code)]`) so they can be re-enabled in a future PR with a configurable larger cache.
+
+- **PR 5 (2026-05-03)** — markdown summary post-processor. Binary `chisel-bench-summarize` in `bench/src/bin/summarize.rs` plus a library module under `bench/src/summary/`. Reads Criterion's `sample.json` per cell plus `bench/results/aux_metrics.jsonl` and emits three artifacts under `bench/results/<UTC-ISO8601>/`: `summary.md` (per-row markdown tables with magnitude-adaptive units), `results.json` (flat composite-key schema for PR 7's CI diff), and `raw/` (archival copy of estimates.json + sample.json per cell). Percentiles are computed directly from `sample.json` per-iteration times via numpy-style linear interpolation (consistent p50/p95/p99 semantics rather than mixing Criterion's bootstrap median with a CI proxy).
+- **PR 6 (2026-05-03)** — scenario tier. Four YCSB-style end-to-end workloads in `bench/src/scenarios.rs` + `bench/benches/scenarios.rs`, driven by `run_scenario_cell` in `bench/src/runner.rs`. YCSB-A (50/50 read/update, Zipfian θ=0.99), YCSB-B (95/5), Mutation Log (25/25/25/25 alloc/read/update/delete uniform), Document Store (70/20/10 read/alloc/update with lognormal sizes, Zipfian θ=0.7). Each runs once per strict durability mode → 12 cells. Inline `Instant::now()` timing rather than Criterion (the master-spec budget of 1–6 minutes per full tier rules out Criterion's many-samples-per-bench model).
+
+  Three latent bugs surfaced at PR 6's end-to-end acceptance gate that no per-task unit test caught: (1) `run_scenario_cell` originally did one-allocate-per-tx during prepop (100K fsyncs on chisel-strict ≈ 12 min/cell on macOS APFS); fixed by mirroring PR 4b's byte-accumulator chunking. (2) `gen_mutation_log` generated Read/Update/Delete on indices without tracking which had been deleted; replaced with a state-aware walk maintaining a live-set `Vec<usize>`. (3) `discover_cells` errored `NoCellsFound` when the criterion dir was empty even with scenarios present; `summarize.rs` now lets the unified `cells.is_empty() && scenarios.is_empty()` gate decide.
+
+  Runtime caveat: the spec target was 1–6 minutes / 10 minutes ceiling. On macOS that ceiling is unreachable — Chisel uses Rust's `sync_all` which calls `fcntl(F_FULLFSYNC)` (durable through the disk cache), while SQLite by default uses plain `fsync()` (which on macOS only flushes to the disk's write cache without `F_FULLFSYNC`). Result: chisel-strict cells are fsync-bound at ~5–10 ms per commit while sqlite-strict cells run ~3 orders of magnitude faster. Full 12-cell grid takes ~70–90 minutes on macOS APFS; Linux CI runners are much faster.
+- **PR 7 (2026-05-04)** — CI integration. `chisel-bench-diff` binary at `bench/src/bin/diff.rs` plus `.github/workflows/bench.yml` that runs the scenario tier on each PR, diffs against `main`'s baseline, and posts a sticky regression-report comment. Two-checkout strategy: build + run scenarios on `main`, build + run on PR HEAD, summarize both, run the diff binary, post via `peter-evans/find-comment` + `create-or-update-comment` keyed on the marker `<!-- chisel-bench-diff -->`. Thresholds: throughput + p50 at 5%, p95 + p99 at 10%, worse-direction only, no absolute time floor in v1. Pinned to `ubuntu-latest` per the PR 6 macOS fsync caveat. Signal-only — never blocks merge.
+
+  PR 7's first acceptance gate caught a real environmental issue: `origin/main` was 76 commits behind local `main` because PRs 4–6 were merged locally but never pushed to GitHub. Fix was a single `git push origin main`. Pattern worth remembering: any workflow that does `Checkout main` + build assumes `origin/main` is current.
+
+- **PR 8 (2026-05-04)** — cross-engine comparison report + macOS-fsync fairness fix. `chisel-bench-summarize` now emits `cross-engine.md` alongside `summary.md` and `results.json` (three per-metric tables: throughput, p99 latency, file size) over the four PR 6 scenarios in strict mode. `SqliteEngine::open_file` issues `PRAGMA fullfsync=ON` for `DurabilityMode::Strict` — no `#[cfg(target_os)]` gate (Linux ignores it; macOS uses `fcntl(F_FULLFSYNC)`), one extra PRAGMA exec at open time. Closes the cross-engine fairness gap that was pre-existing from PR 3's `SqliteEngine` wrapper.
+
+  PR 8's first-run bench-diff signal is a useful calibration point for GitHub-runner variance on the scenario tier: two `document-store` p50 cells flagged as "regressed" (redb-strict +9.4%, chisel-strict +5.6%) while throughput on both was within ±1% (genuine noise on microsecond-scale measurements). Future bench-diff readers should treat ≤±15% deltas on the scenario tier as plausible runner noise rather than real perf signals; the diff binary's job is to surface them, not to gate merges.
+
+A small followup landed alongside PR 8: `bench.yml` now uploads the PR-side `summarize` output (`cross-engine.md`, `summary.md`, `results.json`) as a workflow artifact `bench-results-pr-<N>` with 90-day retention. Retrieve via:
+
+```
+gh run download <run-id> --repo Xof/chisel --name bench-results-pr-<N>
+```
+
+Get `<run-id>` from `gh run list --branch <branch>` or the PR checks page. The `raw/` Criterion archive is intentionally absent from scenario-tier output — scenarios use `Instant::now()` timing rather than Criterion. Main-side output is not uploaded; for absolute README/release-notes numbers, run on dedicated hardware rather than the shared CI runner.
+
+Master design spec at `docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md` covers PRs 1–7; PR 8 has its own spec/plan pair at `docs/superpowers/specs/2026-05-04-chisel-bench-cross-engine-design.md` and `docs/superpowers/plans/2026-05-04-chisel-bench-cross-engine.md`.
+
+### Spillway feature (2026-05-04)
+
+The spillway landed out-of-band from the bench-suite series on the same day as PR 8. It adds `src/spillway.rs` plus integration across `PageCache` (spill on dirty overflow, rehydrate on miss, drain under the existing fsync, truncate on rollback) and the public API (`Chisel::set_cache_max_bytes` / `set_spillway_max_bytes` / `set_drain_insertion`).
+
+Breaking changes:
+- `Options::cache_size: usize` (page count) → `Options::cache_max_bytes: u64` (bytes); default unchanged at 8 MiB.
+- New `Options::spillway_max_bytes` (default `1024 × cache_max_bytes` = 8 GiB; 0 disables the spillway and restores legacy `CacheFull`-at-cap semantics).
+- New `Options::drain_insertion` (`LruTail` default | `Mru`).
+- The pre-existing 8× `HARD_CEILING_MULTIPLIER` elasticity is removed.
+
+The bench engine (`bench/src/chisel_engine.rs`) was updated mid-PR to enable the spillway by default. The original "spillway disabled for cross-engine fairness" reasoning was backwards: SQLite uses a temp file for transaction overflow, redb uses on-disk btrees; disabling Chisel's spillway makes Chisel the only engine that fails on big transactions, which is the unfair config.
+
+Spec/plan at `docs/superpowers/specs/2026-05-03-chisel-spillway-design.md` + `docs/superpowers/plans/2026-05-04-chisel-spillway.md`. Engine-side description in [Cross-cutting concepts → Spillway](#spillway).
+
+### Lessons captured during the spillway rollout
+
+Three engineering lessons surfaced during the spillway PR that are worth remembering for future cross-cutting work:
+
+1. **Per-task `cargo test` from the repo root does NOT run the bench subcrate's tests.** Bench is a sibling crate, not a workspace member. `cd bench && cargo test` is documented separately, but per-task gates skipped it. The final whole-PR review caught the missed bench test failures. Tracked as I58 in ISSUES.md (add bench tests to `ci.yml`).
+2. **A breaking change in cache discipline ripples to every consumer that papered over a different limitation.** The bench engine had been quietly relying on the 8× elasticity as a substitute for proper transaction-overflow handling. Removing the elasticity exposed the missing config; the right fix was to give Chisel the spillway (production parity), not to keep it disabled and lower other budgets.
+3. **No-spill commit cost is 3 fsyncs, not 2.** I28 pre-drain flush + main-pages flush + superblock. The spillway spec called it "two-fsync" because the spec author was thinking only of the spillway's contribution (zero); the actual baseline was already 3. The `no_spill_workload_preserves_two_fsync_commit` test now pins to `== 3` with documentation of the protocol so a future reader knows what each fsync covers.
 
 ---
 

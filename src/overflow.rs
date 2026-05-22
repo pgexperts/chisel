@@ -370,4 +370,51 @@ mod tests {
         let got = Overflow::read(&mut cache, first).unwrap();
         assert_eq!(got, expected);
     }
+
+    // ── Migrated 2026-05-22 from tests/overflow.rs (I35 reshape) ──
+    //
+    // These three originally lived in tests/overflow.rs and exercised
+    // Overflow against a PageCache built from the integration-test
+    // Backing enum (file + memory). The dual-backing coverage was
+    // belt-and-suspenders: Overflow operates one layer above PageIo
+    // and is backing-agnostic. Migrating to file-backed src/ unit
+    // tests is sufficient; the memory path is still exercised
+    // end-to-end via tests/in_memory.rs through the public API.
+    #[test]
+    fn write_and_read_value_smaller_than_threshold() {
+        // 4000 bytes would normally stay inline (MAX_INLINE_VALUE is
+        // larger). Routing it through Overflow::write directly verifies
+        // the chain machinery handles single-page chains even when the
+        // caller could have packed inline — useful as a contract test
+        // for callers that pre-emptively route to overflow on some
+        // sizing heuristic of their own.
+        let mut cache = make_cache();
+        let value = vec![0xAB; 4000];
+        let first_page = Overflow::write(&mut cache, &value).unwrap();
+        let read_back = Overflow::read(&mut cache, first_page).unwrap();
+        assert_eq!(read_back, value);
+    }
+
+    #[test]
+    fn write_and_read_multi_page_value() {
+        // 20000 bytes spans multiple OVERFLOW_PAYLOAD pages and
+        // exercises the chain walk during read.
+        let mut cache = make_cache();
+        let value = vec![0xCD; 20000];
+        let first_page = Overflow::write(&mut cache, &value).unwrap();
+        let read_back = Overflow::read(&mut cache, first_page).unwrap();
+        assert_eq!(read_back, value);
+    }
+
+    #[test]
+    fn delete_returns_every_chain_page() {
+        // delete must return the ids of every page it freed so the
+        // caller can merge them into txn_freed_pages. For a 20000-byte
+        // value the chain is at least 3 pages.
+        let mut cache = make_cache();
+        let value = vec![0xEF; 20000];
+        let first_page = Overflow::write(&mut cache, &value).unwrap();
+        let freed = Overflow::delete(&mut cache, first_page).unwrap();
+        assert!(freed.len() >= 3);
+    }
 }

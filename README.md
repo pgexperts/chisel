@@ -305,7 +305,7 @@ Every page carries an XXH3 checksum validated on load; cache hits skip revalidat
 
 Chisel runs on macOS and Linux. File locking uses `flock(2)` via `libc`. Windows is not currently supported and would require a different locking primitive.
 
-Rust stable, edition 2021.
+Rust stable, edition 2021. Minimum supported Rust version (MSRV): 1.82 — the version that stabilized `Option::is_none_or`, used in `src/page_cache.rs`. A future MSRV bump will appear in `Cargo.toml`'s `rust-version` field and be called out in release notes.
 
 ## Python binding
 
@@ -324,4 +324,4 @@ The Python API mirrors the Rust one but adds context managers for transactions a
 
 ## License
 
-TBD
+MIT — see [LICENSE](LICENSE) for the full text. The same license applies to the `python/` PyO3 binding and the `bench/` benchmark subcrate.

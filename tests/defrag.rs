@@ -171,7 +171,7 @@ fn test_defrag_respects_max_pages_body(b: &Backing) {
     // `max_pages` caps how much work defrag does in one call so
     // large databases can be incrementally compacted. With a cap of
     // 2, defrag should relocate at most 2 values.
-    use chisel::defrag::DefragOptions;
+    use chisel::DefragOptions;
     let mut db = open_chisel(b);
 
     db.begin().unwrap();
