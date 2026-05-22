@@ -7,10 +7,14 @@ name: Bench OS Update
 #
 # Spec: docs/specs/2026-05-04-dedicated-bench-machine-foundation-design.md
 # § "OS upgrades"
+#
+# I60 (ISSUES.md, 2026-05-22): DISABLED — see the matching note in
+# bench-disk-cleanup.yml. Same self-hosted runner not yet provisioned;
+# `schedule:` trigger commented out, `workflow_dispatch:` retained.
 
 on:
-  schedule:
-    - cron: '0 5 1 * *' # monthly, 1st at 05:00 UTC
+  # schedule:
+  #   - cron: '0 5 1 * *' # monthly, 1st at 05:00 UTC — re-enable when runner is online
   workflow_dispatch:
 
 jobs:
