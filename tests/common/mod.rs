@@ -48,7 +48,7 @@ pub fn open_chisel_with(b: &Backing, opts: Options) -> Chisel {
 #[macro_export]
 macro_rules! dual_backing_test {
     ($name:ident, $body:ident) => {
-        paste::paste! {
+        pastey::paste! {
             #[test]
             fn [<$name _file>]() {
                 let b = $crate::common::Backing::fresh_file();

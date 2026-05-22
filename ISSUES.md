@@ -979,7 +979,7 @@ let resolved_spillway_max_bytes = spillway_max_bytes.unwrap_or_else(|| cache_max
 
 Low priority pre-1.0; high value when format evolution starts in earnest.
 
-#### I72. Replace `paste` dev-dependency with the maintained `pastey` fork [deepdive follow-up 2026-05-22] — **P3**
+#### I72. Replace `paste` dev-dependency with the maintained `pastey` fork [deepdive follow-up 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** root `Cargo.toml` (`paste = "1"` in `[dev-dependencies]`); single use site `tests/common/mod.rs:51` (`paste::paste!` inside `dual_backing_test!` macro).
 
 **Problem:** RUSTSEC-2024-0436 — `paste 1.0.15` is **unmaintained**. The author (dtolnay) archived the GitHub repo on 2024-10-07 and the README says the project is no longer maintained. RustSec classifies this as informational (no vulnerability, no broken semantics), but `rustsec/audit-check` flags it by default and blocks the I54 supply-chain CI job.
@@ -1004,3 +1004,16 @@ Surfaced when the I54 audit job landed on main and immediately tripped on this d
 Verify `cargo test` still produces both `_file` and `_memory` test variants via the `dual_backing_test!` expansion, then drop the `ignore: RUSTSEC-2024-0436` line from `.github/workflows/ci.yml`.
 
 Low priority because the warning is informational and only affects a dev-dep; high enough to fix in a small PR before the `ignore` list accumulates more entries.
+
+#### I73. GitHub Actions Node.js 20 deprecation (every job uses `actions/checkout@v4`) [post-P2 CI run 2026-05-22] — **P3**
+**Where:** every job in `.github/workflows/ci.yml` (test, clippy, fmt, audit, msrv, bench-tests, python matrix) — currently 7 distinct jobs all pinned to `actions/checkout@v4`. The `dtolnay/rust-toolchain`, `Swatinem/rust-cache@v2`, `actions/setup-python@v5`, and `rustsec/audit-check@v1.4.1` actions should also be re-checked for Node 24 readiness.
+
+**Problem:** GitHub is forcing Node.js 24 as the default on hosted runners on **June 2nd, 2026** (~10 days from today). Node.js 20 will be removed entirely on **September 16th, 2026**. Surfaced as warning annotations on the first green post-P2 audit run on main:
+
+> `! Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: actions/checkout@v4. … For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/`
+
+CI keeps passing today, but the warning is on every run and there is a hard cutoff coming.
+
+**Direction of fix:** bump each `uses:` line to a version whose action manifest declares `node24` once those versions are GA. As of 2026-05-22, the v5 line of `actions/checkout` is the natural target; the other actions cited above need a one-shot audit of their action.yml `runs.using` field. Until then, the temporary opt-in is the `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true` env var on the runner — but that's worse than just bumping the pin once. Single-PR scope: edit `.github/workflows/ci.yml`, push, verify one CI run goes green.
+
+Low priority because runners auto-upgrade on the cutoff date anyway; medium-low because if `actions/checkout@v5` is GA before then, this is a five-minute PR that closes the warning noise immediately.

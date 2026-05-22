@@ -25,4 +25,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-paste = "1"
+# `pastey` is the maintained drop-in fork of `paste` (dtolnay archived the
+# original crate 2024-10-07; RUSTSEC-2024-0436). Used only by the
+# `dual_backing_test!` macro in tests/common/mod.rs to construct
+# `_file` / `_memory` test-fn identifiers. See I72 in ISSUES.md.
+pastey = "0.1"
