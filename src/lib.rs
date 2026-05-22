@@ -36,6 +36,14 @@ pub mod transaction;
 
 pub use error::{ChiselError, Result};
 
+// I36 follow-up: the PyO3 binding (python/src/db.rs) references
+// chisel::DefragOptions when wiring the defrag() pymethod. This re-export
+// makes that path resolve on this branch even before the broader I35
+// pub→pub(crate) reshape lands and adds its own re-export block. If this
+// PR and the I35 reshape both add the same line, git's three-way merge
+// will see identical edits and keep a single copy with no conflict.
+pub use defrag::{DefragOptions, DefragStats};
+
 use std::path::Path;
 
 use page_cache::PageCache;
