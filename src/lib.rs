@@ -55,9 +55,9 @@ mod recovery_tests;
 pub use error::{ChiselError, Result};
 
 // Re-exports of the curated public surface. The internal modules these
-// items live in will be locked down to `pub(crate)` in a follow-up commit
-// (ISSUES.md I35); these re-exports define the supported access paths and
-// keep the documented API at the crate root.
+// items live in are pub(crate) (ISSUES.md I35, landed in PR #11); these
+// re-exports define the supported access paths and keep the documented
+// API at the crate root.
 pub use defrag::{DefragOptions, DefragStats};
 pub use page::PAGE_SIZE;
 pub use stats::{ChiselCounters, Stats};
@@ -107,6 +107,12 @@ use transaction::TransactionManager;
 /// commit followed by a torn retry, N=4 survives two retries. This
 /// option is ONLY consulted when creating a new database; reopening an
 /// existing file discovers N from the on-disk superblock itself.
+/// I36 (ISSUES.md, 2026-05-22): `#[non_exhaustive]` so adding a future
+/// field (a tuning knob for cache warmup, an fsync-coalescing hint,
+/// etc.) is not a breaking change. External callers must construct via
+/// `Options { ..Options::default() }` rather than a full struct
+/// literal; `Default` is implemented below.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct Options {
     pub cache_max_bytes: u64,
@@ -125,6 +131,11 @@ pub struct Options {
 ///
 /// `Mru` treats drained pages as recently touched. Useful when the
 /// caller expects to read them again next transaction.
+///
+/// I36: `#[non_exhaustive]` so a third drain policy (e.g. a hint-based
+/// split between recently-touched and cold) can land without breaking
+/// callers. External `match` arms need a `_ => …` catchall.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainInsertion {
     LruTail,
@@ -157,6 +168,46 @@ impl Default for Options {
             read_only: false,
             superblock_count: superblock::DEFAULT_SUPERBLOCK_COUNT,
         }
+    }
+}
+
+// I36: chained setters paired with the #[non_exhaustive] attribute on
+// Options above. External crates can't construct via a struct literal
+// — even with `..Options::default()` — so the supported way to build a
+// customized Options is `Options::default().cache_max_bytes(…)…`. The
+// setters take and return `Self` by value (move semantics) so a chain
+// builds the final value in one expression and never holds a `&mut Options`
+// borrow.
+//
+// Method names match the field names, not `with_*`-prefixed. Rust resolves
+// the field-vs-method ambiguity by context: `o.cache_max_bytes` is field
+// access; `o.cache_max_bytes(N)` is a method call. The unprefixed form
+// is consistent with sqlx, redb, and most modern crates; `with_*` is the
+// older convention and uses more vertical space.
+impl Options {
+    pub fn cache_max_bytes(mut self, bytes: u64) -> Self {
+        self.cache_max_bytes = bytes;
+        self
+    }
+    pub fn spillway_max_bytes(mut self, bytes: u64) -> Self {
+        self.spillway_max_bytes = bytes;
+        self
+    }
+    pub fn drain_insertion(mut self, policy: DrainInsertion) -> Self {
+        self.drain_insertion = policy;
+        self
+    }
+    pub fn create_if_missing(mut self, create: bool) -> Self {
+        self.create_if_missing = create;
+        self
+    }
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+    pub fn superblock_count(mut self, count: u32) -> Self {
+        self.superblock_count = count;
+        self
     }
 }
 

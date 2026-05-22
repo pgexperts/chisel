@@ -64,6 +64,13 @@ use crate::transaction::TransactionManager;
 /// touched — the field name is a carry-over from pre-R3 defrag and is
 /// preserved for API stability. Breaking the loop early leaves the
 /// transaction in a valid state; the caller chooses commit vs rollback.
+///
+/// I36 (ISSUES.md, 2026-05-22): `#[non_exhaustive]` so a future
+/// tuning knob (e.g. a per-page time cap, a pages-vs-values-priority
+/// toggle) is not a breaking change. External callers construct via
+/// `DefragOptions { ..Default::default() }` rather than a full struct
+/// literal.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DefragOptions {
     pub sparse_threshold: f64,
@@ -79,6 +86,24 @@ impl Default for DefragOptions {
     }
 }
 
+// I36: chained setters paired with #[non_exhaustive]. Same shape as
+// `Options`'s builder; method names match field names. External callers
+// build via `DefragOptions::default().sparse_threshold(0.1).max_pages(100)`.
+impl DefragOptions {
+    pub fn sparse_threshold(mut self, threshold: f64) -> Self {
+        self.sparse_threshold = threshold;
+        self
+    }
+    pub fn max_pages(mut self, cap: usize) -> Self {
+        self.max_pages = cap;
+        self
+    }
+}
+
+/// I36: `#[non_exhaustive]` for symmetry with `DefragOptions` and so a
+/// future bench-friendly stat (e.g. wall-time elapsed inside the sweep)
+/// is not a breaking change.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DefragStats {
     pub pages_examined: u64,

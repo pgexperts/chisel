@@ -32,14 +32,15 @@ fn expect_err(r: Result<Chisel>) -> ChiselError {
 }
 
 fn opts(superblock_count: u32) -> Options {
-    Options {
-        cache_max_bytes: 16 * chisel::PAGE_SIZE as u64,
-        spillway_max_bytes: 0,
-        drain_insertion: chisel::DrainInsertion::LruTail,
-        create_if_missing: true,
-        read_only: false,
-        superblock_count,
-    }
+    // I36: external callers can't construct Options via struct literal
+    // (or `..Options::default()`); use the chained-setter builder.
+    // create_if_missing=true and read_only=false are the defaults so
+    // they aren't repeated here.
+    Options::default()
+        .cache_max_bytes(16 * chisel::PAGE_SIZE as u64)
+        .spillway_max_bytes(0)
+        .drain_insertion(chisel::DrainInsertion::LruTail)
+        .superblock_count(superblock_count)
 }
 
 // --- superblock_count validation ---
@@ -193,10 +194,7 @@ fn test_create_if_missing_false_on_missing_file_errors() {
     let path = dir.path().join("does_not_exist.chsl");
     let err = expect_err(Chisel::open(
         &path,
-        Options {
-            create_if_missing: false,
-            ..Options::default()
-        },
+        Options::default().create_if_missing(false),
     ));
     assert!(matches!(err, ChiselError::FileNotFound));
 }
@@ -213,10 +211,7 @@ fn test_create_if_missing_false_on_zero_length_file_errors() {
     assert_eq!(std::fs::metadata(f.path()).unwrap().len(), 0);
     let err = expect_err(Chisel::open(
         f.path(),
-        Options {
-            create_if_missing: false,
-            ..Options::default()
-        },
+        Options::default().create_if_missing(false),
     ));
     assert!(matches!(err, ChiselError::FileNotFound));
 }
@@ -258,14 +253,13 @@ fn test_read_only_open_rejects_begin() {
     }
     let mut db = Chisel::open(
         &path,
-        Options {
-            cache_max_bytes: 16 * chisel::PAGE_SIZE as u64,
-            spillway_max_bytes: 0,
-            drain_insertion: chisel::DrainInsertion::LruTail,
-            create_if_missing: false,
-            read_only: true,
-            superblock_count: DEFAULT_SUPERBLOCK_COUNT,
-        },
+        Options::default()
+            .cache_max_bytes(16 * chisel::PAGE_SIZE as u64)
+            .spillway_max_bytes(0)
+            .drain_insertion(chisel::DrainInsertion::LruTail)
+            .create_if_missing(false)
+            .read_only(true)
+            .superblock_count(DEFAULT_SUPERBLOCK_COUNT),
     )
     .unwrap();
     let err = match db.begin() {

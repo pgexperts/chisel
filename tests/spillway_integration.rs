@@ -20,12 +20,10 @@ fn large_transaction_with_spill_produces_identical_state() {
     // 16 pages × 8 KiB = 128 KiB; allocating 200 × 1 KiB payloads
     // (each requiring at least one data page) will push well past that.
     let cache_max_bytes = 16 * 8192; // 16 pages
-    let opts_with_spillway = Options {
-        cache_max_bytes,
-        spillway_max_bytes: 1024 * cache_max_bytes,
-        drain_insertion: DrainInsertion::LruTail,
-        ..Options::default()
-    };
+    let opts_with_spillway = Options::default()
+        .cache_max_bytes(cache_max_bytes)
+        .spillway_max_bytes(1024 * cache_max_bytes)
+        .drain_insertion(DrainInsertion::LruTail);
 
     // Run A: one big transaction, working set ~64 pages of dirty
     // (4× cache cap; spillway absorbs the overflow).
@@ -71,12 +69,10 @@ fn large_transaction_with_spill_produces_identical_state() {
 #[test]
 fn rollback_with_spill_leaves_main_file_unchanged() {
     let cache_max_bytes = 16 * 8192;
-    let opts = Options {
-        cache_max_bytes,
-        spillway_max_bytes: 1024 * cache_max_bytes,
-        drain_insertion: DrainInsertion::LruTail,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .cache_max_bytes(cache_max_bytes)
+        .spillway_max_bytes(1024 * cache_max_bytes)
+        .drain_insertion(DrainInsertion::LruTail);
     let mut db = Chisel::open_in_memory_with_options(opts).unwrap();
 
     // Commit a baseline transaction first.
@@ -160,12 +156,10 @@ fn spillway_max_bytes_zero_disables_spillway_and_fires_cache_full() {
     // the engine must surface CacheFull, not SpillwayFull and not
     // silently grow past the cap.
     let cache_max_bytes = 4 * 8192; // 4 pages
-    let opts = Options {
-        cache_max_bytes,
-        spillway_max_bytes: 0, // OPT-OUT
-        drain_insertion: DrainInsertion::LruTail,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .cache_max_bytes(cache_max_bytes)
+        .spillway_max_bytes(0) // OPT-OUT
+        .drain_insertion(DrainInsertion::LruTail);
     let mut db = Chisel::open_in_memory_with_options(opts).unwrap();
 
     db.begin().unwrap();
@@ -205,10 +199,7 @@ fn spillway_max_bytes_zero_creates_no_spillway_file() {
         PathBuf::from(p)
     };
 
-    let opts = Options {
-        spillway_max_bytes: 0,
-        ..Options::default()
-    };
+    let opts = Options::default().spillway_max_bytes(0);
     let mut db = Chisel::open(&db_path, opts).unwrap();
     db.begin().unwrap();
     let _h = db.allocate(b"x").unwrap();
@@ -264,11 +255,9 @@ fn crash_mid_spill_recovers_to_last_committed_state() {
     // ensure_spillway calls Spillway::open_file which opens with
     // truncate(true) — clearing the orphaned garbage from Step 2.
     let cache_max_bytes = 4 * 8192; // 4 pages — tiny enough to force spill
-    let opts = Options {
-        cache_max_bytes,
-        spillway_max_bytes: 1024 * cache_max_bytes,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .cache_max_bytes(cache_max_bytes)
+        .spillway_max_bytes(1024 * cache_max_bytes);
     let mut db = Chisel::open(&db_path, opts).unwrap();
     db.begin().unwrap();
     // Allocate enough to overflow the 4-page cache and trigger spillway open.
