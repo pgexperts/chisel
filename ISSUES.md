@@ -879,7 +879,7 @@ bench-tests:
 
 Choice (a) is the planned path per the spec; choice (b) is the cleanup if the plan moves out by months.
 
-#### I61. No workspace manifest [deepdive 2026-05-22] — **P3**
+#### I61. No workspace manifest [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22 (default-members = [".", "bench"]; python excluded due to maturin linker requirements)
 **Where:** repo root (no `Cargo.toml` `[workspace]`)
 
 **Problem:** `python/` and `bench/` are sibling subcrates with `chisel = { path = ".." }` path-deps, not workspace members. Each rebuilds `chisel` separately because their `Cargo.lock` files are independent. The README's opening "Rust workspace with three crates" sentence is wrong (see I62). A real workspace would share `target/` and `Cargo.lock`, giving `cargo test --workspace` and `cargo clippy --workspace` coverage of all three at once.

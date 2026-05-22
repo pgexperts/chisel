@@ -98,24 +98,14 @@ jobs:
       - name: Build with MSRV toolchain
         run: cargo build --verbose
 
-  # I58 (ISSUES.md, 2026-05-22): the bench/ subcrate is a sibling, not
-  # a workspace member, so `cargo test` from the repo root does NOT run
-  # its tests. The bench.yml workflow only runs the scenario *bench*
-  # tier on PRs for regression-comment purposes — it never runs
-  # `cargo test`. This job closes the coverage hole that the
-  # spillway-rollout retrospective (ARCHITECTURE.md Implementation
-  # history → Lessons learned, #1) flagged.
-  bench-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: bench
-      - name: Run bench subcrate tests
-        working-directory: bench
-        run: cargo test --verbose
+  # I58 (ISSUES.md, 2026-05-22): a dedicated `bench-tests` job once
+  # ran `cd bench && cargo test --verbose` because bench/ was a
+  # sibling crate (not workspace member), and `cargo test` from root
+  # didn't cover it. I61 made bench/ a workspace member with
+  # `default-members = [".", "bench"]`, so the `test` job's
+  # `cargo test --verbose` now exercises chisel AND chisel-bench in
+  # one shot. The standalone bench-tests job became redundant and
+  # was removed.
 
   python:
     needs: [test, clippy, fmt]

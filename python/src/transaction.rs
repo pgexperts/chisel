@@ -166,11 +166,7 @@ impl PyTransaction {
     // this PyTransaction reference-wise. That is harmless: both
     // objects route through PyChisel, and the engine rejects
     // savepoint ops outside an active transaction.
-    fn savepoint(
-        &self,
-        py: Python<'_>,
-        name: &str,
-    ) -> PyResult<Py<crate::savepoint::PySavepoint>> {
+    fn savepoint(&self, py: Python<'_>, name: &str) -> PyResult<Py<crate::savepoint::PySavepoint>> {
         self.db.bind(py).borrow().savepoint_internal(py, name)?;
         Py::new(
             py,
