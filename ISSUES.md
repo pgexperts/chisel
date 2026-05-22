@@ -978,3 +978,29 @@ let resolved_spillway_max_bytes = spillway_max_bytes.unwrap_or_else(|| cache_max
 - `FreeMap::mark_free(id)` then `FreeMap::is_free(id)` round-trips for any `id < CAPACITY`
 
 Low priority pre-1.0; high value when format evolution starts in earnest.
+
+#### I72. Replace `paste` dev-dependency with the maintained `pastey` fork [deepdive follow-up 2026-05-22] — **P3**
+**Where:** root `Cargo.toml` (`paste = "1"` in `[dev-dependencies]`); single use site `tests/common/mod.rs:51` (`paste::paste!` inside `dual_backing_test!` macro).
+
+**Problem:** RUSTSEC-2024-0436 — `paste 1.0.15` is **unmaintained**. The author (dtolnay) archived the GitHub repo on 2024-10-07 and the README says the project is no longer maintained. RustSec classifies this as informational (no vulnerability, no broken semantics), but `rustsec/audit-check` flags it by default and blocks the I54 supply-chain CI job.
+
+Surfaced when the I54 audit job landed on main and immediately tripped on this dep. Worked around in the same fix-up commit (`ignore: RUSTSEC-2024-0436` in `.github/workflows/ci.yml`); this entry documents the proper fix.
+
+**Direction of fix:** swap `paste` for `pastey`, a drop-in fork explicitly created to address this advisory. Two edits:
+
+```toml
+# Cargo.toml
+[dev-dependencies]
+- paste = "1"
++ pastey = "0.1"
+```
+
+```rust
+// tests/common/mod.rs
+- paste::paste! {
++ pastey::paste! {
+```
+
+Verify `cargo test` still produces both `_file` and `_memory` test variants via the `dual_backing_test!` expansion, then drop the `ignore: RUSTSEC-2024-0436` line from `.github/workflows/ci.yml`.
+
+Low priority because the warning is informational and only affects a dev-dep; high enough to fix in a small PR before the `ignore` list accumulates more entries.
