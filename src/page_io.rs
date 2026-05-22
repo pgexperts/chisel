@@ -58,6 +58,17 @@ pub struct PageIo {
     // so this stays at 0 for the read-only lifetime — a useful invariant
     // when interpreting the counter.
     fsync_calls: Cell<u64>,
+    // I51 (ISSUES.md, 2026-05-22): cached file length in pages. Eliminates
+    // the `lseek(End(0))` syscall that every read_page() used to issue
+    // through `page_count()`. Maintained by:
+    //   - `open()` / `open_in_memory()` — seed from initial file length
+    //   - `write_page()` — extend if page_id+1 > cached value
+    //   - `set_page_count(n)` — overwrite to n (both grow and shrink)
+    // Safe under the single-writer flock contract: no other process can
+    // mutate the file behind our back, so the cached value never goes
+    // stale. Used by both File and Memory backings — for Memory the
+    // cache mirrors `pages.len()` and the maintenance cost is negligible.
+    cached_page_count: Cell<u64>,
 }
 
 impl PageIo {
@@ -76,7 +87,7 @@ impl PageIo {
     /// could observe an inconsistent state. Single-process exclusive access
     /// is the v1 concurrency model.
     pub fn open(path: &Path, read_only: bool) -> Result<PageIo> {
-        let file = if read_only {
+        let mut file = if read_only {
             OpenOptions::new().read(true).open(path)?
         } else {
             OpenOptions::new()
@@ -87,10 +98,17 @@ impl PageIo {
                 .open(path)?
         };
         Self::try_lock(&file)?;
+        // I51: seed the page-count cache from the current file length.
+        // After this, every page_count() call returns the cached value
+        // without a syscall; the cache is kept in sync by write_page()
+        // and set_page_count().
+        let initial_len = file.seek(SeekFrom::End(0))?;
+        let initial_page_count = initial_len / PAGE_SIZE as u64;
         Ok(PageIo {
             backing: Backing::File { file },
             read_only,
             fsync_calls: Cell::new(0),
+            cached_page_count: Cell::new(initial_page_count),
         })
     }
 
@@ -107,6 +125,9 @@ impl PageIo {
             backing: Backing::Memory { pages: Vec::new() },
             read_only: false,
             fsync_calls: Cell::new(0),
+            // I51: seeded to 0; write_page() and set_page_count() keep
+            // it in sync with pages.len() as the Vec grows or shrinks.
+            cached_page_count: Cell::new(0),
         })
     }
 
@@ -172,15 +193,12 @@ impl PageIo {
     /// distinguish "caller asked for a page that doesn't exist" from
     /// "genuine disk I/O failure".
     ///
-    /// Cost note: `page_count()` performs a `seek(End(0))` on the File
-    /// backing, so every read pays one extra lseek syscall. `PageCache`
-    /// absorbs that cost on cache hits (cache only calls `read_page` on
-    /// a miss), so the per-operation overhead is bounded by the miss rate.
-    /// Cached page_count would be strictly faster but would need
-    /// invalidation on every `write_page` past EOF and every
-    /// `set_page_count` — not worth the coupling for the v1 design.
-    /// `&mut self` is required on this method precisely because of the
-    /// seek.
+    /// Cost note: post-I51 (2026-05-22) `page_count()` returns a cached
+    /// value with no syscall, so the bounds check below is effectively
+    /// free. The cache is seeded at `open()` and maintained by
+    /// `write_page()` and `set_page_count()`. `&mut self` is still
+    /// required because the actual page read does `file.seek` +
+    /// `read_exact` — both side-effectful operations on the File handle.
     pub fn read_page(&mut self, page_id: u64) -> Result<[u8; PAGE_SIZE]> {
         let page_count = self.page_count()?;
         if page_id >= page_count {
@@ -219,7 +237,6 @@ impl PageIo {
                 let offset = page_id * PAGE_SIZE as u64;
                 file.seek(SeekFrom::Start(offset))?;
                 file.write_all(buf)?;
-                Ok(())
             }
             Backing::Memory { pages } => {
                 // Match POSIX: writing past end extends, intermediate pages
@@ -230,9 +247,17 @@ impl PageIo {
                     pages.resize(idx + 1, [0u8; PAGE_SIZE]);
                 }
                 pages[idx] = *buf;
-                Ok(())
             }
         }
+        // I51: maintain the page-count cache. Writing past the current
+        // end extends the file (POSIX behavior); intra-cache writes
+        // don't change it. Use max() so an idempotent write to an
+        // existing page doesn't decrement the count.
+        let needed = page_id + 1;
+        if needed > self.cached_page_count.get() {
+            self.cached_page_count.set(needed);
+        }
+        Ok(())
     }
 
     /// Flush all writes to durable storage.
@@ -286,19 +311,19 @@ impl PageIo {
 
     /// Return the number of whole pages in the file.
     ///
-    /// Uses `seek(End(0))` rather than `metadata()` because the former is
-    /// guaranteed to reflect the current, post-write length even for files
-    /// just extended via `write_all`. A partial trailing page (file length
-    /// not a multiple of PAGE_SIZE) is silently floored — such a file is
-    /// corrupt, but detecting it is the superblock layer's job.
+    /// I51 (2026-05-22): returns the cached value. The cache is
+    /// seeded at `open()` from the initial file length and maintained
+    /// by `write_page()` (extend on writes past EOF) and
+    /// `set_page_count()` (resync on truncate/grow). Single-writer
+    /// flock + private-process ownership of the file makes the cache
+    /// always coherent — no external mutator can desync it.
+    ///
+    /// `&mut self` retained for API stability with the pre-I51 version
+    /// (the cache read itself only needs `&self`, but changing the
+    /// signature would touch every caller). A future patch can drop
+    /// the `&mut` if the broader signature ripple is worth landing.
     pub fn page_count(&mut self) -> Result<u64> {
-        match &mut self.backing {
-            Backing::File { file } => {
-                let len = file.seek(SeekFrom::End(0))?;
-                Ok(len / PAGE_SIZE as u64)
-            }
-            Backing::Memory { pages } => Ok(pages.len() as u64),
-        }
+        Ok(self.cached_page_count.get())
     }
 
     /// Truncate (or extend) the file to exactly `n` pages.
@@ -313,13 +338,16 @@ impl PageIo {
         match &mut self.backing {
             Backing::File { file } => {
                 file.set_len(n * PAGE_SIZE as u64)?;
-                Ok(())
             }
             Backing::Memory { pages } => {
                 pages.resize(n as usize, [0u8; PAGE_SIZE]);
-                Ok(())
             }
         }
+        // I51: resync the page-count cache to the authoritative new
+        // length. Unlike write_page (which only grows), set_page_count
+        // can shrink too — overwrite the cache rather than max(cache, n).
+        self.cached_page_count.set(n);
+        Ok(())
     }
 }
 
@@ -461,6 +489,47 @@ mod read_only_tests {
         io.write_page(2, &buf).unwrap();
         assert_eq!(io.page_count().unwrap(), 3);
     }
+
+    // ── I51 page-count cache regressions (file-backed half) ───────
+    //
+    // Companion to the memory-backed cache tests in
+    // `memory_backing_tests` below. These exercise the on-disk seed
+    // path (open reads the file length once and caches it) and the
+    // drop+reopen flow (cache is rebuilt from the on-disk length on
+    // the second open, not carried over in memory).
+
+    #[test]
+    fn page_count_cache_seeded_from_file_length_on_open() {
+        // The whole point of the cache: on a freshly-opened file with
+        // N pages already on disk, page_count() must return N without
+        // any maintenance call from the test. Without the seed, the
+        // cache would be 0 and read_page bounds checks would fail.
+        let f = seeded_file();
+        let mut io = PageIo::open(f.path(), false).unwrap();
+        // seeded_file wrote one page; cache should be 1 immediately.
+        assert_eq!(io.page_count().unwrap(), 1);
+        // And read_page(0) — which uses the cached page_count for its
+        // bounds check — must succeed without tripping InvalidPageId.
+        assert_eq!(io.read_page(0).unwrap(), [0u8; PAGE_SIZE]);
+    }
+
+    #[test]
+    fn page_count_cache_survives_drop_and_reopen() {
+        // Persistence proof: write three pages, drop the PageIo
+        // (releasing the flock), reopen the same path, the cache
+        // seed picks up the on-disk length.
+        let f = NamedTempFile::new().unwrap();
+        {
+            let mut io = PageIo::open(f.path(), false).unwrap();
+            io.write_page(0, &[0u8; PAGE_SIZE]).unwrap();
+            io.write_page(1, &[0u8; PAGE_SIZE]).unwrap();
+            io.write_page(2, &[0u8; PAGE_SIZE]).unwrap();
+            assert_eq!(io.page_count().unwrap(), 3);
+            // io drops here, releasing the flock.
+        }
+        let mut io = PageIo::open(f.path(), false).unwrap();
+        assert_eq!(io.page_count().unwrap(), 3);
+    }
 }
 
 #[cfg(test)]
@@ -575,4 +644,54 @@ mod memory_backing_tests {
         io.fsync().unwrap();
         assert_eq!(io.fsync_count(), 2);
     }
+
+    // ── I51 page-count cache regressions ───────────────────────────
+    //
+    // Pre-I51 every PageIo::read_page() called page_count() which did
+    // a seek(End(0)) syscall to ask the kernel for the file length.
+    // Post-I51 page_count() returns a cached value seeded at open()
+    // and maintained by write_page() / set_page_count(). The tests
+    // below pin the cache-coherence contract: any operation that
+    // changes the file's logical page count must update the cache.
+
+    #[test]
+    fn page_count_cache_extends_on_write_past_eof() {
+        // Fresh memory PageIo starts at 0; writing page 4 extends to 5.
+        let mut io = PageIo::open_in_memory().unwrap();
+        assert_eq!(io.page_count().unwrap(), 0);
+        io.write_page(4, &[0u8; PAGE_SIZE]).unwrap();
+        assert_eq!(io.page_count().unwrap(), 5);
+    }
+
+    #[test]
+    fn page_count_cache_does_not_shrink_on_intra_cache_write() {
+        // After write_page(5), the cache is 6. An idempotent write to
+        // page 2 (already in-range) must NOT shrink the cache to 3.
+        // The pre-fix would have had no cache at all and called seek
+        // each time, which couldn't shrink either; the test pins
+        // that the new write_page logic gets the same answer.
+        let mut io = PageIo::open_in_memory().unwrap();
+        io.write_page(5, &[0u8; PAGE_SIZE]).unwrap();
+        assert_eq!(io.page_count().unwrap(), 6);
+        io.write_page(2, &[0u8; PAGE_SIZE]).unwrap();
+        assert_eq!(io.page_count().unwrap(), 6);
+    }
+
+    #[test]
+    fn page_count_cache_tracks_set_page_count_both_directions() {
+        // set_page_count is the only operation that can SHRINK the
+        // cache. write_page can only grow it. Round-trip a few sizes
+        // to verify both directions.
+        let mut io = PageIo::open_in_memory().unwrap();
+        io.set_page_count(10).unwrap();
+        assert_eq!(io.page_count().unwrap(), 10);
+        io.set_page_count(3).unwrap();
+        assert_eq!(io.page_count().unwrap(), 3);
+        io.set_page_count(7).unwrap();
+        assert_eq!(io.page_count().unwrap(), 7);
+    }
+
+    // The remaining two I51 tests are file-backed and live in
+    // `read_only_tests` below (which already imports NamedTempFile
+    // and defines the `seeded_file` helper).
 }
