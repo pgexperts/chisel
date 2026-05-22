@@ -51,6 +51,57 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+  # I54 (ISSUES.md, 2026-05-22): supply-chain advisory check via cargo-audit.
+  # Runs against the RustSec advisory database. Currently the root crate
+  # ships with only `xxhash-rust` and `libc` as production deps — both
+  # well-maintained — so the practical risk surface is small. Catches any
+  # vulnerable transitive dep that creeps in via a future change.
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v1.4.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # I55 (ISSUES.md, 2026-05-22): pin MSRV in CI. Cargo.toml declares
+  # rust-version = "1.82" (the floor stabilized by Option::is_none_or in
+  # src/page_cache.rs). This job installs exactly that toolchain and runs
+  # `cargo build` to verify the floor still works — catches any new code
+  # that requires a newer Rust without an accompanying release-notes call-out.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: Build with MSRV toolchain
+        run: cargo build --verbose
+
+  # I58 (ISSUES.md, 2026-05-22): the bench/ subcrate is a sibling, not
+  # a workspace member, so `cargo test` from the repo root does NOT run
+  # its tests. The bench.yml workflow only runs the scenario *bench*
+  # tier on PRs for regression-comment purposes — it never runs
+  # `cargo test`. This job closes the coverage hole that the
+  # spillway-rollout retrospective (ARCHITECTURE.md Implementation
+  # history → Lessons learned, #1) flagged.
+  bench-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench
+      - name: Run bench subcrate tests
+        working-directory: bench
+        run: cargo test --verbose
+
   python:
     needs: [test, clippy, fmt]
     runs-on: ${{ matrix.os }}
