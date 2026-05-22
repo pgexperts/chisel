@@ -7,6 +7,8 @@ Sources:
 - **[comment-pass]** — found during the 2026-04-10 commenting pass (read-only review, no tests run)
 - **[comment-pass 2026-04-17]** — found during the 2026-04-17 re-commenting pass (also read-only; covered changed `src/` files and the new `python/src/` subcrate)
 - **[comment-pass 2026-04-22]** — found during the 2026-04-22 third review pass (read-only; five-agent parallel audit over `src/` and `python/src/`)
+- **[perf-review 2026-04-26]** — found during the `chisel-performance` skill fresh-eyes pass after PR-1 + PR-2 of the bench-suite series landed (read-only; output at `docs/reviews/perf-review-2026-04-26.md`)
+- **[deepdive 2026-05-22]** — found during the `deepdive-rust` skill fresh-eyes pass after the spillway feature and the runtime-config setters landed (read-only; output at `docs/reviews/review-20260522-073901.md`)
 - **[roadmap]** — from the README roadmap
 - **[client]** — requested by the primary Chisel client
 
@@ -23,6 +25,8 @@ Priority legend:
 > **Status note (2026-04-17):** every item below has landed. The order is preserved here as historical context — a reader looking at this file for "what's open?" should conclude: nothing from the 2026-04-10 or 2026-04-17 review passes is still actionable. The individual entries in later sections carry the definitive status.
 >
 > **Status note (2026-04-22):** a fresh third review pass re-opened the file with new items I26 (P1, handle-table bounds), I27 (P2, savepoint freed-pages leak on commit), I28 (P2, `CacheFull` poisons during commit), and a doc-sweep bundle (C4), all resolved the same day. Two pre-1.0 infrastructure items also landed that day: I29 (split `format_version` into packed MAJOR / MINOR so the README's "sacred within a major version" promise is enforceable at the bytes level) and I31 (per-page format-version byte + 64-bit reserved common-header region, the foundation for lazy per-page upgrade). These are NOT in the suggested fix order above — see each entry in its own section below. The 2026-04-22 pass specifically looked for invariant mismatches across module boundaries, which is where the remaining bugs now live.
+>
+> **Status note (2026-05-22):** the deepdive-rust fresh-eyes review (output at `docs/reviews/review-20260522-073901.md`) adds I35–I71 in a new "Deepdive review findings (2026-05-22)" section below. The cluster is dominated by 1.0-readiness work: public-API surface (`pub mod` exposure of engine internals, missing `#[non_exhaustive]` on `Options` / `ChiselError` / `DrainInsertion` / `SpillwayLocation`), Cargo.toml publication metadata gaps, `License: TBD` in the README, and a small batch of code-quality, performance, and doc-drift items. None are correctness bugs. Highest leverage before the 1.0 freeze: I35 (`pub` → `pub(crate)` reshape), which forces the urgency of I36 (`#[non_exhaustive]` on the types that remain public); then I54–I57 (CI supply-chain check + MSRV pin + publication metadata + license) to unblock crates.io publication. The 2026-04-26 perf-review's deltas (F1/F4/F5 resolved, F2/F3/F6 unchanged) are recorded inline at the top of the new section.
 
 Dependencies and batching drove this more than raw priority. Earlier items unblocked later ones.
 
@@ -548,3 +552,429 @@ Pervasive change — reaches from `Chisel::read` down through `TransactionManage
 **Design question (open):** `RefCell<PageCache>` (single-threaded, no `Sync`, cheapest) or `Mutex<PageCache>` (leaves the `Sync` door open)? Client is single-threaded today, but committing to single-threaded in the type system is hard to undo.
 
 Interacts with I5 (truncate dropping dirty pages), I7 (rollback not tracking all dirty pages), and I1's poison flag — all become harder to reason about under interior mutability if reads and writes can now interleave even within a single thread. Do F3 *before* F2/I12 pile more API on top; also unblocks R5.
+
+---
+
+## Deepdive review findings (2026-05-22)
+
+Source: `docs/reviews/review-20260522-073901.md` (read-only first-contact review of the root `chisel` crate, the `python/` PyO3 binding, and the `bench/` subcrate).
+
+### Delta from prior perf-review (2026-04-26)
+
+The 2026-04-26 perf-review used its own internal F1–F6 numbering distinct from ISSUES.md's F-series (client feature requests). The deepdive pass found:
+
+- **F1 (delete_many is a thin loop) — RESOLVED.** The doc at `src/transaction.rs:1386-1414` now accurately describes the shape and references the deferred I33 batching work. The recommended option (a) of the prior review landed.
+- **F4 (`ChiselEngine::internal_counters` masks poison) — RESOLVED.** Fixed at `bench/src/chisel_engine.rs:109-114` with `Ok(Some(self.db.counters()?))`. Poison now propagates as the prior review recommended.
+- **F5 (`Identifier` lacks `#[repr(transparent)]`) — RESOLVED.** Attribute applied at `bench/src/engine.rs:29-31`; documented `unsafe` slice transmute at `bench/src/chisel_engine.rs:93-103` eliminates the per-call `Vec<u64>` allocation.
+- **F2 (`read()` allocates a `Vec<u8>`) — UNCHANGED.** `src/transaction.rs:1217` still calls `.to_vec()`. Author classified as deferable; restated below as part of I52 to keep visibility.
+- **F3 (per-call `Cell<u64>` counter overhead in `PageCache::get`/`get_mut`/`new_page`) — UNCHANGED.** Deliberate trade-off per the prior review's resolution. Not re-flagged.
+- **F6 (CI has no supply-chain check) — UNCHANGED.** Promoted to I54 below for proper tracking.
+
+### Public API and 1.0 readiness
+
+#### I35. `pub mod` declarations expose engine internals as 1.0 API surface [deepdive 2026-05-22] — **P1**
+**Where:** `src/lib.rs:22-35`
+
+**Problem:** twelve `pub mod` declarations expose `data_page`, `defrag`, `error`, `freemap`, `handle_table`, `overflow`, `page`, `page_cache`, `page_io`, `stats`, `superblock`, and `transaction`. Every type and method in those modules — `TransactionManager`, `HandleEntry`, `PageCache::set_next_page_id`, `Superblock::serialize`, `OverflowChain`, `DEFAULT_SUPERBLOCK_COUNT`, `MAX_INLINE_VALUE`, and dozens more — becomes part of Chisel's 1.0 stability contract once that release ships. The actual documented public API in `README.md` is 18 methods on `Chisel`; the on-the-wire surface is hundreds of types.
+
+This is the single highest-leverage decision blocking 1.0. Until it's settled, every other API-stability finding (I36, I37, I39) is provisional — they're only worth fixing on the items that stay public.
+
+**Direction of fix:** switch internal modules to `pub(crate)` and re-export only the genuinely public types from `lib.rs`:
+
+```rust
+pub use error::{ChiselError, Result};
+pub use stats::{Stats, ChiselCounters};
+pub use defrag::{DefragOptions, DefragStats};
+// Options, DrainInsertion, SpillwayLocation, Chisel stay defined in lib.rs.
+```
+
+Tests that need access to internals can use `#[cfg(test)] pub use …` re-exports or live inside the modules. The `defrag` module is the trickiest because its `DefragOptions` / `DefragStats` are public; either lift those types into `lib.rs` or keep `pub mod defrag` and rely on `#[non_exhaustive]` to bound the public footprint.
+
+#### I36. Public types not marked `#[non_exhaustive]` [deepdive 2026-05-22] — **P1**
+**Where:** `src/lib.rs:80-88` (`Options`), `src/lib.rs:99-102` (`DrainInsertion`), `src/lib.rs:107-111` (`SpillwayLocation`), `src/error.rs:16` (`ChiselError`), `src/stats.rs::Stats`
+
+**Problem:** of all the public types Chisel ships, only `ChiselCounters` carries `#[non_exhaustive]`. Adding a field to `Options`, a variant to `ChiselError` or `DrainInsertion`, or a backing to `SpillwayLocation` is a breaking change today. This bites both struct-literal callers and exhaustive `match` callers — exactly the patterns Rust idiom encourages.
+
+**Direction of fix:** add `#[non_exhaustive]` to all five types before 1.0. For `Options`, follow up with a `Options::builder()` so callers don't have to construct via `Options { …, …: Default::default() }`. The existing fields stay; only the breakage shape changes — struct-literal construction now requires `..Default::default()`.
+
+Trade-off: `#[non_exhaustive]` enums force callers to write `_ => …` arms, which is a real ergonomic cost for `match` on `DrainInsertion` (only two variants today). The alternative is to commit to "no new variants, ever" — fine for `DrainInsertion`, defensible but constraining for `ChiselError`.
+
+#### I37. `SpillwayLocation` is `pub` but used only internally [deepdive 2026-05-22] — **P3**
+**Where:** `src/lib.rs:107-111`
+
+**Problem:** `SpillwayLocation` is constructed only inside `Chisel::open` and `Chisel::open_in_memory_with_options`; it's part of the `PageCache::new` constructor signature, which is only public because `pub mod page_cache`. Users have no reason to construct one; it leaks because `page_cache` does.
+
+**Direction of fix:** `pub(crate)` once `page_cache` is gated (i.e., as part of I35's reshape). If `page_cache` stays `pub`, leave `SpillwayLocation` `pub` and add `#[non_exhaustive]` (covered by I36).
+
+#### I38. `Chisel::close() -> Result<()>` is always `Ok(())` [deepdive 2026-05-22] — **P3**
+**Where:** `src/lib.rs:264-267`
+
+**Problem:** `close(self)` consumes `self` and always returns `Ok(())`. The `Result` is documented as future-proofing for fsync-on-close failures, but today it's theatre — callers who `?` the result get no observable behaviour. Without `#[must_use]`, callers who *do* care can silently drop the result.
+
+**Direction of fix:** add `#[must_use = "Chisel::close may surface fsync errors in a future release; ignore explicitly with let _ = if intentional"]` on the method. If you're confident close will stay infallible, change the return type to `()` instead.
+
+#### I39. `TransactionManager::current_roots() -> (u64, u64, u64)` returns a positional tuple [deepdive 2026-05-22] — **P3**
+**Where:** `src/transaction.rs:1693-1699`
+
+**Problem:** `pub fn current_roots(&self) -> (u64, u64, u64)` returns `(handle_table_page, freemap_page, next_handle)`. A positional 3-tuple of `u64`s is a stringly-typed API in tuple clothing — the caller has to remember which slot is which. The method is exposed only because `transaction` is `pub mod`.
+
+**Direction of fix:** if the method needs to stay public, introduce `pub struct CurrentRoots { pub handle_table_page: u64, pub freemap_page: u64, pub next_handle: u64 }` with `#[non_exhaustive]`. If it doesn't (probable once I35 lands), drop the `pub` and use it as an internal `pub(crate)` helper.
+
+#### I40. Runtime setters return `Result<()>` but are infallible [deepdive 2026-05-22] — **P3**
+**Where:** `src/page_cache.rs:691, 718, 728`
+
+**Problem:** `PageCache::set_cache_max_bytes`, `set_spillway_max_bytes`, and `set_drain_insertion` all return `Result<()>` but none can fail in the current implementation. `set_drain_insertion` is literally `self.drain_insertion = policy; Ok(())`. The `Result` shape hedges for future fallibility, but right now the type lies about the API.
+
+**Direction of fix:** drop the `Result` from `set_drain_insertion` (truly state-free). For the other two, leave the `Result` with a one-line doc comment explaining the hedge — both are plausibly fallible in a future world where shrinking the cache could observe pinned dirty pages.
+
+#### I41. `ChiselError` has no `source()` impl [deepdive 2026-05-22] — **P2**
+**Where:** `src/error.rs:215` (`impl std::error::Error for ChiselError {}`)
+
+**Problem:** the trait impl is empty. `IoError(io::Error)` wraps an inner cause but exposes it nowhere — `e.source()` returns `None` for every variant. This breaks error-chain walkers (`anyhow::Error::root_cause`, structured-logging adapters, `eyre` reports). The Display message is the only signal an upstream caller can see.
+
+**Direction of fix:** implement `fn source(&self) -> Option<&(dyn Error + 'static)>` that returns the inner `io::Error` for `ChiselError::IoError(e)` and `None` for the rest. If future variants gain inner causes (e.g., wrapping a deserialization error), extend the match.
+
+#### I42. Python `to_py_err` discards inner `io::Error` from `IoError(_)` [deepdive 2026-05-22] — **P2**
+**Where:** `python/src/errors.rs:209-249`
+
+**Problem:** `to_py_err` formats `ChiselError` via `Display` and then drops the variant. A Python caller cannot programmatically distinguish ENOSPC from EACCES from EIO — they all become `chisel.IoError("I/O error: <prose>")`. The comment at lines 211-213 documents the choice as "the string is the only cross-boundary contract"; defensible but worth re-litigating if any caller wants disk-full-vs-permission-denied handling on the Python side.
+
+**Direction of fix:** for `IoError`, attach the inner errno (where available) as a Python exception attribute (`errno` or `winerror`-style). PyO3 exception classes can hold arbitrary data; a `PyIoError::new_err((msg, errno))` would surface it. Trade-off: cross-boundary error fidelity vs. holding the Rust error chain in memory across the FFI boundary.
+
+#### I43. bench `EngineResult` uses `Box<dyn Error + Send + Sync>` and erases engine class [deepdive 2026-05-22] — **P3**
+**Where:** `bench/src/engine.rs:43`
+
+**Problem:** `pub type EngineResult<T> = Result<T, Box<dyn Error + Send + Sync>>;` makes engine-specific errors invisible to downstream `match`. The bench crate is `publish = false` and internal-use-only, so this isn't a true public-API leak, but the runner / diff binary / scenarios already do `?`-propagation through `EngineResult` and can't tell `ChiselError::Poisoned` from `redb::Error::Corrupted` without `downcast`.
+
+**Direction of fix:** introduce a thin enum:
+
+```rust
+pub enum EngineError {
+    Chisel(ChiselError),
+    Redb(redb::Error),
+    Sqlite(rusqlite::Error),
+    Other(Box<dyn Error + Send + Sync>),
+}
+```
+
+with `#[from]` impls so `?` keeps working. Keeps the existing call-site ergonomics; adds introspection where needed.
+
+### Code quality
+
+#### I44. `libc::flock` `unsafe { … }` block missing `// SAFETY:` comment [deepdive 2026-05-22] — **P2**
+**Where:** `src/page_io.rs:133-141`
+
+**Problem:** the only `unsafe` block in the core engine — the syscall the entire single-writer contract rests on — has no `// SAFETY:` comment. The Commenting standards section of `ARCHITECTURE.md` calls this out as a convention violation; this is the one place in the engine that violates it.
+
+The invariants the call upholds: (1) `fd` is valid for the duration of the call because we hold `&File`'s borrow; (2) the syscall returns an `errno`-style int that we check; (3) no resources are leaked because flock release is tied to fd close (which `Drop` handles).
+
+**Direction of fix:**
+
+```rust
+fn try_lock(file: &File) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY:
+    //   * `fd` is valid for the duration of this call: we hold a borrow of
+    //     `&File`, so the descriptor cannot be closed concurrently.
+    //   * `LOCK_EX | LOCK_NB` is a fixed bitflag combination that flock(2)
+    //     accepts on every supported platform (Linux, macOS).
+    //   * The call returns 0 on success, -1 on failure with errno set; we
+    //     do not read errno (`LockFailed` is sufficient diagnostic for the
+    //     "someone else holds the lock" case, the only failure mode in
+    //     practice for a path we can open).
+    //   * No resources are leaked: the lock is released when the underlying
+    //     fd is closed, which happens when `PageIo`'s `Drop` runs.
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(ChiselError::LockFailed);
+    }
+    Ok(())
+}
+```
+
+#### I45. `unreachable!` in `delete_inner` should be `CorruptPage` [deepdive 2026-05-22] — **P3**
+**Where:** `src/transaction.rs:1375-1379`
+
+**Problem:** `delete_inner` ends with `unreachable!("handle_table::delete returns None for Deleted entries; None was already escalated to InvalidHandle by ok_or above")`. The "unreachable" depends on `HandleTable::delete`'s cross-module behaviour. A future refactor that changes that contract turns this into a library-reachable panic instead of a typed error.
+
+**Direction of fix:** convert to `Err(ChiselError::CorruptPage { page_id: entry.page_id })` with a comment noting that reaching this arm would mean the handle table returned a Deleted entry that ok_or didn't catch — i.e., the in-memory state contradicts itself, which is genuinely a corruption signal worth surfacing typed.
+
+#### I46. `DataPage::insert(...).expect("value fits in empty page")` needs an `// INVARIANT:` comment [deepdive 2026-05-22] — **P3**
+**Where:** `src/transaction.rs:1846`
+
+**Problem:** the `expect` is reachable if `DataPage::insert` ever returns `None` for any reason besides "no room" (e.g., a future size-overflow check on a misuse). The invariant is currently sound — the data page was just allocated and initialized, so insert can't fail for size reasons against a value that was already length-checked against `MAX_INLINE_VALUE` — but it's not asserted at a type level.
+
+**Direction of fix:** add a comment naming the data-page contract:
+
+```rust
+// INVARIANT: insert can only return None for "no room"; the page was just
+// init'd via DataPage::init_page (empty), and the value was length-checked
+// against MAX_INLINE_VALUE upstream. If DataPage::insert ever grows other
+// failure modes, this expect needs to translate them to typed errors.
+let slot = DataPage::insert(buf, value).expect("value fits in empty page");
+```
+
+#### I47. `file_size_bytes` multiplication lacks overflow check [deepdive 2026-05-22] — **P3**
+**Where:** `src/lib.rs:411`
+
+**Problem:** `page_count * page::PAGE_SIZE as u64` could overflow at `u64::MAX / 8192 ≈ 2.25 × 10^15` pages (18 EiB). Unreachable for any real database, but unannotated.
+
+**Direction of fix:** `page_count.saturating_mul(page::PAGE_SIZE as u64)` is one character of armor.
+
+#### I48. Five invariant-backed `.unwrap()` sites in `page_cache.rs` need `// INVARIANT:` annotations [deepdive 2026-05-22] — **P3**
+**Where:** `src/page_cache.rs:188, 211, 353, 384, 914`
+
+**Problem:** five `.unwrap()` sites on hashmap `get` / `Option<Spillway>` access immediately after the cache was populated or the spillway was just constructed. Each is invariant-backed but unannotated; in aggregate they're a "trust the local code" pattern that a maintenance read can't verify quickly.
+
+**Direction of fix:** at minimum, annotate each with a one-line `// INVARIANT:` comment naming what guarantees the `Some`. Example for `:188`:
+
+```rust
+// INVARIANT: entry was just inserted by load_page on the miss branch,
+// or contains_key returned true on the hit branch.
+Ok(&self.entries.get(&page_id).unwrap().buf)
+```
+
+A stronger fix is to refactor `get` / `get_mut` to return the borrow from inside the `load_page` branch, but the existing shape predates the spillway and the change has knock-on borrow-checker implications.
+
+#### I49. `expect("LRU referenced page id not in entries")` should be `CorruptPage` [deepdive 2026-05-22] — **P3**
+**Where:** `src/page_cache.rs:865`
+
+**Problem:** reachable if the LRU index and entries map ever desync. Currently kept in sync by `discard`/`truncate`/`flush`, but a future refactor that touches one without the other turns this into a library-reachable panic.
+
+**Direction of fix:** translate to `Err(ChiselError::CorruptPage { page_id: victim_id })` and document that reaching this branch indicates the cache's two-data-structure invariant broke, which is genuinely a corruption signal worth surfacing typed.
+
+#### I50. Hex literal `0x02` used instead of `FLAG_INTERIOR` constant in `open_existing` [deepdive 2026-05-22] — **P3**
+**Where:** `src/transaction.rs:417, 423`
+
+**Problem:** `if root_buf[1] == 0x02 { ... }` reaches for a raw hex literal rather than `handle_table::FLAG_INTERIOR`. The constant exists; using the literal defeats the single-source-of-truth promise for the on-disk format and makes a grep for "interior" miss this site.
+
+**Direction of fix:** import `handle_table::FLAG_INTERIOR` (exposing it if currently private — it's already implicitly public via the on-disk format) and compare against it. Same fix at both line 417 and the implicit comparison logic at 423.
+
+### Performance
+
+#### I51. `read_page` calls `page_count()` (one extra `lseek`) on every call [deepdive 2026-05-22] — **P2**
+**Where:** `src/page_io.rs:166-167`
+
+**Problem:** `read_page` calls `self.page_count()?` every call, which on the file backing does `file.seek(SeekFrom::End(0))` — one extra syscall per read. The doc comment at lines 156-163 documents the cost and the rationale (no cache invalidation complexity), but underweights it ("absorbed by `PageCache` on cache hits") — the cache miss IS the cost site by definition, and high-miss-rate workloads pay this on every page load.
+
+**Direction of fix:** cache a high-water-mark on `PageIo`, invalidated by:
+- `write_page` past EOF (extend the HWM)
+- `set_page_count` (set the HWM exactly)
+
+`page_count()` returns the cached HWM. Initial seed at open via the existing `seek(End(0))`. Two write paths to update; zero seeks on the read path. Saves one syscall per cache miss.
+
+#### I52. `flush()` allocates a transient `Vec<u64>` per commit [deepdive 2026-05-22] — **P3**
+**Where:** `src/page_cache.rs:340-358`
+
+**Problem:** `flush()` collects dirty IDs into `Vec<u64>` for every flush. Sized to `dirty_count`, so for a 10K-page transaction that's 80 KB transient allocation per commit, repeated on every commit. The collect-first idiom is a borrow-checker dodge (the loop needs `&mut self.entries` while iterating).
+
+**Direction of fix:** keep a scratch `Vec<u64>` on `self` and reuse it across flushes (clear before populating). Adds 24 bytes to `PageCache` (the Vec metadata) and eliminates the per-commit allocation.
+
+Related: `read()` similarly allocates a `Vec<u8>` on every call (`src/transaction.rs:1217`, perf-review F2 unchanged). The fixes are different shapes — a `read_borrow(&self, handle) -> Result<Ref<'_, [u8]>>` sibling API would close that one for Rust callers (PyO3 callers cannot benefit because `PyBytes` wants owned bytes).
+
+#### I53. bench `file_size_bytes` triggers an O(live handles) walk via `stats()` [deepdive 2026-05-22] — **P3**
+**Where:** `bench/src/chisel_engine.rs:106`
+
+**Problem:** `self.db.stats()?.file_size_bytes` calls `Chisel::stats()`, which walks the entire handle table (O(live handles)) just to populate `handle_count`. Used per measurement cell in the bench harness — for 100K-handle scenarios this is ~milliseconds per call, dragged into every reporting step.
+
+**Direction of fix:** add a dedicated `Chisel::file_size_bytes() -> Result<u64>` that reads `page_count * PAGE_SIZE` directly (the existing math in `Chisel::stats`) without the handle walk. The bench `file_size_bytes` impl calls the new method; the existing `stats()` keeps its current shape because callers want all three fields together.
+
+### CI, packaging, and publication
+
+#### I54. CI runs no supply-chain check [perf-review 2026-04-26 / deepdive 2026-05-22] — **P2**
+**Where:** `.github/workflows/ci.yml`
+
+**Problem:** three jobs — `test`, `clippy`, `fmt` — all running their respective cargo subcommands. No `cargo audit`, no `cargo deny`, no MSRV pinning. A vulnerable transitive dep would land silently.
+
+(Promoted from perf-review F6 which was deferred at the time.)
+
+**Direction of fix:** add an `audit` job to `.github/workflows/ci.yml`:
+
+```yaml
+audit:
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/checkout@v4
+    - uses: rustsec/audit-check@v1.4.1
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+Costs one CI minute per build. `cargo deny` is the next level up (license + advisory + source policy) and warrants a `deny.toml` policy file.
+
+#### I55. No MSRV pinned in `Cargo.toml` or CI [deepdive 2026-05-22] — **P2**
+**Where:** `Cargo.toml`, `bench/Cargo.toml`, `python/Cargo.toml`, `.github/workflows/ci.yml`
+
+**Problem:** `rust-version` is absent from every `Cargo.toml`. CI uses `dtolnay/rust-toolchain@stable`, so an unannounced 1.x MSRV bump can land silently. README says "Rust stable, edition 2021"; that's not a pinned MSRV. The codebase uses `let-else` (1.65+), `is_none_or` (1.82+), `is_some_and` (1.70+); actual floor is currently ≥ 1.82.
+
+**Direction of fix:** pin `rust-version = "1.82"` (or whatever the current actual floor is — verify via `cargo msrv` if available) in `Cargo.toml`. Add a `msrv` job to CI that uses `dtolnay/rust-toolchain@1.82` and runs `cargo build`. If the project doesn't commit to MSRV stability pre-1.0, document that decision in the README.
+
+#### I56. `Cargo.toml` lacks crates.io publication metadata [deepdive 2026-05-22] — **P1**
+**Where:** root `Cargo.toml`
+
+**Problem:** missing `license`, `repository`, `readme`, `keywords`, `categories`. All required or strongly recommended for crates.io publication. `cargo publish` will refuse without `license` (or `license-file`).
+
+**Direction of fix:**
+
+```toml
+[package]
+name = "chisel"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"   # see I55
+description = "Transactional slot-based storage engine with shadow paging"
+license = "MIT OR Apache-2.0"   # see I57
+repository = "https://github.com/Xof/chisel"
+readme = "README.md"
+keywords = ["database", "storage", "embedded", "transactional", "shadow-paging"]
+categories = ["database", "data-structures"]
+```
+
+#### I57. `License: TBD` blocks any third-party use [deepdive 2026-05-22] — **P1**
+**Where:** `README.md:326-327`
+
+**Problem:** with no license, the code is "all rights reserved" by default — no one can legally use or distribute it. For a pre-1.0 project that's worth flagging visibly on the README.
+
+**Direction of fix:** pick a license now. The prevailing Rust convention is `MIT OR Apache-2.0` dual. Drop `LICENSE-MIT` and `LICENSE-APACHE` files at the repo root, update README from "TBD" to the chosen license, and add `license = "MIT OR Apache-2.0"` to `Cargo.toml` (covered by I56).
+
+#### I58. `bench/` is not in `ci.yml` [deepdive 2026-05-22, formalizing spillway-rollout lesson #1] — **P2**
+**Where:** `.github/workflows/ci.yml`, `bench/Cargo.toml`
+
+**Problem:** the bench subcrate is a sibling — not a workspace member — so `cargo test` from the repo root doesn't run `bench/`'s tests, and `ci.yml` doesn't either. The spillway-rollout retrospective in `ARCHITECTURE.md` (Implementation history → Lessons learned, lesson #1) flagged this as a pattern that bit a real PR. The mid-PR review caught the missed bench test failures, but there's no CI-side safety net.
+
+**Direction of fix:** add a `bench-tests` job to `.github/workflows/ci.yml`:
+
+```yaml
+bench-tests:
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: bench
+    - name: Run bench subcrate tests
+      working-directory: bench
+      run: cargo test --verbose
+```
+
+~2 minutes added; closes the real coverage hole. Distinct from `bench.yml` (which runs the scenario tier on PRs for regression-comment purposes and does not run `cargo test`).
+
+#### I59. `wheels.yml` has no early `cargo test` gate [deepdive 2026-05-22] — **P3**
+**Where:** `.github/workflows/wheels.yml`
+
+**Problem:** the wheels workflow builds and tests wheels at tag time. The CI matrix runs Rust tests on push/PR, and wheels.yml runs `pytest` after building wheels, so underlying Rust correctness is covered transitively. But a wheels build on a tag whose underlying commit is broken still runs pytest against broken bindings and fails there — slower feedback than a pre-wheel `cargo test`.
+
+**Direction of fix:** either add an early `cargo test` step in wheels.yml, or make the wheels job `needs:` the test job (cross-workflow `needs` is supported via a reusable workflow or by re-running tests inline). Less urgent than I54/I55/I56 because wheels.yml is tag-triggered and the underlying problem only manifests if someone tags a broken commit.
+
+#### I60. Orphaned `bench-disk-cleanup.yml` and `bench-os-update.yml` workflows [deepdive 2026-05-22] — **P3**
+**Where:** `.github/workflows/bench-disk-cleanup.yml`, `.github/workflows/bench-os-update.yml`
+
+**Problem:** both workflows are queued waiting for a self-hosted runner that hasn't been provisioned. While they're queueing/expiring, GitHub may surface them as "stuck workflows" in the Actions UI.
+
+**Direction of fix:** either:
+- (a) commit to provisioning the dedicated runner per the "Dedicated bench machine foundation" spec; or
+- (b) flip both workflows to `workflow_dispatch:` only with a `# DISABLED until self-hosted runner provisioned` header, so they don't accumulate failed runs.
+
+Choice (a) is the planned path per the spec; choice (b) is the cleanup if the plan moves out by months.
+
+#### I61. No workspace manifest [deepdive 2026-05-22] — **P3**
+**Where:** repo root (no `Cargo.toml` `[workspace]`)
+
+**Problem:** `python/` and `bench/` are sibling subcrates with `chisel = { path = ".." }` path-deps, not workspace members. Each rebuilds `chisel` separately because their `Cargo.lock` files are independent. The README's opening "Rust workspace with three crates" sentence is wrong (see I62). A real workspace would share `target/` and `Cargo.lock`, giving `cargo test --workspace` and `cargo clippy --workspace` coverage of all three at once.
+
+**Direction of fix:** add a root `[workspace]` declaration:
+
+```toml
+[workspace]
+members = [".", "python", "bench"]
+resolver = "2"
+```
+
+Trade-off: workspace members share an `edition` / `rust-version` / unified feature resolution, which can be restrictive for the PyO3 binding (it has different abi3 considerations than the root). Resolver = "2" addresses most of the friction. Probably worth doing; the current setup costs the project a clean way to test the whole tree (and forces I58 as a separate job rather than `cargo test --workspace` covering it for free).
+
+### Doc fixes
+
+#### I62. `README.md:71` claims "Rust workspace with three crates" but the repo is not a workspace [deepdive 2026-05-22] — **P3**
+**Where:** `README.md:71` ("Building from source" intro)
+
+**Problem:** the README opens "Rust workspace with three crates: the root `chisel` engine, the `python/` PyO3 binding, and the `bench/` benchmark suite." There is no workspace `Cargo.toml`. The same paragraph later acknowledges the truth ("running `cargo test` from the repo root does **not** run the bench subcrate's tests, since `bench/` is a sibling crate, not a workspace member") — those two sentences contradict each other.
+
+**Direction of fix:** either change the opening sentence to "three sibling crates" (the truth today, and aligns with the existing CLAUDE.md→ARCHITECTURE.md migration), or do I61 first and update the README to reflect the new workspace structure.
+
+#### I63. `Chisel::commit` docstring says "two fsyncs"; protocol does three [deepdive 2026-05-22] — **P3**
+**Where:** `src/lib.rs:278-280`
+
+**Problem:** `Chisel::commit`'s docstring reads "Performs two fsyncs (dirty data pages, then the alternate superblock)". `ARCHITECTURE.md`'s commit-protocol section (and the I28 fix) document three: pre-drain flush + main-pages flush + superblock. The `no_spill_workload_preserves_two_fsync_commit` test (despite its name) pins to `== 3` per spillway-rollout lesson #3.
+
+**Direction of fix:** update the docstring to "Performs three fsyncs (pre-drain flush, main pages flush, then the alternate superblock)". Also consider renaming the test to drop the "two_fsync" misnomer; the test's body already documents the three.
+
+#### I64. `python/src/db.rs:155` uses plain `*` where Rust side uses `saturating_mul` [deepdive 2026-05-22] — **P3**
+**Where:** `python/src/db.rs:155`
+
+**Problem:** `let resolved_spillway_max_bytes = spillway_max_bytes.unwrap_or(1024 * cache_max_bytes);` uses plain `*`. `src/lib.rs:118` (`Options::default`) uses `cache_max_bytes.saturating_mul(1024)`. For the default `cache_max_bytes = 8_388_608`, the result fits comfortably in `u64`. A user passing `cache_max_bytes = 1 << 54` (16 PiB) from Python would silently overflow to a small spillway cap rather than saturate to `u64::MAX`.
+
+**Direction of fix:** mirror the Rust side:
+
+```rust
+let resolved_spillway_max_bytes = spillway_max_bytes.unwrap_or_else(|| cache_max_bytes.saturating_mul(1024));
+```
+
+#### I65. `src/spillway.rs` carries stale `#[allow(dead_code)]` on every exported item [deepdive 2026-05-22] — **P3**
+**Where:** `src/spillway.rs:39-74` (and similar repeated attributes throughout the file)
+
+**Problem:** every `pub` item — `SLOT_HEADER_SIZE`, `SLOT_SIZE`, `Backing`, `Spillway`, every `impl` method, `slot_checksum`, `write_slot`, `read_slot` — carries `#[allow(dead_code)]` with the comment "Suppressed until spillway is wired into PageCache (Tasks 7-8)". Tasks 7-8 landed (see `page_cache.rs:824` and surrounding); the spillway IS wired in. The attributes now suppress nothing real, and if any of these items genuinely becomes dead in a future refactor, the attribute will hide that.
+
+**Direction of fix:** remove every `#[allow(dead_code)]` in `src/spillway.rs` along with the explanatory comments that go with them. A `cargo build` after the removal will fail on anything that was legitimately dead; that's the signal worth surfacing.
+
+#### I66. Tests use `std::mem::forget(file)` to bypass `NamedTempFile` cleanup [deepdive 2026-05-22] — **P3**
+**Where:** `src/transaction.rs:2211`, `src/page_cache.rs:930, 1000`, possibly others
+
+**Problem:** `NamedTempFile` cleans up its path via `Drop`; tests that need the file to outlive the `NamedTempFile` value (because they re-open the path) leak the temp file deliberately with `std::mem::forget(file)`. This is fragile: the leaked path stays in `/tmp` after the test exits. Over many CI runs this can fill disk on a long-lived runner.
+
+**Direction of fix:** use `tempfile::TempDir` and construct paths inside it. `TempDir`'s `Drop` cleans up the directory and everything in it, including a re-opened sibling. `src/spillway.rs:338-365` (`open_file_truncates_existing_content`) already does this correctly — use it as the pattern.
+
+### Idiomaticity
+
+#### I67. Three sites use awkward `!self.entries.get(&id).is_none_or(|e| e.dirty)` pattern [deepdive 2026-05-22] — **P3**
+**Where:** `src/page_cache.rs:419, 702, 834`
+
+**Problem:** the double negative ("not none-or-dirty" = "some and clean") is acknowledged as awkward in the comment at line 820. Used at three sites for the same eviction-victim search.
+
+**Direction of fix:** replace with `self.entries.get(&id).is_some_and(|e| !e.dirty)` — reads as "some and clean" and matches the intent directly. Fixes all three sites the same way; no semantic change.
+
+#### I68. `Chisel::Drop` doesn't fsync (correct, but worth a one-line annotation) [deepdive 2026-05-22] — **P3**
+**Where:** `src/lib.rs` (no explicit `Drop` impl on `Chisel`)
+
+**Problem:** if a user forgets to `commit()`, shadow paging guarantees the on-disk state is the last committed state — so dropping without committing is correct, not a data-loss bug. The type-level doc at `src/lib.rs:139-141` documents this. But a reader coming from other ecosystems (Postgres, RocksDB) expects an explicit "close discards uncommitted work" callout at the `Drop` site too.
+
+**Direction of fix:** add a `// Drop intentionally omitted — shadow paging guarantees the on-disk state is the last committed state regardless of how the value goes out of scope. See type-level doc for the full semantics.` block at the top of `impl Chisel` or just below the struct declaration. No behaviour change; documentation for the next reader.
+
+#### I69. `flock` is advisory, not mandatory — worth annotating in an ops/recovery doc [deepdive 2026-05-22] — **P3**
+**Where:** README + `ARCHITECTURE.md` (cross-cutting)
+
+**Problem:** the README and ARCHITECTURE.md both mention that Chisel uses `flock` for single-process exclusion, but neither explicitly states that `flock` is advisory — an external tool that doesn't respect advisory locks (some text editors with "lock files", filesystem dump tools, naive sync utilities) can scribble on the file. This is a Linux/macOS POSIX limitation, not a Chisel bug, but it deserves a sentence so users don't trip over it.
+
+**Direction of fix:** add a sentence to README's "Platform support" section or to ARCHITECTURE.md's "Cross-cutting concepts" — "Chisel's `flock` is *advisory*: cooperating processes (any other Chisel instance) honour it, but a tool that bypasses advisory locking (e.g., `cp` while a transaction is in flight, some sync utilities) can still corrupt the file. The shadow-paging invariants assume an exclusive owner; respect the lock."
+
+### Test coverage gaps
+
+#### I70. No `#[should_panic]` tests for `unreachable!` / `expect` invariant sites [deepdive 2026-05-22] — **P3**
+**Where:** test coverage for `src/transaction.rs:1375` (`unreachable!`), `src/page_cache.rs:865` (`expect`), `src/transaction.rs:1846` (`expect`)
+
+**Problem:** the codebase has good regression tests for documented invariants (I1, I3, I7, I18, I27, I28, I29 all have dedicated tests). The `unreachable!` and `expect` sites name invariants but don't have tests that exercise the invariant-violating path.
+
+**Direction of fix:** lower priority — and if I45 + I49 convert these to typed `CorruptPage` errors, this finding becomes a test for the `CorruptPage` arm instead. Wait for those decisions; revisit afterward.
+
+#### I71. No property tests (`proptest` / `quickcheck`) for byte-roundtrip code [deepdive 2026-05-22] — **P3**
+**Where:** test coverage for `Superblock::serialize` / `deserialize`, `DataPage` slot packing, freemap bitmap operations
+
+**Problem:** the existing targeted tests cover known cases well; property tests would cover the unknown ones. `Superblock::serialize` round-trips, slot-packing fill / compact invariants, and freemap bit operations are all natural fits.
+
+**Direction of fix:** add `proptest = "1"` to `[dev-dependencies]` and write three property tests:
+- `serialize(deserialize(buf)).map(|sb| sb.serialize()) == Some(buf)` for any well-formed superblock
+- `DataPage::insert` then `DataPage::read` round-trips for any value ≤ `MAX_INLINE_VALUE`
+- `FreeMap::mark_free(id)` then `FreeMap::is_free(id)` round-trips for any `id < CAPACITY`
+
+Low priority pre-1.0; high value when format evolution starts in earnest.
