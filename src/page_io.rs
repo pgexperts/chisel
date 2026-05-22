@@ -133,6 +133,24 @@ impl PageIo {
     fn try_lock(file: &File) -> Result<()> {
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
+        // SAFETY:
+        //   * `fd` is valid for the duration of this call: we hold a borrow
+        //     of `&File`, so the descriptor cannot be closed concurrently.
+        //   * `LOCK_EX | LOCK_NB` is a fixed bitflag combination that
+        //     flock(2) accepts on every supported platform (Linux, macOS).
+        //   * Return contract: 0 on success, -1 on failure with errno set.
+        //     We don't read errno — `LockFailed` is sufficient diagnostic
+        //     for the "someone else holds the lock" case, the only failure
+        //     mode in practice for a path we can open. EINVAL / EBADF would
+        //     indicate a programming error and would surface as the same
+        //     LockFailed return; that's acceptable because the next user
+        //     action will fail with a more specific error.
+        //   * No resources are leaked. The lock is released when the
+        //     underlying fd is closed, which happens when the `PageIo`'s
+        //     `Drop` runs (the `File` is owned by `PageIo` and dropped
+        //     with it). We deliberately don't expose an explicit unlock —
+        //     tying lock lifetime to the `File` guarantees we cannot leak
+        //     locks on panic paths.
         let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
             return Err(ChiselError::LockFailed);
