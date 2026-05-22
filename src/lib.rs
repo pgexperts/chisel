@@ -34,6 +34,14 @@ pub mod stats;
 pub mod superblock;
 pub mod transaction;
 
+// I35: crash-recovery integration tests need direct access to internal
+// types (Superblock, PageType, page format constants) for corruption
+// injection. The I35 pub→pub(crate) reshape locks these down, so the
+// suite moved from tests/crash_recovery.rs into src/. cfg(test)-only so
+// it adds nothing to release builds.
+#[cfg(test)]
+mod recovery_tests;
+
 pub use error::{ChiselError, Result};
 
 // Re-exports of the curated public surface. The internal modules these

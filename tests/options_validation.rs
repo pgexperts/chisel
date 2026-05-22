@@ -18,8 +18,7 @@
 
 mod common;
 
-use chisel::superblock::{DEFAULT_SUPERBLOCK_COUNT, MAX_SUPERBLOCKS};
-use chisel::{Chisel, ChiselError, Options, Result};
+use chisel::{Chisel, ChiselError, Options, Result, DEFAULT_SUPERBLOCK_COUNT, MAX_SUPERBLOCKS};
 use tempfile::{NamedTempFile, TempDir};
 
 // `Chisel` does not implement `Debug`, so `Result::unwrap_err()` is not
@@ -34,7 +33,7 @@ fn expect_err(r: Result<Chisel>) -> ChiselError {
 
 fn opts(superblock_count: u32) -> Options {
     Options {
-        cache_max_bytes: 16 * chisel::page::PAGE_SIZE as u64,
+        cache_max_bytes: 16 * chisel::PAGE_SIZE as u64,
         spillway_max_bytes: 0,
         drain_insertion: chisel::DrainInsertion::LruTail,
         create_if_missing: true,
@@ -260,7 +259,7 @@ fn test_read_only_open_rejects_begin() {
     let mut db = Chisel::open(
         &path,
         Options {
-            cache_max_bytes: 16 * chisel::page::PAGE_SIZE as u64,
+            cache_max_bytes: 16 * chisel::PAGE_SIZE as u64,
             spillway_max_bytes: 0,
             drain_insertion: chisel::DrainInsertion::LruTail,
             create_if_missing: false,

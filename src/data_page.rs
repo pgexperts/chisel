@@ -566,4 +566,80 @@ mod corruption_tests {
         assert_eq!(DataPage::iter_live(&buf).len(), 0);
         assert_eq!(DataPage::used_space(&buf), 0);
     }
+
+    // ── Migrated 2026-05-22 from tests/basic_ops.rs (I35 reshape) ──
+    //
+    // Lives in `corruption_tests` despite not being corruption-focused —
+    // data_page.rs has only one #[cfg(test)] mod, and splitting that for
+    // a naming nit is unnecessary churn.
+
+    #[test]
+    fn test_data_page_insert_and_read() {
+        let mut buf = [0u8; PAGE_SIZE];
+        DataPage::init_page(&mut buf);
+        let slot = DataPage::insert(&mut buf, b"hello world").unwrap();
+        let data = DataPage::read(&buf, slot).unwrap();
+        assert_eq!(data, b"hello world");
+    }
+
+    #[test]
+    fn test_data_page_multiple_inserts() {
+        let mut buf = [0u8; PAGE_SIZE];
+        DataPage::init_page(&mut buf);
+        let s0 = DataPage::insert(&mut buf, b"aaa").unwrap();
+        let s1 = DataPage::insert(&mut buf, b"bbb").unwrap();
+        let s2 = DataPage::insert(&mut buf, b"ccc").unwrap();
+        assert_eq!(DataPage::read(&buf, s0).unwrap(), b"aaa");
+        assert_eq!(DataPage::read(&buf, s1).unwrap(), b"bbb");
+        assert_eq!(DataPage::read(&buf, s2).unwrap(), b"ccc");
+        assert_eq!(DataPage::slot_count(&buf), 3);
+    }
+
+    #[test]
+    fn test_data_page_delete_and_compact() {
+        let mut buf = [0u8; PAGE_SIZE];
+        DataPage::init_page(&mut buf);
+        let s0 = DataPage::insert(&mut buf, b"aaa").unwrap();
+        let s1 = DataPage::insert(&mut buf, b"bbb").unwrap();
+        let _s2 = DataPage::insert(&mut buf, b"ccc").unwrap();
+        DataPage::delete(&mut buf, s1);
+        assert!(DataPage::read(&buf, s1).is_none());
+        let free_before = DataPage::free_space(&buf);
+        DataPage::compact(&mut buf);
+        let free_after = DataPage::free_space(&buf);
+        assert!(free_after > free_before);
+        assert_eq!(DataPage::read(&buf, s0).unwrap(), b"aaa");
+    }
+
+    #[test]
+    fn test_data_page_update_same_size() {
+        let mut buf = [0u8; PAGE_SIZE];
+        DataPage::init_page(&mut buf);
+        let slot = DataPage::insert(&mut buf, b"hello").unwrap();
+        assert!(DataPage::update(&mut buf, slot, b"world"));
+        assert_eq!(DataPage::read(&buf, slot).unwrap(), b"world");
+    }
+
+    #[test]
+    fn test_data_page_full() {
+        let mut buf = [0u8; PAGE_SIZE];
+        DataPage::init_page(&mut buf);
+        let big = vec![0xABu8; 2000];
+        let mut count = 0;
+        while DataPage::insert(&mut buf, &big).is_some() {
+            count += 1;
+        }
+        assert!(count >= 3);
+        assert!(count <= 4);
+    }
+
+    #[test]
+    fn test_data_page_max_value() {
+        let mut buf = [0u8; PAGE_SIZE];
+        DataPage::init_page(&mut buf);
+        let max_val = vec![0xCD; 8162];
+        let slot = DataPage::insert(&mut buf, &max_val);
+        assert!(slot.is_some());
+        assert_eq!(DataPage::read(&buf, slot.unwrap()).unwrap().len(), 8162);
+    }
 }

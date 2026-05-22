@@ -2372,4 +2372,44 @@ mod tests {
             }
         }
     }
+
+    // ── Migrated 2026-05-22 from tests/transactions.rs (I35 reshape) ──
+    //
+    // Exercises TransactionManager::open_existing end-to-end: a value
+    // written through one TransactionManager survives a drop + reopen
+    // on the same path. The other tests in tests/transactions.rs use
+    // only the public Chisel API and stay in tests/.
+    #[test]
+    fn reopen_preserves_committed_data() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_owned();
+        let handle;
+        {
+            let io = PageIo::open(&path, false).unwrap();
+            let cache = PageCache::new(
+                io,
+                64 * PAGE_SIZE as u64,
+                0,
+                crate::DrainInsertion::LruTail,
+                crate::SpillwayLocation::InMemory,
+            );
+            let mut txm = TransactionManager::create_new(cache, 2).unwrap();
+            txm.begin().unwrap();
+            handle = txm.allocate(b"persistent").unwrap();
+            txm.commit().unwrap();
+        }
+        {
+            let io = PageIo::open(&path, false).unwrap();
+            let cache = PageCache::new(
+                io,
+                64 * PAGE_SIZE as u64,
+                0,
+                crate::DrainInsertion::LruTail,
+                crate::SpillwayLocation::InMemory,
+            );
+            let txm = TransactionManager::open_existing(cache).unwrap();
+            let data = txm.read(handle).unwrap();
+            assert_eq!(data, b"persistent");
+        }
+    }
 }

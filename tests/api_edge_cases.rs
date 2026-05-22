@@ -406,11 +406,8 @@ fn test_stats_empty_db_has_zero_handles_body(b: &Backing) {
     let s = db.stats().unwrap();
     assert_eq!(s.handle_count, 0);
     // File size is always a whole number of pages.
-    assert_eq!(s.file_size_bytes % chisel::page::PAGE_SIZE as u64, 0);
-    assert_eq!(
-        s.file_size_bytes,
-        s.total_pages * chisel::page::PAGE_SIZE as u64
-    );
+    assert_eq!(s.file_size_bytes % chisel::PAGE_SIZE as u64, 0);
+    assert_eq!(s.file_size_bytes, s.total_pages * chisel::PAGE_SIZE as u64);
 }
 
 dual_backing_test!(
