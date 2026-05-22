@@ -606,21 +606,21 @@ Trade-off: `#[non_exhaustive]` enums force callers to write `_ => …` arms, whi
 
 **Direction of fix:** `pub(crate)` once `page_cache` is gated (i.e., as part of I35's reshape). If `page_cache` stays `pub`, leave `SpillwayLocation` `pub` and add `#[non_exhaustive]` (covered by I36).
 
-#### I38. `Chisel::close() -> Result<()>` is always `Ok(())` [deepdive 2026-05-22] — **P3**
+#### I38. `Chisel::close() -> Result<()>` is always `Ok(())` [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `src/lib.rs:264-267`
 
 **Problem:** `close(self)` consumes `self` and always returns `Ok(())`. The `Result` is documented as future-proofing for fsync-on-close failures, but today it's theatre — callers who `?` the result get no observable behaviour. Without `#[must_use]`, callers who *do* care can silently drop the result.
 
 **Direction of fix:** add `#[must_use = "Chisel::close may surface fsync errors in a future release; ignore explicitly with let _ = if intentional"]` on the method. If you're confident close will stay infallible, change the return type to `()` instead.
 
-#### I39. `TransactionManager::current_roots() -> (u64, u64, u64)` returns a positional tuple [deepdive 2026-05-22] — **P3**
+#### I39. `TransactionManager::current_roots() -> (u64, u64, u64)` returns a positional tuple [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `src/transaction.rs:1693-1699`
 
 **Problem:** `pub fn current_roots(&self) -> (u64, u64, u64)` returns `(handle_table_page, freemap_page, next_handle)`. A positional 3-tuple of `u64`s is a stringly-typed API in tuple clothing — the caller has to remember which slot is which. The method is exposed only because `transaction` is `pub mod`.
 
 **Direction of fix:** if the method needs to stay public, introduce `pub struct CurrentRoots { pub handle_table_page: u64, pub freemap_page: u64, pub next_handle: u64 }` with `#[non_exhaustive]`. If it doesn't (probable once I35 lands), drop the `pub` and use it as an internal `pub(crate)` helper.
 
-#### I40. Runtime setters return `Result<()>` but are infallible [deepdive 2026-05-22] — **P3**
+#### I40. Runtime setters return `Result<()>` but are infallible [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `src/page_cache.rs:691, 718, 728`
 
 **Problem:** `PageCache::set_cache_max_bytes`, `set_spillway_max_bytes`, and `set_drain_insertion` all return `Result<()>` but none can fail in the current implementation. `set_drain_insertion` is literally `self.drain_insertion = policy; Ok(())`. The `Result` shape hedges for future fallibility, but right now the type lies about the API.
@@ -715,7 +715,7 @@ fn try_lock(file: &File) -> Result<()> {
 let slot = DataPage::insert(buf, value).expect("value fits in empty page");
 ```
 
-#### I47. `file_size_bytes` multiplication lacks overflow check [deepdive 2026-05-22] — **P3**
+#### I47. `file_size_bytes` multiplication lacks overflow check [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `src/lib.rs:411`
 
 **Problem:** `page_count * page::PAGE_SIZE as u64` could overflow at `u64::MAX / 8192 ≈ 2.25 × 10^15` pages (18 EiB). Unreachable for any real database, but unannotated.

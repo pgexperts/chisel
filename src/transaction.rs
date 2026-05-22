@@ -1698,12 +1698,19 @@ impl TransactionManager {
         }
     }
 
-    pub fn current_roots(&self) -> (u64, u64, u64) {
-        (
-            self.current_roots.handle_table_page,
-            self.current_roots.freemap_page,
-            self.current_roots.next_handle,
-        )
+    /// The handle-table root page id of the active transaction's
+    /// in-progress roots. Used by `defrag::defrag` to short-circuit
+    /// the empty-database fast path.
+    ///
+    /// I39 (ISSUES.md, 2026-05-22): replaces a `pub fn current_roots()
+    /// -> (u64, u64, u64)` tuple return that exposed three fields when
+    /// only one was ever read. YAGNI: if a future caller wants
+    /// `freemap_page` or `next_handle`, add a sibling accessor at that
+    /// time rather than guessing the API shape now. `pub(crate)`
+    /// because `defrag` is the sole intended caller (transaction
+    /// module became `pub(crate)` in I35).
+    pub(crate) fn current_handle_table_root_page(&self) -> u64 {
+        self.current_roots.handle_table_page
     }
 
     pub fn is_active(&self) -> bool {
@@ -1731,7 +1738,11 @@ impl TransactionManager {
         if self.active_txn {
             return Err(ChiselError::TransactionInProgress);
         }
-        self.cache.borrow_mut().set_drain_insertion(policy)
+        // I40: PageCache::set_drain_insertion is now infallible (returns
+        // `()`). The poison + active-txn checks above are the real
+        // failure modes; we promote PageCache's `()` to `Ok(())` here.
+        self.cache.borrow_mut().set_drain_insertion(policy);
+        Ok(())
     }
 
     // --- Private helpers ---

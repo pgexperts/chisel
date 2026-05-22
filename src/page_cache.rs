@@ -747,6 +747,12 @@ impl PageCache {
     /// dirty entries (which shouldn't exist between transactions) are
     /// preserved and may push the cache temporarily over the new cap
     /// — the next allocation reasserts the limit via maybe_evict.
+    ///
+    /// I40 (ISSUES.md, 2026-05-22): `Result<()>` here is a deliberate
+    /// hedge for plausible future fallibility — shrinking the cache
+    /// could surface a `CacheFull`-shaped failure if a future
+    /// refactor allows pinned dirty pages to survive between
+    /// transactions. Kept now for API stability across that change.
     pub fn set_cache_max_bytes(&mut self, bytes: u64) -> Result<()> {
         let new_max_pages = (bytes / PAGE_SIZE as u64).max(1) as usize;
         self.max_pages = new_max_pages;
@@ -774,6 +780,10 @@ impl PageCache {
     /// transactions (truncated at every commit/rollback), so resize
     /// is a state-free operation. Shrinking to 0 disables the
     /// spillway; subsequent overflow trips CacheFull.
+    ///
+    /// I40 (ISSUES.md, 2026-05-22): same `Result<()>` hedge as
+    /// `set_cache_max_bytes` above — kept for API stability against
+    /// future world where shrinking observes in-flight spillway state.
     pub fn set_spillway_max_bytes(&mut self, bytes: u64) -> Result<()> {
         self.spillway_max_bytes = bytes;
         if let Some(spw) = self.spillway.as_mut() {
@@ -784,9 +794,15 @@ impl PageCache {
 
     /// Update the drain insertion policy. Captured for use by the next
     /// `flush()` invocation.
-    pub fn set_drain_insertion(&mut self, policy: crate::DrainInsertion) -> Result<()> {
+    ///
+    /// I40 (ISSUES.md, 2026-05-22): infallible at this layer (state-free
+    /// assignment), so it returns `()`. The caller-facing wrappers
+    /// (`TransactionManager::set_drain_insertion`, `Chisel::set_drain_insertion`)
+    /// keep `Result<()>` because they perform real fallibility checks
+    /// (poison + active-txn). Only the bottom layer can honestly
+    /// shed the `Result`.
+    pub fn set_drain_insertion(&mut self, policy: crate::DrainInsertion) {
         self.drain_insertion = policy;
-        Ok(())
     }
 
     /// Check if a page is dirty in the cache.
