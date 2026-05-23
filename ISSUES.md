@@ -641,7 +641,7 @@ Trade-off: `#[non_exhaustive]` enums force callers to write `_ => …` arms, whi
 
 **Direction of fix:** for `IoError`, attach the inner errno (where available) as a Python exception attribute (`errno` or `winerror`-style). PyO3 exception classes can hold arbitrary data; a `PyIoError::new_err((msg, errno))` would surface it. Trade-off: cross-boundary error fidelity vs. holding the Rust error chain in memory across the FFI boundary.
 
-#### I43. bench `EngineResult` uses `Box<dyn Error + Send + Sync>` and erases engine class [deepdive 2026-05-22] — **P3**
+#### I43. bench `EngineResult` uses `Box<dyn Error + Send + Sync>` and erases engine class [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `bench/src/engine.rs:43`
 
 **Problem:** `pub type EngineResult<T> = Result<T, Box<dyn Error + Send + Sync>>;` makes engine-specific errors invisible to downstream `match`. The bench crate is `publish = false` and internal-use-only, so this isn't a true public-API leak, but the runner / diff binary / scenarios already do `?`-propagation through `EngineResult` and can't tell `ChiselError::Poisoned` from `redb::Error::Corrupted` without `downcast`.
@@ -693,7 +693,7 @@ fn try_lock(file: &File) -> Result<()> {
 }
 ```
 
-#### I45. `unreachable!` in `delete_inner` should be `CorruptPage` [deepdive 2026-05-22] — **P3**
+#### I45. `unreachable!` in `delete_inner` should be `CorruptPage` [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `src/transaction.rs:1375-1379`
 
 **Problem:** `delete_inner` ends with `unreachable!("handle_table::delete returns None for Deleted entries; None was already escalated to InvalidHandle by ok_or above")`. The "unreachable" depends on `HandleTable::delete`'s cross-module behaviour. A future refactor that changes that contract turns this into a library-reachable panic instead of a typed error.
@@ -737,7 +737,7 @@ Ok(&self.entries.get(&page_id).unwrap().buf)
 
 A stronger fix is to refactor `get` / `get_mut` to return the borrow from inside the `load_page` branch, but the existing shape predates the spillway and the change has knock-on borrow-checker implications.
 
-#### I49. `expect("LRU referenced page id not in entries")` should be `CorruptPage` [deepdive 2026-05-22] — **P3**
+#### I49. `expect("LRU referenced page id not in entries")` should be `CorruptPage` [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** `src/page_cache.rs:865`
 
 **Problem:** reachable if the LRU index and entries map ever desync. Currently kept in sync by `discard`/`truncate`/`flush`, but a future refactor that touches one without the other turns this into a library-reachable panic.

@@ -1369,13 +1369,22 @@ impl TransactionManager {
                 self.txn_freed_pages.extend_from_slice(&freed);
             }
             HandleFlags::Deleted => {
-                // Unreachable: handle_table::delete returns None for
-                // already-tombstoned entries, and we escalated None
-                // to InvalidHandle above.
-                unreachable!(
-                    "handle_table::delete returns None for Deleted entries; \
-                     None was already escalated to InvalidHandle by ok_or above"
-                );
+                // I45 (ISSUES.md, 2026-05-22): translate to a typed
+                // CorruptPage error instead of panicking. Reaching this
+                // arm means the handle table returned a Deleted entry
+                // (a tombstone) that ok_or didn't catch — i.e., the
+                // in-memory state contradicts itself. handle_table::delete
+                // is supposed to return None for already-tombstoned
+                // entries, and the `ok_or(InvalidHandle)` above is
+                // supposed to convert None into the typed error. If
+                // we got here, the cross-module contract broke (most
+                // likely a future refactor of handle_table::delete);
+                // that's genuinely a corruption signal worth surfacing
+                // typed rather than aborting the library caller's
+                // process.
+                return Err(ChiselError::CorruptPage {
+                    page_id: entry.page_id,
+                });
             }
         }
 
