@@ -68,7 +68,7 @@ fn main() -> chisel::Result<()> {
 
 ## Building from source
 
-Three sibling Cargo crates: the root `chisel` engine, the `python/` PyO3 binding, and the `bench/` benchmark suite. They share a repository but are not a Cargo workspace — each has its own `Cargo.lock` and `target/` and is built independently. Running `cargo test` from the repo root does **not** run the bench subcrate's tests; CI runs them in a separate `bench-tests` job (see I58 in ISSUES.md).
+Cargo workspace with three members: the root `chisel` engine, the `python/` PyO3 binding, and the `bench/` benchmark suite. They share a single `Cargo.lock` and `target/` at the repo root. `default-members` is `[".", "bench"]`, so `cargo build` / `cargo test` from the workspace root exercise the engine and the bench harness together — the Python crate is workspace-resident (for Cargo.lock unification) but excluded from default builds because PyO3's `extension-module` feature needs maturin to set up linker flags. To build/install the Python binding, use `cd python && maturin develop --release`.
 
 ### Root crate
 

@@ -65,11 +65,15 @@ jobs:
   #     by integration" because GitHub restricts GITHUB_TOKEN's check-run
   #     write scope on push events by default.
   #
-  # No `ignore:` list right now. The previous RUSTSEC-2024-0436 ignore
-  # (paste 1.0.15 unmaintained) was removed when I72 landed and swapped
-  # the dev-dep for the maintained `pastey` fork. If a future advisory
-  # needs ignoring, file an ISSUES.md entry explaining why before adding
-  # the ignore — don't let the list accumulate silently.
+  # Ignored advisories:
+  #   * RUSTSEC-2025-0020 — pyo3 0.22.x has a "Risk of buffer overflow
+  #     in PyString::from_object". Patched in pyo3 0.24.1+. Our python/
+  #     binding pins pyo3 = "0.22" because the upgrade from 0.22 to 0.24
+  #     is a real API migration (PyO3 has breaking changes between
+  #     majors). Surfaced when I61 unified all three subcrates' lockfiles
+  #     under a workspace Cargo.lock — pre-I61, only the root crate's
+  #     deps (no pyo3) were audited. Tracked as I75 in ISSUES.md;
+  #     remove this ignore when the pyo3 bump lands.
   audit:
     runs-on: ubuntu-latest
     permissions:
@@ -81,12 +85,21 @@ jobs:
       - uses: rustsec/audit-check@v1.4.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2025-0020
 
   # I55 (ISSUES.md, 2026-05-22): pin MSRV in CI. Cargo.toml declares
   # rust-version = "1.82" (the floor stabilized by Option::is_none_or in
   # src/page_cache.rs). This job installs exactly that toolchain and runs
   # `cargo build` to verify the floor still works — catches any new code
   # that requires a newer Rust without an accompanying release-notes call-out.
+  #
+  # I61 (ISSUES.md, 2026-05-22): `-p chisel` scopes the build to the
+  # library crate ONLY. The MSRV promise is about what users see when
+  # they depend on `chisel` — bench is internal tooling whose heavy
+  # deps (criterion, rusqlite, redb, rand → getrandom, clap → clap_lex,
+  # ...) are now adopting `edition2024` faster than we want to bump our
+  # floor. Bench can lag the library's MSRV without affecting any
+  # downstream consumer.
   msrv:
     runs-on: ubuntu-latest
     steps:
@@ -95,27 +108,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
-      - name: Build with MSRV toolchain
-        run: cargo build --verbose
+      - name: Build chisel library with MSRV toolchain
+        run: cargo build --verbose -p chisel
 
-  # I58 (ISSUES.md, 2026-05-22): the bench/ subcrate is a sibling, not
-  # a workspace member, so `cargo test` from the repo root does NOT run
-  # its tests. The bench.yml workflow only runs the scenario *bench*
-  # tier on PRs for regression-comment purposes — it never runs
-  # `cargo test`. This job closes the coverage hole that the
-  # spillway-rollout retrospective (ARCHITECTURE.md Implementation
-  # history → Lessons learned, #1) flagged.
-  bench-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: bench
-      - name: Run bench subcrate tests
-        working-directory: bench
-        run: cargo test --verbose
+  # I58 (ISSUES.md, 2026-05-22): a dedicated `bench-tests` job once
+  # ran `cd bench && cargo test --verbose` because bench/ was a
+  # sibling crate (not workspace member), and `cargo test` from root
+  # didn't cover it. I61 made bench/ a workspace member with
+  # `default-members = [".", "bench"]`, so the `test` job's
+  # `cargo test --verbose` now exercises chisel AND chisel-bench in
+  # one shot. The standalone bench-tests job became redundant and
+  # was removed.
 
   python:
     needs: [test, clippy, fmt]

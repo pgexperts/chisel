@@ -1,3 +1,36 @@
+# I61 (ISSUES.md, 2026-05-22): Cargo workspace declaration. Members
+# share one Cargo.lock (at workspace root) and one target/ directory,
+# so `cargo build --workspace` / `cargo test --workspace` exercise
+# the engine, the PyO3 binding, and the bench harness in one shot.
+#
+# `resolver = "2"` is the post-edition-2021 default but spelled
+# explicitly here. The 2021 resolver does NOT unify feature flags
+# across build targets (lib vs bin, deps vs dev-deps, host vs target),
+# which is what we want — the PyO3 crate uses pyo3 with
+# `extension-module` only in its own build, and the bench crate
+# pulls heavyweight deps (criterion, rusqlite, redb) that shouldn't
+# leak features into the root.
+#
+# Each member retains its own [package] block (name, version, edition,
+# rust-version, etc.) — workspace inheritance via [workspace.package]
+# is a separate refactor (cosmetic, not functional). The path-deps
+# `chisel = { path = ".." }` in python/Cargo.toml and bench/Cargo.toml
+# work unchanged.
+[workspace]
+members = [".", "python", "bench"]
+# `default-members` excludes `python` from `cargo build` / `cargo test`
+# from the workspace root. The Python crate uses pyo3's
+# `extension-module` feature, which expects the linker to leave Python
+# symbols (Py_None, Py_True, etc.) undefined — they're resolved at
+# runtime by the loading Python interpreter. cargo doesn't know how
+# to do that without help; maturin sets up the right `-undefined
+# dynamic_lookup` linker flags. So the Python crate is workspace-
+# resident (shares Cargo.lock and target/) but only buildable via
+# `cd python && maturin develop` or `cargo build -p chisel-py` with
+# matching linker config.
+default-members = [".", "bench"]
+resolver = "2"
+
 [package]
 name = "chisel"
 version = "0.1.0"
