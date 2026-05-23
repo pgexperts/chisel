@@ -290,6 +290,19 @@ impl PageCache {
         }
     }
 
+    /// I74 (ISSUES.md, 2026-05-22): snapshot the spillway's current
+    /// logical-bytes use and max-bytes cap. Returns `None` if the
+    /// spillway has never been opened — it is lazily constructed on
+    /// the first spill, so `None` distinguishes "no overflow has
+    /// happened yet" from "spillway is empty and ready." Returns
+    /// `Some((logical_bytes, max_bytes))` otherwise; the ratio
+    /// answers "how close to `SpillwayFull` are we?"
+    pub fn spillway_capacity(&self) -> Option<(u64, u64)> {
+        self.spillway
+            .as_ref()
+            .map(|spw| (spw.logical_bytes(), spw.max_bytes()))
+    }
+
     /// Allocate a new zeroed page, mark it dirty, return its page_id.
     ///
     /// This is the heart of shadow paging: every write goes to a brand-new

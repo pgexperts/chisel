@@ -525,6 +525,11 @@ impl Chisel {
         // `commit()`. Takes `&self` (F3) — `stats` is semantically a read.
         let handles = self.txm.handles()?;
         let page_count = self.txm.file_page_count()?;
+        // I74 (ISSUES.md, 2026-05-22): spillway capacity peek. Returns
+        // None until the spillway is first opened (lazy construction
+        // on first overflow); Some((logical, max)) otherwise. The
+        // tuple is split into the two Option<u64> fields below.
+        let spillway_cap = self.txm.spillway_capacity()?;
         Ok(Stats {
             handle_count: handles.len() as u64,
             total_pages: page_count,
@@ -537,6 +542,8 @@ impl Chisel {
             // can represent" is closer to truth than "wrapped to a
             // small number".
             file_size_bytes: page_count.saturating_mul(PAGE_SIZE as u64),
+            spillway_logical_bytes: spillway_cap.map(|(logical, _)| logical),
+            spillway_max_bytes: spillway_cap.map(|(_, max)| max),
         })
     }
 

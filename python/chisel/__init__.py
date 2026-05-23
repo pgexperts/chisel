@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 from chisel._chisel import (
     __version__,
@@ -56,6 +57,16 @@ class Stats:
     handle_count: int
     total_pages: int
     file_size_bytes: int
+    # I74 (ISSUES.md, 2026-05-22): the two spillway fields are Optional
+    # because the spillway is lazily opened on first overflow spill.
+    # None means "no overflow has happened yet on this handle"; Some(0)
+    # means "spillway exists but is currently empty (just truncated by
+    # commit/rollback)." Operators predict SpillwayFullError by
+    # watching spillway_logical_bytes / spillway_max_bytes climb across
+    # commits. Defaults to None for backward compatibility with code
+    # that constructs Stats(...) without the new kwargs.
+    spillway_logical_bytes: Optional[int] = None
+    spillway_max_bytes: Optional[int] = None
 
 
 @dataclass(frozen=True)

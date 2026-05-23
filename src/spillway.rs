@@ -123,9 +123,8 @@ impl Spillway {
     /// I74 (ISSUES.md, 2026-05-22): `#[cfg(test)]` because there is no
     /// production caller today. Worth exposing via `Chisel::stats` /
     /// `ChiselCounters` so operators can monitor spillway capacity
-    /// use — file I74 tracks that as a follow-up. Until then,
-    /// gating to test-only keeps the lib build clean.
-    #[cfg(test)]
+    /// use — wired to `Chisel::stats` via I74. The exposure point
+    /// is the new `spillway_logical_bytes` field on `Stats`.
     pub fn logical_bytes(&self) -> u64 {
         self.next_slot_index * PAGE_SIZE as u64
     }
@@ -133,11 +132,10 @@ impl Spillway {
     /// Strict upper bound on logical size, settable at construction or
     /// via PageCache::set_spillway_max_bytes between transactions.
     ///
-    /// I74 (ISSUES.md, 2026-05-22): `#[cfg(test)]` for the same reason
-    /// as `logical_bytes` above — useful for stats exposure, no
-    /// production caller today. The setter (`set_max_bytes`) IS used
-    /// in production via `PageCache::set_spillway_max_bytes`.
-    #[cfg(test)]
+    /// I74 (ISSUES.md, 2026-05-22): exposed via `Stats::spillway_max_bytes`
+    /// so operators can compute `logical_bytes / max_bytes` and predict
+    /// `SpillwayFull` before it fires. The setter (`set_max_bytes`) was
+    /// already production code via `PageCache::set_spillway_max_bytes`.
     pub fn max_bytes(&self) -> u64 {
         self.max_bytes
     }

@@ -28,6 +28,22 @@ pub struct Stats {
     /// Chisel is single-writer, so there is no concurrent commit
     /// that could cause a transient divergence.
     pub file_size_bytes: u64,
+    /// I74 (ISSUES.md, 2026-05-22): current spillway logical-bytes in
+    /// flight (sum of `PAGE_SIZE` × resident spilled pages). `None`
+    /// when the spillway has never been opened — it is lazily
+    /// constructed on the first overflow spill, so `None` means "no
+    /// overflow has happened yet on this handle." `Some(0)` means
+    /// "spillway exists but is empty (just truncated by commit /
+    /// rollback)." The distinction matters for monitoring: a
+    /// long-lived `None` says "this workload fits comfortably in
+    /// cache," whereas `Some(0)` says "we have spilled before, might
+    /// again."
+    pub spillway_logical_bytes: Option<u64>,
+    /// I74: the spillway's `max_bytes` cap. Same `None`-vs-`Some(0)`
+    /// distinction as `spillway_logical_bytes`. Operators predict
+    /// `SpillwayFull` by watching `spillway_logical_bytes / spillway_max_bytes`
+    /// climb across commits.
+    pub spillway_max_bytes: Option<u64>,
 }
 
 /// Cumulative engine-activity counters since `open()`.

@@ -331,6 +331,12 @@ impl PyChisel {
         kwargs.set_item("handle_count", s.handle_count)?;
         kwargs.set_item("total_pages", s.total_pages)?;
         kwargs.set_item("file_size_bytes", s.file_size_bytes)?;
+        // I74 (ISSUES.md, 2026-05-22): forward the two spillway
+        // capacity fields. Option<u64> auto-converts to Python
+        // Optional[int] via pyo3's IntoPyObject impl — None on the
+        // Rust side becomes Python None.
+        kwargs.set_item("spillway_logical_bytes", s.spillway_logical_bytes)?;
+        kwargs.set_item("spillway_max_bytes", s.spillway_max_bytes)?;
         Ok(cls.call((), Some(&kwargs))?.unbind())
     }
 
