@@ -1065,3 +1065,35 @@ Plan:
 6. Mark I75 as ✅ FIXED here.
 
 Higher priority than most other P3s because (a) it's a real (not informational) security advisory and (b) the `ignore:` workaround is a temporary measure that should be cleared promptly.
+
+#### I76. Periodic clean-checkout `cargo clippy` job to catch lint regressions hidden by build cache [I53/I74 follow-up 2026-05-22] — **P3**
+**Where:** `.github/workflows/ci.yml` (would add a new scheduled job).
+
+**Problem:** CI uses `Swatinem/rust-cache@v2` so per-PR clippy runs are fast — but the cache can mask a clippy regression. Concretely: PR #27 introduced `1024u64 * cache_max_bytes as u64` in `tests/spillway_integration.rs`. The `as u64` cast is redundant (`cache_max_bytes` was inferred to u64), but PR #27's CI ran clippy against a warm cache from the previous PR's build and the lint never fired. PR #28 (cleanup, against a fresh branch) caught it because the cache key changed (different branch, different file set) and clippy did a full re-check.
+
+The general shape: any time `cargo clippy --all-targets` skips a file because the cached build artifact is still valid, lints that depend on context (`-D warnings`, new lints in a clippy upgrade, lints that fire only against fresh expansion) can be silently missed. The cost is a wrong-feedback signal at PR time — the regression lands and is found by a future unrelated PR.
+
+**Direction of fix:** add a scheduled-trigger CI job that runs clippy without the cache:
+
+```yaml
+clippy-no-cache:
+  # Periodic clean-checkout clippy. Catches lint regressions hidden by
+  # Swatinem/rust-cache@v2's incremental cache on PR-triggered runs.
+  # See I76 in ISSUES.md.
+  on:
+    schedule:
+      - cron: '0 6 * * 1'  # Mondays, 06:00 UTC
+    workflow_dispatch:
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/checkout@v5
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+    # No Swatinem/rust-cache step — intentional.
+    - run: cargo clippy --all-targets --workspace --exclude chisel-py -- -D warnings
+```
+
+Runs once a week; ~5 minutes per run; would have caught the PR #27 leak immediately on the following Monday. Cheap insurance for a real (if rare) failure mode.
+
+Low priority because (a) the leak is caught eventually by the next unrelated PR's CI, (b) the leak is always a clippy warning (not a runtime bug), (c) the cleanup PR #28 already absorbed the actual fix.
