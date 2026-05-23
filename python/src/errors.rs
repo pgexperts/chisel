@@ -107,93 +107,78 @@ create_exception!(_chisel, PoisonedError, FatalError);
 // cares only about the parent chain, which was set at class creation.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
-    m.add("ChiselError", py.get_type_bound::<ChiselError>())?;
-    m.add("OperationalError", py.get_type_bound::<OperationalError>())?;
-    m.add("FatalError", py.get_type_bound::<FatalError>())?;
+    m.add("ChiselError", py.get_type::<ChiselError>())?;
+    m.add("OperationalError", py.get_type::<OperationalError>())?;
+    m.add("FatalError", py.get_type::<FatalError>())?;
 
-    m.add(
-        "InvalidHandleError",
-        py.get_type_bound::<InvalidHandleError>(),
-    )?;
+    m.add("InvalidHandleError", py.get_type::<InvalidHandleError>())?;
     m.add(
         "NoActiveTransactionError",
-        py.get_type_bound::<NoActiveTransactionError>(),
+        py.get_type::<NoActiveTransactionError>(),
     )?;
     m.add(
         "TransactionAlreadyActiveError",
-        py.get_type_bound::<TransactionAlreadyActiveError>(),
+        py.get_type::<TransactionAlreadyActiveError>(),
     )?;
     m.add(
         "SavepointNotFoundError",
-        py.get_type_bound::<SavepointNotFoundError>(),
+        py.get_type::<SavepointNotFoundError>(),
     )?;
     m.add(
         "DuplicateSavepointError",
-        py.get_type_bound::<DuplicateSavepointError>(),
+        py.get_type::<DuplicateSavepointError>(),
     )?;
-    m.add(
-        "ReadOnlyModeError",
-        py.get_type_bound::<ReadOnlyModeError>(),
-    )?;
+    m.add("ReadOnlyModeError", py.get_type::<ReadOnlyModeError>())?;
     m.add(
         "DatabaseFileNotFoundError",
-        py.get_type_bound::<DatabaseFileNotFoundError>(),
+        py.get_type::<DatabaseFileNotFoundError>(),
     )?;
     m.add(
         "InvalidRootNameError",
-        py.get_type_bound::<InvalidRootNameError>(),
+        py.get_type::<InvalidRootNameError>(),
     )?;
     m.add(
         "RootNameTableFullError",
-        py.get_type_bound::<RootNameTableFullError>(),
+        py.get_type::<RootNameTableFullError>(),
     )?;
     m.add(
         "InvalidSuperblockCountError",
-        py.get_type_bound::<InvalidSuperblockCountError>(),
+        py.get_type::<InvalidSuperblockCountError>(),
     )?;
-    m.add("CacheFullError", py.get_type_bound::<CacheFullError>())?;
-    m.add(
-        "SpillwayFullError",
-        py.get_type_bound::<SpillwayFullError>(),
-    )?;
+    m.add("CacheFullError", py.get_type::<CacheFullError>())?;
+    m.add("SpillwayFullError", py.get_type::<SpillwayFullError>())?;
     m.add(
         "TransactionInProgressError",
-        py.get_type_bound::<TransactionInProgressError>(),
+        py.get_type::<TransactionInProgressError>(),
     )?;
-    m.add("ClosedError", py.get_type_bound::<ClosedError>())?;
+    m.add("ClosedError", py.get_type::<ClosedError>())?;
     m.add(
         "AlreadyFinishedError",
-        py.get_type_bound::<AlreadyFinishedError>(),
+        py.get_type::<AlreadyFinishedError>(),
     )?;
 
-    m.add("IoError", py.get_type_bound::<IoError>())?;
+    m.add("IoError", py.get_type::<IoError>())?;
     m.add(
         "ChecksumMismatchError",
-        py.get_type_bound::<ChecksumMismatchError>(),
+        py.get_type::<ChecksumMismatchError>(),
     )?;
     m.add(
         "CorruptSuperblockError",
-        py.get_type_bound::<CorruptSuperblockError>(),
+        py.get_type::<CorruptSuperblockError>(),
     )?;
     m.add(
         "FileSizeMismatchError",
-        py.get_type_bound::<FileSizeMismatchError>(),
+        py.get_type::<FileSizeMismatchError>(),
     )?;
-    m.add(
-        "InvalidMagicError",
-        py.get_type_bound::<InvalidMagicError>(),
-    )?;
-    m.add("LockFailedError", py.get_type_bound::<LockFailedError>())?;
+    m.add("InvalidMagicError", py.get_type::<InvalidMagicError>())?;
+    m.add("LockFailedError", py.get_type::<LockFailedError>())?;
     m.add(
         "UnsupportedFormatVersionError",
-        py.get_type_bound::<UnsupportedFormatVersionError>(),
+        py.get_type::<UnsupportedFormatVersionError>(),
     )?;
-    m.add("CorruptPageError", py.get_type_bound::<CorruptPageError>())?;
-    m.add(
-        "InvalidPageIdError",
-        py.get_type_bound::<InvalidPageIdError>(),
-    )?;
-    m.add("PoisonedError", py.get_type_bound::<PoisonedError>())?;
+    m.add("CorruptPageError", py.get_type::<CorruptPageError>())?;
+    m.add("InvalidPageIdError", py.get_type::<InvalidPageIdError>())?;
+    m.add("PoisonedError", py.get_type::<PoisonedError>())?;
 
     Ok(())
 }
@@ -248,7 +233,7 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
             let kind = format!("{:?}", io_err.kind());
             let py_err = IoError::new_err(msg);
             Python::with_gil(|py| {
-                let val = py_err.value_bound(py);
+                let val = py_err.value(py);
                 let _ = val.setattr("errno", errno);
                 let _ = val.setattr("kind", kind);
             });

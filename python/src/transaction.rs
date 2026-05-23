@@ -33,7 +33,7 @@
 // nested transactions.
 
 use pyo3::prelude::*;
-use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::db::PyChisel;
 
@@ -46,17 +46,20 @@ pub struct PyTransaction {
     // still call `db.close()`, which nulls out the Option and turns
     // subsequent transaction calls into PoisonedError.
     db: Py<PyChisel>,
-    // Cell<bool>: __exit__ takes `&self`, so we need interior
-    // mutability to set the one-shot guard. Cell (not RefCell) because
-    // bool is Copy and there is no borrow to juggle.
-    finished: Cell<bool>,
+    // I75 (ISSUES.md, 2026-05-22): AtomicBool (not Cell<bool>) because
+    // PyO3 0.24+ requires `#[pyclass]` types to be Sync. The original
+    // rationale ("__exit__ takes &self, need interior mutability for
+    // the one-shot guard, bool is Copy so Cell suffices") is still
+    // true — we just need the Sync flavor. Ordering::SeqCst for the
+    // same reason as PySavepoint: overkill but safest.
+    finished: AtomicBool,
 }
 
 impl PyTransaction {
     pub fn new(db: Py<PyChisel>) -> Self {
         Self {
             db,
-            finished: Cell::new(false),
+            finished: AtomicBool::new(false),
         }
     }
 }
@@ -86,10 +89,10 @@ impl PyTransaction {
         _exc: PyObject,
         _tb: PyObject,
     ) -> PyResult<bool> {
-        if self.finished.get() {
+        if self.finished.load(Ordering::SeqCst) {
             return Ok(false);
         }
-        self.finished.set(true);
+        self.finished.store(true, Ordering::SeqCst);
         let db = self.db.bind(py).borrow();
         if !exc_type.is_none(py) {
             db.rollback_internal(py)?;
@@ -104,10 +107,10 @@ impl PyTransaction {
     // Raises AlreadyFinishedError if called a second time (after
     // another commit, a rollback, or a __exit__ has already run).
     fn commit(&self, py: Python<'_>) -> PyResult<()> {
-        if self.finished.get() {
+        if self.finished.load(Ordering::SeqCst) {
             return Err(already_finished_err());
         }
-        self.finished.set(true);
+        self.finished.store(true, Ordering::SeqCst);
         self.db.bind(py).borrow().commit_internal(py)
     }
 
@@ -115,10 +118,10 @@ impl PyTransaction {
     // when a user wants to abort a transaction manually without raising
     // an exception through the enclosing `with` block.
     fn rollback(&self, py: Python<'_>) -> PyResult<()> {
-        if self.finished.get() {
+        if self.finished.load(Ordering::SeqCst) {
             return Err(already_finished_err());
         }
-        self.finished.set(true);
+        self.finished.store(true, Ordering::SeqCst);
         self.db.bind(py).borrow().rollback_internal(py)
     }
 
