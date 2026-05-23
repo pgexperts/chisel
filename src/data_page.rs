@@ -663,4 +663,25 @@ mod corruption_tests {
         assert!(slot.is_some());
         assert_eq!(DataPage::read(&buf, slot.unwrap()).unwrap().len(), 8162);
     }
+
+    // I71 (ISSUES.md, 2026-05-22): property test — DataPage::insert
+    // then DataPage::read round-trips byte content for any value at
+    // or below the inline maximum (PAGE_BODY_SIZE - SLOT_ENTRY_SIZE
+    // = 8168 - 6 = 8162). proptest shrinks failures down to minimal
+    // counterexamples: an off-by-one in slot layout would reproduce
+    // at e.g. value.len() == 1 rather than burying it in an 8000-byte
+    // dump.
+    proptest::proptest! {
+        #[test]
+        fn prop_insert_read_roundtrip(value in proptest::collection::vec(0u8..=255, 0..=8162)) {
+            let mut buf = [0u8; PAGE_SIZE];
+            DataPage::init_page(&mut buf);
+            let slot = DataPage::insert(&mut buf, &value)
+                .expect("insert must succeed for value sized within the inline max");
+            let read_back = DataPage::read(&buf, slot)
+                .expect("read must return the value at its own slot");
+            assert_eq!(read_back, value.as_slice(),
+                "insert then read must preserve bytes exactly");
+        }
+    }
 }

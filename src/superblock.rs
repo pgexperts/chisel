@@ -491,4 +491,73 @@ mod tests {
         let buf2 = [0u8; PAGE_SIZE];
         assert!(Superblock::select(&[buf1, buf2]).is_none());
     }
+
+    // I71 (ISSUES.md, 2026-05-22): property test —
+    // `deserialize(serialize(sb)) == Some(sb)` for any well-formed
+    // Superblock. The proptest strategy builds a Superblock by
+    // sampling its individually-varying fields (txn_counter, roots,
+    // page-id fields, named-root names/handles, superblock_count)
+    // while pinning the format-invariant fields (magic, format_version,
+    // page_size). NamedRoot.name uses a byte-array strategy so the
+    // empty-slot convention (name[0] == 0) gets exercised alongside
+    // populated names.
+    proptest::proptest! {
+        #[test]
+        fn prop_serialize_deserialize_roundtrip(
+            txn_counter in 0u64..u64::MAX,
+            root_handle_table_page in 0u64..u64::MAX,
+            root_freemap_page in 0u64..u64::MAX,
+            total_pages in 0u64..u64::MAX,
+            next_handle in 0u64..u64::MAX,
+            // superblock_count must lie in the validated range
+            // MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS (2..=16); values
+            // outside this range cause deserialize() to return None
+            // by design (defends against torn-slot corruption that
+            // would otherwise direct a superblock write into the
+            // data region). Sampling only the valid range keeps the
+            // round-trip property well-defined.
+            superblock_count in MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS,
+            named_root_bytes in proptest::array::uniform8(
+                proptest::array::uniform24(0u8..=255u8)
+            ),
+            named_root_handles in proptest::array::uniform8(0u64..u64::MAX),
+        ) {
+            let mut named_roots = [NamedRoot::EMPTY; NAMED_ROOT_COUNT];
+            for (i, slot) in named_roots.iter_mut().enumerate() {
+                slot.name = named_root_bytes[i];
+                slot.handle = named_root_handles[i];
+            }
+            let sb = Superblock {
+                magic: MAGIC,
+                format_version: crate::page::FORMAT_VERSION,
+                txn_counter,
+                root_handle_table_page,
+                root_freemap_page,
+                total_pages,
+                next_handle,
+                page_size: PAGE_SIZE as u32,
+                named_roots,
+                superblock_count,
+            };
+            let buf = sb.serialize();
+            let parsed = Superblock::deserialize(&buf)
+                .expect("a freshly-serialized superblock must deserialize");
+            // Field-by-field equality. PartialEq isn't derived on
+            // Superblock, so compare structurally — easier to diagnose
+            // if a single field round-trips wrong.
+            assert_eq!(parsed.magic, sb.magic);
+            assert_eq!(parsed.format_version, sb.format_version);
+            assert_eq!(parsed.txn_counter, sb.txn_counter);
+            assert_eq!(parsed.root_handle_table_page, sb.root_handle_table_page);
+            assert_eq!(parsed.root_freemap_page, sb.root_freemap_page);
+            assert_eq!(parsed.total_pages, sb.total_pages);
+            assert_eq!(parsed.next_handle, sb.next_handle);
+            assert_eq!(parsed.page_size, sb.page_size);
+            assert_eq!(parsed.superblock_count, sb.superblock_count);
+            for i in 0..NAMED_ROOT_COUNT {
+                assert_eq!(parsed.named_roots[i].name, sb.named_roots[i].name);
+                assert_eq!(parsed.named_roots[i].handle, sb.named_roots[i].handle);
+            }
+        }
+    }
 }

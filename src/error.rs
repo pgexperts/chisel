@@ -291,4 +291,35 @@ mod tests {
             );
         }
     }
+
+    // I70 (ISSUES.md, 2026-05-22): unit test for the typed
+    // CorruptPage variant. Group F's I45 + I49 convert two
+    // previously-panicking sites to return CorruptPage errors; the
+    // fault-injection paths needed to trigger those sites from a
+    // black-box test would be invasive (would need test-only
+    // force_lru_desync / force_handle_table_desync helpers). This
+    // test covers the variant's value-level contract instead:
+    // page_id round-trips through construction, the variant is
+    // classified as fatal (so it poisons the manager per I1), and
+    // Display formats the page id. Integration coverage of the
+    // CorruptPage path against on-disk corruption already exists in
+    // src/recovery_tests.rs (the I14 test).
+    #[test]
+    fn corrupt_page_variant_contract() {
+        let e = ChiselError::CorruptPage { page_id: 42 };
+        // is_fatal() returns true → TransactionManager will poison.
+        assert!(
+            e.is_fatal(),
+            "CorruptPage must be fatal so the manager poisons"
+        );
+        // source() returns None — CorruptPage does not wrap an inner cause.
+        assert!(e.source().is_none(), "CorruptPage has no inner source");
+        // Display includes the page id so log inspectors can identify
+        // the bad page without round-tripping through Debug.
+        let msg = format!("{e}");
+        assert!(
+            msg.contains("42"),
+            "Display message {msg:?} should mention page id 42"
+        );
+    }
 }

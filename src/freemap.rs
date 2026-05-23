@@ -246,4 +246,22 @@ mod tests {
     fn test_freemap_capacity() {
         assert_eq!(FreeMap::capacity(), PAGE_BODY_SIZE * 8);
     }
+
+    // I71 (ISSUES.md, 2026-05-22): property test — for any page_id
+    // within the freemap's capacity, mark_free followed by is_free
+    // returns true. Cheap shrinking via proptest catches off-by-one
+    // errors at byte/bit boundaries (0, 7, 8, 9, capacity-1) without
+    // hand-writing each.
+    proptest::proptest! {
+        #[test]
+        fn prop_mark_free_then_is_free(page_id in 0u64..(PAGE_BODY_SIZE as u64 * 8)) {
+            let mut buf = [0u8; PAGE_SIZE];
+            FreeMap::init_page(&mut buf);
+            // Sanity: an unmarked id is in-use.
+            assert!(!FreeMap::is_free(&buf, page_id));
+            FreeMap::mark_free(&mut buf, page_id);
+            assert!(FreeMap::is_free(&buf, page_id),
+                "page_id {} should be free after mark_free", page_id);
+        }
+    }
 }

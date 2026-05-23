@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1a079da2f56b668ffe6e3197541937e1ca0abb2702157c65542e976cc7ed2dff # shrinks to txn_counter = 0, root_handle_table_page = 0, root_freemap_page = 0, total_pages = 0, next_handle = 0, superblock_count = 17, named_root_bytes = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 52, 189, 178, 155, 114, 93, 70, 216, 2, 156, 9, 28, 112, 95, 10, 82, 9, 44, 59, 85], [152, 26, 102, 15, 64, 182, 240, 106, 127, 172, 16, 5, 98, 192, 214, 150, 1, 80, 205, 226, 9, 93, 52, 14], [92, 13, 62, 198, 42, 158, 206, 136, 212, 251, 204, 159, 8, 79, 207, 235, 213, 30, 207, 66, 27, 184, 11, 122], [21, 73, 80, 67, 44, 137, 222, 249, 160, 247, 225, 11, 219, 50, 19, 27, 208, 106, 92, 176, 203, 253, 84, 201]], named_root_handles = [17663351913673301668, 4708736021640633510, 13323448066254198778, 1514872834711162956, 16191642543035954483, 13902804956270029251, 5581424720221231820, 10452613325909533968]
