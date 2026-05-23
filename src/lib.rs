@@ -558,6 +558,23 @@ impl Chisel {
         self.txm.counters()
     }
 
+    /// Page-aligned on-disk size of the database, computed as
+    /// `page_count × PAGE_SIZE`. Same number `stats().file_size_bytes`
+    /// returns, but without the handle-table scan that `stats()` does
+    /// to populate `handle_count`.
+    ///
+    /// I53 (ISSUES.md, 2026-05-22): broken out for the bench harness,
+    /// which calls this per measurement cell — `stats()` walks all
+    /// live handles via `handles()` (O(live handles)), which adds
+    /// milliseconds per call at 100K-handle scale. Reading just
+    /// `file_size_bytes` shouldn't pay that cost. `stats()` keeps its
+    /// current shape because the typical caller wants all three
+    /// fields together; this is the dedicated single-field accessor.
+    pub fn file_size_bytes(&self) -> Result<u64> {
+        let page_count = self.txm.file_page_count()?;
+        Ok(page_count.saturating_mul(PAGE_SIZE as u64))
+    }
+
     /// Returns true if this database handle has been poisoned by a
     /// previous fatal error. A poisoned handle returns
     /// `ChiselError::Poisoned` from every operation; the caller must drop
