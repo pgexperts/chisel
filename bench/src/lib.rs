@@ -18,7 +18,7 @@ pub mod summary;
 pub mod workload;
 
 pub use chisel_engine::ChiselEngine;
-pub use engine::{DurabilityMode, Engine, EngineResult, Identifier};
+pub use engine::{DurabilityMode, Engine, EngineError, EngineResult, Identifier};
 pub use redb_engine::RedbEngine;
 pub use runner::{
     run_scenario_cell, AuxMetricsWriter, CellAuxMetrics, CellId, ChiselCountersDelta, EngineMode,

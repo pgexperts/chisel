@@ -934,10 +934,20 @@ impl PageCache {
             };
             // Lift the page bytes out of the cache before calling into
             // ensure_spillway (which borrows &mut self).
+            //
+            // I49 (ISSUES.md, 2026-05-22): translate to a typed
+            // CorruptPage error instead of panicking. victim_id was
+            // produced by `self.lru.iter_lru_to_mru().next()` above,
+            // so `self.entries.remove(&victim_id)` should always be
+            // Some — the LRU index and the entries map are kept in
+            // sync by `discard`/`truncate`/`flush`. If we observe
+            // None here, the two-data-structure invariant broke
+            // (most likely a future refactor that touches one without
+            // the other), which is genuinely a corruption signal.
             let entry = self
                 .entries
                 .remove(&victim_id)
-                .expect("LRU referenced page id not in entries");
+                .ok_or(ChiselError::CorruptPage { page_id: victim_id })?;
             self.lru.remove(victim_id);
             // entry was dirty; preserve dirty_count's invariant.
             self.dirty_count -= 1;

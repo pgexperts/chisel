@@ -10,8 +10,9 @@
 // Read takes `&self`; mutating methods take `&mut self`. This matches
 // Chisel's post-F3 shape and fits redb / SQLite naturally.
 
-use chisel::ChiselCounters;
+use chisel::{ChiselCounters, ChiselError};
 use std::error::Error;
+use std::fmt;
 
 /// Opaque identifier returned by an engine's `allocate` and consumed by
 /// later `read`/`update`/`delete` calls. Each engine maps this to its
@@ -30,17 +31,137 @@ use std::error::Error;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Identifier(pub u64);
 
-/// Trait-wide error type. Each engine impl boxes its native error
-/// into this — `ChiselError`, `redb::Error`, `rusqlite::Error` all
-/// implement `std::error::Error` and convert via the standard
-/// `Box<dyn Error>` blanket `From` impl.
+/// Trait-wide error type. One variant per engine class, plus a
+/// catchall for engine-setup failures that don't fit the typed slots
+/// (e.g., a `std::io::Error` from a TempDir construction).
 ///
-/// `Send + Sync` is included so a `Box<dyn Engine>` can be moved
-/// across thread boundaries even though the engines themselves are
-/// single-threaded — a future Criterion configuration may want to
-/// drop this constraint or retain it; including it now is no
-/// runtime cost and keeps options open.
-pub type EngineResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+/// I43 (ISSUES.md, 2026-05-22): replaces a pre-I43 `Box<dyn Error +
+/// Send + Sync>` that erased engine class. Bench scenarios + runner
+/// can now `match` on the variant — e.g., to assert a chisel run hit
+/// `ChiselError::SpillwayFull` specifically, not just "some error".
+/// `Send + Sync` is preserved so `Box<dyn Engine>` can be moved
+/// across thread boundaries.
+/// All inner-error variants are boxed: `redb::Error` and
+/// `rusqlite::Error` are large enums (clippy's `result_large_err`
+/// lint fires above ~128 bytes); even `ChiselError` is non-trivial.
+/// Boxing keeps `EngineError` at ~16 bytes (discriminant + pointer),
+/// which is the size every `EngineResult` allocation pays. The
+/// `From` impls below auto-box so call-site ergonomics are unchanged.
+#[derive(Debug)]
+pub enum EngineError {
+    Chisel(Box<ChiselError>),
+    Redb(Box<redb::Error>),
+    Sqlite(Box<rusqlite::Error>),
+    /// Catchall for errors that arise outside the engine's own error
+    /// type — e.g., filesystem operations in test setup, OS-level
+    /// resource failures during open(). Already boxed.
+    Other(Box<dyn Error + Send + Sync>),
+}
+
+impl fmt::Display for EngineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Prefix with engine class for log-line legibility — the bench
+        // runner's diff-report mixes errors from all engines and the
+        // prefix makes "which engine surfaced this" unambiguous.
+        match self {
+            EngineError::Chisel(e) => write!(f, "chisel: {e}"),
+            EngineError::Redb(e) => write!(f, "redb: {e}"),
+            EngineError::Sqlite(e) => write!(f, "sqlite: {e}"),
+            EngineError::Other(e) => write!(f, "engine-setup: {e}"),
+        }
+    }
+}
+
+impl Error for EngineError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            EngineError::Chisel(e) => Some(&**e),
+            EngineError::Redb(e) => Some(&**e),
+            EngineError::Sqlite(e) => Some(&**e),
+            EngineError::Other(e) => Some(&**e),
+        }
+    }
+}
+
+impl From<ChiselError> for EngineError {
+    fn from(e: ChiselError) -> Self {
+        EngineError::Chisel(Box::new(e))
+    }
+}
+
+impl From<redb::Error> for EngineError {
+    fn from(e: redb::Error) -> Self {
+        EngineError::Redb(Box::new(e))
+    }
+}
+
+// redb has several specialized error sub-types (DatabaseError,
+// TransactionError, etc.) that all `Into<redb::Error>`; the blanket
+// conversion below routes them through the typed variant.
+impl From<redb::DatabaseError> for EngineError {
+    fn from(e: redb::DatabaseError) -> Self {
+        EngineError::Redb(Box::new(e.into()))
+    }
+}
+
+impl From<redb::TransactionError> for EngineError {
+    fn from(e: redb::TransactionError) -> Self {
+        EngineError::Redb(Box::new(e.into()))
+    }
+}
+
+impl From<redb::TableError> for EngineError {
+    fn from(e: redb::TableError) -> Self {
+        EngineError::Redb(Box::new(e.into()))
+    }
+}
+
+impl From<redb::StorageError> for EngineError {
+    fn from(e: redb::StorageError) -> Self {
+        EngineError::Redb(Box::new(e.into()))
+    }
+}
+
+impl From<redb::CommitError> for EngineError {
+    fn from(e: redb::CommitError) -> Self {
+        EngineError::Redb(Box::new(e.into()))
+    }
+}
+
+impl From<rusqlite::Error> for EngineError {
+    fn from(e: rusqlite::Error) -> Self {
+        EngineError::Sqlite(Box::new(e))
+    }
+}
+
+impl From<std::io::Error> for EngineError {
+    fn from(e: std::io::Error) -> Self {
+        EngineError::Other(Box::new(e))
+    }
+}
+
+impl From<Box<dyn Error + Send + Sync>> for EngineError {
+    fn from(e: Box<dyn Error + Send + Sync>) -> Self {
+        EngineError::Other(e)
+    }
+}
+
+// Ad-hoc string errors raised inside engine methods (e.g.,
+// `return Err("transaction already active".into())`). Routed to
+// EngineError::Other via Box<dyn Error>'s String conversion.
+impl From<&str> for EngineError {
+    fn from(s: &str) -> Self {
+        EngineError::Other(s.into())
+    }
+}
+
+impl From<String> for EngineError {
+    fn from(s: String) -> Self {
+        EngineError::Other(s.into())
+    }
+}
+
+pub type EngineResult<T> = Result<T, EngineError>;
 
 /// Durability mode for engines that support relaxed-fsync configurations
 /// (redb's Durability::Eventual, SQLite's synchronous=OFF). Chisel does
