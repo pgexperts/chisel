@@ -292,8 +292,8 @@ fn crash_mid_spill_recovers_to_last_committed_state() {
 //      drained — operators see "we have spilled before, might again").
 #[test]
 fn stats_exposes_spillway_capacity_across_lifecycle() {
-    let cache_max_bytes = 16 * 8192; // 16 pages — tiny cache to force a spill
-    let spillway_cap = 1024u64 * cache_max_bytes as u64;
+    let cache_max_bytes: u64 = 16 * 8192; // 16 pages — tiny cache to force a spill
+    let spillway_cap = 1024u64 * cache_max_bytes;
     let opts = Options::default()
         .cache_max_bytes(cache_max_bytes)
         .spillway_max_bytes(spillway_cap)

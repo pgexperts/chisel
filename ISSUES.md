@@ -572,7 +572,7 @@ The 2026-04-26 perf-review used its own internal F1–F6 numbering distinct from
 
 ### Public API and 1.0 readiness
 
-#### I35. `pub mod` declarations expose engine internals as 1.0 API surface [deepdive 2026-05-22] — **P1**
+#### I35. `pub mod` declarations expose engine internals as 1.0 API surface [deepdive 2026-05-22] — **P1** ✅ FIXED 2026-05-22 (PR #11; pub → pub(crate) reshape with selective re-exports of the surface kept public)
 **Where:** `src/lib.rs:22-35`
 
 **Problem:** twelve `pub mod` declarations expose `data_page`, `defrag`, `error`, `freemap`, `handle_table`, `overflow`, `page`, `page_cache`, `page_io`, `stats`, `superblock`, and `transaction`. Every type and method in those modules — `TransactionManager`, `HandleEntry`, `PageCache::set_next_page_id`, `Superblock::serialize`, `OverflowChain`, `DEFAULT_SUPERBLOCK_COUNT`, `MAX_INLINE_VALUE`, and dozens more — becomes part of Chisel's 1.0 stability contract once that release ships. The actual documented public API in `README.md` is 18 methods on `Chisel`; the on-the-wire surface is hundreds of types.
@@ -590,7 +590,7 @@ pub use defrag::{DefragOptions, DefragStats};
 
 Tests that need access to internals can use `#[cfg(test)] pub use …` re-exports or live inside the modules. The `defrag` module is the trickiest because its `DefragOptions` / `DefragStats` are public; either lift those types into `lib.rs` or keep `pub mod defrag` and rely on `#[non_exhaustive]` to bound the public footprint.
 
-#### I36. Public types not marked `#[non_exhaustive]` [deepdive 2026-05-22] — **P1**
+#### I36. Public types not marked `#[non_exhaustive]` [deepdive 2026-05-22] — **P1** ✅ FIXED 2026-05-22 (PR #12; ChiselError, Options, DrainInsertion, Stats, DefragOptions, DefragStats all gained `#[non_exhaustive]`; fluent builders added on Options + DefragOptions so external callers can still construct them)
 **Where:** `src/lib.rs:80-88` (`Options`), `src/lib.rs:99-102` (`DrainInsertion`), `src/lib.rs:107-111` (`SpillwayLocation`), `src/error.rs:16` (`ChiselError`), `src/stats.rs::Stats`
 
 **Problem:** of all the public types Chisel ships, only `ChiselCounters` carries `#[non_exhaustive]`. Adding a field to `Options`, a variant to `ChiselError` or `DrainInsertion`, or a backing to `SpillwayLocation` is a breaking change today. This bites both struct-literal callers and exhaustive `match` callers — exactly the patterns Rust idiom encourages.
@@ -599,7 +599,7 @@ Tests that need access to internals can use `#[cfg(test)] pub use …` re-export
 
 Trade-off: `#[non_exhaustive]` enums force callers to write `_ => …` arms, which is a real ergonomic cost for `match` on `DrainInsertion` (only two variants today). The alternative is to commit to "no new variants, ever" — fine for `DrainInsertion`, defensible but constraining for `ChiselError`.
 
-#### I37. `SpillwayLocation` is `pub` but used only internally [deepdive 2026-05-22] — **P3**
+#### I37. `SpillwayLocation` is `pub` but used only internally [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22 (PR #11; folded into the I35 reshape — `pub(crate)`-scoped along with the other engine-internal types)
 **Where:** `src/lib.rs:107-111`
 
 **Problem:** `SpillwayLocation` is constructed only inside `Chisel::open` and `Chisel::open_in_memory_with_options`; it's part of the `PageCache::new` constructor signature, which is only public because `pub mod page_cache`. Users have no reason to construct one; it leaks because `page_cache` does.
@@ -627,14 +627,14 @@ Trade-off: `#[non_exhaustive]` enums force callers to write `_ => …` arms, whi
 
 **Direction of fix:** drop the `Result` from `set_drain_insertion` (truly state-free). For the other two, leave the `Result` with a one-line doc comment explaining the hedge — both are plausibly fallible in a future world where shrinking the cache could observe pinned dirty pages.
 
-#### I41. `ChiselError` has no `source()` impl [deepdive 2026-05-22] — **P2**
+#### I41. `ChiselError` has no `source()` impl [deepdive 2026-05-22] — **P2** ✅ FIXED 2026-05-22 (PR #14; `source()` returns the inner `io::Error` for the `IoError` arm and `None` for all other variants — preserves the error-chain walker contract for anyhow / eyre / tracing)
 **Where:** `src/error.rs:215` (`impl std::error::Error for ChiselError {}`)
 
 **Problem:** the trait impl is empty. `IoError(io::Error)` wraps an inner cause but exposes it nowhere — `e.source()` returns `None` for every variant. This breaks error-chain walkers (`anyhow::Error::root_cause`, structured-logging adapters, `eyre` reports). The Display message is the only signal an upstream caller can see.
 
 **Direction of fix:** implement `fn source(&self) -> Option<&(dyn Error + 'static)>` that returns the inner `io::Error` for `ChiselError::IoError(e)` and `None` for the rest. If future variants gain inner causes (e.g., wrapping a deserialization error), extend the match.
 
-#### I42. Python `to_py_err` discards inner `io::Error` from `IoError(_)` [deepdive 2026-05-22] — **P2**
+#### I42. Python `to_py_err` discards inner `io::Error` from `IoError(_)` [deepdive 2026-05-22] — **P2** ✅ FIXED 2026-05-22 (PR #15; IoError instances now carry `.errno` (raw OS error code) and `.kind` (string form of `std::io::ErrorKind`) as Python attributes — callers branch on those instead of parsing the Display message)
 **Where:** `python/src/errors.rs:209-249`
 
 **Problem:** `to_py_err` formats `ChiselError` via `Display` and then drops the variant. A Python caller cannot programmatically distinguish ENOSPC from EACCES from EIO — they all become `chisel.IoError("I/O error: <prose>")`. The comment at lines 211-213 documents the choice as "the string is the only cross-boundary contract"; defensible but worth re-litigating if any caller wants disk-full-vs-permission-denied handling on the Python side.
@@ -661,7 +661,7 @@ with `#[from]` impls so `?` keeps working. Keeps the existing call-site ergonomi
 
 ### Code quality
 
-#### I44. `libc::flock` `unsafe { … }` block missing `// SAFETY:` comment [deepdive 2026-05-22] — **P2**
+#### I44. `libc::flock` `unsafe { … }` block missing `// SAFETY:` comment [deepdive 2026-05-22] — **P2** ✅ FIXED 2026-05-22 (PR #14; multi-line SAFETY block documents the fd validity, flag composition, and signal-safety reasoning)
 **Where:** `src/page_io.rs:133-141`
 
 **Problem:** the only `unsafe` block in the core engine — the syscall the entire single-writer contract rests on — has no `// SAFETY:` comment. The Commenting standards section of `ARCHITECTURE.md` calls this out as a convention violation; this is the one place in the engine that violates it.
@@ -753,7 +753,7 @@ A stronger fix is to refactor `get` / `get_mut` to return the borrow from inside
 
 ### Performance
 
-#### I51. `read_page` calls `page_count()` (one extra `lseek`) on every call [deepdive 2026-05-22] — **P2**
+#### I51. `read_page` calls `page_count()` (one extra `lseek`) on every call [deepdive 2026-05-22] — **P2** ✅ FIXED 2026-05-22 (PR #16; `PageIo` carries a `cached_page_count: Cell<u64>` HWM seeded at open and updated on every extending write — eliminates one `lseek` per cache miss; 5 regression tests in src/page_io.rs verify the cache stays coherent across truncate / extend / set_page_count)
 **Where:** `src/page_io.rs:166-167`
 
 **Problem:** `read_page` calls `self.page_count()?` every call, which on the file backing does `file.seek(SeekFrom::End(0))` — one extra syscall per read. The doc comment at lines 156-163 documents the cost and the rationale (no cache invalidation complexity), but underweights it ("absorbed by `PageCache` on cache hits") — the cache miss IS the cost site by definition, and high-miss-rate workloads pay this on every page load.
@@ -773,7 +773,7 @@ A stronger fix is to refactor `get` / `get_mut` to return the borrow from inside
 
 Related: `read()` similarly allocates a `Vec<u8>` on every call (`src/transaction.rs:1217`, perf-review F2 unchanged). The fixes are different shapes — a `read_borrow(&self, handle) -> Result<Ref<'_, [u8]>>` sibling API would close that one for Rust callers (PyO3 callers cannot benefit because `PyBytes` wants owned bytes).
 
-#### I53. bench `file_size_bytes` triggers an O(live handles) walk via `stats()` [deepdive 2026-05-22] — **P3**
+#### I53. bench `file_size_bytes` triggers an O(live handles) walk via `stats()` [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22 (added `Chisel::file_size_bytes() -> Result<u64>` — O(1) single-field accessor that skips the handle-table walk; bench `chisel_engine.rs::file_size_bytes` now calls it instead of materializing the full Stats struct)
 **Where:** `bench/src/chisel_engine.rs:106`
 
 **Problem:** `self.db.stats()?.file_size_bytes` calls `Chisel::stats()`, which walks the entire handle table (O(live handles)) just to populate `handle_count`. Used per measurement cell in the bench harness — for 100K-handle scenarios this is ~milliseconds per call, dragged into every reporting step.
@@ -782,7 +782,7 @@ Related: `read()` similarly allocates a `Vec<u8>` on every call (`src/transactio
 
 ### CI, packaging, and publication
 
-#### I54. CI runs no supply-chain check [perf-review 2026-04-26 / deepdive 2026-05-22] — **P2**
+#### I54. CI runs no supply-chain check [perf-review 2026-04-26 / deepdive 2026-05-22] — **P2** ✅ FIXED 2026-05-22 (PR #13; `audit` job via `rustsec/audit-check@v1.4.1` runs on every push/PR; the hotfix history at PRs #17 + #26 cleared two transient ignores — paste 1.0.15 unmaintained and pyo3 0.22.x PyString overflow — both via real fixes, not permanent ignores)
 **Where:** `.github/workflows/ci.yml`
 
 **Problem:** three jobs — `test`, `clippy`, `fmt` — all running their respective cargo subcommands. No `cargo audit`, no `cargo deny`, no MSRV pinning. A vulnerable transitive dep would land silently.
@@ -803,14 +803,14 @@ audit:
 
 Costs one CI minute per build. `cargo deny` is the next level up (license + advisory + source policy) and warrants a `deny.toml` policy file.
 
-#### I55. No MSRV pinned in `Cargo.toml` or CI [deepdive 2026-05-22] — **P2**
+#### I55. No MSRV pinned in `Cargo.toml` or CI [deepdive 2026-05-22] — **P2** ✅ FIXED 2026-05-22 (PR #13; `rust-version = "1.82"` in all three subcrates' Cargo.toml; CI `msrv` job uses `dtolnay/rust-toolchain@1.82` and builds `-p chisel` only — scoping per I61 since bench's deps adopt edition2024 faster than we want to float the floor)
 **Where:** `Cargo.toml`, `bench/Cargo.toml`, `python/Cargo.toml`, `.github/workflows/ci.yml`
 
 **Problem:** `rust-version` is absent from every `Cargo.toml`. CI uses `dtolnay/rust-toolchain@stable`, so an unannounced 1.x MSRV bump can land silently. README says "Rust stable, edition 2021"; that's not a pinned MSRV. The codebase uses `let-else` (1.65+), `is_none_or` (1.82+), `is_some_and` (1.70+); actual floor is currently ≥ 1.82.
 
 **Direction of fix:** pin `rust-version = "1.82"` (or whatever the current actual floor is — verify via `cargo msrv` if available) in `Cargo.toml`. Add a `msrv` job to CI that uses `dtolnay/rust-toolchain@1.82` and runs `cargo build`. If the project doesn't commit to MSRV stability pre-1.0, document that decision in the README.
 
-#### I56. `Cargo.toml` lacks crates.io publication metadata [deepdive 2026-05-22] — **P1**
+#### I56. `Cargo.toml` lacks crates.io publication metadata [deepdive 2026-05-22] — **P1** ✅ FIXED 2026-05-22 (PR #10; root Cargo.toml has license, repository, readme, keywords, categories, description, authors; python and bench subcrates also have publish=false and matching metadata)
 **Where:** root `Cargo.toml`
 
 **Problem:** missing `license`, `repository`, `readme`, `keywords`, `categories`. All required or strongly recommended for crates.io publication. `cargo publish` will refuse without `license` (or `license-file`).
@@ -831,14 +831,14 @@ keywords = ["database", "storage", "embedded", "transactional", "shadow-paging"]
 categories = ["database", "data-structures"]
 ```
 
-#### I57. `License: TBD` blocks any third-party use [deepdive 2026-05-22] — **P1**
+#### I57. `License: TBD` blocks any third-party use [deepdive 2026-05-22] — **P1** ✅ FIXED 2026-05-22 (PR #10; MIT license; LICENSE file at repo root, README badge updated, license = "MIT" in Cargo.toml. User explicitly chose MIT-only over the conventional MIT-OR-Apache-2.0 dual)
 **Where:** `README.md:326-327`
 
 **Problem:** with no license, the code is "all rights reserved" by default — no one can legally use or distribute it. For a pre-1.0 project that's worth flagging visibly on the README.
 
 **Direction of fix:** pick a license now. The prevailing Rust convention is `MIT OR Apache-2.0` dual. Drop `LICENSE-MIT` and `LICENSE-APACHE` files at the repo root, update README from "TBD" to the chosen license, and add `license = "MIT OR Apache-2.0"` to `Cargo.toml` (covered by I56).
 
-#### I58. `bench/` is not in `ci.yml` [deepdive 2026-05-22, formalizing spillway-rollout lesson #1] — **P2**
+#### I58. `bench/` is not in `ci.yml` [deepdive 2026-05-22, formalizing spillway-rollout lesson #1] — **P2** ✅ FIXED 2026-05-22 (PR #13 added a dedicated `bench-tests` job; superseded by I61's workspace migration in PR #23 — `cargo test` from root now covers bench via `default-members = [".", "bench"]`, so the standalone bench-tests job was removed in the same PR)
 **Where:** `.github/workflows/ci.yml`, `bench/Cargo.toml`
 
 **Problem:** the bench subcrate is a sibling — not a workspace member — so `cargo test` from the repo root doesn't run `bench/`'s tests, and `ci.yml` doesn't either. The spillway-rollout retrospective in `ARCHITECTURE.md` (Implementation history → Lessons learned, lesson #1) flagged this as a pattern that bit a real PR. The mid-PR review caught the missed bench test failures, but there's no CI-side safety net.

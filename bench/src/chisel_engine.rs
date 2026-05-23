@@ -101,7 +101,14 @@ impl Engine for ChiselEngine {
     }
 
     fn file_size_bytes(&self) -> EngineResult<u64> {
-        Ok(self.db.stats()?.file_size_bytes)
+        // I53 (ISSUES.md, 2026-05-22): use the dedicated
+        // Chisel::file_size_bytes accessor that skips the handle-table
+        // walk that stats() does to populate handle_count. Bench
+        // harness reads this per measurement cell, so the O(live
+        // handles) cost from stats() was load-bearing at 100K-handle
+        // scenarios. The new accessor is O(1) — just page_count *
+        // PAGE_SIZE.
+        Ok(self.db.file_size_bytes()?)
     }
 
     fn internal_counters(&self) -> EngineResult<Option<ChiselCounters>> {

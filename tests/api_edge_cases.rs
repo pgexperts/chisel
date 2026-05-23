@@ -450,3 +450,42 @@ dual_backing_test!(
     test_stats_is_idempotent_without_mutation,
     test_stats_is_idempotent_without_mutation_body
 );
+
+// I53 (ISSUES.md, 2026-05-22): `Chisel::file_size_bytes()` is a
+// dedicated O(1) accessor added for the bench harness — it must
+// return the same value `stats().file_size_bytes` does, but without
+// the handle-table scan. This test pins the equality across a few
+// representative database states (empty, just-allocated,
+// just-committed) so a future refactor of either method that breaks
+// the equality is caught immediately.
+fn test_file_size_bytes_matches_stats_body(b: &Backing) {
+    let mut db = open_chisel(b);
+    // Phase 1: fresh database, before any allocations.
+    assert_eq!(
+        db.file_size_bytes().unwrap(),
+        db.stats().unwrap().file_size_bytes,
+        "file_size_bytes must match stats().file_size_bytes on fresh db"
+    );
+    // Phase 2: mid-transaction with allocations in flight.
+    db.begin().unwrap();
+    for i in 0..20u32 {
+        db.allocate(&i.to_le_bytes()).unwrap();
+    }
+    assert_eq!(
+        db.file_size_bytes().unwrap(),
+        db.stats().unwrap().file_size_bytes,
+        "file_size_bytes must match stats().file_size_bytes mid-transaction"
+    );
+    // Phase 3: post-commit.
+    db.commit().unwrap();
+    assert_eq!(
+        db.file_size_bytes().unwrap(),
+        db.stats().unwrap().file_size_bytes,
+        "file_size_bytes must match stats().file_size_bytes post-commit"
+    );
+}
+
+dual_backing_test!(
+    test_file_size_bytes_matches_stats,
+    test_file_size_bytes_matches_stats_body
+);
