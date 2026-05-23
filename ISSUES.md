@@ -1042,7 +1042,7 @@ Wire them into `Chisel::stats` by inspecting `PageCache::spillway` (which is alr
 
 Low priority because spillway exhaustion currently surfaces as `SpillwayFull` (a typed error) rather than a silent slowdown; operators can hook on that. But adding observability is the difference between "see the wall coming" and "hit the wall."
 
-#### I75. Bump `pyo3` from 0.22 to 0.24+ to clear RUSTSEC-2025-0020 [I61 follow-up 2026-05-22] — **P2**
+#### I75. Bump `pyo3` from 0.22 to 0.24+ to clear RUSTSEC-2025-0020 [I61 follow-up 2026-05-22] — **P2** ✅ FIXED 2026-05-22 (bumped to 0.24; RefCell→Mutex, Cell→AtomicBool for PyO3 0.24's Sync requirement; cargo audit shows 0 vulns / 0 warns; 85/85 Python tests pass)
 **Where:** `python/Cargo.toml` (`pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }`); call sites throughout `python/src/`.
 
 **Problem:** `pyo3 0.22.x` (we're pinned at 0.22.6 in Cargo.lock) ships `PyString::from_object` with a "Risk of buffer overflow" — `from_object` takes `&str` arguments and forwards them directly to the Python C API without checking for terminating NUL bytes, so the Python interpreter can read beyond the end of the `&str` data and potentially leak the contents of the OOB read by raising a Python exception containing a copy of the data including the overflow.

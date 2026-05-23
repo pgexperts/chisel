@@ -65,15 +65,12 @@ jobs:
   #     by integration" because GitHub restricts GITHUB_TOKEN's check-run
   #     write scope on push events by default.
   #
-  # Ignored advisories:
-  #   * RUSTSEC-2025-0020 — pyo3 0.22.x has a "Risk of buffer overflow
-  #     in PyString::from_object". Patched in pyo3 0.24.1+. Our python/
-  #     binding pins pyo3 = "0.22" because the upgrade from 0.22 to 0.24
-  #     is a real API migration (PyO3 has breaking changes between
-  #     majors). Surfaced when I61 unified all three subcrates' lockfiles
-  #     under a workspace Cargo.lock — pre-I61, only the root crate's
-  #     deps (no pyo3) were audited. Tracked as I75 in ISSUES.md;
-  #     remove this ignore when the pyo3 bump lands.
+  # No `ignore:` list right now. The previous RUSTSEC-2025-0020 ignore
+  # (pyo3 0.22.x PyString::from_object overflow) was removed when I75
+  # landed and bumped pyo3 from 0.22 to 0.24 (patched in 0.24.1+). If
+  # a future advisory needs ignoring, file an ISSUES.md entry
+  # explaining why before adding the ignore — don't let the list
+  # accumulate silently.
   audit:
     runs-on: ubuntu-latest
     permissions:
@@ -85,7 +82,6 @@ jobs:
       - uses: rustsec/audit-check@v1.4.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2025-0020
 
   # I55 (ISSUES.md, 2026-05-22): pin MSRV in CI. Cargo.toml declares
   # rust-version = "1.82" (the floor stabilized by Option::is_none_or in

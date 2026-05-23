@@ -17,7 +17,7 @@
 // explicit call. Mirrors the same pattern in PyTransaction.
 
 use pyo3::prelude::*;
-use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::db::PyChisel;
 
@@ -35,7 +35,12 @@ pub struct PySavepoint {
     name: String,
     // true once the savepoint has been released or rolled back; prevents
     // a context-manager __exit__ from double-firing after an explicit call.
-    finished: Cell<bool>,
+    // I75 (ISSUES.md, 2026-05-22): AtomicBool (not Cell<bool>) because
+    // PyO3 0.24+ requires `#[pyclass]` types to be Sync. Same one-shot
+    // semantics; Ordering::SeqCst is overkill for a flag that's only
+    // read after being written from the same thread, but it's the
+    // safest default and the perf delta is unmeasurable.
+    finished: AtomicBool,
 }
 
 impl PySavepoint {
@@ -43,7 +48,7 @@ impl PySavepoint {
         Self {
             db,
             name,
-            finished: Cell::new(false),
+            finished: AtomicBool::new(false),
         }
     }
 }
@@ -64,10 +69,10 @@ impl PySavepoint {
         _exc: PyObject,
         _tb: PyObject,
     ) -> PyResult<bool> {
-        if self.finished.get() {
+        if self.finished.load(Ordering::SeqCst) {
             return Ok(false);
         }
-        self.finished.set(true);
+        self.finished.store(true, Ordering::SeqCst);
         let db = self.db.bind(py).borrow();
         if !exc_type.is_none(py) {
             db.rollback_to_internal(py, &self.name)?;
@@ -84,10 +89,10 @@ impl PySavepoint {
     // path itself stays idempotent (guard short-circuits without
     // raising), so normal context-manager usage is unaffected.
     fn release(&self, py: Python<'_>) -> PyResult<()> {
-        if self.finished.get() {
+        if self.finished.load(Ordering::SeqCst) {
             return Err(already_finished_err());
         }
-        self.finished.set(true);
+        self.finished.store(true, Ordering::SeqCst);
         self.db.bind(py).borrow().release_internal(py, &self.name)
     }
 
@@ -98,10 +103,10 @@ impl PySavepoint {
     // layer with SavepointNotFound regardless. The guard here turns
     // that into a cleaner, more specific AlreadyFinishedError.
     fn rollback_to(&self, py: Python<'_>) -> PyResult<()> {
-        if self.finished.get() {
+        if self.finished.load(Ordering::SeqCst) {
             return Err(already_finished_err());
         }
-        self.finished.set(true);
+        self.finished.store(true, Ordering::SeqCst);
         self.db
             .bind(py)
             .borrow()

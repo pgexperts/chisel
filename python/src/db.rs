@@ -41,8 +41,8 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyString;
-use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use chisel::Chisel;
 
@@ -53,7 +53,27 @@ pub struct PyChisel {
     // Option<> so close() can take the inner engine and drop it
     // deterministically. After close(), is_poisoned reports true and
     // (future) mutating methods will raise PoisonedError.
-    inner: RefCell<Option<Chisel>>,
+    //
+    // I75 (ISSUES.md, 2026-05-22): Mutex (not RefCell) because PyO3
+    // 0.24+ requires `#[pyclass]` types to be Sync. RefCell is !Sync;
+    // Mutex provides Sync at near-zero uncontended cost. The
+    // GIL+Python-level serialization argument from the original
+    // pre-I75 design is still true at the Python level, but PyO3 0.24
+    // enforces Sync as a *compile-time* property the GIL cannot
+    // satisfy. Mutex also preserves the cross-thread-handoff use case
+    // (test_threading.py asserts a Chisel handle can migrate between
+    // threads — single-writer migration, not concurrent access),
+    // which the `unsendable` annotation would have forbidden.
+    //
+    // I21 (still relevant): same-thread re-entry on the lock would
+    // deadlock (std::sync::Mutex is non-reentrant) rather than
+    // panicking as RefCell did. The bug-surfacing property is
+    // preserved — both forms are noisy at the point of misuse. No
+    // current API surface invites such re-entry; if a future callback
+    // API is added, either wrap each `lock()` in `try_lock()` and
+    // raise an explicit reentrancy error, or release the lock before
+    // calling back into Python.
+    inner: Mutex<Option<Chisel>>,
 }
 
 // `DrainInsertion` mirrors `chisel::DrainInsertion` one-to-one. We use a
@@ -141,7 +161,7 @@ pub fn open(
             let s: String = if let Ok(py_str) = bound.downcast::<PyString>() {
                 py_str.to_str()?.to_owned()
             } else {
-                let os = py.import_bound("os")?;
+                let os = py.import("os")?;
                 os.call_method1("fspath", (obj,))?.extract()?
             };
             Some(PathBuf::from(s))
@@ -188,7 +208,7 @@ pub fn open(
 
     let engine = result.map_err(to_py_err)?;
     Ok(PyChisel {
-        inner: RefCell::new(Some(engine)),
+        inner: Mutex::new(Some(engine)),
     })
 }
 
@@ -204,7 +224,7 @@ impl PyChisel {
         // Chisel::close method. An in-flight transaction is silently
         // discarded by shadow paging; the last committed state remains
         // durable on disk.
-        let _ = self.inner.borrow_mut().take();
+        let _ = self.inner.lock().unwrap().take();
         Ok(())
     }
 
@@ -221,7 +241,7 @@ impl PyChisel {
 
     #[getter]
     fn is_poisoned(&self) -> bool {
-        let guard = self.inner.borrow();
+        let guard = self.inner.lock().unwrap();
         match guard.as_ref() {
             Some(c) => c.is_poisoned(),
             None => true, // closed == poisoned from the caller's POV
@@ -305,9 +325,9 @@ impl PyChisel {
     // standard dataclass ergonomics (repr, eq, frozen).
     fn stats(&self, py: Python<'_>) -> PyResult<PyObject> {
         let s = self.with_inner_io(py, |c| c.stats())?;
-        let module = py.import_bound("chisel")?;
+        let module = py.import("chisel")?;
         let cls = module.getattr("Stats")?;
-        let kwargs = pyo3::types::PyDict::new_bound(py);
+        let kwargs = pyo3::types::PyDict::new(py);
         kwargs.set_item("handle_count", s.handle_count)?;
         kwargs.set_item("total_pages", s.total_pages)?;
         kwargs.set_item("file_size_bytes", s.file_size_bytes)?;
@@ -319,9 +339,9 @@ impl PyChisel {
     // `chisel.Counters` dataclass — same shape as stats().
     fn counters(&self, py: Python<'_>) -> PyResult<PyObject> {
         let c = self.with_inner_io(py, |c| c.counters())?;
-        let module = py.import_bound("chisel")?;
+        let module = py.import("chisel")?;
         let cls = module.getattr("Counters")?;
-        let kwargs = pyo3::types::PyDict::new_bound(py);
+        let kwargs = pyo3::types::PyDict::new(py);
         kwargs.set_item("cache_hits", c.cache_hits)?;
         kwargs.set_item("cache_misses", c.cache_misses)?;
         kwargs.set_item("pages_allocated", c.pages_allocated)?;
@@ -355,9 +375,9 @@ impl PyChisel {
 
         let stats = self.with_inner_mut_io(py, |c| c.defrag(rust_opts.clone()))?;
 
-        let module = py.import_bound("chisel")?;
+        let module = py.import("chisel")?;
         let cls = module.getattr("DefragStats")?;
-        let kwargs = pyo3::types::PyDict::new_bound(py);
+        let kwargs = pyo3::types::PyDict::new(py);
         kwargs.set_item("pages_examined", stats.pages_examined)?;
         kwargs.set_item("pages_freed", stats.pages_freed)?;
         kwargs.set_item("values_moved", stats.values_moved)?;
@@ -398,7 +418,7 @@ impl PyChisel {
 // Rationale: every method that mutates or reads the engine must go
 // through one of these two helpers, so there is exactly one site where
 // "closed" collapses into PoisonedError. Bypassing them would create a
-// path where `self.inner.borrow().as_ref().unwrap()` panics a closed db.
+// path where `self.inner.lock().unwrap().as_ref().unwrap()` panics a closed db.
 impl PyChisel {
     pub(crate) fn commit_internal(&self, py: Python<'_>) -> PyResult<()> {
         self.with_inner_mut_io(py, |c| c.commit())
@@ -423,7 +443,7 @@ impl PyChisel {
         handle: u64,
     ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
         let data = self.with_inner_io(py, |c| c.read(handle))?;
-        Ok(pyo3::types::PyBytes::new_bound(py, &data))
+        Ok(pyo3::types::PyBytes::new(py, &data))
     }
 
     pub(crate) fn update_internal(
@@ -505,7 +525,7 @@ impl PyChisel {
         _py: Python<'_>,
         f: impl FnOnce(&Chisel) -> chisel::Result<R>,
     ) -> PyResult<R> {
-        let guard = self.inner.borrow();
+        let guard = self.inner.lock().unwrap();
         let c = guard.as_ref().ok_or_else(closed_err)?;
         f(c).map_err(to_py_err)
     }
@@ -515,7 +535,7 @@ impl PyChisel {
         _py: Python<'_>,
         f: impl FnOnce(&mut Chisel) -> chisel::Result<R>,
     ) -> PyResult<R> {
-        let mut guard = self.inner.borrow_mut();
+        let mut guard = self.inner.lock().unwrap();
         let c = guard.as_mut().ok_or_else(closed_err)?;
         f(c).map_err(to_py_err)
     }

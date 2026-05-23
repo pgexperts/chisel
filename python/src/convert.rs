@@ -40,10 +40,10 @@ pub fn coerce_value(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     // storage engine stores raw octets, and silently reinterpreting a
     // multi-byte-per-element buffer would hide endianness and padding
     // bugs. Callers who want that should do `.tobytes()` explicitly.
-    if let Ok(buf) = PyBuffer::<u8>::get_bound(value) {
+    if let Ok(buf) = PyBuffer::<u8>::get(value) {
         return copy_buffer_u8(value.py(), &buf);
     }
-    if let Ok(buf) = PyBuffer::<i8>::get_bound(value) {
+    if let Ok(buf) = PyBuffer::<i8>::get(value) {
         if !buf.is_c_contiguous() {
             return Err(PyTypeError::new_err(
                 "bytes-like buffer must be C-contiguous",
