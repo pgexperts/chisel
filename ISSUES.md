@@ -1018,7 +1018,7 @@ CI keeps passing today, but the warning is on every run and there is a hard cuto
 
 Low priority because runners auto-upgrade on the cutoff date anyway; medium-low because if `actions/checkout@v5` is GA before then, this is a five-minute PR that closes the warning noise immediately.
 
-#### I74. Expose `Spillway::logical_bytes` and `max_bytes` via `Chisel::stats` / `ChiselCounters` [I65 follow-up 2026-05-22] — **P3**
+#### I74. Expose `Spillway::logical_bytes` and `max_bytes` via `Chisel::stats` / `ChiselCounters` [I65 follow-up 2026-05-22] — **P3** ✅ FIXED 2026-05-22 (added `spillway_logical_bytes: Option<u64>` and `spillway_max_bytes: Option<u64>` to Stats; wired through PageCache → TransactionManager → Chisel::stats; Python `chisel.Stats` dataclass updated; integration tests in tests/spillway_integration.rs + python/tests/test_stats_defrag.py exercise the None → Some(>0) → Some(0) lifecycle)
 **Where:** `src/spillway.rs` (`logical_bytes`, `max_bytes` — currently `#[cfg(test)]`); `src/stats.rs` (`Stats` / `ChiselCounters`); `src/lib.rs` (`Chisel::stats`).
 
 **Problem:** when I65 stripped every `#[allow(dead_code)]` from `src/spillway.rs`, `Spillway::logical_bytes()` and `Spillway::max_bytes()` surfaced as legitimately unused — they had no production caller. Gating them as `#[cfg(test)]` keeps the lib build clean and preserves the methods for the test module, but throws away the chance for operators to read spillway capacity utilisation through the public stats API.

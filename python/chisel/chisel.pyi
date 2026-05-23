@@ -76,6 +76,11 @@ class Stats:
     handle_count: int
     total_pages: int
     file_size_bytes: int
+    # I74: spillway capacity — None until the spillway is first opened
+    # on an overflow spill. See chisel/__init__.py for the rationale on
+    # None-vs-Some(0).
+    spillway_logical_bytes: int | None = None
+    spillway_max_bytes: int | None = None
 
 
 @dataclass(frozen=True)

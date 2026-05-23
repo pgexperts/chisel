@@ -1456,6 +1456,17 @@ impl TransactionManager {
         Ok(self.cache.borrow().counters())
     }
 
+    /// I74 (ISSUES.md, 2026-05-22): peek the spillway's current
+    /// (logical_bytes, max_bytes) for `Chisel::stats`. `None` if the
+    /// spillway has never been opened. Routes through the same
+    /// poison check as `counters()` so a fatal-error state surfaces
+    /// here too — operators reading `stats()` get a `Poisoned`
+    /// error rather than stale-looking Some(0,0).
+    pub fn spillway_capacity(&self) -> Result<Option<(u64, u64)>> {
+        self.check_alive()?;
+        Ok(self.cache.borrow().spillway_capacity())
+    }
+
     // --- Named roots (ISSUES.md F2) ---
     //
     // The named-root table lives inside the superblock (see

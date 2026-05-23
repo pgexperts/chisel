@@ -278,3 +278,76 @@ fn crash_mid_spill_recovers_to_last_committed_state() {
         "spillway must be truncated to zero after open + commit (garbage from crash must be gone)"
     );
 }
+
+// I74 (ISSUES.md, 2026-05-22): Stats exposes the spillway's current
+// (logical_bytes, max_bytes) as Optional fields. The lazy-construction
+// of the spillway means the values transition through three observable
+// states across the workload below:
+//
+//   1. Fresh open, no spill ever happened → both fields are None.
+//   2. After an overflow allocation that triggered a spill → both fields
+//      are Some, and logical_bytes > 0.
+//   3. After commit (which truncates the spillway) → both fields are
+//      still Some, but logical_bytes == 0 (spillway exists, currently
+//      drained — operators see "we have spilled before, might again").
+#[test]
+fn stats_exposes_spillway_capacity_across_lifecycle() {
+    let cache_max_bytes = 16 * 8192; // 16 pages — tiny cache to force a spill
+    let spillway_cap = 1024u64 * cache_max_bytes as u64;
+    let opts = Options::default()
+        .cache_max_bytes(cache_max_bytes)
+        .spillway_max_bytes(spillway_cap)
+        .drain_insertion(DrainInsertion::LruTail);
+
+    let mut db = Chisel::open_in_memory_with_options(opts).unwrap();
+
+    // Phase 1: fresh open — spillway has not yet been constructed.
+    let s = db.stats().unwrap();
+    assert_eq!(
+        s.spillway_logical_bytes, None,
+        "fresh handle: spillway has never been opened"
+    );
+    assert_eq!(
+        s.spillway_max_bytes, None,
+        "fresh handle: spillway has never been opened"
+    );
+
+    // Phase 2: allocate enough to force at least one spill. 200 × 1 KB
+    // payloads against a 16-page cache definitely overflows. The
+    // spillway is constructed lazily on the first overflow; after
+    // these allocations it MUST exist (Some(_)).
+    db.begin().unwrap();
+    for i in 0..200 {
+        let payload = vec![i as u8; 1024];
+        db.allocate(&payload).unwrap();
+    }
+    let s = db.stats().unwrap();
+    assert!(
+        s.spillway_logical_bytes.is_some(),
+        "after overflow workload: spillway must have been opened"
+    );
+    assert!(
+        s.spillway_logical_bytes.unwrap() > 0,
+        "after overflow workload: spillway must hold at least one spilled page"
+    );
+    assert_eq!(
+        s.spillway_max_bytes,
+        Some(spillway_cap),
+        "max_bytes must report the configured cap"
+    );
+
+    // Phase 3: commit truncates the spillway. The spillway object
+    // persists (still Some), but logical_bytes drops to 0.
+    db.commit().unwrap();
+    let s = db.stats().unwrap();
+    assert_eq!(
+        s.spillway_logical_bytes,
+        Some(0),
+        "post-commit: spillway exists but is drained"
+    );
+    assert_eq!(
+        s.spillway_max_bytes,
+        Some(spillway_cap),
+        "max_bytes is unchanged across commit"
+    );
+}
