@@ -63,3 +63,10 @@ tempfile = "3"
 # `dual_backing_test!` macro in tests/common/mod.rs to construct
 # `_file` / `_memory` test-fn identifiers. See I72 in ISSUES.md.
 pastey = "0.1"
+# I71 (ISSUES.md, 2026-05-22): `proptest` powers the byte-roundtrip
+# property tests in src/superblock.rs, src/data_page.rs, and
+# src/freemap.rs. Dev-dep only — never reaches the published crate's
+# dependency tree. Default-feature shrinking is the killer feature
+# here: when a property fails, proptest finds the minimal failing
+# input rather than dumping a 10000-byte buffer.
+proptest = "1"

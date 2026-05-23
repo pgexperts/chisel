@@ -960,14 +960,14 @@ let resolved_spillway_max_bytes = spillway_max_bytes.unwrap_or_else(|| cache_max
 
 ### Test coverage gaps
 
-#### I70. No `#[should_panic]` tests for `unreachable!` / `expect` invariant sites [deepdive 2026-05-22] — **P3**
+#### I70. No `#[should_panic]` tests for `unreachable!` / `expect` invariant sites [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22 (reframed post-Group F: typed CorruptPage variant contract covered by `corrupt_page_variant_contract` in src/error.rs; integration-test coverage of the I14 path already existed in src/recovery_tests.rs)
 **Where:** test coverage for `src/transaction.rs:1375` (`unreachable!`), `src/page_cache.rs:865` (`expect`), `src/transaction.rs:1846` (`expect`)
 
 **Problem:** the codebase has good regression tests for documented invariants (I1, I3, I7, I18, I27, I28, I29 all have dedicated tests). The `unreachable!` and `expect` sites name invariants but don't have tests that exercise the invariant-violating path.
 
 **Direction of fix:** lower priority — and if I45 + I49 convert these to typed `CorruptPage` errors, this finding becomes a test for the `CorruptPage` arm instead. Wait for those decisions; revisit afterward.
 
-#### I71. No property tests (`proptest` / `quickcheck`) for byte-roundtrip code [deepdive 2026-05-22] — **P3**
+#### I71. No property tests (`proptest` / `quickcheck`) for byte-roundtrip code [deepdive 2026-05-22] — **P3** ✅ FIXED 2026-05-22
 **Where:** test coverage for `Superblock::serialize` / `deserialize`, `DataPage` slot packing, freemap bitmap operations
 
 **Problem:** the existing targeted tests cover known cases well; property tests would cover the unknown ones. `Superblock::serialize` round-trips, slot-packing fill / compact invariants, and freemap bit operations are all natural fits.
