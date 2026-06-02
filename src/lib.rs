@@ -489,6 +489,19 @@ impl Chisel {
         self.txm.delete(handle)
     }
 
+    /// Remove a handle only if its tag equals `tag`. Returns
+    /// `ChiselError::TagMismatch` (leaving the chunk and membership index
+    /// untouched) if the stored tag differs. On success, delegates to
+    /// `delete`, so the membership index is self-maintained.
+    ///
+    /// Use this when the caller wants to assert ownership (a stale or
+    /// mis-directed handle should not silently delete the wrong chunk).
+    /// `delete` remains the unchecked fast path for callers that trust
+    /// their handle provenance.
+    pub fn delete_tagged(&mut self, handle: u64, tag: u32) -> Result<()> {
+        self.txm.delete_tagged(handle, tag)
+    }
+
     /// Delete many handles in one transaction (ISSUES.md F1 / I12).
     ///
     /// Motivating use case (from the primary Chisel client): bulk

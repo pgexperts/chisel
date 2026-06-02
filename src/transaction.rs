@@ -1532,6 +1532,40 @@ impl TransactionManager {
         Ok(())
     }
 
+    pub fn delete_tagged(&mut self, handle: u64, tag: u32) -> Result<()> {
+        self.check_alive()?;
+        let result = self.delete_tagged_inner(handle, tag);
+        self.poison_on_fatal(result)
+    }
+
+    fn delete_tagged_inner(&mut self, handle: u64, tag: u32) -> Result<()> {
+        if !self.active_txn {
+            return Err(ChiselError::NoActiveTransaction);
+        }
+        // Lookup-then-delete: verify the tag before mutating anything, so a wrong
+        // tag leaves both the chunk and the membership index untouched. The extra
+        // lookup walk (delete_inner walks again) is the price of verify-before-mutate.
+        let actual = {
+            let root = self.current_roots.handle_table_page;
+            if root == PAGE_ID_NONE {
+                return Err(ChiselError::InvalidHandle(handle));
+            }
+            let mut cache = self.cache.borrow_mut();
+            self.handle_table
+                .lookup(&mut cache, root, handle)?
+                .ok_or(ChiselError::InvalidHandle(handle))?
+                .tag
+        };
+        if actual != tag {
+            return Err(ChiselError::TagMismatch {
+                handle,
+                expected: tag,
+                actual,
+            });
+        }
+        self.delete_inner(handle)
+    }
+
     /// Delete many handles in a single transaction.
     ///
     /// Today: this is a loop over `delete_inner`. After PR-A's fusion
@@ -2690,6 +2724,23 @@ mod tests {
         tm.commit().unwrap();
         // The tag's last member is gone -> handles_with_tag is empty.
         assert_eq!(tm.handles_with_tag(7).unwrap(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn delete_tagged_rejects_wrong_tag() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let h = tm.allocate_tagged(b"row", 5).unwrap();
+        // Wrong tag: error, nothing deleted, index intact.
+        let err = tm.delete_tagged(h, 6).unwrap_err();
+        assert!(
+            matches!(err, ChiselError::TagMismatch { handle, expected: 6, actual: 5 } if handle == h)
+        );
+        assert_eq!(tm.handles_with_tag(5).unwrap(), vec![h]);
+        // Right tag: deletes (and self-maintains the index via delete_inner).
+        tm.delete_tagged(h, 5).unwrap();
+        assert_eq!(tm.handles_with_tag(5).unwrap(), Vec::<u64>::new());
+        tm.commit().unwrap();
     }
 
     #[test]
