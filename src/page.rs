@@ -119,7 +119,7 @@ pub const MAGIC: u32 = 0x4348534C; // "CHSL"
 // major byte = 0 and are rejected with UnsupportedFormatVersion — a
 // clean break, since there are no production DBs yet.
 pub const FORMAT_MAJOR_VERSION: u16 = 1;
-pub const FORMAT_MINOR_VERSION: u16 = 0;
+pub const FORMAT_MINOR_VERSION: u16 = 1;
 
 /// Pack a (major, minor) pair into the on-disk u32 format version.
 pub const fn pack_format_version(major: u16, minor: u16) -> u32 {
@@ -161,6 +161,8 @@ pub enum PageType {
     Data = 0x02,
     Overflow = 0x03,
     FreeMap = 0x04,
+    MembershipInterior = 0x05,
+    MembershipLeaf = 0x06,
 }
 
 impl PageType {
@@ -181,6 +183,8 @@ impl PageType {
             0x02 => Some(PageType::Data),
             0x03 => Some(PageType::Overflow),
             0x04 => Some(PageType::FreeMap),
+            0x05 => Some(PageType::MembershipInterior),
+            0x06 => Some(PageType::MembershipLeaf),
             _ => None,
         }
     }
@@ -386,13 +390,15 @@ mod tests {
         assert_eq!(PageType::from_u8(0x02), Some(PageType::Data));
         assert_eq!(PageType::from_u8(0x03), Some(PageType::Overflow));
         assert_eq!(PageType::from_u8(0x04), Some(PageType::FreeMap));
+        assert_eq!(PageType::from_u8(0x05), Some(PageType::MembershipInterior));
+        assert_eq!(PageType::from_u8(0x06), Some(PageType::MembershipLeaf));
     }
 
     #[test]
     fn test_page_type_from_u8_rejects_zero_and_unknown() {
         // 0x00 is reserved so a zeroed page cannot impersonate a valid type.
         assert_eq!(PageType::from_u8(0x00), None);
-        assert_eq!(PageType::from_u8(0x05), None);
+        assert_eq!(PageType::from_u8(0x07), None);
         assert_eq!(PageType::from_u8(0xFF), None);
     }
 
