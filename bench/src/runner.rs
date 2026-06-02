@@ -257,7 +257,9 @@ pub fn apply_op(
             // region. Every timed read path (scenario tier, warm/cold micro-grid
             // rows, drive_workload_with_tx_granularity) funnels through here, so
             // this one site covers them all.
-            let value = engine.read(std::hint::black_box(resolve(*alloc_index))).unwrap();
+            let value = engine
+                .read(std::hint::black_box(resolve(*alloc_index)))
+                .unwrap();
             std::hint::black_box(value);
         }
         Operation::Update { alloc_index, size } => {
