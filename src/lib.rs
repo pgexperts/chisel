@@ -442,6 +442,28 @@ impl Chisel {
         self.txm.allocate(value)
     }
 
+    /// Store `value` tagged with `tag` and return a freshly minted stable handle.
+    /// Like `allocate`, but additionally registers the handle in the reverse
+    /// membership index (tag→handles) so `handles_with_tag(tag)` can enumerate it.
+    /// Tag 0 is the "untagged" sentinel — prefer plain `allocate` for untagged
+    /// values; the membership index is not updated for tag 0.
+    pub fn allocate_tagged(&mut self, value: &[u8], tag: u32) -> Result<u64> {
+        self.txm.allocate_tagged(value, tag)
+    }
+
+    /// Return the tag stored in the handle-table entry for `handle`.
+    /// Returns 0 for untagged handles. Takes `&self` (F3).
+    pub fn tag(&self, handle: u64) -> Result<u32> {
+        self.txm.tag(handle)
+    }
+
+    /// Enumerate all live handles that carry `tag`. Returns an empty Vec if
+    /// no handles with that tag exist. Tag 0 always returns an empty Vec
+    /// (the membership index is not updated for untagged values). Takes `&self` (F3).
+    pub fn handles_with_tag(&self, tag: u32) -> Result<Vec<u64>> {
+        self.txm.handles_with_tag(tag)
+    }
+
     /// Read the current value for `handle`. Takes `&self` — the page cache
     /// is mutated on miss (LRU bookkeeping, page loading) via interior
     /// mutability (see F3 in ISSUES.md). The returned `Vec<u8>` is a copy;

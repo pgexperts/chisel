@@ -139,9 +139,6 @@ pub struct TransactionManager {
     handle_table: HandleTable,
     /// In-memory state for the membership index (chunk tags). Holds only the
     /// outer tree's depth; the root lives in current/committed `Roots`.
-    // Tag operations are wired in a follow-on task; suppress dead_code until
-    // the first read site exists.
-    #[allow(dead_code)]
     membership_index: MembershipIndex,
     // Monotonically increasing. Written into each new superblock; the higher value
     // wins on recovery. Also used to pick the inactive slot on commit via
@@ -1153,11 +1150,17 @@ impl TransactionManager {
     /// untouched on disk until commit swaps the superblock.
     pub fn allocate(&mut self, value: &[u8]) -> Result<u64> {
         self.check_alive()?;
-        let result = self.allocate_inner(value);
+        let result = self.allocate_inner(value, 0);
         self.poison_on_fatal(result)
     }
 
-    fn allocate_inner(&mut self, value: &[u8]) -> Result<u64> {
+    pub fn allocate_tagged(&mut self, value: &[u8], tag: u32) -> Result<u64> {
+        self.check_alive()?;
+        let result = self.allocate_inner(value, tag);
+        self.poison_on_fatal(result)
+    }
+
+    fn allocate_inner(&mut self, value: &[u8], tag: u32) -> Result<u64> {
         if !self.active_txn {
             return Err(ChiselError::NoActiveTransaction);
         }
@@ -1174,7 +1177,7 @@ impl TransactionManager {
                 page_id: first_page,
                 slot_index: 0,
                 flags: HandleFlags::Overflow,
-                tag: 0,
+                tag,
             }
         } else {
             let (data_page_id, slot) = self.insert_into_data_page(value)?;
@@ -1182,7 +1185,7 @@ impl TransactionManager {
                 page_id: data_page_id,
                 slot_index: slot,
                 flags: HandleFlags::Live,
-                tag: 0,
+                tag,
             }
         };
 
@@ -1198,7 +1201,63 @@ impl TransactionManager {
         };
         self.current_roots.handle_table_page = new_root;
 
+        // Tagged chunks join the reverse membership index (tag 0 = untagged, no
+        // index work). The forward handle->tag mapping is the HandleEntry.tag
+        // written above; this is the reverse tag->handles mapping that powers
+        // handles_with_tag / delete-by-tag. Both must agree at all times.
+        if tag != 0 {
+            let new_index_root = {
+                let mut cache = self.cache.borrow_mut();
+                self.membership_index.insert(
+                    &mut cache,
+                    self.current_roots.membership_index_page,
+                    tag,
+                    handle,
+                )?
+            };
+            self.current_roots.membership_index_page = new_index_root;
+        }
+
         Ok(handle)
+    }
+
+    pub fn tag(&self, handle: u64) -> Result<u32> {
+        self.check_alive()?;
+        let result = self.tag_inner(handle);
+        self.poison_on_fatal(result)
+    }
+
+    fn tag_inner(&self, handle: u64) -> Result<u32> {
+        let root = if self.active_txn {
+            self.current_roots.handle_table_page
+        } else {
+            self.committed_roots.handle_table_page
+        };
+        if root == PAGE_ID_NONE {
+            return Err(ChiselError::InvalidHandle(handle));
+        }
+        let mut cache = self.cache.borrow_mut();
+        let entry = self
+            .handle_table
+            .lookup(&mut cache, root, handle)?
+            .ok_or(ChiselError::InvalidHandle(handle))?;
+        Ok(entry.tag)
+    }
+
+    pub fn handles_with_tag(&self, tag: u32) -> Result<Vec<u64>> {
+        self.check_alive()?;
+        let result = self.handles_with_tag_inner(tag);
+        self.poison_on_fatal(result)
+    }
+
+    fn handles_with_tag_inner(&self, tag: u32) -> Result<Vec<u64>> {
+        let root = if self.active_txn {
+            self.current_roots.membership_index_page
+        } else {
+            self.committed_roots.membership_index_page
+        };
+        let mut cache = self.cache.borrow_mut();
+        self.membership_index.handles_for_tag(&mut cache, root, tag)
     }
 
     /// Read a value by handle.
@@ -1321,6 +1380,10 @@ impl TransactionManager {
             HandleFlags::Deleted => {}
         }
 
+        // Tags are immutable: update relocates the value but must carry the old
+        // entry's tag forward, keeping HandleEntry.tag and the membership index
+        // in agreement (the handle and its tag are unchanged, so the index needs
+        // no edit — only the value's storage moves).
         let new_entry = if value.len() > MAX_INLINE_VALUE {
             let first_page = {
                 let mut cache = self.cache.borrow_mut();
@@ -1330,7 +1393,7 @@ impl TransactionManager {
                 page_id: first_page,
                 slot_index: 0,
                 flags: HandleFlags::Overflow,
-                tag: 0,
+                tag: entry.tag,
             }
         } else {
             let (data_page_id, slot) = self.insert_into_data_page(value)?;
@@ -1338,7 +1401,7 @@ impl TransactionManager {
                 page_id: data_page_id,
                 slot_index: slot,
                 flags: HandleFlags::Live,
-                tag: 0,
+                tag: entry.tag,
             }
         };
 
@@ -2470,6 +2533,34 @@ mod tests {
                 Ok(_) => panic!("expected UnsupportedFormatVersion, got Ok"),
             }
         }
+    }
+
+    #[test]
+    fn allocate_tagged_then_tag_and_handles_with_tag() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let h = tm.allocate_tagged(b"row", 42).unwrap();
+        let u = tm.allocate(b"untagged").unwrap();
+        tm.commit().unwrap();
+        assert_eq!(tm.tag(h).unwrap(), 42);
+        assert_eq!(tm.tag(u).unwrap(), 0);
+        assert_eq!(tm.handles_with_tag(42).unwrap(), vec![h]);
+        assert_eq!(tm.handles_with_tag(99).unwrap(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn update_preserves_immutable_tag() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let h = tm.allocate_tagged(b"v1", 42).unwrap();
+        tm.commit().unwrap();
+        tm.begin().unwrap();
+        tm.update(h, b"v2").unwrap();
+        tm.commit().unwrap();
+        // Tags are immutable: changing the value must NOT change the tag, and the
+        // membership index must still list the handle under its original tag.
+        assert_eq!(tm.tag(h).unwrap(), 42);
+        assert_eq!(tm.handles_with_tag(42).unwrap(), vec![h]);
     }
 
     // ── Migrated 2026-05-22 from tests/transactions.rs (I35 reshape) ──
