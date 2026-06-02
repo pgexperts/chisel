@@ -1003,6 +1003,18 @@ impl TransactionManager {
         }
 
         self.current_roots = self.committed_roots.clone();
+        // C1: MembershipIndex.outer_depth is in-memory state that index grows
+        // mutate during the transaction, but it is NOT carried in Roots, so the
+        // snapshot restore above does not rewind it. Re-derive it from the (now
+        // committed) root — mirroring the open-time recovery — so the in-memory
+        // descent depth matches the page it descends. Otherwise handles_with_tag
+        // mis-descends a rolled-back-shallow root with a stale-deep depth.
+        {
+            let mut cache = self.cache.borrow_mut();
+            let depth =
+                RadixU64::recover_depth(&mut cache, self.current_roots.membership_index_page)?;
+            self.membership_index.set_outer_depth(depth);
+        }
         // Revert the freemap working copy — any marks (free or allocate)
         // made during the transaction are discarded.
         self.current_freemap = self.committed_freemap.clone();
@@ -1086,6 +1098,13 @@ impl TransactionManager {
         self.cache.borrow_mut().truncate(watermark)?;
 
         self.current_roots = self.savepoints[idx].roots.clone();
+        // C1: re-derive outer_depth from the restored savepoint root (see rollback_inner).
+        {
+            let mut cache = self.cache.borrow_mut();
+            let depth =
+                RadixU64::recover_depth(&mut cache, self.current_roots.membership_index_page)?;
+            self.membership_index.set_outer_depth(depth);
+        }
         // R1: restore live-slot counts and cursor from the savepoint
         // snapshot. The cursor was force-cleared when the savepoint was
         // created, so this sets the cursor back to whatever value it
@@ -2044,6 +2063,47 @@ mod tests {
         tm.begin().unwrap();
         tm.commit().unwrap();
         tm
+    }
+
+    #[test]
+    fn tagged_membership_survives_rolled_back_outer_grow() {
+        let mut tm = fresh_manager();
+        // Commit a small tag; the outer (tag-keyed) tree stays depth 0.
+        tm.begin().unwrap();
+        let h = tm.allocate_tagged(b"keep", 3).unwrap();
+        tm.commit().unwrap();
+        assert_eq!(tm.handles_with_tag(3).unwrap(), vec![h]);
+        // New txn: a tag >= 1021 forces the outer tree to grow (depth 0 -> 1).
+        // Roll back. The grown root is discarded and current_roots snaps back to
+        // the depth-0 committed root; outer_depth must be restored to match.
+        tm.begin().unwrap();
+        let _ = tm.allocate_tagged(b"discard", 5000).unwrap();
+        tm.rollback().unwrap();
+        // The committed small tag must still be readable (was silently lost before the fix).
+        assert_eq!(
+            tm.handles_with_tag(3).unwrap(),
+            vec![h],
+            "rolled-back outer grow corrupted committed membership"
+        );
+        assert_eq!(tm.tag(h).unwrap(), 3);
+        // The discarded tag is gone.
+        assert_eq!(tm.handles_with_tag(5000).unwrap(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn tagged_membership_survives_rollback_to_savepoint() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let h = tm.allocate_tagged(b"keep", 7).unwrap();
+        tm.savepoint("sp").unwrap();
+        // Grow the outer tree past depth 0 inside the savepoint, then roll back to it.
+        let _ = tm.allocate_tagged(b"discard", 6000).unwrap();
+        tm.rollback_to("sp").unwrap();
+        // Still inside the active txn: the pre-savepoint tag must remain readable.
+        assert_eq!(tm.handles_with_tag(7).unwrap(), vec![h]);
+        assert_eq!(tm.handles_with_tag(6000).unwrap(), Vec::<u64>::new());
+        tm.commit().unwrap();
+        assert_eq!(tm.handles_with_tag(7).unwrap(), vec![h]);
     }
 
     // Regression test for ISSUES.md I1. Once the manager is poisoned,
