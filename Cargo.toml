@@ -70,3 +70,37 @@ pastey = "0.1"
 # here: when a property fails, proptest finds the minimal failing
 # input rather than dumping a 10000-byte buffer.
 proptest = "1"
+
+# ---------------------------------------------------------------------------
+# Build profiles (I91). These live at the WORKSPACE ROOT, so they affect only
+# builds performed *inside this repo* (benches, tests, examples, local release
+# builds). Cargo ignores a dependency's profile settings — a downstream crate
+# that depends on `chisel` is unaffected; its own `[profile.release]` governs.
+# This is the consumer-neutral way to tune: the published library forces
+# nothing on its users.
+#
+# Motivation: the cross-engine bench grid compiles `chisel` and `redb` under
+# Cargo's Rust profile, while `rusqlite` (bundled) compiles SQLite's C at its
+# own -O2. Untuned, the two Rust engines built at lto=false / codegen-units=16
+# — weaker codegen than the C competitor — biasing the headline comparison.
+# fat LTO + one codegen unit closes that gap (whole-program cross-crate
+# inlining), putting the Rust engines on codegen parity with bundled SQLite.
+#
+# Cost: `cargo bench` / `cargo build --release` compile noticeably slower. The
+# gating CI jobs (test/clippy/fmt) build in the dev profile and are unaffected;
+# only the report-only bench job and explicit release builds pay it. For fast
+# local iteration on a bench, temporarily switch `lto = "fat"` to `lto = "thin"`
+# (~80% of the win at a fraction of the compile cost). Re-record tracked bench
+# baselines after this lands — the shift is uniform, not a regression.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# Profiled builds (samply / Instruments / cargo-flamegraph) need line-table
+# debuginfo that `release` omits. Select with
+# `cargo build --profile release-with-debug`. Used when measuring the engine
+# optimizations the 2026-06-01 review queued behind this groundwork (I77, I78).
+[profile.release-with-debug]
+inherits = "release"
+debug = "line-tables-only"
