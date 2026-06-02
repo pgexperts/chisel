@@ -1,7 +1,7 @@
 # Chunk Tags — Design Spec
 
 - **Date:** 2026-06-02
-- **Status:** approved design, pending implementation plan
+- **Status:** approved design (open questions resolved 2026-06-02), pending implementation plan
 - **Source:** brainstorm with the primary Chisel client (relational layer)
 
 ## Summary
@@ -10,7 +10,7 @@ Add an optional, immutable `u32` "chunk tag" to each chunk (handle). The tag is 
 client-supplied, opaque grouping key — in the relational layer that builds on Chisel,
 one tag per *relation* (table or index), and a chunk's tag is the relation it belongs
 to. Chisel maintains a reverse membership index (`tag → {handles}`) so the client can
-sequentially scan a relation, drop a relation in one pass, and remove a single chunk
+sequentially scan a relation, drop a relation incrementally, and remove a single chunk
 from its relation without scanning. Untagged chunks (the common case for any
 non-relational use of Chisel) cost nothing — they never enter the index and carry only a
 sentinel tag value.
@@ -25,9 +25,9 @@ A relational database layered on Chisel needs to track which chunks make up each
 relation, for three operations the engine cannot currently do efficiently:
 
 1. **Sequential scan** of a relation — enumerate all chunks of one table/index.
-2. **Drop** a relation — delete all its chunks in one transaction. (This also closes the
-   existing `drop_table` / `drop_index_table` handle-and-page leak tracked as F1 / I12:
-   today those operations orphan row/node handles that only `defrag` eventually reclaims.)
+2. **Drop** a relation — delete all its chunks. (This also closes the existing
+   `drop_table` / `drop_index_table` handle-and-page leak tracked as F1 / I12: today those
+   operations orphan row/node handles that only `defrag` eventually reclaims.)
 3. **Single-chunk delete** that also removes the chunk from its relation's membership,
    without scanning the membership to find it.
 
@@ -55,12 +55,10 @@ These were settled during the brainstorm; each entry records the decision and wh
    forced by the storage choice.)
 4. **The forward tag lives in the `HandleEntry` reserved bytes.** The full `u32` occupies 4
    of the 5 currently-reserved bytes of each 16-byte handle entry. Consequences:
-   - No data-page format change and no separate side structure: the tag rides the handle
-     entry, which every read/update/delete already loads, so reading the tag adds *zero*
-     page reads.
-   - `tag_of(handle)` is `O(1)` — a field read off the entry. (This dissolves the earlier
-     `O(T)` skip-scan workaround, which only existed to compensate for *not* storing the
-     tag forward.)
+   - No data-page format change and no side structure: the tag rides the handle entry,
+     which every read/update/delete already loads, so reading the tag adds *zero* page
+     reads.
+   - `tag(handle)` is `O(1)` — a field read off the entry.
    - A bare `delete(handle)` self-maintains the index: it reads the tag from the entry and
      removes `(tag, handle)` from the membership index with no client cooperation.
    - No separate "tagged" flag bit is needed; `tag == 0` encodes "untagged."
@@ -94,28 +92,38 @@ today except for the (zero) tag bytes and the (zero) superblock field.
 
 ## API surface
 
-Names are provisional; the implementation plan can refine them. Rust core (mirrored in
-`chisel-py`):
+Names follow the existing Chisel idioms: CRUD verbs (`allocate`/`read`/`update`/`delete`);
+the `_tagged` qualifier for single-handle operations that take a tag (cf. `delete_many`);
+the `_with_tag` qualifier for operations over the set of handles bearing a tag; the
+bare-noun accessor style (`handles`, `stats`, `tag`); and `defrag`'s bounded-work-returns-
+progress shape for the drop. Rust core, mirrored in `chisel-py`:
 
 - `allocate_tagged(&mut self, value: &[u8], tag: u32) -> Result<u64>` — allocate a chunk
-  and set its tag. `tag == 0` is equivalent to `allocate()` (untagged). Inserts
+  and set its (immutable) tag. `tag == 0` is exactly `allocate()` (untagged). Inserts
   `(tag, handle)` into the membership index when `tag != 0`.
-- `tag_of(&self, handle: u64) -> Result<u32>` — the chunk's tag (`0` if untagged). `O(1)`.
-- `for_each_with_tag(&self, tag: u32, f: impl FnMut(u64)) -> Result<()>` — enumerate the
-  handles of a tag (callback, mirroring the I97 enumeration shape so large memberships do
-  not materialize). `handles_with_tag(tag) -> Result<Vec<u64>>` is the eager convenience.
-- `delete_all_with_tag(&mut self, tag: u32) -> Result<usize>` — delete every chunk of a
-  tag (its value/overflow pages freed) and drop the tag's inner subtree + outer entry.
-  Returns the count deleted. This is the relation-drop primitive (closes F1 / I12).
-- `delete(&mut self, handle: u64)` — unchanged signature; now also removes `(tag, handle)`
-  from the index if the chunk is tagged (self-maintaining).
-- `delete_tagged(&mut self, handle: u64, tag: u32) -> Result<()>` — optional defensive
-  variant that verifies `(tag, handle)` is present in the index before deleting, erroring
-  if not (catches a caller passing the wrong tag). Since a chunk has exactly one tag,
-  `(tag, handle)` exists only for the correct tag, so the check is total.
+- `tag(&self, handle: u64) -> Result<u32>` — the chunk's tag (`0` if untagged). `O(1)`
+  (a field read off the handle entry).
+- `handles_with_tag(&self, tag: u32) -> Result<Vec<u64>>` — the handles of a tag, parallel
+  to `handles()`. (A callback variant — `for_each_handle_with_tag` — can follow once I97's
+  `for_each_handle` shape lands, so very large memberships need not materialize.)
+- `delete(&mut self, handle: u64) -> Result<()>` — **the fast path, unchanged signature.**
+  Self-maintaining: it reads the tag from the handle entry (free — the entry is loaded
+  anyway) and, if tagged, removes `(tag, handle)` from the index. Untagged chunks do no
+  index work. No tag argument; correct by construction because the tag comes from the entry.
+- `delete_tagged(&mut self, handle: u64, tag: u32) -> Result<()>` — the specialized,
+  defensive variant: asserts the chunk's tag equals `tag` (typed error on mismatch) before
+  deleting. For callers that want to assert membership rather than trust it.
+- `delete_with_tag(&mut self, tag: u32, max: usize) -> Result<TagDropProgress>` — delete up
+  to `max` chunks of a tag (each chunk's value/overflow pages freed; an emptied inner
+  subtree + outer entry dropped). Returns `TagDropProgress { deleted: usize, complete: bool }`.
+  **Bounded** so a large relation drops incrementally: the caller loops
+  `begin → delete_with_tag → commit` until `complete`, each batch a bounded, separately-
+  durable transaction. This is the relation-drop primitive (closes F1 / I12). Operates
+  within the active transaction, like `delete_many`. The `max` bound doubles as a cap on the
+  transaction's working set, keeping each batch within the cache/spillway budget.
 
-`read`/`update` are unchanged except that `update` copies the (immutable) tag forward when
-it COWs the handle entry.
+`read` / `update` are unchanged except that `update` copies the (immutable) tag forward
+when it COWs the handle entry.
 
 ## Operation semantics and cost
 
@@ -125,16 +133,16 @@ it COWs the handle entry.
 | `read` / `update` | unchanged; `update` preserves tag on entry COW | unchanged |
 | `delete(h)` | read tag from entry; if tagged, remove `(tag, h)` from index; delete chunk | chunk delete + COW the index path |
 | `delete_tagged(h, t)` | verify `(t, h)` present (error if not) then as `delete` | + one keyed index lookup |
-| `tag_of(h)` | read tag field off the handle entry | `O(1)` (handle-table lookup already done) |
-| `for_each_with_tag(t)` | enumerate tag `t`'s inner radix | `O(members of t)`, sequential |
-| `delete_all_with_tag(t)` | enumerate + delete each member + drop subtree | `O(members of t)`, one transaction (~3 fsyncs total) |
+| `tag(h)` | read tag field off the handle entry | `O(1)` (handle-table lookup already done) |
+| `handles_with_tag(t)` | enumerate tag `t`'s inner radix | `O(members of t)`, sequential |
+| `delete_with_tag(t, max)` | enumerate up to `max` members, delete each, drop emptied subtree/entry | `O(min(max, members))` per call, one bounded transaction |
 
 **Untagged chunks cost nothing extra:** tag `0`, no index entry, no index COW. The feature
 is invisible to any workload that does not use it.
 
-When a tag's last member is deleted (via `delete`/`delete_tagged`), its now-empty inner
-radix root is freed and the outer entry removed, so a tag occupies index space only while
-it has members.
+When a tag's last member is deleted — via `delete` / `delete_tagged`, or as the final batch
+of `delete_with_tag` — its now-empty inner radix root is freed and the outer entry removed,
+so a tag occupies index space only while it has members.
 
 ## Transaction, durability, and poison semantics
 
@@ -173,7 +181,7 @@ additions, and the API. It is "more of what Chisel already does."
 - **Wrong tag on `delete_tagged`:** the membership verification fails → typed error; the
   index is never silently desynced. (A bare `delete` cannot pass a wrong tag because it
   reads the correct tag from the entry itself.)
-- **Untagged chunk:** tag `0`, no index entry; `tag_of` returns `0`; `delete` skips index
+- **Untagged chunk:** tag `0`, no index entry; `tag` returns `0`; `delete` skips index
   maintenance.
 - **Backward compatibility:** an old database opens with all chunks untagged and an empty
   membership index, with no migration step.
@@ -182,15 +190,21 @@ additions, and the API. It is "more of what Chisel already does."
 - **Re-tagging:** unsupported by design; the client creates a new chunk and deletes the old
   (the new chunk gets a new handle — the client is responsible for updating any of its own
   references, exactly as it would for any value it chooses to relocate).
+- **Partial drop:** `delete_with_tag` returning `complete == false` leaves the tag with its
+  remaining members intact and consistent; the next batch resumes. A crash between batches
+  loses only the uncommitted batch (each committed batch is durable).
 
 ## Testing surface
 
-- Round-trip: `allocate_tagged` → `tag_of` matches; `for_each_with_tag` returns exactly the
-  members; `delete_all_with_tag` removes all members and frees their value/overflow pages.
-- Untagged: tag `0` creates no index entry; `tag_of` returns `0`; zero index growth.
+- Round-trip: `allocate_tagged` → `tag` matches; `handles_with_tag` returns exactly the
+  members; `delete_with_tag` removes them and frees their value/overflow pages.
+- Untagged: tag `0` creates no index entry; `tag` returns `0`; zero index growth.
 - Self-maintaining delete: `delete(h)` of a tagged chunk removes its index entry; iterating
   the tag afterward does not return it.
 - `delete_tagged` with the wrong tag errors and leaves the index intact.
+- Bounded incremental drop: `delete_with_tag(t, max)` deletes at most `max`, reports
+  `complete` correctly, and a loop to completion removes every member exactly once; a
+  committed batch survives a simulated crash mid-loop.
 - Empty-tag reclaim: deleting a tag's last member frees the inner root and removes the outer
   entry.
 - COW / rollback: tagged ops inside a transaction revert on rollback (index returns to the
@@ -201,8 +215,8 @@ additions, and the API. It is "more of what Chisel already does."
   empty index.
 - Format round-trips: `HandleEntry` tag bytes and the superblock membership root serialize
   and deserialize losslessly.
-- F1 / I12 regression: dropping a relation via `delete_all_with_tag` leaks no handles or
-  pages (the original motivation).
+- F1 / I12 regression: dropping a relation via `delete_with_tag` leaks no handles or pages
+  (the original motivation).
 - Both backends (in-memory and file) and the cross-engine bench harness exercise the new
   paths.
 
@@ -214,31 +228,38 @@ additions, and the API. It is "more of what Chisel already does."
 - No change to the commit fsync protocol, the pre-drain (I28), the poison model (I1), the
   checksum coverage, the layer dependency graph, or the single-writer contract.
 - `PageType = 0x00` reservation untouched; the membership-index pages are ordinary radix
-  pages with their own page type and checksum.
+  pages with their own (nonzero) page type and checksum.
+
+## Resolved decisions (2026-06-02 review)
+
+- **API names** follow the existing idioms (see API surface): `_tagged` for single-handle
+  ops with a tag argument, `_with_tag` for ops over a tag's member set, the bare-noun
+  accessor `tag(handle)`, and a `defrag`-style bounded drop.
+- **`delete_with_tag` is bounded** by a `max` argument and returns
+  `TagDropProgress { deleted, complete }`, so a large relation drops incrementally in
+  bounded-time batches (the caller loops until `complete`). This mirrors `defrag`'s
+  `max_pages` posture — incremental cleanup that never blocks for an unbounded span.
+- **`delete(handle)` is the fast path**, self-maintaining and unchanged in signature;
+  `delete_tagged(handle, tag)` is the specialized variant that additionally verifies the
+  supplied tag. The fast path needs no tag argument because it reads the tag from the entry.
 
 ## Out of scope for v1 (possible future refinements)
 
 - **Mutable tags.** Cheaply possible now (forward tag is readable), but deliberately
   deferred; immutable for v1.
-- **Per-tag summaries** (Bloom filter / `[min,max]` handle range) to accelerate a
-  hypothetical handle-across-tags scan — moot while `tag_of` is `O(1)`.
+- **Callback enumeration** (`for_each_handle_with_tag`) once I97's `for_each_handle` lands,
+  so very large memberships need not materialize a `Vec`.
+- **Per-tag summaries** (Bloom filter / `[min,max]` handle range) — moot while `tag` is
+  `O(1)`; relevant only if a forward-less variant were ever revisited.
 - **Bitmap inner sets** instead of radix, if profiling ever shows dense per-tag handle
   ranges (expected sparse → radix is the right default).
-- **Batched per-page frees** in `delete_all_with_tag`, mirroring the deferred I33 batching
-  for `delete_many`.
+- **Batched per-page frees** in `delete_with_tag`, mirroring the deferred I33 batching for
+  `delete_many`.
 
 ## Relationship to existing tracked work
 
 - **Closes F1 / I12** (`drop_table` / `drop_index_table` handle-and-page leak) —
-  `delete_all_with_tag` is the clean bulk-drop primitive those requests wanted.
-- **Reuses the I97 enumeration shape** (`for_each_*` callback) for `for_each_with_tag`.
+  `delete_with_tag` is the clean, bounded bulk-drop primitive those requests wanted.
+- **Reuses the I97 enumeration shape** (`for_each_*` callback) for the future
+  `for_each_handle_with_tag`.
 - **Rides I29/I31** format-version machinery for the additive on-disk changes.
-
-## Open questions
-
-- Final API names (`allocate_tagged` vs `allocate_with_tag`, `tag_of` vs `tag`, etc.).
-- Whether `delete_all_with_tag` should also accept a per-call cap (like `DefragOptions`)
-  to bound the work of dropping a very large relation in one transaction, or whether the
-  caller chunks it.
-- Whether to expose `delete_tagged`'s verification as the default and make bare `delete`
-  the unchecked fast path, or vice versa.
