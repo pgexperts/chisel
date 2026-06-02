@@ -1142,6 +1142,7 @@ impl TransactionManager {
                 page_id: first_page,
                 slot_index: 0,
                 flags: HandleFlags::Overflow,
+                tag: 0,
             }
         } else {
             let (data_page_id, slot) = self.insert_into_data_page(value)?;
@@ -1149,6 +1150,7 @@ impl TransactionManager {
                 page_id: data_page_id,
                 slot_index: slot,
                 flags: HandleFlags::Live,
+                tag: 0,
             }
         };
 
@@ -1296,6 +1298,7 @@ impl TransactionManager {
                 page_id: first_page,
                 slot_index: 0,
                 flags: HandleFlags::Overflow,
+                tag: 0,
             }
         } else {
             let (data_page_id, slot) = self.insert_into_data_page(value)?;
@@ -1303,6 +1306,7 @@ impl TransactionManager {
                 page_id: data_page_id,
                 slot_index: slot,
                 flags: HandleFlags::Live,
+                tag: 0,
             }
         };
 
