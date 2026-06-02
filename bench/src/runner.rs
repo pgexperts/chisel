@@ -232,7 +232,19 @@ pub fn apply_op(
             new_ids.push(id);
         }
         Operation::Read { alloc_index } => {
-            engine.read(resolve(*alloc_index)).unwrap();
+            // I90: black_box both ends of the timed read. Without the output
+            // fence the returned Vec is never observed, so the optimizer is
+            // free to elide the read body and the redb/sqlite adapters'
+            // `to_vec()` copies — which silently zeroes the very work the
+            // read rows measure. This is latent today (the `&mut dyn Engine`
+            // virtual call blocks devirtualization) but becomes live under the
+            // I91 LTO profile, which is exactly why I90 must land first. The
+            // input fence keeps the id's address arithmetic inside the measured
+            // region. Every timed read path (scenario tier, warm/cold micro-grid
+            // rows, drive_workload_with_tx_granularity) funnels through here, so
+            // this one site covers them all.
+            let value = engine.read(std::hint::black_box(resolve(*alloc_index))).unwrap();
+            std::hint::black_box(value);
         }
         Operation::Update { alloc_index, size } => {
             engine
