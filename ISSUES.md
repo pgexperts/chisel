@@ -9,6 +9,7 @@ Sources:
 - **[comment-pass 2026-04-22]** — found during the 2026-04-22 third review pass (read-only; five-agent parallel audit over `src/` and `python/src/`)
 - **[perf-review 2026-04-26]** — found during the `chisel-performance` skill fresh-eyes pass after PR-1 + PR-2 of the bench-suite series landed (read-only; output at `docs/reviews/perf-review-2026-04-26.md`)
 - **[deepdive 2026-05-22]** — found during the `deepdive-rust` skill fresh-eyes pass after the spillway feature and the runtime-config setters landed (read-only; output at `docs/reviews/review-20260522-073901.md`)
+- **[perf-review 2026-06-01]** — found during the `chisel-performance` + `rust-performance` full hot-path sweep (read-only; six-agent parallel audit over `src/` and `bench/`; output at `docs/reviews/perf-review-2026-06-01.md`)
 - **[roadmap]** — from the README roadmap
 - **[client]** — requested by the primary Chisel client
 
@@ -27,6 +28,8 @@ Priority legend:
 > **Status note (2026-04-22):** a fresh third review pass re-opened the file with new items I26 (P1, handle-table bounds), I27 (P2, savepoint freed-pages leak on commit), I28 (P2, `CacheFull` poisons during commit), and a doc-sweep bundle (C4), all resolved the same day. Two pre-1.0 infrastructure items also landed that day: I29 (split `format_version` into packed MAJOR / MINOR so the README's "sacred within a major version" promise is enforceable at the bytes level) and I31 (per-page format-version byte + 64-bit reserved common-header region, the foundation for lazy per-page upgrade). These are NOT in the suggested fix order above — see each entry in its own section below. The 2026-04-22 pass specifically looked for invariant mismatches across module boundaries, which is where the remaining bugs now live.
 >
 > **Status note (2026-05-22):** the deepdive-rust fresh-eyes review (output at `docs/reviews/review-20260522-073901.md`) adds I35–I71 in a new "Deepdive review findings (2026-05-22)" section below. The cluster is dominated by 1.0-readiness work: public-API surface (`pub mod` exposure of engine internals, missing `#[non_exhaustive]` on `Options` / `ChiselError` / `DrainInsertion` / `SpillwayLocation`), Cargo.toml publication metadata gaps, `License: TBD` in the README, and a small batch of code-quality, performance, and doc-drift items. None are correctness bugs. Highest leverage before the 1.0 freeze: I35 (`pub` → `pub(crate)` reshape), which forces the urgency of I36 (`#[non_exhaustive]` on the types that remain public); then I54–I57 (CI supply-chain check + MSRV pin + publication metadata + license) to unblock crates.io publication. The 2026-04-26 perf-review's deltas (F1/F4/F5 resolved, F2/F3/F6 unchanged) are recorded inline at the top of the new section.
+>
+> **Status note (2026-06-01):** the `chisel-performance` + `rust-performance` full hot-path sweep (output at `docs/reviews/perf-review-2026-06-01.md`) adds I77–I96 in a new "Perf-review findings (2026-06-01)" section below. No correctness bugs and no Don't-Break-List violations were found — the engine's data-handling is confirmed tight (zero-copy reads, in-place slot mutation, dead-on-prod `compact()`, verified I18 / I51 / 3-fsync discipline). The cluster splits into engine hot-path optimizations (I77–I89) and benchmark-harness integrity (I90–I96). The central conclusion is a **sequencing constraint**: the bench harness cannot currently validate an engine change (no `black_box`, no `[profile.release]`, no in-memory-backend row), so the I90/I91/I92 measurement-integrity fixes GATE the two engine P1s (I77 SipHash hasher, I78 per-insert XXH3 re-stamp) — and `black_box` (I90) must precede the LTO profile (I91) because LTO widens the dead-code-elimination window. Prior deferred perf items are unchanged: F2 (`read` → `to_vec`) and F3 (`Cell` counters) still UNCHANGED; I33 (`delete_many` per-leaf) and I34 (mmap cache) still DEFERRED.
 
 Dependencies and batching drove this more than raw priority. Earlier items unblocked later ones.
 
@@ -1097,3 +1100,159 @@ clippy-no-cache:
 Runs once a week; ~5 minutes per run; would have caught the PR #27 leak immediately on the following Monday. Cheap insurance for a real (if rare) failure mode.
 
 Low priority because (a) the leak is caught eventually by the next unrelated PR's CI, (b) the leak is always a clippy warning (not a runtime bug), (c) the cleanup PR #28 already absorbed the actual fix.
+
+---
+
+## Perf-review findings (2026-06-01)
+
+Source: `docs/reviews/perf-review-2026-06-01.md` (read-only full hot-path sweep, `chisel-performance` + `rust-performance` skills; six-agent parallel audit over `src/` and `bench/`). No correctness bugs, no Don't-Break-List violations. Each item carries its review-doc ref (PR-x) and classification — **[STATIC FACT]** (provable by reading) or **[HYPOTHESIS]** (mechanism certain, magnitude needs a bench). Severities are as-assessed by the sweep and open to re-triage. Line numbers are as-of the sweep and prefixed `~`; the symbol names are the durable anchor.
+
+**Sequencing:** the benchmark-harness items (I90–I92) are prerequisites — the grid cannot trustworthily validate an engine change until they land, and I90 (`black_box`) must precede I91 (LTO profile) because LTO widens the dead-code-elimination window. Measure the two engine P1s (I77, I78) only afterward. Do not gate CI pass/fail on the resulting numbers (shared-runner noise; perf is report-only per the project CI policy).
+
+### Engine — hot path & commit
+
+#### I77. Default SipHash on `PageCache.entries` and `LruIndex.nodes` [perf-review 2026-06-01] — **P1** (PR-A, [HYPOTHESIS])
+**Where:** `src/page_cache.rs` `entries` (init ~:167) + `get`/`get_mut`; `src/lru.rs` `nodes` (~:67) + `push_front`/`unlink`
+
+**Problem:** both hot maps use `std::collections::HashMap` with the default SipHash-1-3 `RandomState`. A warm `cache.get(id)` costs ≈ six SipHash probes of a `u64` key (`contains_key` + `get` + the `touch_lru` bookkeeping); a depth-2 read calls `get` four times → ≈ 24 SipHash hashings per cache-hit read. SipHash's DoS-resistance is worthless for a single-writer embedded engine keyed on trusted local page IDs. Related (PR-R): `get`/`get_mut` and the `LruIndex` ops also double-probe (`contains_key` then `get`) — folding those into a single probe is the same area.
+
+**Direction of fix:** swap both maps to a fast `u64` hasher (`foldhash`, `rustc_hash::FxHashMap`, or `ahash`). Validate on the existing `read-warm` micro-grid row (all cache hits, zero I/O — isolates hashing + LRU cost). In-memory only; no on-disk format, fsync, poison, or `&mut self` interaction; LRU order rides the linked-list pointers, not map iteration order.
+
+#### I78. Per-insert full-page XXH3 re-stamp on the slot-packing path [perf-review 2026-06-01] — **P1** (PR-B, [HYPOTHESIS])
+**Where:** `src/transaction.rs` `insert_into_data_page` (cursor path ~:1856-1869, fresh-page path ~:1892); cost in `src/page.rs` `compute_checksum`
+
+**Problem:** `page::stamp_checksum(buf)` runs after **every** `DataPage::insert`, hashing all 8184 page-body bytes regardless of how few changed. A 1000-small-value transaction packing ≈ 39 values/page re-hashes its data pages once per value instead of once per page — `O(values × 8 KB)` where `O(pages × 8 KB)` would do.
+
+**Direction of fix:** defer stamping — stamp a data page lazily at flush time and on the eviction path (a "needs-stamp" sub-flag, or stamp on cursor retirement + an eviction hook). **Caveat (Don't-Break #8):** a stamped checksum must still be guaranteed before any eviction-to-spillway/disk and before flush; eager stamping exists for exactly the evict-mid-transaction case (documented at `transaction.rs:1839-1842`). Validate on `allocate-1000pertx` / `update-1000pertx` at small value sizes.
+
+#### I79. `commit_inner` promotes `current_freemap` / `current_live_slots` by clone, not swap [perf-review 2026-06-01] — **P2** (PR-F, [STATIC FACT])
+**Where:** `src/transaction.rs` `commit_inner` step 5 (~:917-920); mirrored per `begin()` (~:717-721)
+
+**Problem:** every commit deep-copies the full 8 KB `Box<[u8; PAGE_SIZE]>` freemap and rebuilds the `O(live-pages)` `current_live_slots` HashMap, even for a single-row commit (one bit / one page changed). The bitmap is moved ≈ 3× per small commit (this clone + the `persist_freemap` copy at ~:684).
+
+**Direction of fix:** `std::mem::swap(&mut committed_*, &mut current_*)` at step 5, then reseed `current_*` from `committed_*` at the next `begin()` (which already clones). Same shape as the accepted I52 fix; strictly fewer allocations, so it does not need a bench to justify (one would size it). **Don't-Break:** the swap must occur after the step-4 fsync linearization point (it does).
+
+#### I80. `maybe_evict` re-scans the dirty LRU prefix per eviction in the mixed clean/dirty regime [perf-review 2026-06-01] — **P2** (PR-G, [HYPOTHESIS])
+**Where:** `src/page_cache.rs` `maybe_evict` Phase A (~:912-930)
+
+**Problem:** the `dirty_count == entries.len()` early-out only fires when **every** entry is dirty. In a mixed regime (clean read-through pages interleaved with dirty pinned ones, clean victims toward the MRU end) the `iter_lru_to_mru().find(|id| !dirty)` walks past the whole dirty prefix from the tail on each call — `O(n²)` across a transaction that evicts repeatedly.
+
+**Direction of fix:** a separate intrusive "clean LRU" sub-list or a free-victim cursor so eviction is `O(1)` amortized. Confirm the regime occurs first (pure-write hits the all-dirty early-out; pure-read finds the first tail item — the quadratic only bites mixed read+write transactions large enough to evict). No invariant exposure.
+
+#### I81. No cache buffer pool — malloc/free per page churn + 8 KB memset on `new_page` [perf-review 2026-06-01] — **P2** (PR-H, [HYPOTHESIS])
+**Where:** `src/page_cache.rs` page allocation sites (~:326, :446, :736, :853, :873); eviction drops the `CacheEntry` (frees its Box)
+
+**Problem:** under sustained pressure (working set > cache) the cache does malloc-on-load / free-on-evict in lockstep — a fresh 8 KB allocation per miss and per `new_page`, the just-freed buffer not reused; `new_page` additionally zeroes 8 KB. (Alloc-heavy → worst case for shared-CI bench noise; measure on dedicated hardware, report-only.)
+
+**Direction of fix:** a small free-list capped at a few× the cache size — push freed `Box`es on eviction, pop on load / `new_page` (zero only when handing out a `new_page`). The **small-pool** idea, explicitly NOT the deferred I34 mmap-backed-storage redesign.
+
+#### I82. `page_io` / `spillway` use seek+write (two syscalls/page) instead of positioned pread/pwrite [perf-review 2026-06-01] — **P2** (PR-I, [HYPOTHESIS])
+**Where:** `src/page_io.rs` `read_page` (~:209-213) / `write_page` (~:236-240); `src/spillway.rs` `write_slot` (~:280-284) / `read_slot` (~:307-311)
+
+**Problem:** each page I/O issues `seek(Start(off))` then `read_exact`/`write_all` — two syscalls where `FileExt::{read_exact_at, write_all_at}` (pread/pwrite) does one. `flush()` calls `write_page` once per dirty page per commit; the spillway drain adds more (and splits header/page into two writes).
+
+**Direction of fix:** switch the `File` arm to positioned I/O; for the spillway, assemble header+page into one `[u8; SLOT_SIZE]` and issue a single positioned write. Stays inside the I/O modules (invariant 6); the single-writer flock makes shared-offset removal safe. For fsync-dominated commits the win may be in the noise — bench with a large-dirty-set commit + syscall count.
+
+#### I83. No `read_many` — batched reads re-descend the handle table per key [perf-review 2026-06-01] — **P2** (PR-J, [HYPOTHESIS])
+**Where:** absent from `src/lib.rs` / `src/transaction.rs` (only single `read`)
+
+**Problem:** the read-side analogue of the deferred I33. K reads pay K independent `find_leaf` descents from the root; keys sharing interior/leaf pages (monotonic handles read in ranges) re-fetch and re-hash the same interior pages K times.
+
+**Direction of fix:** land I77 first (cuts per-descent cost for free). Whether a leaf-grouping `read_many` beats the simple loop is the hypothesis — settle with a clustered-read bench row before building the batched descent (same YAGNI posture that deferred I33). Read-only `&self`; preserve per-handle error semantics.
+
+#### I84. Freemap `allocate_first` linear-scans the bitmap from byte 0 with no cursor [perf-review 2026-06-01] — **P3** (PR-O, [HYPOTHESIS])
+**Where:** `src/freemap.rs` `allocate_first` (~:135-146); found independently by the commit and write-path agents
+
+**Problem:** every freemap-backed allocation (and the per-commit freemap-page placement) scans from byte 0. With a dense low region and frees concentrated high, each allocation re-walks the same leading zero bytes — `O(n²)` across a reuse-heavy transaction. Minor (single 8 KB page, whole-byte skip, L1/L2-resident), but pure repeated work.
+
+**Direction of fix:** an in-memory `next_free_hint` byte cursor (reset on `begin()` clone / lower-id `mark_free`), optionally `u64`-word scanning. In-memory allocator state only — no on-disk format impact, and the I18 lowest-id ordering is about which ids are visible, not scan order. ARCHITECTURE.md:434 documents the from-0 scan as behavior; this is the perf entry for it.
+
+#### I85. `update_inner` always relocates; in-code cost-model text inaccurate under R1 [perf-review 2026-06-01] — **P3** (PR-K, [STATIC FACT]; doc + narrow opt)
+**Where:** `src/transaction.rs` `update_inner` (~:1251-1321); unused in-place `src/data_page.rs` `DataPage::update`
+
+**Problem:** a same-size update unconditionally retires the old slot and packs the new value into the cursor page (delete+insert leaving a tombstone), so the cost-model line "update(same size) = 1 data page COW" does not describe reality — there is no in-place data COW. Correct under R1 (a committed packed page can't be rewritten in place without rewriting every co-resident handle); the finding is a doc inaccuracy plus a narrow optimization.
+
+**Direction of fix:** correct the cost-model text. Optional narrow win: when the old value lives on a page dirtied **in the current transaction** and the new value fits the old slot, overwrite in place via `DataPage::update`. **Don't-Break:** any in-place path MUST be restricted to current-transaction dirty pages — overwriting a committed data page violates shadow paging.
+
+### Spillway
+
+#### I86. Spillway re-validates XXH3 on every unspill — redundant with the main-file checksum on the drain path [perf-review 2026-06-01] — **P3** (PR-P, [STATIC FACT]; hazard-flagged)
+**Where:** `src/spillway.rs` `rehydrate` / `slot_checksum` (~:235-255); callers `src/page_cache.rs` drain (~:438) and resident read-back (~:848)
+
+**Problem:** every `rehydrate` recomputes an XXH3 over the slot. On the **drain** path the bytes are immediately written to the main file and re-validated structurally on their next cold load, so that verify is arguably redundant (spilled → checksummed → drain-verified → cold-load-verified). **But** the resident read-back path re-inserts the rehydrated page as dirty without a fresh main-file write, so dropping its checksum would let an undetected sidecar bit-flip enter the cache and later flush with a freshly-stamped valid-looking checksum — silent corruption.
+
+**Direction of fix:** at most skip the verify on the drain-and-immediately-rewrite path; **keep** it on the resident read-back path (Don't-Break #8). The spill-side checksum (torn-sidecar-write detection) stays. Marginal — bench a spill-heavy workload before touching.
+
+#### I87. Spillway micro-allocations: rehydrate `Box::new(buf)` copy + per-batch `drain_batch` Vec [perf-review 2026-06-01] — **P3** (PR-Q, [STATIC FACT])
+**Where:** `src/page_cache.rs` rehydrate sites (~:436-448, :848-856, :866-873); `src/spillway.rs` `drain_batch` (~:204-210)
+
+**Problem:** (a) `read_slot` / `rehydrate` return `[u8; PAGE_SIZE]` by value, then the cache does `Box::new(buf)` — a stack→heap 8 KB copy on top of the file read (the spill *write* side is clean). (b) `drain_batch` allocates a fresh `Vec<u64>` per batch — the exact shape I52 eliminated elsewhere with a reused scratch vec, not applied here.
+
+**Direction of fix:** (a) have `rehydrate` / `read_slot` take a `&mut Box<[u8; PAGE_SIZE]>` out-param and `read_exact` directly into the heap buffer (pairs with I81's pool). (b) reuse a `drain_scratch: Vec<u64>` mirroring `dirty_scratch`. Sidecar layout is ephemeral — free to change.
+
+#### I88. `Spillway::logical_bytes` over-reports after `forget` (high-water, not live) [perf-review 2026-06-01] — **P3** (PR-U, [STATIC FACT]; stats-accuracy, non-perf)
+**Where:** `src/spillway.rs` `logical_bytes` (~:128-130)
+
+**Problem:** `logical_bytes` returns `next_slot_index * PAGE_SIZE`, but `forget` / `forget_above` remove from `slots` without decrementing `next_slot_index` (slots aren't reused until `truncate`). During a drain (which calls `forget` per page) the I74 `spillway_logical_bytes` stat reports the high-water size, not the live resident size. Stats-accuracy quirk surfaced via the I74 surface; not a perf or durability issue.
+
+**Direction of fix:** track a live-byte counter decremented in `forget` / `forget_above`, or document `logical_bytes` as a high-water mark. Decide alongside any I74 stats follow-up.
+
+### Error path
+
+#### I89. Savepoint error variants allocate a `String` at construction [perf-review 2026-06-01] — **P3** (PR-S, [STATIC FACT])
+**Where:** `src/error.rs` `SavepointNotFound(String)` / `DuplicateSavepoint(String)` (~:30-31); constructed at `src/transaction.rs:1005,1054,1093` via `name.to_string()`
+
+**Problem:** these eagerly heap-allocate at error construction (error branch only). Cold savepoint-control path, so no perf impact — recorded for completeness and as the contrast to `InvalidHandle(u64)`, which correctly carries a bare `u64` with lazy `Display` formatting on the hot lookup-miss path.
+
+**Direction of fix:** none required for perf. If the error enum is ever reworked, a borrowed / `Box<str>` payload would remove the allocation, but it is not worth a standalone change.
+
+### Bench harness & build (measurement-integrity cluster — prerequisites)
+
+#### I90. Bench harness has no `black_box` — read/alloc results are dead-code-eligible [perf-review 2026-06-01] — **P1** (PR-C, [STATIC FACT])
+**Where:** `bench/src/runner.rs` `apply_op` (~:216-250); `bench/benches/micro_grid.rs` read loops (~:111-115, :139-144); `bench/benches/scenarios.rs` timed loop. `grep black_box bench/` → none.
+
+**Problem:** read results (`Vec<u8>`) are dropped, never observed; the criterion closures return `()`, so criterion's built-in `black_box` on the closure return value doesn't protect per-op results. The optimizer may elide the unused-result work — and the risk **grows when the I91 LTO profile lands**. This is the single most important bench-hygiene gap and must be fixed first.
+
+**Direction of fix:** feed the resolved id through `black_box` on the way in and `black_box` the returned bytes in `apply_op` and the read loops. Bench-only; consumer-neutral.
+
+#### I91. No `[profile.release]` — Chisel/redb benched under weaker codegen than bundled SQLite [perf-review 2026-06-01] — **P1** (PR-D, [STATIC FACT] asymmetry / [HYPOTHESIS] magnitude)
+**Where:** workspace `Cargo.toml` (no `[profile.*]`); confirmed absent in `bench/` and `python/`; no `.cargo/config.toml`.
+
+**Problem:** with no profile override, `cargo bench` builds `chisel` + `redb` at `opt-level=3` but `lto=false`, `codegen-units=16`, `panic=unwind`, while `rusqlite` `bundled` compiles SQLite C at its own `-O2`. The headline cross-engine table handicaps the two Rust engines (no cross-crate inlining across the `chisel`→bench boundary) — a "SQLite is faster here" conclusion is partly a build-config artifact. (The harness already equalizes the macOS `F_FULLFSYNC` path in `sqlite_engine.rs:50-62`; profile parity is the missing build-side half.)
+
+**Direction of fix:** add a tuned profile at the **workspace root** (`lto = "thin"`/`"fat"`, `codegen-units = 1`) and re-record baselines once (uniform shift, not a regression). Land **after** I90. **Consumer-neutral:** a workspace-root profile affects only in-repo builds (benches/tests/examples); Cargo ignores a dependency's profile, so downstream `chisel = "0.1"` consumers are unaffected. Do NOT tune via the published lib crate.
+
+#### I92. In-memory Chisel backend exists but is never benched [perf-review 2026-06-01] — **P1** (PR-E, [STATIC FACT])
+**Where:** `bench/src/runner.rs` `EngineMode` (~:30-98, only `ChiselStrict` → `open_file`); `micro_grid.rs:168`, `scenarios.rs:27-31` all file-backed. `ChiselEngine::open_in_memory` only used in `bench/tests/`.
+
+**Problem:** without an in-memory row the harness can't separate Chisel's CPU cost (slot packing, XXH3, handle-table walk, COW) from its full durability cost (fsync, `F_FULLFSYNC`, pwrite) — the decomposition that makes a "commit is slow" finding actionable. A pure-CPU regression can be masked by fsync-dominated wall time. (chisel-performance Lever 5.)
+
+**Direction of fix:** add a `ChiselMemory` `EngineMode` via `open_in_memory(cache_size)`, include it in `EngineMode::ALL` and the scenarios mode list (cleanest through `run_scenario_cell`, which pre-populates in-process). Track both backends so the ratio is visible. Bench-only.
+
+#### I93. Bench binaries could pin `mimalloc` for realistic best-case + cross-engine allocator parity [perf-review 2026-06-01] — **P2** (PR-N, [STATIC FACT] absent / [HYPOTHESIS] win)
+**Where:** no `#[global_allocator]` anywhere; natural home `bench/benches/{scenarios,micro_grid}.rs`
+
+**Problem:** Chisel (`Box<[u8;8192]>` per page, `Vec<u8>` per read) and redb (`value().to_vec()`) are alloc-heavy; SQLite's C core does far less Rust-side heap traffic. All three run on the platform default allocator, so the tracked numbers reflect "Chisel on system malloc," not its best, and the allocator tax falls unevenly.
+
+**Direction of fix:** set `#[global_allocator] = MiMalloc` in the two bench binaries (the `publish=false` crate) and re-record baselines. **Consumer-neutral and load-bearing:** a `#[global_allocator]` is process-global and a library must never force one — the bench crate is the only correct home; do NOT add it to `chisel` or `chisel-py`.
+
+#### I94. Scenario timed region includes begin/commit framing, per-op `Instant::now()`, and payload `Vec` alloc [perf-review 2026-06-01] — **P2** (PR-M, [STATIC FACT] region / [HYPOTHESIS] distortion)
+**Where:** `bench/src/runner.rs` scenario timed loop (~:548-563) + `apply_op` payload alloc (~:230-240)
+
+**Problem:** the CI-tracked scenario tier brackets the whole loop, takes a per-op `Instant::now()` pair inside it, and builds `vec![0u8; size]` inside the timed op. Per-op clock reads (200K on a 100K-op run) and payload alloc/zeroing fold into throughput, taxing fast (read) ops more than fsync-bound (write) ops and compressing cross-engine deltas. (The micro-grid correctly hoists setup into `iter_batched`; the hand-rolled scenario timer does not.)
+
+**Direction of fix:** pre-build payloads once per size outside the loop; compute throughput from a single outer timer over a loop with no inner `Instant::now()` (run the latency-sampled pass separately); document that scenario throughput is per-transaction. Bench-only.
+
+#### I95. Noise gate N=1 false-green; gate/diff conflate "no signal" with PASS/FAIL [perf-review 2026-06-01] — **P2** (PR-L, [STATIC FACT])
+**Where:** `bench/src/noise_gate/cov.rs` (~:24-30, :36), `bench/src/bin/noise_gate.rs` (~:147-148), `bench/src/diff/compare.rs` (~:200-208)
+
+**Problem:** `compute_cov` returns `0.0` for a single sample and the gate treats `cov <= threshold` as pass, so a `--runs 1` invocation reports PASS with zero observed variance — qualifying a noisy machine (defeating the gate's purpose). Zero-mean cells produce `NaN`/`inf` cov and `delta_pct`, marked failing rather than recognized as broken. (The gate is correctly **report-only** — `diff.rs` returns success regardless of regression count and `bench.yml` has no `needs:` into the gating jobs — so it cannot turn CI red on shared-runner noise, consistent with policy; these gaps are about report trustworthiness, not gating.)
+
+**Direction of fix:** require `runs >= 2`; surface a distinct `INDETERMINATE` / `Undefined` state for N<2 and zero-mean cells so "no signal" renders separately from PASS/FAIL. Guard `baseline == 0.0` in the diff. Bench-only.
+
+#### I96. Scenario tier has no warmup-discard — cold-start ops inflate tracked p95/p99 [perf-review 2026-06-01] — **P3** (PR-T, [STATIC FACT])
+**Where:** `bench/src/runner.rs` `run_scenario_cell` percentile computation (~:570-574)
+
+**Problem:** the single-run-no-warmup scenario design folds cold-start ops (cold cache, unwarmed allocator arenas / branch predictors) into the same distribution as steady-state, inflating the tracked `THRESHOLD_PCT_P95/P99` tails.
+
+**Direction of fix:** discard a warmup prefix from `per_op_ns` before percentile computation, or run a short untimed warmup pass first. Bench-only; document the choice.
