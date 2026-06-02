@@ -401,8 +401,8 @@ impl HandleTable {
         Ok(depth)
     }
 
-    /// `#[allow(dead_code)]`: companion to `set_depth`. Production
-    /// `open_existing` reconstructs depth from the on-disk spine walk
+    /// `#[allow(dead_code)]`: companion to `set_depth`. Production code
+    /// reconstructs depth via `recover_depth` (at open and on each rollback)
     /// and stores it via `set_depth`, but no current reader queries it
     /// back. Kept for forensic / debug-print use and so the
     /// set_depth/depth pair stays symmetric.
