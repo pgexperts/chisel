@@ -25,6 +25,14 @@ use chisel_bench::scenarios::{
 use chisel_bench::workload::Workload;
 use std::io::Write;
 
+// I93: pin mimalloc as this bench binary's process allocator (same rationale as
+// micro_grid.rs): Chisel and redb are allocation-heavy, SQLite's C core is not,
+// so a fast fixed allocator removes the allocator as an uneven cross-engine
+// variable and reports each engine's realistic best case. Scoped to the bench
+// binary (publish=false) — never imposed on the library's consumers.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // Modes compared per scenario. chisel-mem (in-memory Chisel) sits directly
 // after chisel-strict so the per-scenario fsync/file-I/O tax reads off the two
 // columns' delta (I92). redb/sqlite stay strict here — their unsafe variants

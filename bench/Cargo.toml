@@ -37,6 +37,12 @@ clap = { version = "~4.5", features = ["derive"] }
 hostname = "0.4"
 
 [dev-dependencies]
+# I93: mimalloc is the process allocator for the two measurement benches
+# (micro_grid, scenarios) via their #[global_allocator]. Dev-dep because only
+# the bench targets link it — the publish=false summarize/diff/noise-gate bins
+# and the chisel library never do. A global allocator must never be forced on a
+# library's consumers, so it lives here, not in the root crate.
+mimalloc = "0.1"
 criterion = "0.5"
 assert_cmd = "2"
 regex = "1"

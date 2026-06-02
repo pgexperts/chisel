@@ -26,6 +26,16 @@ use criterion::{
 };
 use tempfile::NamedTempFile;
 
+// I93: pin mimalloc as this bench binary's process allocator. Chisel is
+// allocation-heavy by construction (a boxed 8 KB page per cache entry, a Vec
+// per read), as is redb; the system malloc taxes them unevenly versus SQLite's
+// C core, which does far less Rust-side heap traffic. A fast, fixed allocator
+// removes that variable and reports each engine's realistic best case. Scoped
+// to the bench binary (publish=false) — a #[global_allocator] is process-global
+// and a library must never impose one on its consumers.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Six log-spaced sizes, one per Chisel internal regime (master spec §3.2).
 /// `prepop_count` calibrated to ~25 MB raw payload per cell (master spec §3.4).
 const SIZES: [(usize, &str, usize); 6] = [
