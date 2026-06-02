@@ -1836,10 +1836,24 @@ impl TransactionManager {
     /// under a savepoint gets its own page (the pre-R1 behavior). This
     /// keeps the per-savepoint snapshot cheap to restore.
     ///
-    /// Checksum is stamped eagerly after any mutation so the page is
-    /// valid if it later gets evicted and reloaded mid-transaction.
-    /// Without this, a dirty page evicted by LRU pressure would fail
-    /// checksum verification on reload.
+    /// Checksum is stamped eagerly after every mutation so the page carries a
+    /// valid internal checksum before any path could write it to the main
+    /// file — either the `flush` `write_page` at commit, or a spill-then-drain
+    /// write (an LRU-pressured dirty page is spilled to the spillway and later
+    /// drained back out to the main file). The next cold-load
+    /// (`page_cache::load_page`) verifies that checksum.
+    ///
+    /// Note: the spillway *transfer* does NOT rely on this. `rehydrate`
+    /// verifies the spillway's own per-slot checksum (`spillway::slot_checksum`),
+    /// never the page's internal bytes 8184..8192 — so a spilled page round-trips
+    /// safely whether or not its internal checksum is current. The internal
+    /// checksum only matters on the way to the main file.
+    ///
+    /// I78 proposes deferring this re-stamp to flush/drain time so a packed page
+    /// is hashed once, not once per value (a large bulk-insert win on fast
+    /// storage). It is deferred pending a benchmark; the difficulty is exactly
+    /// the spill-then-drain path, which would then have to re-stamp before the
+    /// main-file write. See ISSUES.md.
     ///
     /// Live-slot bookkeeping: every successful insert increments
     /// `current_live_slots[page_id]`. `delete`/`update` consult this
