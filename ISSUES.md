@@ -1111,14 +1111,14 @@ Source: `docs/reviews/perf-review-2026-06-01.md` (read-only full hot-path sweep,
 
 ### Engine — hot path & commit
 
-#### I77. Default SipHash on `PageCache.entries` and `LruIndex.nodes` [perf-review 2026-06-01] — **P1** (PR-A, [HYPOTHESIS])
+#### I77. Default SipHash on `PageCache.entries` and `LruIndex.nodes` [perf-review 2026-06-01] — **P1** (PR-A, [HYPOTHESIS]) ✅ FIXED 2026-06-01 (rustc_hash::FxHashMap on both maps; zero new transitive deps — only the 3rd runtime dependency. Behavior-preserving: 174 engine tests green. Magnitude still unmeasured — run the read-warm bench, with I90 black_box + I91 profile, on dedicated hardware)
 **Where:** `src/page_cache.rs` `entries` (init ~:167) + `get`/`get_mut`; `src/lru.rs` `nodes` (~:67) + `push_front`/`unlink`
 
 **Problem:** both hot maps use `std::collections::HashMap` with the default SipHash-1-3 `RandomState`. A warm `cache.get(id)` costs ≈ six SipHash probes of a `u64` key (`contains_key` + `get` + the `touch_lru` bookkeeping); a depth-2 read calls `get` four times → ≈ 24 SipHash hashings per cache-hit read. SipHash's DoS-resistance is worthless for a single-writer embedded engine keyed on trusted local page IDs. Related (PR-R): `get`/`get_mut` and the `LruIndex` ops also double-probe (`contains_key` then `get`) — folding those into a single probe is the same area.
 
 **Direction of fix:** swap both maps to a fast `u64` hasher (`foldhash`, `rustc_hash::FxHashMap`, or `ahash`). Validate on the existing `read-warm` micro-grid row (all cache hits, zero I/O — isolates hashing + LRU cost). In-memory only; no on-disk format, fsync, poison, or `&mut self` interaction; LRU order rides the linked-list pointers, not map iteration order.
 
-#### I78. Per-insert full-page XXH3 re-stamp on the slot-packing path [perf-review 2026-06-01] — **P1** (PR-B, [HYPOTHESIS])
+#### I78. Per-insert full-page XXH3 re-stamp on the slot-packing path [perf-review 2026-06-01] — **P1** (PR-B, [HYPOTHESIS]) — ⏸️ OPTIMIZATION DEFERRED 2026-06-01 (pending a bulk-insert bench on Phase 0's tooling / dedicated hardware). Investigation CORRECTED the caveat below: the eager stamp is NOT needed for the evict-mid-transaction case — the spillway round-trip verifies its own `slot_checksum`, never the internal page checksum (only main-file cold-load does, `page_cache.rs:872`). The eager stamp's real job is "valid internal checksum before the main-file write — commit flush OR spill-then-drain"; that drain path is precisely what makes the deferral non-trivial. The misleading `transaction.rs` comment is fixed; see memory `project_chisel_i78_restamp_deferred.md`.
 **Where:** `src/transaction.rs` `insert_into_data_page` (cursor path ~:1856-1869, fresh-page path ~:1892); cost in `src/page.rs` `compute_checksum`
 
 **Problem:** `page::stamp_checksum(buf)` runs after **every** `DataPage::insert`, hashing all 8184 page-body bytes regardless of how few changed. A 1000-small-value transaction packing ≈ 39 values/page re-hashes its data pages once per value instead of once per page — `O(values × 8 KB)` where `O(pages × 8 KB)` would do.
