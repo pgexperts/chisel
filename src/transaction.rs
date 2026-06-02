@@ -1276,6 +1276,9 @@ impl TransactionManager {
             self.committed_roots.membership_index_page
         };
         let mut cache = self.cache.borrow_mut();
+        // No PAGE_ID_NONE guard (unlike tag_inner): an empty/absent index is a
+        // legitimate "no handles with this tag" -> handles_for_tag returns an
+        // empty Vec for a PAGE_ID_NONE root, whereas a missing handle table is an error.
         self.membership_index.handles_for_tag(&mut cache, root, tag)
     }
 
@@ -2606,6 +2609,39 @@ mod tests {
         assert_eq!(tm.tag(u).unwrap(), 0);
         assert_eq!(tm.handles_with_tag(42).unwrap(), vec![h]);
         assert_eq!(tm.handles_with_tag(99).unwrap(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn handles_with_tag_accumulates_multiple_handles() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let a = tm.allocate_tagged(b"a", 42).unwrap();
+        let b = tm.allocate_tagged(b"b", 42).unwrap();
+        let c = tm.allocate_tagged(b"c", 42).unwrap();
+        tm.commit().unwrap();
+        // The reverse index accumulates members; it must not overwrite.
+        let mut got = tm.handles_with_tag(42).unwrap();
+        got.sort();
+        let mut want = vec![a, b, c];
+        want.sort();
+        assert_eq!(got, want);
+        assert_eq!(tm.tag(a).unwrap(), 42);
+        assert_eq!(tm.tag(c).unwrap(), 42);
+    }
+
+    #[test]
+    fn allocate_tagged_overflow_value_preserves_tag() {
+        let mut tm = fresh_manager();
+        // A value larger than MAX_INLINE_VALUE takes the overflow path in
+        // allocate_inner; the tag must be stored on the Overflow HandleEntry,
+        // readable via tag(), and indexed for handles_with_tag().
+        let big = vec![0xABu8; MAX_INLINE_VALUE + 100];
+        tm.begin().unwrap();
+        let h = tm.allocate_tagged(&big, 77).unwrap();
+        tm.commit().unwrap();
+        assert_eq!(tm.tag(h).unwrap(), 77);
+        assert_eq!(tm.handles_with_tag(77).unwrap(), vec![h]);
+        assert_eq!(tm.read(h).unwrap(), big);
     }
 
     #[test]
