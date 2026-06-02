@@ -22,6 +22,9 @@ fn tag_survives_in_session_body(b: &Backing) {
     let h = db.allocate_tagged(b"relation row", 77).unwrap();
     db.commit().unwrap();
     assert_eq!(db.tag(h).unwrap(), 77);
+    // Also exercise the membership-index read path on BOTH backings (the
+    // in-memory backing's index read is otherwise only covered transitively).
+    assert_eq!(db.handles_with_tag(77).unwrap(), vec![h]);
     db.close().unwrap();
 }
 dual_backing_test!(tag_survives_in_session, tag_survives_in_session_body);
@@ -108,6 +111,9 @@ fn dropping_a_relation_removes_all_handles_no_orphans() {
 fn old_database_opens_with_all_untagged() {
     // A database created before tags (simulated with plain allocate) opens with
     // tag 0 everywhere and an empty membership index -- backward compatibility.
+    // This asserts the observable open-time contract; the literal pre-tag
+    // zeroed-field normalization (root_membership_index_page == 0 -> PAGE_ID_NONE)
+    // is unit-covered by the superblock deserialize test.
     let file = NamedTempFile::new().unwrap();
     let path = file.path().to_owned();
     let h;
