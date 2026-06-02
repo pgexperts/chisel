@@ -128,8 +128,9 @@ fn test_recovery_tagged_index_recovers_from_prior_superblock() {
     // slot. Corrupt the ACTIVE slot (page 1, the newer commit's slot — see
     // test_recovery_corrupt_superblock_b, which establishes that the first commit
     // lands in page 0). Recovery must reject the torn active slot, fall back to the
-    // prior slot, and rebuild the membership index (RadixU64::recover_depth) from
-    // ITS root — so only the prior relation (h1) is visible, never a half-torn mix.
+    // prior slot, and rebuild the membership index DEPTH (RadixU64::recover_depth)
+    // from ITS root — so reads of that root see only the prior relation (h1),
+    // never a half-torn mix.
     let file = NamedTempFile::new().unwrap();
     let path = file.path().to_owned();
     let h1;
@@ -152,6 +153,8 @@ fn test_recovery_tagged_index_recovers_from_prior_superblock() {
     }
     // Recovery falls back to the prior slot; its index holds only h1, and the
     // membership read path (recover_depth + handles_for_tag) returns it cleanly.
+    // Teeth: if recovery had instead kept the corrupted active slot, this would
+    // be [h1, h2] (the counterfactual: corrupting page 0 makes it fail that way).
     let db = Chisel::open(&path, Default::default()).unwrap();
     assert_eq!(db.handles_with_tag(9).unwrap(), vec![h1]);
     assert_eq!(db.tag(h1).unwrap(), 9);
