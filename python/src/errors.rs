@@ -73,6 +73,11 @@ create_exception!(_chisel, SpillwayFullError, OperationalError);
 // active. Analogous to TransactionAlreadyActiveError — both are
 // operational "wrong state" errors; the database is unharmed.
 create_exception!(_chisel, TransactionInProgressError, OperationalError);
+// Raised by delete_tagged when the caller supplies a tag that does not
+// match the handle's stored tag. The chunk and membership index are
+// left unmodified — the mismatch is purely a caller error, not a
+// data-integrity problem.
+create_exception!(_chisel, TagMismatchError, OperationalError);
 // ISSUES.md I25: raised by PyChisel's with_inner_io/with_inner_mut_io
 // helpers when `inner` has been cleared by a prior close(). Distinct
 // from PoisonedError because close() is a user action — the DB file
@@ -156,6 +161,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "AlreadyFinishedError",
         py.get_type::<AlreadyFinishedError>(),
     )?;
+    m.add("TagMismatchError", py.get_type::<TagMismatchError>())?;
 
     m.add("IoError", py.get_type::<IoError>())?;
     m.add(
@@ -218,6 +224,10 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
         // TransactionAlreadyActive: both are operational "wrong state for
         // this call" errors that the database recovers from without harm.
         RustChiselError::TransactionInProgress => TransactionInProgressError::new_err(msg),
+        // TagMismatch is the "wrong tag on delete_tagged" caller error:
+        // the chunk and membership index are left intact, so it is
+        // operational — distinct from any data-integrity problem.
+        RustChiselError::TagMismatch { .. } => TagMismatchError::new_err(msg),
         // Fatal
         //
         // I42 (ISSUES.md, 2026-05-22): expose the inner io::Error's errno
