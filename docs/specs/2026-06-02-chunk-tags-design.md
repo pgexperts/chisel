@@ -1,7 +1,10 @@
 # Chunk Tags — Design Spec
 
 - **Date:** 2026-06-02
-- **Status:** approved design (open questions resolved 2026-06-02), pending implementation plan
+- **Status:** implemented 2026-06-02 on branch `feature/chunk-tags` (engine + public
+  Rust API + Python binding + integration tests). One v1 simplification recorded during
+  planning: `delete_with_tag` enumerates members with a bounded `iter_bounded` (`max + 1`)
+  rather than the spec's unbounded sketch, to honor the bounded-time requirement.
 - **Source:** brainstorm with the primary Chisel client (relational layer)
 
 ## Summary

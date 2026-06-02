@@ -1301,3 +1301,18 @@ Source: primary Chisel client, 2026-06-02.
 **Test to add (either fix):** the probe above as a regression test — commit `ENTRIES_PER_LEAF` handles, grow+rollback one more, assert every committed handle still reads back; plus the `rollback_to(savepoint)` variant. (The membership-index equivalents — `tagged_membership_survives_rolled_back_outer_grow` / `..._rollback_to_savepoint` in `src/transaction.rs` — are the template.)
 
 **Severity note:** P1 because it is silent data loss on the engine's most fundamental structure, reachable from ordinary `allocate`+`rollback` usage with no unsafe code or corruption precondition. Mitigating factor: no production databases exist yet (cf. format-version tentativeness), and a process restart accidentally "heals" the in-memory depth via open-time recovery — so the corruption is confined to the lifetime of a single open handle after a rolled-back grow.
+
+### I100. Callback enumeration `for_each_handle_with_tag` [chunk-tags out-of-scope 2026-06-02] — **P3**
+**Where:** `src/transaction.rs` (`handles_with_tag`); `src/membership_index.rs` (`handles_for_tag`); `src/lib.rs` / `python/src/db.rs` public surface.
+
+**Motivation:** `handles_with_tag(tag)` materializes the full `Vec<u64>` of a tag's members, the same multi-megabyte spike I97 calls out for `handles()`. A relation with millions of chunks has no lazy option. Mirror I97's planned `for_each_handle(f)` shape with `for_each_handle_with_tag(tag, f: impl FnMut(u64))` driving the inner radix iteration without collecting. Blocked on I97 landing first so the two share one callback idiom. Additive; the eager `handles_with_tag` stays as the convenience wrapper. The Python binding can expose a generator over the callback. Filed from the chunk-tags spec's "Out of scope for v1".
+
+### I101. Bitmap inner sets for dense per-tag handle ranges [chunk-tags out-of-scope 2026-06-02] — **P3** (profile-gated)
+**Where:** `src/membership_index.rs` — the per-tag inner `RadixU64` (handle → 1 membership bit).
+
+**Motivation:** the membership index stores each tag's member set as a radix tree, optimal for the EXPECTED sparse handle distribution. If profiling on a real relational workload ever shows DENSE per-tag handle ranges (e.g. a relation whose chunks are allocated contiguously), a bitmap inner set would be both smaller and faster to scan than the radix. Do NOT do this speculatively — the radix is the right default; this is a measured-need optimization only. Filed from the chunk-tags spec's "Out of scope for v1".
+
+### I102. Batched per-page frees / streaming drop in `delete_with_tag` [chunk-tags out-of-scope 2026-06-02] — **P3**
+**Where:** `src/transaction.rs::delete_with_tag_inner` — the `for &h in &take { self.delete_inner(h)?; }` loop.
+
+**Motivation:** `delete_with_tag` deletes one handle per `delete_inner` call, each a full handle-table walk + per-handle freeing, exactly the per-handle shape I33 wants to batch for `delete_many` (per-leaf batched delete walks the tree once per leaf, not once per handle). When I33's batched-delete primitive lands, route `delete_with_tag`'s bounded batch through it for dense-relation drops. Also relevant: a relation far larger than one `max` batch already drops incrementally (the caller loops `begin → delete_with_tag → commit`), so this is a per-batch efficiency item, not a correctness or unbounded-time gap. Filed from the chunk-tags spec's "Out of scope for v1".
