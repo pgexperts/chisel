@@ -51,7 +51,7 @@ use crate::data_page::DataPage;
 use crate::error::{ChiselError, Result};
 use crate::freemap::FreeMap;
 use crate::handle_table::{HandleEntry, HandleFlags, HandleTable, FLAG_INTERIOR};
-use crate::membership_index::{MembershipIndex, RadixU64};
+use crate::membership_index::{MembershipIndex, RadixU64, TagDropProgress};
 use crate::overflow::Overflow;
 use crate::page::{self, PAGE_ID_NONE, PAGE_SIZE};
 use crate::page_cache::PageCache;
@@ -1566,6 +1566,43 @@ impl TransactionManager {
         self.delete_inner(handle)
     }
 
+    pub fn delete_with_tag(&mut self, tag: u32, max: usize) -> Result<TagDropProgress> {
+        self.check_alive()?;
+        let result = self.delete_with_tag_inner(tag, max);
+        self.poison_on_fatal(result)
+    }
+
+    fn delete_with_tag_inner(&mut self, tag: u32, max: usize) -> Result<TagDropProgress> {
+        if !self.active_txn {
+            return Err(ChiselError::NoActiveTransaction);
+        }
+        if max == 0 {
+            return Ok(TagDropProgress {
+                deleted: Vec::new(),
+                complete: false,
+            });
+        }
+        // Bounded enumeration: ask for max+1 so the count tells us whether more
+        // remain (len > max => not complete). The members snapshot is taken
+        // BEFORE the deletions, then each is deleted via delete_inner (which
+        // removes it from the index and frees its chunk).
+        let members = {
+            let root = self.current_roots.membership_index_page;
+            let mut cache = self.cache.borrow_mut();
+            self.membership_index
+                .handles_for_tag_bounded(&mut cache, root, tag, max + 1)?
+        };
+        let complete = members.len() <= max;
+        let take: Vec<u64> = members.into_iter().take(max).collect();
+        for &h in &take {
+            self.delete_inner(h)?;
+        }
+        Ok(TagDropProgress {
+            deleted: take,
+            complete,
+        })
+    }
+
     /// Delete many handles in a single transaction.
     ///
     /// Today: this is a loop over `delete_inner`. After PR-A's fusion
@@ -2186,6 +2223,17 @@ mod tests {
         assert!(matches!(tm.delete(0), Err(ChiselError::Poisoned)));
         assert!(matches!(tm.handles(), Err(ChiselError::Poisoned)));
         assert!(matches!(tm.file_page_count(), Err(ChiselError::Poisoned)));
+        assert!(matches!(
+            tm.allocate_tagged(b"v", 1),
+            Err(ChiselError::Poisoned)
+        ));
+        assert!(matches!(tm.tag(0), Err(ChiselError::Poisoned)));
+        assert!(matches!(tm.handles_with_tag(1), Err(ChiselError::Poisoned)));
+        assert!(matches!(tm.delete_tagged(0, 1), Err(ChiselError::Poisoned)));
+        assert!(matches!(
+            tm.delete_with_tag(1, 10),
+            Err(ChiselError::Poisoned)
+        ));
     }
 
     // A fatal error observed during a normal operation must also poison
@@ -2798,6 +2846,30 @@ mod tests {
             let txm = TransactionManager::open_existing(cache).unwrap();
             let data = txm.read(handle).unwrap();
             assert_eq!(data, b"persistent");
+        }
+    }
+
+    #[test]
+    fn delete_with_tag_drops_in_bounded_batches() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let mut hs = Vec::new();
+        for i in 0..10u64 {
+            hs.push(tm.allocate_tagged(format!("row{i}").as_bytes(), 3).unwrap());
+        }
+        tm.commit().unwrap();
+        tm.begin().unwrap();
+        let p1 = tm.delete_with_tag(3, 4).unwrap();
+        assert_eq!(p1.deleted.len(), 4);
+        assert!(!p1.complete);
+        let p2 = tm.delete_with_tag(3, 100).unwrap();
+        assert_eq!(p2.deleted.len(), 6);
+        assert!(p2.complete);
+        tm.commit().unwrap();
+        assert_eq!(tm.handles_with_tag(3).unwrap(), Vec::<u64>::new());
+        // The chunks themselves are gone too.
+        for h in hs {
+            assert!(tm.read(h).is_err());
         }
     }
 }

@@ -60,6 +60,7 @@ pub use error::{ChiselError, Result};
 // re-exports define the supported access paths and keep the documented
 // API at the crate root.
 pub use defrag::{DefragOptions, DefragStats};
+pub use membership_index::TagDropProgress;
 pub use page::PAGE_SIZE;
 pub use stats::{ChiselCounters, Stats};
 pub use superblock::{
@@ -500,6 +501,14 @@ impl Chisel {
     /// their handle provenance.
     pub fn delete_tagged(&mut self, handle: u64, tag: u32) -> Result<()> {
         self.txm.delete_tagged(handle, tag)
+    }
+
+    /// Delete up to `max` chunks carrying `tag`, returning the handles dropped
+    /// this pass and whether the tag is now fully drained (`complete`). Loop
+    /// `begin -> delete_with_tag -> commit` until `complete` for an incremental,
+    /// bounded-time relation drop. `max == 0` is a no-op (`complete == false`).
+    pub fn delete_with_tag(&mut self, tag: u32, max: usize) -> Result<TagDropProgress> {
+        self.txm.delete_with_tag(tag, max)
     }
 
     /// Delete many handles in one transaction (ISSUES.md F1 / I12).

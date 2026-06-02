@@ -449,6 +449,7 @@ fn unpack_inner(packed: u64) -> (u64, u32) {
 }
 
 /// Progress report from a bounded `delete_with_tag` pass.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct TagDropProgress {
     /// Handles removed from the index in this pass (the engine deletes their
