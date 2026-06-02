@@ -35,6 +35,7 @@ pub(crate) mod error;
 pub(crate) mod freemap;
 pub(crate) mod handle_table;
 mod lru;
+pub(crate) mod membership_index;
 pub(crate) mod overflow;
 pub(crate) mod page;
 pub(crate) mod page_cache;
