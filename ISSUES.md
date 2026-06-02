@@ -1256,3 +1256,18 @@ Source: `docs/reviews/perf-review-2026-06-01.md` (read-only full hot-path sweep,
 **Problem:** the single-run-no-warmup scenario design folds cold-start ops (cold cache, unwarmed allocator arenas / branch predictors) into the same distribution as steady-state, inflating the tracked `THRESHOLD_PCT_P95/P99` tails.
 
 **Direction of fix:** discard a warmup prefix from `per_op_ns` before percentile computation, or run a short untimed warmup pass first. Bench-only; document the choice.
+
+---
+
+## Feature requests (2026-06-02)
+
+Source: primary Chisel client, 2026-06-02.
+
+### I97. Streaming handle enumeration (`for_each_handle` callback) [client 2026-06-02] — **P3**
+**Where:** `src/lib.rs` `Chisel::handles` (~:512); `src/transaction.rs::handles_inner` (~:1435); `src/handle_table.rs::iter_live` / `iter_recursive` (~:353 / ~:604)
+
+**Motivation:** `Chisel::handles()` already enumerates all live handles, but it MATERIALIZES the full `Vec<u64>` (plus a transient `Vec<(u64, HandleEntry)>` inside `iter_live`). For a database with millions of live handles that is a multi-megabyte allocation spike on top of the `O(live handles)` tree walk — the same walk that makes `stats()` O(live handles), see I53. A caller that wants to process every handle without holding them all in memory has no lazy option today.
+
+**Direction of fix:** add a callback enumerator — e.g. `Chisel::for_each_handle(&self, f: impl FnMut(u64)) -> Result<()>` — that drives `iter_recursive` directly and invokes the closure per live handle instead of pushing into a Vec. A callback, NOT a lazy `Iterator`, is the right shape: the walk holds `&mut PageCache` throughout (pages load/evict as it descends), so a lazy iterator would have to carry that mutable borrow across every `next()` — borrow-checker-hostile. `iter_recursive` already has the structure; it would call `f(handle)` where it currently does `result.push((handle, entry))`. Keep `handles()` as the eager convenience built on top. The Python binding can expose a generator backed by the callback — which would also make the existing `Iterable[int]` `.pyi` annotation honest (it returns an eager `list` today).
+
+**Thin-impl note (client):** even a callback that internally collects then iterates is a strict ergonomic win over returning the Vec; the zero-materialization version is the actual goal.
