@@ -1510,6 +1510,25 @@ impl TransactionManager {
         }
 
         self.current_roots.handle_table_page = new_root;
+
+        // Self-maintaining: a tagged chunk must leave the reverse membership
+        // index when it's deleted, so handles_with_tag no longer returns it and
+        // the forward (HandleEntry.tag) / reverse (index) maps stay in agreement.
+        // The tag comes from the entry being tombstoned -- no tag argument needed.
+        // Untagged chunks (tag 0 are never in the index) do no index work.
+        if entry.tag != 0 {
+            let (new_index_root, _removed) = {
+                let mut cache = self.cache.borrow_mut();
+                self.membership_index.remove(
+                    &mut cache,
+                    self.current_roots.membership_index_page,
+                    entry.tag,
+                    handle,
+                )?
+            };
+            self.current_roots.membership_index_page = new_index_root;
+        }
+
         Ok(())
     }
 
@@ -2657,6 +2676,35 @@ mod tests {
         // membership index must still list the handle under its original tag.
         assert_eq!(tm.tag(h).unwrap(), 42);
         assert_eq!(tm.handles_with_tag(42).unwrap(), vec![h]);
+    }
+
+    #[test]
+    fn delete_removes_tagged_chunk_from_index() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let h = tm.allocate_tagged(b"row", 7).unwrap();
+        tm.commit().unwrap();
+        assert_eq!(tm.handles_with_tag(7).unwrap(), vec![h]);
+        tm.begin().unwrap();
+        tm.delete(h).unwrap();
+        tm.commit().unwrap();
+        // The tag's last member is gone -> handles_with_tag is empty.
+        assert_eq!(tm.handles_with_tag(7).unwrap(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn delete_one_of_two_tagged_keeps_the_other() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let a = tm.allocate_tagged(b"a", 7).unwrap();
+        let b = tm.allocate_tagged(b"b", 7).unwrap();
+        tm.commit().unwrap();
+        tm.begin().unwrap();
+        tm.delete(a).unwrap();
+        tm.commit().unwrap();
+        // Only `a` is removed from the reverse index; `b` survives under tag 7.
+        assert_eq!(tm.handles_with_tag(7).unwrap(), vec![b]);
+        assert_eq!(tm.tag(b).unwrap(), 7);
     }
 
     // ── Migrated 2026-05-22 from tests/transactions.rs (I35 reshape) ──
