@@ -51,6 +51,7 @@ use crate::data_page::DataPage;
 use crate::error::{ChiselError, Result};
 use crate::freemap::FreeMap;
 use crate::handle_table::{HandleEntry, HandleFlags, HandleTable, FLAG_INTERIOR};
+use crate::membership_index::{MembershipIndex, RadixU64};
 use crate::overflow::Overflow;
 use crate::page::{self, PAGE_ID_NONE, PAGE_SIZE};
 use crate::page_cache::PageCache;
@@ -136,6 +137,12 @@ pub struct TransactionManager {
     // diverges from it as mutations create new COW pages during a txn.
     current_roots: Roots,
     handle_table: HandleTable,
+    /// In-memory state for the membership index (chunk tags). Holds only the
+    /// outer tree's depth; the root lives in current/committed `Roots`.
+    // Tag operations are wired in a follow-on task; suppress dead_code until
+    // the first read site exists.
+    #[allow(dead_code)]
+    membership_index: MembershipIndex,
     // Monotonically increasing. Written into each new superblock; the higher value
     // wins on recovery. Also used to pick the inactive slot on commit via
     // `txn_counter % superblock_count`.
@@ -288,6 +295,7 @@ impl TransactionManager {
             committed_roots: roots.clone(),
             current_roots: roots,
             handle_table: HandleTable::new(),
+            membership_index: MembershipIndex::new(),
             // Slot 0 was written last in the loop above, at counter
             // (superblock_count - 1 - 0) = superblock_count - 1. That's
             // the highest counter and therefore the winner on select().
@@ -448,6 +456,16 @@ impl TransactionManager {
             }
         }
 
+        // Mirror the handle-table depth recovery for the membership index: its
+        // outer RadixU64 keeps only depth in memory, rebuilt by walking the
+        // persisted spine from the root recorded in the superblock. Uses the
+        // normalized roots.membership_index_page (PAGE_ID_NONE for legacy files).
+        let mut membership_index = MembershipIndex::new();
+        if roots.membership_index_page != PAGE_ID_NONE {
+            let depth = RadixU64::recover_depth(&mut cache, roots.membership_index_page)?;
+            membership_index.set_outer_depth(depth);
+        }
+
         // Load the freemap, if this database has ever persisted one.
         // A DB created under v1 (pre-R2) will have root_freemap_page ==
         // PAGE_ID_NONE because the freemap was never wired into the
@@ -486,6 +504,7 @@ impl TransactionManager {
             committed_roots: roots.clone(),
             current_roots: roots,
             handle_table: ht,
+            membership_index,
             txn_counter: sb.txn_counter,
             // R4: discovered from the winning superblock's own
             // `superblock_count` field. Cached so commit doesn't have
