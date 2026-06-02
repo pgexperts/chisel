@@ -30,6 +30,11 @@ pub const CACHE_SIZE_PAGES: usize = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EngineMode {
     ChiselStrict,
+    /// Chisel against its `Vec<u8>`-backed in-memory PageIo — same engine,
+    /// no file, no fsync. Exists so the scenario tier can measure Chisel's
+    /// pure CPU/memory cost; the `chisel-mem` − `chisel-strict` delta on the
+    /// same scenario is a direct read of the fsync/file-I/O tax (I92).
+    ChiselMemory,
     RedbStrict,
     RedbUnsafe,
     SqliteStrict,
@@ -37,8 +42,12 @@ pub enum EngineMode {
 }
 
 impl EngineMode {
-    /// All five modes the micro grid measures. The order is the canonical
-    /// column order in the markdown summary (PR 5).
+    /// The five file-backed modes the micro grid measures, in canonical
+    /// markdown-summary column order (PR 5). `ChiselMemory` is deliberately
+    /// excluded: the snapshot-restore and cold-read rows seed an engine by
+    /// `fs::copy`-ing a populated file, which a `Vec<u8>`-backed engine cannot
+    /// observe. In-memory is exercised only by the scenario tier
+    /// (`scenarios.rs`), which pre-populates in-process. (I92)
     pub const ALL: [Self; 5] = [
         Self::ChiselStrict,
         Self::RedbStrict,
@@ -51,6 +60,7 @@ impl EngineMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::ChiselStrict => "chisel-strict",
+            Self::ChiselMemory => "chisel-mem",
             Self::RedbStrict => "redb-strict",
             Self::RedbUnsafe => "redb-unsafe",
             Self::SqliteStrict => "sqlite-strict",
@@ -63,7 +73,7 @@ impl EngineMode {
     /// black-box). The post-processor uses this to decide whether to
     /// fill the Chisel-internals appendix table for a cell.
     pub fn supports_internal_counters(self) -> bool {
-        matches!(self, Self::ChiselStrict)
+        matches!(self, Self::ChiselStrict | Self::ChiselMemory)
     }
 
     /// Construct a fresh engine of this mode, file-backed at `path` with
@@ -73,6 +83,10 @@ impl EngineMode {
     pub fn open(self, path: &Path, cache_size_pages: usize) -> EngineResult<Box<dyn Engine>> {
         match self {
             Self::ChiselStrict => Ok(Box::new(ChiselEngine::open_file(path, cache_size_pages)?)),
+            // I92: in-memory backing ignores `path` — there is no file. Exercised
+            // only by the scenario tier, which pre-populates in-process; any
+            // tempfile the caller opens alongside is simply unused.
+            Self::ChiselMemory => Ok(Box::new(ChiselEngine::open_in_memory(cache_size_pages)?)),
             Self::RedbStrict => Ok(Box::new(RedbEngine::open_file(
                 path,
                 cache_size_pages,
@@ -821,5 +835,46 @@ mod tests {
             result.counters.is_none(),
             "redb cells produce counters: None"
         );
+    }
+
+    #[test]
+    fn run_scenario_cell_in_memory_mode_is_wired_and_does_work() {
+        // I92: verify the chisel-mem mode is correctly wired into the scenario
+        // runner and does real engine work.
+        //
+        // Subtlety worth pinning (it cost a wrong first assertion): the
+        // in-memory backend does NOT report fsync_calls == 0. `fsync_calls`
+        // counts *protocol-level* fsync operations (3 per commit), incremented
+        // regardless of backing; on the Vec<u8> backing those are no-op
+        // syscalls. So for an identical workload the counters are identical to
+        // chisel-strict — which is the point: with the work held equal, the
+        // chisel-mem − chisel-strict *wall-clock* delta is a clean read of the
+        // fsync/file-I/O tax. We assert wiring + real work, never timing
+        // (timing assertions are flaky).
+        let prepop = Workload {
+            name: "mem-prepop".to_string(),
+            seed: 0x9003,
+            prepop_count: 0,
+            ops: (0..50).map(|_| Operation::Allocate { size: 256 }).collect(),
+        };
+        let workload = Workload {
+            name: "mem-scenario".to_string(),
+            seed: 0x9003,
+            prepop_count: 50,
+            ops: (0..20).map(|_| Operation::Allocate { size: 256 }).collect(),
+        };
+        let result = run_scenario_cell(EngineMode::ChiselMemory, "smoke", &prepop, &workload);
+        assert_eq!(result.mode, "chisel-mem");
+        assert_eq!(result.op_count, 20);
+        let counters = result
+            .counters
+            .expect("in-memory chisel still reports internal counters");
+        assert!(
+            counters.pages_allocated > 0,
+            "timed allocates must dirty pages"
+        );
+        // Commits executed (3 protocol fsyncs each) even though the Vec backing
+        // makes them no-op syscalls — confirms the timed mutating phase ran.
+        assert!(counters.fsync_calls > 0);
     }
 }

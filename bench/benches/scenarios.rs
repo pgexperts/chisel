@@ -1,5 +1,6 @@
-// Bench-binary entry for the scenario tier. Iterates the 12 cells
-// (4 scenarios × 3 strict modes), calls run_scenario_cell for each,
+// Bench-binary entry for the scenario tier. Iterates the 16 cells
+// (4 scenarios × 4 modes: chisel-strict, chisel-mem, redb-strict,
+// sqlite-strict), calls run_scenario_cell for each,
 // streams ScenarioResult rows to bench/results/scenarios_metrics.jsonl
 // (one JSON object per line, flushed after each cell for crash
 // resilience).
@@ -24,8 +25,13 @@ use chisel_bench::scenarios::{
 use chisel_bench::workload::Workload;
 use std::io::Write;
 
-const STRICT_MODES: &[EngineMode] = &[
+// Modes compared per scenario. chisel-mem (in-memory Chisel) sits directly
+// after chisel-strict so the per-scenario fsync/file-I/O tax reads off the two
+// columns' delta (I92). redb/sqlite stay strict here — their unsafe variants
+// are a micro-grid concern, not a scenario one.
+const SCENARIO_MODES: &[EngineMode] = &[
     EngineMode::ChiselStrict,
+    EngineMode::ChiselMemory,
     EngineMode::RedbStrict,
     EngineMode::SqliteStrict,
 ];
@@ -38,8 +44,9 @@ fn main() -> std::io::Result<()> {
     }
     let mut writer = std::fs::File::create(&out_path)?;
 
+    let mut cells_written = 0usize;
     for (scenario_name, prepop, workload) in build_scenarios() {
-        for &mode in STRICT_MODES {
+        for &mode in SCENARIO_MODES {
             eprintln!("running {scenario_name} on {} ...", mode.label());
             let result = run_scenario_cell(mode, scenario_name, &prepop, &workload);
             serde_json::to_writer(&mut writer, &result)?;
@@ -52,9 +59,10 @@ fn main() -> std::io::Result<()> {
                 result.p99_ns,
                 result.throughput_ops_per_sec,
             );
+            cells_written += 1;
         }
     }
-    eprintln!("Wrote 12 cells to {out_path}");
+    eprintln!("Wrote {cells_written} cells to {out_path}");
     Ok(())
 }
 
