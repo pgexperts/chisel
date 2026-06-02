@@ -120,6 +120,46 @@ fn test_recovery_corrupt_superblock_b() {
 }
 
 #[test]
+fn test_recovery_tagged_index_recovers_from_prior_superblock() {
+    // The membership-index root (root_membership_index_page) rides the superblock
+    // and swaps atomically with the handle-table / freemap roots on every commit.
+    // Prove that atomicity for the index: commit a PRIOR state (tag 9 -> {h1}),
+    // then a NEWER state (tag 9 -> {h1, h2}) which lands in the other superblock
+    // slot. Corrupt the ACTIVE slot (page 1, the newer commit's slot — see
+    // test_recovery_corrupt_superblock_b, which establishes that the first commit
+    // lands in page 0). Recovery must reject the torn active slot, fall back to the
+    // prior slot, and rebuild the membership index (RadixU64::recover_depth) from
+    // ITS root — so only the prior relation (h1) is visible, never a half-torn mix.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    let h1;
+    let h2;
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        h1 = db.allocate_tagged(b"row1", 9).unwrap();
+        db.commit().unwrap(); // prior state -> superblock slot A (page 0)
+        db.begin().unwrap();
+        h2 = db.allocate_tagged(b"row2", 9).unwrap();
+        db.commit().unwrap(); // newer state -> superblock slot B (page 1), now active
+    }
+    // Corrupt the active superblock slot (page 1) by zeroing it.
+    {
+        let mut f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        f.write_all(&[0u8; PAGE_SIZE]).unwrap();
+        f.sync_all().unwrap();
+    }
+    // Recovery falls back to the prior slot; its index holds only h1, and the
+    // membership read path (recover_depth + handles_for_tag) returns it cleanly.
+    let db = Chisel::open(&path, Default::default()).unwrap();
+    assert_eq!(db.handles_with_tag(9).unwrap(), vec![h1]);
+    assert_eq!(db.tag(h1).unwrap(), 9);
+    // h2 existed only in the corrupted newer state -> gone after recovery.
+    assert!(db.read(h2).is_err());
+}
+
+#[test]
 fn test_recovery_torn_first_commit() {
     // Regression test for ISSUES.md I2: historically `create_new` left
     // superblock slot 1 as an all-zero buffer. The very first user commit
