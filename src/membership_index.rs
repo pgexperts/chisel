@@ -185,6 +185,8 @@ impl RadixU64 {
                 } else {
                     PageType::MembershipInterior
                 };
+                // A fresh child here is immediately re-COWed by the recursive call
+                // below (orphaning this scratch page); benign, first-touch only.
                 init_page(cache, pt)?
             } else {
                 child
@@ -427,6 +429,199 @@ impl RadixU64 {
     }
 }
 
+// The outer tree's value bit-packs the inner tree's (depth, root): depth in the
+// top 6 bits (max radix depth for u64 keys is < 7), root in the low 58 bits.
+// Page ids never approach 2^58 (2^58 * 8 KiB ~= 2.3 ZiB), so this is lossless.
+const INNER_ROOT_BITS: u32 = 58;
+const INNER_ROOT_MASK: u64 = (1u64 << INNER_ROOT_BITS) - 1;
+
+fn pack_inner(root: u64, depth: u32) -> u64 {
+    debug_assert!(root <= INNER_ROOT_MASK, "page id exceeds 2^58");
+    debug_assert!(
+        depth < (1 << (64 - INNER_ROOT_BITS)),
+        "inner depth too large"
+    );
+    ((depth as u64) << INNER_ROOT_BITS) | root
+}
+
+fn unpack_inner(packed: u64) -> (u64, u32) {
+    (packed & INNER_ROOT_MASK, (packed >> INNER_ROOT_BITS) as u32)
+}
+
+/// Progress report from a bounded `delete_with_tag` pass.
+#[derive(Debug, Clone)]
+pub struct TagDropProgress {
+    /// Handles removed from the index in this pass (the engine deletes their
+    /// chunks). May be fewer than `max` if the tag emptied first.
+    pub deleted: Vec<u64>,
+    /// `true` if the tag has no remaining members after this pass.
+    pub complete: bool,
+}
+
+/// Two-level membership index: tag -> {handles}. Owns the outer tree's depth;
+/// inner depths ride the outer values via `pack_inner`. The caller (transaction
+/// layer) owns the outer root and threads it through `Roots`/superblock.
+pub(crate) struct MembershipIndex {
+    outer_depth: u32,
+}
+
+impl MembershipIndex {
+    pub fn new() -> MembershipIndex {
+        MembershipIndex { outer_depth: 0 }
+    }
+
+    /// Restore the outer depth on open (the engine calls `RadixU64::recover_depth`
+    /// on the index root and passes it here).
+    pub fn set_outer_depth(&mut self, depth: u32) {
+        self.outer_depth = depth;
+    }
+
+    /// Insert `(tag, handle)`. `tag` must be non-zero (0 = untagged is filtered
+    /// by the caller). Returns the new outer root.
+    pub fn insert(
+        &mut self,
+        cache: &mut PageCache,
+        outer_root: u64,
+        tag: u32,
+        handle: u64,
+    ) -> Result<u64> {
+        let mut outer = RadixU64 {
+            depth: self.outer_depth,
+        };
+        let root = if outer_root == PAGE_ID_NONE {
+            outer.create_root(cache)?
+        } else {
+            outer_root
+        };
+        let (mut inner_root, inner_depth) = unpack_inner(outer.lookup(cache, root, tag as u64)?);
+        let mut inner = RadixU64 { depth: inner_depth };
+        if inner_root == 0 {
+            inner_root = inner.create_root(cache)?;
+        }
+        let new_inner_root = inner.insert(cache, inner_root, handle, 1)?;
+        let packed = pack_inner(new_inner_root, inner.depth);
+        let new_outer_root = outer.insert(cache, root, tag as u64, packed)?;
+        self.outer_depth = outer.depth;
+        Ok(new_outer_root)
+    }
+
+    /// Remove `(tag, handle)`. Returns `(new_outer_root, was_present)`. Reclaims
+    /// the tag's outer entry when its last member is removed (cheap: the
+    /// emptiness check early-exits unless the tag truly emptied).
+    pub fn remove(
+        &mut self,
+        cache: &mut PageCache,
+        outer_root: u64,
+        tag: u32,
+        handle: u64,
+    ) -> Result<(u64, bool)> {
+        if outer_root == PAGE_ID_NONE {
+            return Ok((outer_root, false));
+        }
+        let mut outer = RadixU64 {
+            depth: self.outer_depth,
+        };
+        let (inner_root, inner_depth) = unpack_inner(outer.lookup(cache, outer_root, tag as u64)?);
+        if inner_root == 0 {
+            return Ok((outer_root, false));
+        }
+        let mut inner = RadixU64 { depth: inner_depth };
+        let (new_inner_root, prev) = inner.delete(cache, inner_root, handle)?;
+        if prev == 0 {
+            return Ok((outer_root, false));
+        }
+        let new_outer_root = if inner.any_present(cache, new_inner_root)? {
+            outer.insert(
+                cache,
+                outer_root,
+                tag as u64,
+                pack_inner(new_inner_root, inner.depth),
+            )?
+        } else {
+            let (r, _) = outer.delete(cache, outer_root, tag as u64)?;
+            r
+        };
+        self.outer_depth = outer.depth;
+        Ok((new_outer_root, true))
+    }
+
+    #[allow(dead_code)] // index-completeness + tests; production reads tags via handle_table.lookup
+    pub fn contains(
+        &self,
+        cache: &mut PageCache,
+        outer_root: u64,
+        tag: u32,
+        handle: u64,
+    ) -> Result<bool> {
+        if outer_root == PAGE_ID_NONE {
+            return Ok(false);
+        }
+        let outer = RadixU64 {
+            depth: self.outer_depth,
+        };
+        let (inner_root, inner_depth) = unpack_inner(outer.lookup(cache, outer_root, tag as u64)?);
+        if inner_root == 0 {
+            return Ok(false);
+        }
+        let inner = RadixU64 { depth: inner_depth };
+        Ok(inner.lookup(cache, inner_root, handle)? != 0)
+    }
+
+    pub fn handles_for_tag(
+        &self,
+        cache: &mut PageCache,
+        outer_root: u64,
+        tag: u32,
+    ) -> Result<Vec<u64>> {
+        if outer_root == PAGE_ID_NONE {
+            return Ok(Vec::new());
+        }
+        let outer = RadixU64 {
+            depth: self.outer_depth,
+        };
+        let (inner_root, inner_depth) = unpack_inner(outer.lookup(cache, outer_root, tag as u64)?);
+        if inner_root == 0 {
+            return Ok(Vec::new());
+        }
+        let inner = RadixU64 { depth: inner_depth };
+        Ok(inner
+            .iter(cache, inner_root)?
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect())
+    }
+
+    /// Return at most `limit` handles of `tag` (bounded enumeration). The engine
+    /// loops `delete` over these so each `delete_with_tag` pass is bounded-time;
+    /// `complete` is derived by the engine (it requests `max + 1` and checks the
+    /// count). The full drop (members + chunks) lives in the engine because
+    /// deleting a member's chunk is the engine's responsibility, not the index's.
+    pub fn handles_for_tag_bounded(
+        &self,
+        cache: &mut PageCache,
+        outer_root: u64,
+        tag: u32,
+        limit: usize,
+    ) -> Result<Vec<u64>> {
+        if outer_root == PAGE_ID_NONE {
+            return Ok(Vec::new());
+        }
+        let outer = RadixU64 {
+            depth: self.outer_depth,
+        };
+        let (inner_root, inner_depth) = unpack_inner(outer.lookup(cache, outer_root, tag as u64)?);
+        if inner_root == 0 {
+            return Ok(Vec::new());
+        }
+        let inner = RadixU64 { depth: inner_depth };
+        Ok(inner
+            .iter_bounded(cache, inner_root, limit)?
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,5 +716,57 @@ mod tests {
         root = t.insert(&mut c, root, 5_000_000, 1).unwrap();
         let recovered = RadixU64::recover_depth(&mut c, root).unwrap();
         assert_eq!(recovered, t.depth);
+    }
+
+    #[test]
+    fn membership_insert_contains_remove() {
+        let mut c = cache(8192);
+        let mut idx = MembershipIndex::new();
+        let mut root = PAGE_ID_NONE;
+        root = idx.insert(&mut c, root, 7, 100).unwrap();
+        root = idx.insert(&mut c, root, 7, 200).unwrap();
+        root = idx.insert(&mut c, root, 9, 300).unwrap();
+        assert!(idx.contains(&mut c, root, 7, 100).unwrap());
+        assert!(idx.contains(&mut c, root, 7, 200).unwrap());
+        assert!(!idx.contains(&mut c, root, 7, 300).unwrap());
+        let mut h7 = idx.handles_for_tag(&mut c, root, 7).unwrap();
+        h7.sort();
+        assert_eq!(h7, vec![100, 200]);
+        assert_eq!(idx.handles_for_tag(&mut c, root, 9).unwrap(), vec![300]);
+
+        let (root2, removed) = idx.remove(&mut c, root, 7, 100).unwrap();
+        assert!(removed);
+        assert!(!idx.contains(&mut c, root2, 7, 100).unwrap());
+        assert!(idx.contains(&mut c, root2, 7, 200).unwrap());
+        let (_root3, removed_again) = idx.remove(&mut c, root2, 7, 100).unwrap();
+        assert!(!removed_again, "removing an absent member reports false");
+    }
+
+    #[test]
+    fn handles_for_tag_bounded_caps_results() {
+        let mut c = cache(16384);
+        let mut idx = MembershipIndex::new();
+        let mut root = PAGE_ID_NONE;
+        for h in 0..10u64 {
+            root = idx.insert(&mut c, root, 3, 1000 + h).unwrap();
+        }
+        assert_eq!(
+            idx.handles_for_tag_bounded(&mut c, root, 3, 4)
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            idx.handles_for_tag_bounded(&mut c, root, 3, 100)
+                .unwrap()
+                .len(),
+            10
+        );
+        assert_eq!(
+            idx.handles_for_tag_bounded(&mut c, root, 3, 5)
+                .unwrap()
+                .len(),
+            5
+        );
     }
 }
