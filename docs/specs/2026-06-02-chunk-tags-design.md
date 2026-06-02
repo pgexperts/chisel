@@ -1,7 +1,10 @@
 # Chunk Tags — Design Spec
 
 - **Date:** 2026-06-02
-- **Status:** approved design (open questions resolved 2026-06-02), pending implementation plan
+- **Status:** implemented 2026-06-02 on branch `feature/chunk-tags` (engine + public
+  Rust API + Python binding + integration tests). One v1 simplification recorded during
+  planning: `delete_with_tag` enumerates members with a bounded `iter_bounded` (`max + 1`)
+  rather than the spec's unbounded sketch, to honor the bounded-time requirement.
 - **Source:** brainstorm with the primary Chisel client (relational layer)
 
 ## Summary
@@ -115,8 +118,10 @@ progress shape for the drop. Rust core, mirrored in `chisel-py`:
   deleting. For callers that want to assert membership rather than trust it.
 - `delete_with_tag(&mut self, tag: u32, max: usize) -> Result<TagDropProgress>` — delete up
   to `max` chunks of a tag (each chunk's value/overflow pages freed; an emptied inner
-  subtree + outer entry dropped). Returns `TagDropProgress { deleted: usize, complete: bool }`.
-  **Bounded** so a large relation drops incrementally: the caller loops
+  subtree + outer entry dropped). Returns `TagDropProgress { deleted: Vec<u64>, complete: bool }`
+  — the handles actually dropped this batch (the count is `deleted.len()`), so the caller can
+  prune its own tag→handle bookkeeping in lockstep. **Bounded** so a large relation drops
+  incrementally: the caller loops
   `begin → delete_with_tag → commit` until `complete`, each batch a bounded, separately-
   durable transaction. This is the relation-drop primitive (closes F1 / I12). Operates
   within the active transaction, like `delete_many`. The `max` bound doubles as a cap on the

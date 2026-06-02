@@ -307,6 +307,30 @@ impl PyChisel {
         self.with_inner_io(py, |c| c.handles())
     }
 
+    fn allocate_tagged(&self, py: Python<'_>, value: &Bound<'_, PyAny>, tag: u32) -> PyResult<u64> {
+        let bytes = crate::convert::coerce_value(value)?;
+        self.with_inner_mut_io(py, |c| c.allocate_tagged(&bytes, tag))
+    }
+
+    fn tag(&self, py: Python<'_>, handle: u64) -> PyResult<u32> {
+        self.with_inner_io(py, |c| c.tag(handle))
+    }
+
+    fn handles_with_tag(&self, py: Python<'_>, tag: u32) -> PyResult<Vec<u64>> {
+        self.with_inner_io(py, |c| c.handles_with_tag(tag))
+    }
+
+    fn delete_tagged(&self, py: Python<'_>, handle: u64, tag: u32) -> PyResult<()> {
+        self.with_inner_mut_io(py, |c| c.delete_tagged(handle, tag))
+    }
+
+    /// Returns (deleted: list[int], complete: bool).
+    fn delete_with_tag(&self, py: Python<'_>, tag: u32, max: usize) -> PyResult<(Vec<u64>, bool)> {
+        self.with_inner_mut_io(py, |c| {
+            c.delete_with_tag(tag, max).map(|p| (p.deleted, p.complete))
+        })
+    }
+
     fn set_root_name(&self, py: Python<'_>, name: &str, handle: u64) -> PyResult<()> {
         self.set_root_name_internal(py, name, handle)
     }

@@ -43,7 +43,9 @@ pub enum ChiselError {
     // R4). Only raised at open time when the caller passed a value
     // < MIN_SUPERBLOCKS (2) or > MAX_SUPERBLOCKS (16). Operational —
     // the caller fixes their Options and tries again.
-    InvalidSuperblockCount { value: u32 },
+    InvalidSuperblockCount {
+        value: u32,
+    },
     // The page cache has reached its strict cap (`max_pages`) with
     // every cached entry dirty and the spillway disabled
     // (`spillway_max_bytes == 0`), so there is no clean page available
@@ -53,13 +55,17 @@ pub enum ChiselError {
     // the in-flight work entirely). The pre-spillway 8x
     // HARD_CEILING_MULTIPLIER design is gone — see spec
     // 2026-05-03-chisel-spillway-design.md.
-    CacheFull { limit: usize },
+    CacheFull {
+        limit: usize,
+    },
     // The spillway file has reached its `spillway_max_bytes` cap with
     // every cached entry dirty, so there is neither room in the cache
     // nor room in the spillway. Operational: the DB on disk is still
     // intact. Recovery is to commit (which drains the spillway and
     // resets it) or roll back. Spec 2026-05-03-chisel-spillway-design.md.
-    SpillwayFull { limit_bytes: u64 },
+    SpillwayFull {
+        limit_bytes: u64,
+    },
     // Raised when a configuration mutator (e.g. set_cache_max_bytes,
     // set_spillway_max_bytes, set_drain_insertion) is called while a
     // transaction is in flight. Operational: caller commits or rolls
@@ -67,6 +73,14 @@ pub enum ChiselError {
     // transactions state; mid-transaction shrink would either reject
     // or silently spill, neither of which is a clean story.
     TransactionInProgress,
+    // delete_tagged was given a tag that does not match the chunk's actual tag.
+    // Operational: the caller passed the wrong tag; the chunk and the membership
+    // index are untouched, so the transaction may continue.
+    TagMismatch {
+        handle: u64,
+        expected: u32,
+        actual: u32,
+    },
 
     // Fatal — database integrity is in question. Close and re-open
     // before attempting further work. The reopen will re-run superblock
@@ -78,7 +92,9 @@ pub enum ChiselError {
     // TransactionManager, so `close-and-reopen` is the only legitimate
     // response regardless of which fatal variant fired.
     IoError(io::Error),
-    ChecksumMismatch { page_id: u64 },
+    ChecksumMismatch {
+        page_id: u64,
+    },
     // Raised when `Superblock::select` finds no usable slot. "Usable"
     // means `deserialize` returned Some, which in turn requires a valid
     // XXH3 checksum, correct magic, AND a `superblock_count` inside
@@ -88,7 +104,10 @@ pub enum ChiselError {
     // diagnosing a bad file should look at the raw slot bytes if a
     // more specific cause is needed.
     CorruptSuperblock,
-    FileSizeMismatch { expected: u64, actual: u64 },
+    FileSizeMismatch {
+        expected: u64,
+        actual: u64,
+    },
     InvalidMagic,
     LockFailed,
     // Raised when a superblock's checksum is valid but its format_version
@@ -96,7 +115,10 @@ pub enum ChiselError {
     // CorruptSuperblock (which means no readable superblock at all) so
     // users can tell "unopenable because damaged" from "unopenable because
     // written by a newer/incompatible Chisel build".
-    UnsupportedFormatVersion { found: u32, expected: u32 },
+    UnsupportedFormatVersion {
+        found: u32,
+        expected: u32,
+    },
     // Raised by every operation on a TransactionManager that has previously
     // seen a fatal error (commit I/O failure, checksum mismatch on read,
     // etc.). See ISSUES.md I1: modeled after std::sync::Mutex poisoning.
@@ -111,7 +133,9 @@ pub enum ChiselError {
     // total_length). Distinct from `ChecksumMismatch` because the
     // checksum may be valid — the bytes are "structurally wrong"
     // rather than "bit-flipped". See ISSUES.md I14.
-    CorruptPage { page_id: u64 },
+    CorruptPage {
+        page_id: u64,
+    },
     // Raised when a caller asks `PageIo::read_page` for a page id that
     // is beyond the current physical file length. Pre-I16, this path
     // surfaced as a generic IoError(UnexpectedEof) which obscured the
@@ -119,7 +143,9 @@ pub enum ChiselError {
     // the request is an upstream bug (stale handle-table entry,
     // arithmetic error in a cache consumer) rather than a real I/O
     // failure. See ISSUES.md I16.
-    InvalidPageId { page_id: u64 },
+    InvalidPageId {
+        page_id: u64,
+    },
 }
 
 impl ChiselError {
@@ -152,6 +178,9 @@ impl fmt::Display for ChiselError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ChiselError::InvalidHandle(h) => write!(f, "invalid handle: {h}"),
+            ChiselError::TagMismatch { handle, expected, actual } => {
+                write!(f, "handle {handle} has tag {actual}, not the expected {expected}")
+            }
             ChiselError::NoActiveTransaction => write!(f, "no active transaction"),
             ChiselError::TransactionAlreadyActive => write!(f, "transaction already active"),
             ChiselError::SavepointNotFound(name) => write!(f, "savepoint not found: {name}"),

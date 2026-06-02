@@ -35,6 +35,7 @@ pub(crate) mod error;
 pub(crate) mod freemap;
 pub(crate) mod handle_table;
 mod lru;
+pub(crate) mod membership_index;
 pub(crate) mod overflow;
 pub(crate) mod page;
 pub(crate) mod page_cache;
@@ -59,6 +60,7 @@ pub use error::{ChiselError, Result};
 // re-exports define the supported access paths and keep the documented
 // API at the crate root.
 pub use defrag::{DefragOptions, DefragStats};
+pub use membership_index::TagDropProgress;
 pub use page::PAGE_SIZE;
 pub use stats::{ChiselCounters, Stats};
 pub use superblock::{
@@ -441,6 +443,28 @@ impl Chisel {
         self.txm.allocate(value)
     }
 
+    /// Store `value` tagged with `tag` and return a freshly minted stable handle.
+    /// Like `allocate`, but additionally registers the handle in the reverse
+    /// membership index (tag→handles) so `handles_with_tag(tag)` can enumerate it.
+    /// Tag 0 is the "untagged" sentinel — prefer plain `allocate` for untagged
+    /// values; the membership index is not updated for tag 0.
+    pub fn allocate_tagged(&mut self, value: &[u8], tag: u32) -> Result<u64> {
+        self.txm.allocate_tagged(value, tag)
+    }
+
+    /// Return the tag stored in the handle-table entry for `handle`.
+    /// Returns 0 for untagged handles. Takes `&self` (F3).
+    pub fn tag(&self, handle: u64) -> Result<u32> {
+        self.txm.tag(handle)
+    }
+
+    /// Enumerate all live handles that carry `tag`. Returns an empty Vec if
+    /// no handles with that tag exist. Tag 0 always returns an empty Vec
+    /// (the membership index is not updated for untagged values). Takes `&self` (F3).
+    pub fn handles_with_tag(&self, tag: u32) -> Result<Vec<u64>> {
+        self.txm.handles_with_tag(tag)
+    }
+
     /// Read the current value for `handle`. Takes `&self` — the page cache
     /// is mutated on miss (LRU bookkeeping, page loading) via interior
     /// mutability (see F3 in ISSUES.md). The returned `Vec<u8>` is a copy;
@@ -464,6 +488,30 @@ impl Chisel {
     /// overflow pages it owned are queued for release on commit.
     pub fn delete(&mut self, handle: u64) -> Result<()> {
         self.txm.delete(handle)
+    }
+
+    /// Remove a handle only if its tag equals `tag`. Returns
+    /// `ChiselError::TagMismatch` (leaving the chunk and membership index
+    /// untouched) if the stored tag differs. On success, delegates to
+    /// `delete`, so the membership index is self-maintained.
+    ///
+    /// Use this when the caller wants to assert ownership (a stale or
+    /// mis-directed handle should not silently delete the wrong chunk).
+    /// `delete` remains the unchecked fast path for callers that trust
+    /// their handle provenance.
+    pub fn delete_tagged(&mut self, handle: u64, tag: u32) -> Result<()> {
+        self.txm.delete_tagged(handle, tag)
+    }
+
+    /// Delete up to `max` chunks carrying `tag`, returning the handles dropped
+    /// this pass and whether the tag is now fully drained (`complete`). Loop
+    /// `begin -> delete_with_tag -> commit` until `complete` for an incremental,
+    /// bounded-time relation drop. `max == 0` is a no-op (`complete == false`).
+    /// On an error mid-pass the handles already deleted remain tombstoned in the
+    /// current transaction (same posture as `delete_many`) — roll back or commit;
+    /// a fatal error additionally poisons the manager.
+    pub fn delete_with_tag(&mut self, tag: u32, max: usize) -> Result<TagDropProgress> {
+        self.txm.delete_with_tag(tag, max)
     }
 
     /// Delete many handles in one transaction (ISSUES.md F1 / I12).

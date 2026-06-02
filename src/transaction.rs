@@ -51,6 +51,7 @@ use crate::data_page::DataPage;
 use crate::error::{ChiselError, Result};
 use crate::freemap::FreeMap;
 use crate::handle_table::{HandleEntry, HandleFlags, HandleTable, FLAG_INTERIOR};
+use crate::membership_index::{MembershipIndex, RadixU64, TagDropProgress};
 use crate::overflow::Overflow;
 use crate::page::{self, PAGE_ID_NONE, PAGE_SIZE};
 use crate::page_cache::PageCache;
@@ -79,6 +80,10 @@ struct Roots {
     next_handle: u64,
     total_pages: u64,
     named_roots: [NamedRoot; NAMED_ROOT_COUNT],
+    // Root page of the membership index (chunk-tags). PAGE_ID_NONE until the
+    // first tagged chunk is written. Cloned automatically with the rest of
+    // Roots at begin/commit/rollback/savepoint — no extra plumbing needed.
+    membership_index_page: u64,
 }
 
 /// A nested rollback point within an active transaction.
@@ -132,6 +137,9 @@ pub struct TransactionManager {
     // diverges from it as mutations create new COW pages during a txn.
     current_roots: Roots,
     handle_table: HandleTable,
+    /// In-memory state for the membership index (chunk tags). Holds only the
+    /// outer tree's depth; the root lives in current/committed `Roots`.
+    membership_index: MembershipIndex,
     // Monotonically increasing. Written into each new superblock; the higher value
     // wins on recovery. Also used to pick the inactive slot on commit via
     // `txn_counter % superblock_count`.
@@ -267,6 +275,7 @@ impl TransactionManager {
             next_handle: 0,
             total_pages: superblock_count as u64,
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
+            membership_index_page: PAGE_ID_NONE,
         };
 
         // A brand-new database has no freemap page on disk yet. Both
@@ -283,6 +292,7 @@ impl TransactionManager {
             committed_roots: roots.clone(),
             current_roots: roots,
             handle_table: HandleTable::new(),
+            membership_index: MembershipIndex::new(),
             // Slot 0 was written last in the loop above, at counter
             // (superblock_count - 1 - 0) = superblock_count - 1. That's
             // the highest counter and therefore the winner on select().
@@ -404,6 +414,13 @@ impl TransactionManager {
             next_handle: sb.next_handle,
             total_pages: sb.total_pages,
             named_roots: sb.named_roots,
+            // Normalize old files (pre-chunk-tags bytes were zeroed) so the
+            // rest of the engine has a single "empty" sentinel: PAGE_ID_NONE.
+            membership_index_page: if sb.root_membership_index_page == 0 {
+                PAGE_ID_NONE
+            } else {
+                sb.root_membership_index_page
+            },
         };
 
         // The HandleTable struct keeps only its depth in memory; physical pages
@@ -434,6 +451,16 @@ impl TransactionManager {
                 }
                 ht.set_depth(depth);
             }
+        }
+
+        // Mirror the handle-table depth recovery for the membership index: its
+        // outer RadixU64 keeps only depth in memory, rebuilt by walking the
+        // persisted spine from the root recorded in the superblock. Uses the
+        // normalized roots.membership_index_page (PAGE_ID_NONE for legacy files).
+        let mut membership_index = MembershipIndex::new();
+        if roots.membership_index_page != PAGE_ID_NONE {
+            let depth = RadixU64::recover_depth(&mut cache, roots.membership_index_page)?;
+            membership_index.set_outer_depth(depth);
         }
 
         // Load the freemap, if this database has ever persisted one.
@@ -474,6 +501,7 @@ impl TransactionManager {
             committed_roots: roots.clone(),
             current_roots: roots,
             handle_table: ht,
+            membership_index,
             txn_counter: sb.txn_counter,
             // R4: discovered from the winning superblock's own
             // `superblock_count` field. Cached so commit doesn't have
@@ -891,6 +919,7 @@ impl TransactionManager {
             // recovery can discover it from the winning slot without
             // external hints.
             superblock_count: self.superblock_count,
+            root_membership_index_page: self.current_roots.membership_index_page,
         };
         let buf = sb.serialize();
         // Step 3: Write to the INACTIVE slot. For N superblock slots,
@@ -974,6 +1003,18 @@ impl TransactionManager {
         }
 
         self.current_roots = self.committed_roots.clone();
+        // C1: MembershipIndex.outer_depth is in-memory state that index grows
+        // mutate during the transaction, but it is NOT carried in Roots, so the
+        // snapshot restore above does not rewind it. Re-derive it from the (now
+        // committed) root — mirroring the open-time recovery — so the in-memory
+        // descent depth matches the page it descends. Otherwise handles_with_tag
+        // mis-descends a rolled-back-shallow root with a stale-deep depth.
+        {
+            let mut cache = self.cache.borrow_mut();
+            let depth =
+                RadixU64::recover_depth(&mut cache, self.current_roots.membership_index_page)?;
+            self.membership_index.set_outer_depth(depth);
+        }
         // Revert the freemap working copy — any marks (free or allocate)
         // made during the transaction are discarded.
         self.current_freemap = self.committed_freemap.clone();
@@ -1057,6 +1098,13 @@ impl TransactionManager {
         self.cache.borrow_mut().truncate(watermark)?;
 
         self.current_roots = self.savepoints[idx].roots.clone();
+        // C1: re-derive outer_depth from the restored savepoint root (see rollback_inner).
+        {
+            let mut cache = self.cache.borrow_mut();
+            let depth =
+                RadixU64::recover_depth(&mut cache, self.current_roots.membership_index_page)?;
+            self.membership_index.set_outer_depth(depth);
+        }
         // R1: restore live-slot counts and cursor from the savepoint
         // snapshot. The cursor was force-cleared when the savepoint was
         // created, so this sets the cursor back to whatever value it
@@ -1121,11 +1169,17 @@ impl TransactionManager {
     /// untouched on disk until commit swaps the superblock.
     pub fn allocate(&mut self, value: &[u8]) -> Result<u64> {
         self.check_alive()?;
-        let result = self.allocate_inner(value);
+        let result = self.allocate_inner(value, 0);
         self.poison_on_fatal(result)
     }
 
-    fn allocate_inner(&mut self, value: &[u8]) -> Result<u64> {
+    pub fn allocate_tagged(&mut self, value: &[u8], tag: u32) -> Result<u64> {
+        self.check_alive()?;
+        let result = self.allocate_inner(value, tag);
+        self.poison_on_fatal(result)
+    }
+
+    fn allocate_inner(&mut self, value: &[u8], tag: u32) -> Result<u64> {
         if !self.active_txn {
             return Err(ChiselError::NoActiveTransaction);
         }
@@ -1142,6 +1196,7 @@ impl TransactionManager {
                 page_id: first_page,
                 slot_index: 0,
                 flags: HandleFlags::Overflow,
+                tag,
             }
         } else {
             let (data_page_id, slot) = self.insert_into_data_page(value)?;
@@ -1149,6 +1204,7 @@ impl TransactionManager {
                 page_id: data_page_id,
                 slot_index: slot,
                 flags: HandleFlags::Live,
+                tag,
             }
         };
 
@@ -1164,7 +1220,66 @@ impl TransactionManager {
         };
         self.current_roots.handle_table_page = new_root;
 
+        // Tagged chunks join the reverse membership index (tag 0 = untagged, no
+        // index work). The forward handle->tag mapping is the HandleEntry.tag
+        // written above; this is the reverse tag->handles mapping that powers
+        // handles_with_tag / delete-by-tag. Both must agree at all times.
+        if tag != 0 {
+            let new_index_root = {
+                let mut cache = self.cache.borrow_mut();
+                self.membership_index.insert(
+                    &mut cache,
+                    self.current_roots.membership_index_page,
+                    tag,
+                    handle,
+                )?
+            };
+            self.current_roots.membership_index_page = new_index_root;
+        }
+
         Ok(handle)
+    }
+
+    pub fn tag(&self, handle: u64) -> Result<u32> {
+        self.check_alive()?;
+        let result = self.tag_inner(handle);
+        self.poison_on_fatal(result)
+    }
+
+    fn tag_inner(&self, handle: u64) -> Result<u32> {
+        let root = if self.active_txn {
+            self.current_roots.handle_table_page
+        } else {
+            self.committed_roots.handle_table_page
+        };
+        if root == PAGE_ID_NONE {
+            return Err(ChiselError::InvalidHandle(handle));
+        }
+        let mut cache = self.cache.borrow_mut();
+        let entry = self
+            .handle_table
+            .lookup(&mut cache, root, handle)?
+            .ok_or(ChiselError::InvalidHandle(handle))?;
+        Ok(entry.tag)
+    }
+
+    pub fn handles_with_tag(&self, tag: u32) -> Result<Vec<u64>> {
+        self.check_alive()?;
+        let result = self.handles_with_tag_inner(tag);
+        self.poison_on_fatal(result)
+    }
+
+    fn handles_with_tag_inner(&self, tag: u32) -> Result<Vec<u64>> {
+        let root = if self.active_txn {
+            self.current_roots.membership_index_page
+        } else {
+            self.committed_roots.membership_index_page
+        };
+        let mut cache = self.cache.borrow_mut();
+        // No PAGE_ID_NONE guard (unlike tag_inner): an empty/absent index is a
+        // legitimate "no handles with this tag" -> handles_for_tag returns an
+        // empty Vec for a PAGE_ID_NONE root, whereas a missing handle table is an error.
+        self.membership_index.handles_for_tag(&mut cache, root, tag)
     }
 
     /// Read a value by handle.
@@ -1287,6 +1402,10 @@ impl TransactionManager {
             HandleFlags::Deleted => {}
         }
 
+        // Tags are immutable: update relocates the value but must carry the old
+        // entry's tag forward, keeping HandleEntry.tag and the membership index
+        // in agreement (the handle and its tag are unchanged, so the index needs
+        // no edit — only the value's storage moves).
         let new_entry = if value.len() > MAX_INLINE_VALUE {
             let first_page = {
                 let mut cache = self.cache.borrow_mut();
@@ -1296,6 +1415,7 @@ impl TransactionManager {
                 page_id: first_page,
                 slot_index: 0,
                 flags: HandleFlags::Overflow,
+                tag: entry.tag,
             }
         } else {
             let (data_page_id, slot) = self.insert_into_data_page(value)?;
@@ -1303,6 +1423,7 @@ impl TransactionManager {
                 page_id: data_page_id,
                 slot_index: slot,
                 flags: HandleFlags::Live,
+                tag: entry.tag,
             }
         };
 
@@ -1389,7 +1510,104 @@ impl TransactionManager {
         }
 
         self.current_roots.handle_table_page = new_root;
+
+        // Self-maintaining: a tagged chunk must leave the reverse membership
+        // index when it's deleted, so handles_with_tag no longer returns it and
+        // the forward (HandleEntry.tag) / reverse (index) maps stay in agreement.
+        // The tag comes from the entry being tombstoned -- no tag argument needed.
+        // Tag 0 (untagged) is never in the index, so there is nothing to remove.
+        if entry.tag != 0 {
+            let (new_index_root, _removed) = {
+                let mut cache = self.cache.borrow_mut();
+                self.membership_index.remove(
+                    &mut cache,
+                    self.current_roots.membership_index_page,
+                    entry.tag,
+                    handle,
+                )?
+            };
+            self.current_roots.membership_index_page = new_index_root;
+        }
+
         Ok(())
+    }
+
+    pub fn delete_tagged(&mut self, handle: u64, tag: u32) -> Result<()> {
+        self.check_alive()?;
+        let result = self.delete_tagged_inner(handle, tag);
+        self.poison_on_fatal(result)
+    }
+
+    fn delete_tagged_inner(&mut self, handle: u64, tag: u32) -> Result<()> {
+        if !self.active_txn {
+            return Err(ChiselError::NoActiveTransaction);
+        }
+        // Lookup-then-delete: verify the tag before mutating anything, so a wrong
+        // tag leaves both the chunk and the membership index untouched. The extra
+        // lookup walk (delete_inner walks again) is the price of verify-before-mutate.
+        let actual = {
+            let root = self.current_roots.handle_table_page;
+            if root == PAGE_ID_NONE {
+                return Err(ChiselError::InvalidHandle(handle));
+            }
+            let mut cache = self.cache.borrow_mut();
+            self.handle_table
+                .lookup(&mut cache, root, handle)?
+                .ok_or(ChiselError::InvalidHandle(handle))?
+                .tag
+        };
+        if actual != tag {
+            return Err(ChiselError::TagMismatch {
+                handle,
+                expected: tag,
+                actual,
+            });
+        }
+        self.delete_inner(handle)
+    }
+
+    pub fn delete_with_tag(&mut self, tag: u32, max: usize) -> Result<TagDropProgress> {
+        self.check_alive()?;
+        let result = self.delete_with_tag_inner(tag, max);
+        self.poison_on_fatal(result)
+    }
+
+    fn delete_with_tag_inner(&mut self, tag: u32, max: usize) -> Result<TagDropProgress> {
+        if !self.active_txn {
+            return Err(ChiselError::NoActiveTransaction);
+        }
+        if max == 0 {
+            return Ok(TagDropProgress {
+                deleted: Vec::new(),
+                complete: false,
+            });
+        }
+        // Bounded enumeration: ask for max+1 so the count tells us whether more
+        // remain (len > max => not complete). saturating_add keeps the absurd
+        // max == usize::MAX case meaning "enumerate everything" instead of
+        // wrapping to 0 — which would enumerate nothing and falsely report the
+        // tag complete. The members snapshot is taken BEFORE the deletions, then
+        // each is deleted via delete_inner (which removes it from the index and
+        // frees its chunk).
+        let members = {
+            let root = self.current_roots.membership_index_page;
+            let mut cache = self.cache.borrow_mut();
+            self.membership_index.handles_for_tag_bounded(
+                &mut cache,
+                root,
+                tag,
+                max.saturating_add(1),
+            )?
+        };
+        let complete = members.len() <= max;
+        let take: Vec<u64> = members.into_iter().take(max).collect();
+        for &h in &take {
+            self.delete_inner(h)?;
+        }
+        Ok(TagDropProgress {
+            deleted: take,
+            complete,
+        })
     }
 
     /// Delete many handles in a single transaction.
@@ -1947,6 +2165,47 @@ mod tests {
         tm
     }
 
+    #[test]
+    fn tagged_membership_survives_rolled_back_outer_grow() {
+        let mut tm = fresh_manager();
+        // Commit a small tag; the outer (tag-keyed) tree stays depth 0.
+        tm.begin().unwrap();
+        let h = tm.allocate_tagged(b"keep", 3).unwrap();
+        tm.commit().unwrap();
+        assert_eq!(tm.handles_with_tag(3).unwrap(), vec![h]);
+        // New txn: a tag >= 1021 forces the outer tree to grow (depth 0 -> 1).
+        // Roll back. The grown root is discarded and current_roots snaps back to
+        // the depth-0 committed root; outer_depth must be restored to match.
+        tm.begin().unwrap();
+        let _ = tm.allocate_tagged(b"discard", 5000).unwrap();
+        tm.rollback().unwrap();
+        // The committed small tag must still be readable (was silently lost before the fix).
+        assert_eq!(
+            tm.handles_with_tag(3).unwrap(),
+            vec![h],
+            "rolled-back outer grow corrupted committed membership"
+        );
+        assert_eq!(tm.tag(h).unwrap(), 3);
+        // The discarded tag is gone.
+        assert_eq!(tm.handles_with_tag(5000).unwrap(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn tagged_membership_survives_rollback_to_savepoint() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let h = tm.allocate_tagged(b"keep", 7).unwrap();
+        tm.savepoint("sp").unwrap();
+        // Grow the outer tree past depth 0 inside the savepoint, then roll back to it.
+        let _ = tm.allocate_tagged(b"discard", 6000).unwrap();
+        tm.rollback_to("sp").unwrap();
+        // Still inside the active txn: the pre-savepoint tag must remain readable.
+        assert_eq!(tm.handles_with_tag(7).unwrap(), vec![h]);
+        assert_eq!(tm.handles_with_tag(6000).unwrap(), Vec::<u64>::new());
+        tm.commit().unwrap();
+        assert_eq!(tm.handles_with_tag(7).unwrap(), vec![h]);
+    }
+
     // Regression test for ISSUES.md I1. Once the manager is poisoned,
     // every public entry point must return ChiselError::Poisoned rather
     // than attempting the operation. This is the core invariant of the
@@ -1971,6 +2230,17 @@ mod tests {
         assert!(matches!(tm.delete(0), Err(ChiselError::Poisoned)));
         assert!(matches!(tm.handles(), Err(ChiselError::Poisoned)));
         assert!(matches!(tm.file_page_count(), Err(ChiselError::Poisoned)));
+        assert!(matches!(
+            tm.allocate_tagged(b"v", 1),
+            Err(ChiselError::Poisoned)
+        ));
+        assert!(matches!(tm.tag(0), Err(ChiselError::Poisoned)));
+        assert!(matches!(tm.handles_with_tag(1), Err(ChiselError::Poisoned)));
+        assert!(matches!(tm.delete_tagged(0, 1), Err(ChiselError::Poisoned)));
+        assert!(matches!(
+            tm.delete_with_tag(1, 10),
+            Err(ChiselError::Poisoned)
+        ));
     }
 
     // A fatal error observed during a normal operation must also poison
@@ -2436,6 +2706,116 @@ mod tests {
         }
     }
 
+    #[test]
+    fn allocate_tagged_then_tag_and_handles_with_tag() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let h = tm.allocate_tagged(b"row", 42).unwrap();
+        let u = tm.allocate(b"untagged").unwrap();
+        tm.commit().unwrap();
+        assert_eq!(tm.tag(h).unwrap(), 42);
+        assert_eq!(tm.tag(u).unwrap(), 0);
+        assert_eq!(tm.handles_with_tag(42).unwrap(), vec![h]);
+        assert_eq!(tm.handles_with_tag(99).unwrap(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn handles_with_tag_accumulates_multiple_handles() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let a = tm.allocate_tagged(b"a", 42).unwrap();
+        let b = tm.allocate_tagged(b"b", 42).unwrap();
+        let c = tm.allocate_tagged(b"c", 42).unwrap();
+        tm.commit().unwrap();
+        // The reverse index accumulates members; it must not overwrite.
+        let mut got = tm.handles_with_tag(42).unwrap();
+        got.sort();
+        let mut want = vec![a, b, c];
+        want.sort();
+        assert_eq!(got, want);
+        assert_eq!(tm.tag(a).unwrap(), 42);
+        assert_eq!(tm.tag(c).unwrap(), 42);
+    }
+
+    #[test]
+    fn allocate_tagged_overflow_value_preserves_tag() {
+        let mut tm = fresh_manager();
+        // A value larger than MAX_INLINE_VALUE takes the overflow path in
+        // allocate_inner; the tag must be stored on the Overflow HandleEntry,
+        // readable via tag(), and indexed for handles_with_tag().
+        let big = vec![0xABu8; MAX_INLINE_VALUE + 100];
+        tm.begin().unwrap();
+        let h = tm.allocate_tagged(&big, 77).unwrap();
+        tm.commit().unwrap();
+        assert_eq!(tm.tag(h).unwrap(), 77);
+        assert_eq!(tm.handles_with_tag(77).unwrap(), vec![h]);
+        assert_eq!(tm.read(h).unwrap(), big);
+    }
+
+    #[test]
+    fn update_preserves_immutable_tag() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let h = tm.allocate_tagged(b"v1", 42).unwrap();
+        tm.commit().unwrap();
+        tm.begin().unwrap();
+        tm.update(h, b"v2").unwrap();
+        tm.commit().unwrap();
+        // Tags are immutable: changing the value must NOT change the tag, and the
+        // membership index must still list the handle under its original tag.
+        assert_eq!(tm.tag(h).unwrap(), 42);
+        assert_eq!(tm.handles_with_tag(42).unwrap(), vec![h]);
+    }
+
+    #[test]
+    fn delete_removes_tagged_chunk_from_index() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let h = tm.allocate_tagged(b"row", 7).unwrap();
+        tm.commit().unwrap();
+        assert_eq!(tm.handles_with_tag(7).unwrap(), vec![h]);
+        tm.begin().unwrap();
+        tm.delete(h).unwrap();
+        tm.commit().unwrap();
+        // The tag's last member is gone -> handles_with_tag is empty.
+        assert_eq!(tm.handles_with_tag(7).unwrap(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn delete_tagged_rejects_wrong_tag() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let h = tm.allocate_tagged(b"row", 5).unwrap();
+        // Wrong tag: error, nothing deleted, index intact.
+        let err = tm.delete_tagged(h, 6).unwrap_err();
+        assert!(
+            matches!(err, ChiselError::TagMismatch { handle, expected: 6, actual: 5 } if handle == h)
+        );
+        assert_eq!(tm.handles_with_tag(5).unwrap(), vec![h]);
+        // TagMismatch is operational, NOT fatal: a wrong tag must leave the
+        // manager usable (guards against a future edit moving it into is_fatal).
+        assert!(!tm.is_poisoned());
+        // Right tag: deletes (and self-maintains the index via delete_inner).
+        tm.delete_tagged(h, 5).unwrap();
+        assert_eq!(tm.handles_with_tag(5).unwrap(), Vec::<u64>::new());
+        tm.commit().unwrap();
+    }
+
+    #[test]
+    fn delete_one_of_two_tagged_keeps_the_other() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let a = tm.allocate_tagged(b"a", 7).unwrap();
+        let b = tm.allocate_tagged(b"b", 7).unwrap();
+        tm.commit().unwrap();
+        tm.begin().unwrap();
+        tm.delete(a).unwrap();
+        tm.commit().unwrap();
+        // Only `a` is removed from the reverse index; `b` survives under tag 7.
+        assert_eq!(tm.handles_with_tag(7).unwrap(), vec![b]);
+        assert_eq!(tm.tag(b).unwrap(), 7);
+    }
+
     // ── Migrated 2026-05-22 from tests/transactions.rs (I35 reshape) ──
     //
     // Exercises TransactionManager::open_existing end-to-end: a value
@@ -2474,5 +2854,53 @@ mod tests {
             let data = txm.read(handle).unwrap();
             assert_eq!(data, b"persistent");
         }
+    }
+
+    #[test]
+    fn delete_with_tag_drops_in_bounded_batches() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let mut hs = Vec::new();
+        for i in 0..10u64 {
+            hs.push(tm.allocate_tagged(format!("row{i}").as_bytes(), 3).unwrap());
+        }
+        tm.commit().unwrap();
+        tm.begin().unwrap();
+        let p1 = tm.delete_with_tag(3, 4).unwrap();
+        assert_eq!(p1.deleted.len(), 4);
+        assert!(!p1.complete);
+        let p2 = tm.delete_with_tag(3, 100).unwrap();
+        assert_eq!(p2.deleted.len(), 6);
+        assert!(p2.complete);
+        tm.commit().unwrap();
+        assert_eq!(tm.handles_with_tag(3).unwrap(), Vec::<u64>::new());
+        // The chunks themselves are gone too.
+        for h in hs {
+            assert!(tm.read(h).is_err());
+        }
+    }
+
+    #[test]
+    fn delete_with_tag_exact_max_reports_complete() {
+        // Boundary: exactly `max` members remain, so the max+1 enumeration
+        // returns exactly `max` and `complete = max <= max` must be TRUE. This
+        // is the <= vs < edge: a `<` here would falsely report incomplete and
+        // cost the caller an extra empty pass. (The other delete_with_tag test
+        // only exercises len > max and len < max, never len == max.)
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        for i in 0..5u64 {
+            tm.allocate_tagged(format!("r{i}").as_bytes(), 8).unwrap();
+        }
+        tm.commit().unwrap();
+        tm.begin().unwrap();
+        let p = tm.delete_with_tag(8, 5).unwrap();
+        assert_eq!(p.deleted.len(), 5);
+        assert!(
+            p.complete,
+            "deleting exactly all members in one max-sized pass must report complete"
+        );
+        tm.commit().unwrap();
+        assert_eq!(tm.handles_with_tag(8).unwrap(), Vec::<u64>::new());
     }
 }
