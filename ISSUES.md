@@ -1208,28 +1208,28 @@ Source: `docs/reviews/perf-review-2026-06-01.md` (read-only full hot-path sweep,
 
 ### Bench harness & build (measurement-integrity cluster — prerequisites)
 
-#### I90. Bench harness has no `black_box` — read/alloc results are dead-code-eligible [perf-review 2026-06-01] — **P1** (PR-C, [STATIC FACT])
+#### I90. Bench harness has no `black_box` — read/alloc results are dead-code-eligible [perf-review 2026-06-01] — **P1** (PR-C, [STATIC FACT]) ✅ FIXED 2026-06-01 (std::hint::black_box on both ends of apply_op's Read arm; one funnel covers the scenario tier + warm/cold micro-grid rows + drive_workload_with_tx_granularity)
 **Where:** `bench/src/runner.rs` `apply_op` (~:216-250); `bench/benches/micro_grid.rs` read loops (~:111-115, :139-144); `bench/benches/scenarios.rs` timed loop. `grep black_box bench/` → none.
 
 **Problem:** read results (`Vec<u8>`) are dropped, never observed; the criterion closures return `()`, so criterion's built-in `black_box` on the closure return value doesn't protect per-op results. The optimizer may elide the unused-result work — and the risk **grows when the I91 LTO profile lands**. This is the single most important bench-hygiene gap and must be fixed first.
 
 **Direction of fix:** feed the resolved id through `black_box` on the way in and `black_box` the returned bytes in `apply_op` and the read loops. Bench-only; consumer-neutral.
 
-#### I91. No `[profile.release]` — Chisel/redb benched under weaker codegen than bundled SQLite [perf-review 2026-06-01] — **P1** (PR-D, [STATIC FACT] asymmetry / [HYPOTHESIS] magnitude)
+#### I91. No `[profile.release]` — Chisel/redb benched under weaker codegen than bundled SQLite [perf-review 2026-06-01] — **P1** (PR-D, [STATIC FACT] asymmetry / [HYPOTHESIS] magnitude) ✅ FIXED 2026-06-01 (workspace-root [profile.release] lto="fat" + codegen-units=1, plus [profile.release-with-debug] for profiling; consumer-neutral — root profile affects only in-repo builds. Tracked baselines need a one-time re-record)
 **Where:** workspace `Cargo.toml` (no `[profile.*]`); confirmed absent in `bench/` and `python/`; no `.cargo/config.toml`.
 
 **Problem:** with no profile override, `cargo bench` builds `chisel` + `redb` at `opt-level=3` but `lto=false`, `codegen-units=16`, `panic=unwind`, while `rusqlite` `bundled` compiles SQLite C at its own `-O2`. The headline cross-engine table handicaps the two Rust engines (no cross-crate inlining across the `chisel`→bench boundary) — a "SQLite is faster here" conclusion is partly a build-config artifact. (The harness already equalizes the macOS `F_FULLFSYNC` path in `sqlite_engine.rs:50-62`; profile parity is the missing build-side half.)
 
 **Direction of fix:** add a tuned profile at the **workspace root** (`lto = "thin"`/`"fat"`, `codegen-units = 1`) and re-record baselines once (uniform shift, not a regression). Land **after** I90. **Consumer-neutral:** a workspace-root profile affects only in-repo builds (benches/tests/examples); Cargo ignores a dependency's profile, so downstream `chisel = "0.1"` consumers are unaffected. Do NOT tune via the published lib crate.
 
-#### I92. In-memory Chisel backend exists but is never benched [perf-review 2026-06-01] — **P1** (PR-E, [STATIC FACT])
+#### I92. In-memory Chisel backend exists but is never benched [perf-review 2026-06-01] — **P1** (PR-E, [STATIC FACT]) ✅ FIXED 2026-06-01 (ChiselMemory EngineMode → chisel-mem column in the scenario tier; chisel-mem − chisel-strict wall-clock delta = the fsync tax. Scenario-tier only — micro-grid's fs::copy fixtures can't seed a Vec-backed engine. Regression test pins wiring + the fsync_calls protocol-counter subtlety)
 **Where:** `bench/src/runner.rs` `EngineMode` (~:30-98, only `ChiselStrict` → `open_file`); `micro_grid.rs:168`, `scenarios.rs:27-31` all file-backed. `ChiselEngine::open_in_memory` only used in `bench/tests/`.
 
 **Problem:** without an in-memory row the harness can't separate Chisel's CPU cost (slot packing, XXH3, handle-table walk, COW) from its full durability cost (fsync, `F_FULLFSYNC`, pwrite) — the decomposition that makes a "commit is slow" finding actionable. A pure-CPU regression can be masked by fsync-dominated wall time. (chisel-performance Lever 5.)
 
 **Direction of fix:** add a `ChiselMemory` `EngineMode` via `open_in_memory(cache_size)`, include it in `EngineMode::ALL` and the scenarios mode list (cleanest through `run_scenario_cell`, which pre-populates in-process). Track both backends so the ratio is visible. Bench-only.
 
-#### I93. Bench binaries could pin `mimalloc` for realistic best-case + cross-engine allocator parity [perf-review 2026-06-01] — **P2** (PR-N, [STATIC FACT] absent / [HYPOTHESIS] win)
+#### I93. Bench binaries could pin `mimalloc` for realistic best-case + cross-engine allocator parity [perf-review 2026-06-01] — **P2** (PR-N, [STATIC FACT] absent / [HYPOTHESIS] win) ✅ FIXED 2026-06-01 (#[global_allocator] = MiMalloc in the micro_grid + scenarios bench binaries; mimalloc 0.1.52 dev-dep, publish=false — never the library. Builds on MSRV 1.82, fat-LTO release links + launches clean. Re-record baselines)
 **Where:** no `#[global_allocator]` anywhere; natural home `bench/benches/{scenarios,micro_grid}.rs`
 
 **Problem:** Chisel (`Box<[u8;8192]>` per page, `Vec<u8>` per read) and redb (`value().to_vec()`) are alloc-heavy; SQLite's C core does far less Rust-side heap traffic. All three run on the platform default allocator, so the tracked numbers reflect "Chisel on system malloc," not its best, and the allocator tax falls unevenly.
