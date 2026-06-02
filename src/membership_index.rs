@@ -8,15 +8,6 @@
 //! Like the handle table, this module returns the new root page id after a COW
 //! mutation; all page dirtiness lives in `PageCache`, flushed at commit.
 
-// Staged ahead of its consumer: `RadixU64` is the reusable radix that the
-// two-level membership index (next task) composes; nothing in production wires
-// it in yet, so the whole module reads as dead code to the non-test lib build.
-// The module-level allow keeps `cargo clippy -- -D warnings` green until the
-// index lands — it is the staged-component analogue of the per-method
-// `#[allow(dead_code)]` on `new()` below, not a license to leave anything
-// genuinely unused once the consumer exists.
-#![allow(dead_code)]
-
 use crate::error::Result;
 use crate::page::{
     self, PageType, CHECKSUM_OFFSET, DATA_PAGE_HEADER_SIZE, PAGE_ID_NONE, PAGE_SIZE,
