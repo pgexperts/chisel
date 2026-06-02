@@ -2737,6 +2737,9 @@ mod tests {
             matches!(err, ChiselError::TagMismatch { handle, expected: 6, actual: 5 } if handle == h)
         );
         assert_eq!(tm.handles_with_tag(5).unwrap(), vec![h]);
+        // TagMismatch is operational, NOT fatal: a wrong tag must leave the
+        // manager usable (guards against a future edit moving it into is_fatal).
+        assert!(!tm.is_poisoned());
         // Right tag: deletes (and self-maintains the index via delete_inner).
         tm.delete_tagged(h, 5).unwrap();
         assert_eq!(tm.handles_with_tag(5).unwrap(), Vec::<u64>::new());
