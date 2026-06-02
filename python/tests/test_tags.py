@@ -22,6 +22,24 @@ def test_chunk_tags_roundtrip(mem_db):
     assert mem_db.handles_with_tag(42) == []
 
 
+def test_chunk_tags_via_transaction_context(mem_db):
+    # Exercise all 5 tag ops through the with-transaction context manager.
+    with mem_db.transaction() as tx:
+        h_tagged = tx.allocate_tagged(b"row", 55)
+        assert tx.tag(h_tagged) == 55
+        assert tx.handles_with_tag(55) == [h_tagged]
+
+    # After commit the tag is visible outside the transaction.
+    assert mem_db.tag(h_tagged) == 55
+    assert mem_db.handles_with_tag(55) == [h_tagged]
+
+    with mem_db.transaction() as tx:
+        deleted, complete = tx.delete_with_tag(55, 100)
+        assert deleted == [h_tagged] and complete
+
+    assert mem_db.handles_with_tag(55) == []
+
+
 def test_delete_tagged_wrong_tag_raises(mem_db):
     mem_db.begin()
     h = mem_db.allocate_tagged(b"row", 7)

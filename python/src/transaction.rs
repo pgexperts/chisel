@@ -149,6 +149,35 @@ impl PyTransaction {
         self.db.bind(py).borrow().delete_many_internal(py, &handles)
     }
 
+    fn allocate_tagged(&self, py: Python<'_>, value: &Bound<'_, PyAny>, tag: u32) -> PyResult<u64> {
+        self.db
+            .bind(py)
+            .borrow()
+            .allocate_tagged_internal(py, value, tag)
+    }
+
+    fn tag(&self, py: Python<'_>, handle: u64) -> PyResult<u32> {
+        self.db.bind(py).borrow().tag_internal(py, handle)
+    }
+
+    fn handles_with_tag(&self, py: Python<'_>, tag: u32) -> PyResult<Vec<u64>> {
+        self.db.bind(py).borrow().handles_with_tag_internal(py, tag)
+    }
+
+    fn delete_tagged(&self, py: Python<'_>, handle: u64, tag: u32) -> PyResult<()> {
+        self.db
+            .bind(py)
+            .borrow()
+            .delete_tagged_internal(py, handle, tag)
+    }
+
+    fn delete_with_tag(&self, py: Python<'_>, tag: u32, max: usize) -> PyResult<(Vec<u64>, bool)> {
+        self.db
+            .bind(py)
+            .borrow()
+            .delete_with_tag_internal(py, tag, max)
+    }
+
     fn set_root_name(&self, py: Python<'_>, name: &str, handle: u64) -> PyResult<()> {
         self.db
             .bind(py)

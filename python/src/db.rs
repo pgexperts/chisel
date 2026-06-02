@@ -308,27 +308,24 @@ impl PyChisel {
     }
 
     fn allocate_tagged(&self, py: Python<'_>, value: &Bound<'_, PyAny>, tag: u32) -> PyResult<u64> {
-        let bytes = crate::convert::coerce_value(value)?;
-        self.with_inner_mut_io(py, |c| c.allocate_tagged(&bytes, tag))
+        self.allocate_tagged_internal(py, value, tag)
     }
 
     fn tag(&self, py: Python<'_>, handle: u64) -> PyResult<u32> {
-        self.with_inner_io(py, |c| c.tag(handle))
+        self.tag_internal(py, handle)
     }
 
     fn handles_with_tag(&self, py: Python<'_>, tag: u32) -> PyResult<Vec<u64>> {
-        self.with_inner_io(py, |c| c.handles_with_tag(tag))
+        self.handles_with_tag_internal(py, tag)
     }
 
     fn delete_tagged(&self, py: Python<'_>, handle: u64, tag: u32) -> PyResult<()> {
-        self.with_inner_mut_io(py, |c| c.delete_tagged(handle, tag))
+        self.delete_tagged_internal(py, handle, tag)
     }
 
     /// Returns (deleted: list[int], complete: bool).
     fn delete_with_tag(&self, py: Python<'_>, tag: u32, max: usize) -> PyResult<(Vec<u64>, bool)> {
-        self.with_inner_mut_io(py, |c| {
-            c.delete_with_tag(tag, max).map(|p| (p.deleted, p.complete))
-        })
+        self.delete_with_tag_internal(py, tag, max)
     }
 
     fn set_root_name(&self, py: Python<'_>, name: &str, handle: u64) -> PyResult<()> {
@@ -513,6 +510,44 @@ impl PyChisel {
 
     pub(crate) fn clear_root_name_internal(&self, py: Python<'_>, name: &str) -> PyResult<()> {
         self.with_inner_mut_io(py, |c| c.clear_root_name(name))
+    }
+
+    pub(crate) fn allocate_tagged_internal(
+        &self,
+        py: Python<'_>,
+        value: &Bound<'_, PyAny>,
+        tag: u32,
+    ) -> PyResult<u64> {
+        let bytes = crate::convert::coerce_value(value)?;
+        self.with_inner_mut_io(py, |c| c.allocate_tagged(&bytes, tag))
+    }
+
+    pub(crate) fn tag_internal(&self, py: Python<'_>, handle: u64) -> PyResult<u32> {
+        self.with_inner_io(py, |c| c.tag(handle))
+    }
+
+    pub(crate) fn handles_with_tag_internal(&self, py: Python<'_>, tag: u32) -> PyResult<Vec<u64>> {
+        self.with_inner_io(py, |c| c.handles_with_tag(tag))
+    }
+
+    pub(crate) fn delete_tagged_internal(
+        &self,
+        py: Python<'_>,
+        handle: u64,
+        tag: u32,
+    ) -> PyResult<()> {
+        self.with_inner_mut_io(py, |c| c.delete_tagged(handle, tag))
+    }
+
+    pub(crate) fn delete_with_tag_internal(
+        &self,
+        py: Python<'_>,
+        tag: u32,
+        max: usize,
+    ) -> PyResult<(Vec<u64>, bool)> {
+        self.with_inner_mut_io(py, |c| {
+            c.delete_with_tag(tag, max).map(|p| (p.deleted, p.complete))
+        })
     }
 
     pub(crate) fn savepoint_internal(&self, py: Python<'_>, name: &str) -> PyResult<()> {
