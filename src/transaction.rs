@@ -1515,7 +1515,7 @@ impl TransactionManager {
         // index when it's deleted, so handles_with_tag no longer returns it and
         // the forward (HandleEntry.tag) / reverse (index) maps stay in agreement.
         // The tag comes from the entry being tombstoned -- no tag argument needed.
-        // Untagged chunks (tag 0 are never in the index) do no index work.
+        // Tag 0 (untagged) is never in the index, so there is nothing to remove.
         if entry.tag != 0 {
             let (new_index_root, _removed) = {
                 let mut cache = self.cache.borrow_mut();
