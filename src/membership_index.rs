@@ -769,4 +769,28 @@ mod tests {
             5
         );
     }
+
+    #[test]
+    fn inner_grow_roundtrip() {
+        // >1021 handles under one tag splits the inner tree past depth 0; the
+        // post-grow depth must round-trip through pack_inner so readers descend
+        // the right number of levels. The other membership tests stay at depth 0,
+        // where a stale-vs-fresh inner-depth bug is invisible.
+        let mut c = cache(1_000_000);
+        let mut idx = MembershipIndex::new();
+        let mut root = PAGE_ID_NONE;
+        let n = 1100u64;
+        for h in 0..n {
+            root = idx.insert(&mut c, root, 7, h).unwrap();
+        }
+        let mut got = idx.handles_for_tag(&mut c, root, 7).unwrap();
+        got.sort();
+        assert_eq!(got, (0..n).collect::<Vec<_>>());
+        for h in 0..n {
+            let (r, removed) = idx.remove(&mut c, root, 7, h).unwrap();
+            root = r;
+            assert!(removed);
+        }
+        assert!(idx.handles_for_tag(&mut c, root, 7).unwrap().is_empty());
+    }
 }
