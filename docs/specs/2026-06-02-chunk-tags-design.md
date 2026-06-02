@@ -115,8 +115,10 @@ progress shape for the drop. Rust core, mirrored in `chisel-py`:
   deleting. For callers that want to assert membership rather than trust it.
 - `delete_with_tag(&mut self, tag: u32, max: usize) -> Result<TagDropProgress>` — delete up
   to `max` chunks of a tag (each chunk's value/overflow pages freed; an emptied inner
-  subtree + outer entry dropped). Returns `TagDropProgress { deleted: usize, complete: bool }`.
-  **Bounded** so a large relation drops incrementally: the caller loops
+  subtree + outer entry dropped). Returns `TagDropProgress { deleted: Vec<u64>, complete: bool }`
+  — the handles actually dropped this batch (the count is `deleted.len()`), so the caller can
+  prune its own tag→handle bookkeeping in lockstep. **Bounded** so a large relation drops
+  incrementally: the caller loops
   `begin → delete_with_tag → commit` until `complete`, each batch a bounded, separately-
   durable transaction. This is the relation-drop primitive (closes F1 / I12). Operates
   within the active transaction, like `delete_many`. The `max` bound doubles as a cap on the
