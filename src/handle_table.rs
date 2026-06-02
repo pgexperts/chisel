@@ -666,7 +666,7 @@ impl HandleTable {
     //   [8..10)  slot_index (u16 LE)
     //   [10]     flags (HandleFlags u8)
     //   [11..15) tag (u32 LE)
-    //   [15]     reserved
+    //   [15]     reserved (always zeroed for forward compatibility)
     fn write_entry(buf: &mut [u8; PAGE_SIZE], index: usize, entry: &HandleEntry) {
         let base = DATA_PAGE_HEADER_SIZE + index * ENTRY_SIZE;
         buf[base..base + 8].copy_from_slice(&entry.page_id.to_le_bytes());

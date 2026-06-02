@@ -130,8 +130,10 @@ impl NamedRoot {
 
 /// In-memory superblock. The on-disk encoding is a fixed little-endian layout:
 /// bytes 0..52 hold the scalar fields, bytes 52..308 hold the named-root
-/// table (8 × 32-byte entries), and bytes 308..CHECKSUM_OFFSET are reserved
-/// (zero) for forward compatibility. The last 8 bytes are the checksum.
+/// table (8 × 32-byte entries), bytes 308..312 hold `superblock_count`,
+/// bytes 312..320 hold `root_membership_index_page`, and bytes
+/// 320..CHECKSUM_OFFSET are reserved (zero) for forward compatibility.
+/// The last 8 bytes are the checksum.
 ///
 /// `format_version` is a packed u32 (upper 16 = MAJOR, lower 16 = MINOR);
 /// see `page.rs`. Within a major version, new fields may be added by

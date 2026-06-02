@@ -263,7 +263,8 @@ bytes        | field                              | type
 52..308      | named_roots                        | 8 entries × 32 bytes
              |   each: 24-byte name + 8-byte handle |
 308..312     | superblock_count                   | u32 LE (= N, in 2..=16)
-312..8184    | reserved (zeroed for forward compat)| [u8; ~7872]
+312..320     | root_membership_index_page         | u64 LE (PAGE_ID_NONE if no index)
+320..8184    | reserved (zeroed for forward compat)| [u8; ~7864]
 8184..8192   | XXH3 checksum                      | u64 LE
 ```
 
@@ -380,7 +381,8 @@ bytes              | field                         | type
                    |                               |     0..8  page_id      (u64)
                    |                               |     8..10 slot_index   (u16)
                    |                               |     10    flags        (u8)
-                   |                               |     11..16 reserved
+                   |                               |     11..15 tag         (u32 LE; 0 = untagged)
+                   |                               |     15    reserved
 8176..8184         | reserved padding              | [u8; 8]
 8184..8192         | XXH3 checksum                 | u64 LE
 ```
@@ -510,7 +512,7 @@ Chisel versions its on-disk format at two levels.
 - **File level** (I29): the superblock carries a packed `format_version` u32 — upper 16 bits MAJOR, lower 16 bits MINOR. Open-time gate compares MAJOR only. Any same-major file opens regardless of minor; a different-major file is rejected with `UnsupportedFormatVersion`. This is what makes the README's "sacred within a major version" promise enforceable.
 - **Page level** (I31): each non-superblock page carries a one-byte `page_format_version` in its header (byte 1 for Data/Overflow/FreeMap; byte 2 for HandleTable, where byte 1 holds the FLAG byte). This lets individual page layouts evolve within a major without a file-wide bump. The current value is `0` everywhere. The post-1.0 upgrade plan is lazy migration: reads dispatch on the version byte, writes always produce the latest version, and an opt-in eager upgrader (deferred) sweeps remaining old pages.
 
-Both schemes leave reserved space for forward compatibility — the superblock has bytes 312..8184 reserved (a lot of headroom), and every non-superblock page has bytes 8..16 reserved (8 bytes / 64 bits) for future common-header fields.
+Both schemes leave reserved space for forward compatibility — the superblock has bytes 320..8184 reserved (after the `root_membership_index_page` field at 312..320), and every non-superblock page has bytes 8..16 reserved (8 bytes / 64 bits) for future common-header fields.
 
 ---
 
@@ -612,7 +614,7 @@ Three engineering lessons surfaced during the spillway PR that are worth remembe
 - **Operational error** — a `ChiselError` variant indicating the caller made a mistake or hit a transient condition; the database is fine. `is_fatal()` returns false.
 - **Overflow chain** — a singly-linked sequence of overflow pages holding one large value. Owned exclusively by one handle.
 - **PAGE_ID_NONE** — `u64::MAX`. Sentinel meaning "not yet allocated" for root pointers (handle-table root, freemap root).
-- **PageType** — the 1-byte tag at offset 0 of every non-superblock page. Values: `0x01` HandleTable, `0x02` Data, `0x03` Overflow, `0x04` FreeMap. `0x00` is reserved so a zeroed page cannot masquerade as a valid type.
+- **PageType** — the 1-byte tag at offset 0 of every non-superblock page. Values: `0x01` HandleTable, `0x02` Data, `0x03` Overflow, `0x04` FreeMap, `0x05` MembershipInterior, `0x06` MembershipLeaf. `0x00` is reserved so a zeroed page cannot masquerade as a valid type.
 - **Poison** — the state a `TransactionManager` enters after any fatal error. Every subsequent call returns `Poisoned` until the handle is dropped and the database reopened.
 - **Shadow paging** — the durability technique Chisel uses: writes go to new pages; commit swaps a superblock pointer; old state stays intact for crash recovery.
 - **Slot packing (R1)** — multiple values per data page. Each value occupies one slot; the slot directory grows forward and value data grows backward from the page's checksum.
