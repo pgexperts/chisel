@@ -50,7 +50,7 @@ use std::collections::HashMap;
 use crate::data_page::DataPage;
 use crate::error::{ChiselError, Result};
 use crate::freemap::FreeMap;
-use crate::handle_table::{HandleEntry, HandleFlags, HandleTable, FLAG_INTERIOR};
+use crate::handle_table::{HandleEntry, HandleFlags, HandleTable};
 use crate::membership_index::{MembershipIndex, RadixU64, TagDropProgress};
 use crate::overflow::Overflow;
 use crate::page::{self, PAGE_ID_NONE, PAGE_SIZE};
@@ -424,34 +424,13 @@ impl TransactionManager {
         };
 
         // The HandleTable struct keeps only its depth in memory; physical pages
-        // live in the cache and are reached through the root page_id in the
-        // superblock. Reconstruct the depth by walking the left spine until we
-        // hit a leaf (type byte != 0x02 interior marker).
+        // live in the cache, reached via the root page_id in the superblock.
+        // Reconstruct depth by walking the left spine (see HandleTable::recover_depth).
         let mut ht = HandleTable::new();
-        if sb.root_handle_table_page != PAGE_ID_NONE {
-            // Determine depth by walking down the left spine.
-            let root_buf = cache.get(sb.root_handle_table_page)?;
-            if root_buf[1] == FLAG_INTERIOR {
-                // Interior node — walk down to find depth.
-                let mut depth = 0u32;
-                let mut current = sb.root_handle_table_page;
-                loop {
-                    let buf = cache.get(current)?;
-                    if buf[1] != FLAG_INTERIOR {
-                        break;
-                    }
-                    depth += 1;
-                    let child_offset = page::DATA_PAGE_HEADER_SIZE;
-                    let child =
-                        u64::from_le_bytes(buf[child_offset..child_offset + 8].try_into().unwrap());
-                    if child == 0 {
-                        break;
-                    }
-                    current = child;
-                }
-                ht.set_depth(depth);
-            }
-        }
+        ht.set_depth(HandleTable::recover_depth(
+            &mut cache,
+            sb.root_handle_table_page,
+        )?);
 
         // Mirror the handle-table depth recovery for the membership index: its
         // outer RadixU64 keeps only depth in memory, rebuilt by walking the
@@ -1015,6 +994,17 @@ impl TransactionManager {
                 RadixU64::recover_depth(&mut cache, self.current_roots.membership_index_page)?;
             self.membership_index.set_outer_depth(depth);
         }
+        // I99: HandleTable.depth is the same kind of in-memory radix-depth cache
+        // as outer_depth above -- mutated by grows, not carried in Roots -- so it
+        // must also be re-derived from the restored root. Otherwise a rolled-back
+        // handle-table grow leaves the descent depth too deep and lookups
+        // mis-descend, returning InvalidHandle for committed handles.
+        {
+            let mut cache = self.cache.borrow_mut();
+            let depth =
+                HandleTable::recover_depth(&mut cache, self.current_roots.handle_table_page)?;
+            self.handle_table.set_depth(depth);
+        }
         // Revert the freemap working copy — any marks (free or allocate)
         // made during the transaction are discarded.
         self.current_freemap = self.committed_freemap.clone();
@@ -1104,6 +1094,14 @@ impl TransactionManager {
             let depth =
                 RadixU64::recover_depth(&mut cache, self.current_roots.membership_index_page)?;
             self.membership_index.set_outer_depth(depth);
+        }
+        // I99: re-derive handle-table depth from the restored savepoint root
+        // (same rationale as rollback_inner / outer_depth).
+        {
+            let mut cache = self.cache.borrow_mut();
+            let depth =
+                HandleTable::recover_depth(&mut cache, self.current_roots.handle_table_page)?;
+            self.handle_table.set_depth(depth);
         }
         // R1: restore live-slot counts and cursor from the savepoint
         // snapshot. The cursor was force-cleared when the savepoint was
@@ -2902,5 +2900,49 @@ mod tests {
         );
         tm.commit().unwrap();
         assert_eq!(tm.handles_with_tag(8).unwrap(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn handle_table_depth_restored_after_rolled_back_grow() {
+        // I99 regression: a rolled-back handle-table grow must not leave the
+        // in-memory depth too deep. 510 handles (ENTRIES_PER_LEAF) fill depth 0;
+        // the 511th grows to depth 1. Roll that back, then a committed handle must
+        // still read (it returned InvalidHandle before the fix).
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        for i in 0..510u64 {
+            tm.allocate(format!("v{i}").as_bytes()).unwrap();
+        }
+        tm.commit().unwrap();
+        let baseline = tm.read(5).unwrap();
+        tm.begin().unwrap();
+        tm.allocate(b"grow").unwrap();
+        tm.rollback().unwrap();
+        assert_eq!(
+            tm.read(5).unwrap(),
+            baseline,
+            "committed handle lost after rolled-back grow"
+        );
+        // New inserts still work (depth consistent for the next transaction).
+        tm.begin().unwrap();
+        let h = tm.allocate(b"after").unwrap();
+        tm.commit().unwrap();
+        assert_eq!(tm.read(h).unwrap(), b"after");
+    }
+
+    #[test]
+    fn handle_table_depth_restored_after_rollback_to_savepoint() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        for i in 0..510u64 {
+            tm.allocate(format!("v{i}").as_bytes()).unwrap();
+        }
+        tm.savepoint("sp").unwrap();
+        tm.allocate(b"grow").unwrap(); // grows depth 0 -> 1 past the savepoint
+        tm.rollback_to("sp").unwrap();
+        // A handle present at the savepoint must still read within the active txn.
+        assert_eq!(tm.read(5).unwrap(), b"v5");
+        tm.commit().unwrap();
+        assert_eq!(tm.read(5).unwrap(), b"v5");
     }
 }

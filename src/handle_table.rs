@@ -374,6 +374,33 @@ impl HandleTable {
         self.depth = depth;
     }
 
+    /// Rebuild the tree depth by walking the left spine from `root` until a leaf
+    /// (page type byte != `FLAG_INTERIOR`). Returns 0 for an empty tree
+    /// (`PAGE_ID_NONE`) or a leaf root. The in-memory `depth` is NOT carried in
+    /// `Roots`, so the transaction layer re-derives it from the restored root both
+    /// at open AND after a rollback rewinds to a shallower committed/savepoint root.
+    pub fn recover_depth(cache: &mut PageCache, root: u64) -> Result<u32> {
+        if root == PAGE_ID_NONE {
+            return Ok(0);
+        }
+        let mut depth = 0u32;
+        let mut current = root;
+        loop {
+            let buf = cache.get(current)?;
+            if buf[1] != FLAG_INTERIOR {
+                break;
+            }
+            depth += 1;
+            let child_offset = page::DATA_PAGE_HEADER_SIZE;
+            let child = u64::from_le_bytes(buf[child_offset..child_offset + 8].try_into().unwrap());
+            if child == 0 {
+                break;
+            }
+            current = child;
+        }
+        Ok(depth)
+    }
+
     /// `#[allow(dead_code)]`: companion to `set_depth`. Production
     /// `open_existing` reconstructs depth from the on-disk spine walk
     /// and stores it via `set_depth`, but no current reader queries it
