@@ -507,6 +507,9 @@ impl Chisel {
     /// this pass and whether the tag is now fully drained (`complete`). Loop
     /// `begin -> delete_with_tag -> commit` until `complete` for an incremental,
     /// bounded-time relation drop. `max == 0` is a no-op (`complete == false`).
+    /// On an error mid-pass the handles already deleted remain tombstoned in the
+    /// current transaction (same posture as `delete_many`) — roll back or commit;
+    /// a fatal error additionally poisons the manager.
     pub fn delete_with_tag(&mut self, tag: u32, max: usize) -> Result<TagDropProgress> {
         self.txm.delete_with_tag(tag, max)
     }

@@ -1583,14 +1583,21 @@ impl TransactionManager {
             });
         }
         // Bounded enumeration: ask for max+1 so the count tells us whether more
-        // remain (len > max => not complete). The members snapshot is taken
-        // BEFORE the deletions, then each is deleted via delete_inner (which
-        // removes it from the index and frees its chunk).
+        // remain (len > max => not complete). saturating_add keeps the absurd
+        // max == usize::MAX case meaning "enumerate everything" instead of
+        // wrapping to 0 — which would enumerate nothing and falsely report the
+        // tag complete. The members snapshot is taken BEFORE the deletions, then
+        // each is deleted via delete_inner (which removes it from the index and
+        // frees its chunk).
         let members = {
             let root = self.current_roots.membership_index_page;
             let mut cache = self.cache.borrow_mut();
-            self.membership_index
-                .handles_for_tag_bounded(&mut cache, root, tag, max + 1)?
+            self.membership_index.handles_for_tag_bounded(
+                &mut cache,
+                root,
+                tag,
+                max.saturating_add(1),
+            )?
         };
         let complete = members.len() <= max;
         let take: Vec<u64> = members.into_iter().take(max).collect();
@@ -2871,5 +2878,29 @@ mod tests {
         for h in hs {
             assert!(tm.read(h).is_err());
         }
+    }
+
+    #[test]
+    fn delete_with_tag_exact_max_reports_complete() {
+        // Boundary: exactly `max` members remain, so the max+1 enumeration
+        // returns exactly `max` and `complete = max <= max` must be TRUE. This
+        // is the <= vs < edge: a `<` here would falsely report incomplete and
+        // cost the caller an extra empty pass. (The other delete_with_tag test
+        // only exercises len > max and len < max, never len == max.)
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        for i in 0..5u64 {
+            tm.allocate_tagged(format!("r{i}").as_bytes(), 8).unwrap();
+        }
+        tm.commit().unwrap();
+        tm.begin().unwrap();
+        let p = tm.delete_with_tag(8, 5).unwrap();
+        assert_eq!(p.deleted.len(), 5);
+        assert!(
+            p.complete,
+            "deleting exactly all members in one max-sized pass must report complete"
+        );
+        tm.commit().unwrap();
+        assert_eq!(tm.handles_with_tag(8).unwrap(), Vec::<u64>::new());
     }
 }
