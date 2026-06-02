@@ -55,6 +55,14 @@ categories = ["database-implementations", "data-structures"]
 [dependencies]
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 libc = "0.2"
+# I77: rustc_hash::FxHashMap replaces the default SipHash on the two hottest
+# internal maps (PageCache.entries, LruIndex.nodes). Their keys are trusted
+# local u64 page ids with no DoS surface, so SipHash's DoS-resistance is pure
+# overhead (~2-3x slower per probe). FxHash is a fast multiply-based hash with
+# ZERO transitive dependencies — it preserves the crate's minimal-dep footprint
+# (this is only the third runtime dependency). The crates.io package is
+# `rustc-hash` (hyphen); the import path is `rustc_hash` (underscore).
+rustc-hash = "2"
 
 [dev-dependencies]
 tempfile = "3"

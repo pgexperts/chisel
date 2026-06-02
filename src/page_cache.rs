@@ -38,7 +38,8 @@
 //   2026-05-03-chisel-spillway-design.md.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+
+use rustc_hash::FxHashMap;
 
 use crate::error::{ChiselError, Result};
 use crate::lru::LruIndex;
@@ -63,7 +64,11 @@ struct CacheEntry {
 
 pub struct PageCache {
     io: PageIo,
-    entries: HashMap<u64, CacheEntry>,
+    // I77: FxHashMap, not the default SipHash. Keys are trusted local u64 page
+    // ids — no DoS surface — so SipHash's DoS-resistance is pure cost. This map
+    // is probed ~twice per `get` plus the LRU touch, and a read descends it
+    // once per handle-table level, so the per-probe hash cost is hot.
+    entries: FxHashMap<u64, CacheEntry>,
     // O(1) LRU index over page IDs. Head of the index = most recently
     // used; `maybe_evict` walks `iter_lru_to_mru()` looking for a clean
     // victim. Backed by a HashMap-of-(prev,next) doubly-linked list —
@@ -164,7 +169,7 @@ impl PageCache {
         let next_page_id = io.page_count().unwrap_or(0);
         PageCache {
             io,
-            entries: HashMap::new(),
+            entries: FxHashMap::default(),
             lru: LruIndex::new(),
             dirty_count: 0,
             dirty_scratch: Vec::new(),
@@ -347,9 +352,9 @@ impl PageCache {
     ///
     /// We collect dirty IDs into a Vec first to sidestep the borrow checker
     /// (we need `&mut self.entries` inside the loop while iterating). The
-    /// iteration order is HashMap order — i.e. non-deterministic. That is
-    /// fine: all writes share one fsync, so intra-batch ordering is
-    /// irrelevant for durability.
+    /// iteration order is unspecified map order (under the Fx hasher it is
+    /// deterministic, but we rely on neither). That is fine: all writes share
+    /// one fsync, so intra-batch ordering is irrelevant for durability.
     ///
     /// After a successful flush, every entry is clean and therefore
     /// eligible for LRU eviction. The entries are NOT removed from the

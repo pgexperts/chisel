@@ -16,7 +16,8 @@
 //! ## Implementation
 //!
 //! A doubly-linked list is maintained over IDs, with neighbour pointers
-//! stored in a single `HashMap<u64, Node>` rather than as `Box`/`Rc`
+//! stored in a single `FxHashMap<u64, Node>` (I77: a fast hasher over the
+//! trusted u64 page-id keys) rather than as `Box`/`Rc`
 //! pointers in heap-allocated nodes. Each `Node` holds `(prev, next)`
 //! IDs; `head` is the most-recently-used (MRU) end, `tail` is the
 //! least-recently-used (LRU) end.
@@ -35,7 +36,7 @@
 //!
 //! ## Correctness model
 //!
-//! Two HashMap entries hold redundant information about each linked
+//! Two map entries hold redundant information about each linked
 //! pair: A's `next` points to B, and B's `prev` points to A. Mutators
 //! must update both sides of every neighbour edge. The `unlink` helper
 //! is the single place that does this; all public mutators call through
@@ -47,9 +48,9 @@
 //! `iter_lru_to_mru` and `push_front` don't have to scan to find them.
 //!
 //! No `unsafe`. Fits in cache-line-sized state per node (16 bytes for
-//! the `Node` plus HashMap overhead).
+//! the `Node` plus map overhead).
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 #[derive(Debug, Clone, Copy)]
 struct Node {
@@ -64,7 +65,9 @@ pub(crate) struct LruIndex {
     /// LRU end. `Some` iff the index is non-empty.
     tail: Option<u64>,
     /// Per-id neighbour pointers. The set of keys IS the membership.
-    nodes: HashMap<u64, Node>,
+    /// I77: FxHashMap, not default SipHash — keys are trusted u64 page ids
+    /// (no DoS surface) and every `push_front`/`unlink` probes this map.
+    nodes: FxHashMap<u64, Node>,
 }
 
 impl LruIndex {
