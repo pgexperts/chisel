@@ -329,6 +329,7 @@ fn test_recovery_superblock_pointing_past_eof_is_rejected() {
         page_size: PAGE_SIZE as u32,
         named_roots: [crate::superblock::NamedRoot::EMPTY; crate::superblock::NAMED_ROOT_COUNT],
         superblock_count: crate::superblock::DEFAULT_SUPERBLOCK_COUNT,
+        root_membership_index_page: page::PAGE_ID_NONE,
     };
     let buf = sb.serialize();
     {
@@ -439,6 +440,7 @@ fn test_reject_unsupported_format_version() {
         page_size: PAGE_SIZE as u32,
         named_roots: [crate::superblock::NamedRoot::EMPTY; crate::superblock::NAMED_ROOT_COUNT],
         superblock_count: crate::superblock::DEFAULT_SUPERBLOCK_COUNT,
+        root_membership_index_page: page::PAGE_ID_NONE,
     };
     let buf_a = sb.serialize();
     sb.txn_counter = 4;

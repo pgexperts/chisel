@@ -79,6 +79,10 @@ struct Roots {
     next_handle: u64,
     total_pages: u64,
     named_roots: [NamedRoot; NAMED_ROOT_COUNT],
+    // Root page of the membership index (chunk-tags). PAGE_ID_NONE until the
+    // first tagged chunk is written. Cloned automatically with the rest of
+    // Roots at begin/commit/rollback/savepoint — no extra plumbing needed.
+    membership_index_page: u64,
 }
 
 /// A nested rollback point within an active transaction.
@@ -267,6 +271,7 @@ impl TransactionManager {
             next_handle: 0,
             total_pages: superblock_count as u64,
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
+            membership_index_page: PAGE_ID_NONE,
         };
 
         // A brand-new database has no freemap page on disk yet. Both
@@ -404,6 +409,13 @@ impl TransactionManager {
             next_handle: sb.next_handle,
             total_pages: sb.total_pages,
             named_roots: sb.named_roots,
+            // Normalize old files (pre-chunk-tags bytes were zeroed) so the
+            // rest of the engine has a single "empty" sentinel: PAGE_ID_NONE.
+            membership_index_page: if sb.root_membership_index_page == 0 {
+                PAGE_ID_NONE
+            } else {
+                sb.root_membership_index_page
+            },
         };
 
         // The HandleTable struct keeps only its depth in memory; physical pages
@@ -891,6 +903,7 @@ impl TransactionManager {
             // recovery can discover it from the winning slot without
             // external hints.
             superblock_count: self.superblock_count,
+            root_membership_index_page: self.current_roots.membership_index_page,
         };
         let buf = sb.serialize();
         // Step 3: Write to the INACTIVE slot. For N superblock slots,

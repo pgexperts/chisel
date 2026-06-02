@@ -54,6 +54,12 @@ pub const DEFAULT_SUPERBLOCK_COUNT: u32 = 2;
 // direct superblock writes into the data region.
 const SUPERBLOCK_COUNT_OFFSET: usize = 308;
 
+// Membership-index root (chunk-tags). 8 bytes at 312..320, the first
+// free reserved bytes after superblock_count. PAGE_ID_NONE when no
+// tagged chunk exists (field was added as part of the chunk-tags
+// feature; bytes were previously zeroed reserved space).
+const ROOT_MEMBERSHIP_INDEX_OFFSET: usize = 312;
+
 // Named-root table (ISSUES.md F2). A small fixed-width table lives inside
 // the superblock itself so that named roots get the same atomic-commit
 // semantics as the handle-table root for free. Client use case (from the
@@ -168,6 +174,13 @@ pub struct Superblock {
     // would be catastrophic because the commit path uses
     // `txn_counter % superblock_count` to pick the write slot.
     pub superblock_count: u32,
+    // Root page of the membership index (chunk-tags feature). PAGE_ID_NONE
+    // until the first tagged chunk is written. Serialized at bytes 312..320,
+    // the first 8 bytes of the reserved region that follows superblock_count.
+    // Old files (pre-chunk-tags) have these bytes zeroed; callers normalize
+    // 0 → PAGE_ID_NONE on open so the rest of the engine has a single
+    // "empty" sentinel.
+    pub root_membership_index_page: u64,
 }
 
 impl Superblock {
@@ -198,9 +211,10 @@ impl Superblock {
         // reserved region that follows the named-root table.
         buf[SUPERBLOCK_COUNT_OFFSET..SUPERBLOCK_COUNT_OFFSET + 4]
             .copy_from_slice(&self.superblock_count.to_le_bytes());
-        // bytes after SUPERBLOCK_COUNT_OFFSET + 4 up to CHECKSUM_OFFSET
-        // are reserved for future fields and must stay zero so existing
-        // checksums remain reproducible.
+        // Membership-index root (chunk-tags). Written at bytes 312..320,
+        // immediately after superblock_count.
+        buf[ROOT_MEMBERSHIP_INDEX_OFFSET..ROOT_MEMBERSHIP_INDEX_OFFSET + 8]
+            .copy_from_slice(&self.root_membership_index_page.to_le_bytes());
         page::stamp_checksum(&mut buf);
         buf
     }
@@ -263,6 +277,11 @@ impl Superblock {
             page_size: u32::from_le_bytes(buf[48..52].try_into().unwrap()),
             named_roots,
             superblock_count,
+            root_membership_index_page: u64::from_le_bytes(
+                buf[ROOT_MEMBERSHIP_INDEX_OFFSET..ROOT_MEMBERSHIP_INDEX_OFFSET + 8]
+                    .try_into()
+                    .unwrap(),
+            ),
         })
     }
 
@@ -330,6 +349,7 @@ impl Superblock {
             page_size: PAGE_SIZE as u32,
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
             superblock_count,
+            root_membership_index_page: page::PAGE_ID_NONE,
         }
     }
 }
@@ -337,6 +357,7 @@ impl Superblock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prop_assert_eq;
 
     /// A superblock whose count field is outside [MIN, MAX] must be
     /// rejected by `deserialize`. Otherwise the recovered count would
@@ -408,6 +429,7 @@ mod tests {
             page_size: PAGE_SIZE as u32,
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
             superblock_count: DEFAULT_SUPERBLOCK_COUNT,
+            root_membership_index_page: crate::page::PAGE_ID_NONE,
         };
         let buf = sb.serialize();
         let sb2 = Superblock::deserialize(&buf).unwrap();
@@ -427,6 +449,7 @@ mod tests {
             page_size: PAGE_SIZE as u32,
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
             superblock_count: DEFAULT_SUPERBLOCK_COUNT,
+            root_membership_index_page: crate::page::PAGE_ID_NONE,
         };
         let mut buf = sb.serialize();
         buf[10] ^= 0xFF;
@@ -446,6 +469,7 @@ mod tests {
             page_size: PAGE_SIZE as u32,
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
             superblock_count: DEFAULT_SUPERBLOCK_COUNT,
+            root_membership_index_page: crate::page::PAGE_ID_NONE,
         };
         let sb2 = Superblock {
             magic: MAGIC,
@@ -458,6 +482,7 @@ mod tests {
             page_size: PAGE_SIZE as u32,
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
             superblock_count: DEFAULT_SUPERBLOCK_COUNT,
+            root_membership_index_page: crate::page::PAGE_ID_NONE,
         };
         let buf1 = sb1.serialize();
         let buf2 = sb2.serialize();
@@ -478,6 +503,7 @@ mod tests {
             page_size: PAGE_SIZE as u32,
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
             superblock_count: DEFAULT_SUPERBLOCK_COUNT,
+            root_membership_index_page: crate::page::PAGE_ID_NONE,
         };
         let sb2_buf = [0u8; PAGE_SIZE];
         let buf1 = sb1.serialize();
@@ -490,6 +516,29 @@ mod tests {
         let buf1 = [0u8; PAGE_SIZE];
         let buf2 = [0u8; PAGE_SIZE];
         assert!(Superblock::select(&[buf1, buf2]).is_none());
+    }
+
+    /// The new root_membership_index_page field must persist across serialize/
+    /// deserialize and default to PAGE_ID_NONE on new_empty(). Also verifies
+    /// that an old serialized form (bytes 312..320 zeroed) reads back as 0, not
+    /// as PAGE_ID_NONE — callers like open_existing normalize 0 → PAGE_ID_NONE.
+    #[test]
+    fn membership_root_round_trips_through_serialize() {
+        let mut sb = Superblock::new_empty(DEFAULT_SUPERBLOCK_COUNT);
+        assert_eq!(sb.root_membership_index_page, page::PAGE_ID_NONE);
+        sb.root_membership_index_page = 1234;
+        let buf = sb.serialize();
+        let back = Superblock::deserialize(&buf).unwrap();
+        assert_eq!(back.root_membership_index_page, 1234);
+        let mut old = sb.serialize();
+        old[312..320].fill(0);
+        page::stamp_checksum(&mut old);
+        assert_eq!(
+            Superblock::deserialize(&old)
+                .unwrap()
+                .root_membership_index_page,
+            0
+        );
     }
 
     // I71 (ISSUES.md, 2026-05-22): property test —
@@ -521,6 +570,7 @@ mod tests {
                 proptest::array::uniform24(0u8..=255u8)
             ),
             named_root_handles in proptest::array::uniform8(0u64..u64::MAX),
+            root_membership_index_page in 0u64..u64::MAX,
         ) {
             let mut named_roots = [NamedRoot::EMPTY; NAMED_ROOT_COUNT];
             for (i, slot) in named_roots.iter_mut().enumerate() {
@@ -538,6 +588,7 @@ mod tests {
                 page_size: PAGE_SIZE as u32,
                 named_roots,
                 superblock_count,
+                root_membership_index_page,
             };
             let buf = sb.serialize();
             let parsed = Superblock::deserialize(&buf)
@@ -545,18 +596,19 @@ mod tests {
             // Field-by-field equality. PartialEq isn't derived on
             // Superblock, so compare structurally — easier to diagnose
             // if a single field round-trips wrong.
-            assert_eq!(parsed.magic, sb.magic);
-            assert_eq!(parsed.format_version, sb.format_version);
-            assert_eq!(parsed.txn_counter, sb.txn_counter);
-            assert_eq!(parsed.root_handle_table_page, sb.root_handle_table_page);
-            assert_eq!(parsed.root_freemap_page, sb.root_freemap_page);
-            assert_eq!(parsed.total_pages, sb.total_pages);
-            assert_eq!(parsed.next_handle, sb.next_handle);
-            assert_eq!(parsed.page_size, sb.page_size);
-            assert_eq!(parsed.superblock_count, sb.superblock_count);
+            prop_assert_eq!(parsed.magic, sb.magic);
+            prop_assert_eq!(parsed.format_version, sb.format_version);
+            prop_assert_eq!(parsed.txn_counter, sb.txn_counter);
+            prop_assert_eq!(parsed.root_handle_table_page, sb.root_handle_table_page);
+            prop_assert_eq!(parsed.root_freemap_page, sb.root_freemap_page);
+            prop_assert_eq!(parsed.total_pages, sb.total_pages);
+            prop_assert_eq!(parsed.next_handle, sb.next_handle);
+            prop_assert_eq!(parsed.page_size, sb.page_size);
+            prop_assert_eq!(parsed.superblock_count, sb.superblock_count);
+            prop_assert_eq!(parsed.root_membership_index_page, sb.root_membership_index_page);
             for i in 0..NAMED_ROOT_COUNT {
-                assert_eq!(parsed.named_roots[i].name, sb.named_roots[i].name);
-                assert_eq!(parsed.named_roots[i].handle, sb.named_roots[i].handle);
+                prop_assert_eq!(parsed.named_roots[i].name, sb.named_roots[i].name);
+                prop_assert_eq!(parsed.named_roots[i].handle, sb.named_roots[i].handle);
             }
         }
     }
