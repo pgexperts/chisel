@@ -14,6 +14,7 @@ Pre-1.0. Current release: `0.1.0`. The API is stable-by-intent but subject to re
 - **Transactions** — begin / commit / rollback with two-phase durability (fsync data pages, then fsync superblock).
 - **Savepoints** — PostgreSQL-style named savepoints with `rollback_to` (savepoint preserved for retry) and `release` (merges into the enclosing scope).
 - **Handles** — store a value, get back a `u64` handle. Read, update, or delete by handle. Handles are stable across updates, defrag, and reopens.
+- **Chunk tags** — attach an immutable `u32` tag to a chunk at allocation time; a reverse membership index maps each tag back to its handles. Enumerate a tag's members, delete with a tag-match assertion, or bulk-drop a whole tagged relation in bounded passes. Tag `0` means untagged.
 - **Value packing** — slotted data pages pack multiple small values per 8 KB page; values over ~8 KB transparently overflow into chained pages.
 - **Named roots** — a small fixed table in the superblock mapping string names to handles. Survives commit / rollback transactionally.
 - **Defragmentation** — explicit `defrag()` consolidates sparse pages and returns a count-based stats record.
@@ -178,6 +179,31 @@ let stats = db.defrag(DefragOptions {
 db.commit()?;
 ```
 
+### Chunk tags
+
+`allocate_tagged(value, tag)` attaches an immutable `u32` tag to a chunk and registers it in a reverse membership index. The tag is fixed at allocation: `update` preserves it, and retagging means delete + re-allocate. Tag `0` is the untagged sentinel and is never indexed — use plain `allocate` for untagged values. Plain `delete` is self-maintaining (it drops the handle from the index automatically); `delete_tagged` is the verified variant that errors with `TagMismatch` if the stored tag differs.
+
+```rust
+db.begin()?;
+let a = db.allocate_tagged(b"row-a", 42)?;
+let _b = db.allocate_tagged(b"row-b", 42)?;
+db.commit()?;
+
+assert_eq!(db.tag(a)?, 42);
+let members = db.handles_with_tag(42)?; // both handles, order unspecified
+assert_eq!(members.len(), 2);
+
+// Bounded relation-drop: loop until the tag is fully drained.
+loop {
+    db.begin()?;
+    let progress = db.delete_with_tag(42, 256)?; // up to 256 chunks per pass
+    db.commit()?;
+    if progress.complete {
+        break;
+    }
+}
+```
+
 ### In-memory mode
 
 `Chisel::open_in_memory()` creates a memory-backed database using a `Vec<u8>`-backed `PageIo`. Same code path, same guarantees except durability — no filesystem, no `flock`, and all data is lost on drop.
@@ -205,10 +231,15 @@ For tuned options (cache size, superblock count), use `Chisel::open_in_memory_wi
 | `rollback_to(name)` | Undo to savepoint (savepoint preserved) |
 | `release(name)` | Merge savepoint into enclosing scope |
 | `allocate(value)` | Store a value; returns a `u64` handle |
+| `allocate_tagged(value, tag)` | Store a value with an immutable `u32` tag; returns a `u64` handle |
 | `read(handle)` | Retrieve a value (takes `&self`) |
 | `update(handle, value)` | Replace a value (handle preserved) |
 | `delete(handle)` | Remove a handle |
 | `delete_many(handles)` | Batch-delete in the current transaction |
+| `tag(handle)` | Read a handle's tag, `0` if untagged (takes `&self`) |
+| `handles_with_tag(tag)` | Enumerate live handles carrying `tag` (takes `&self`) |
+| `delete_tagged(handle, tag)` | Delete only if the handle's tag matches; else `TagMismatch` |
+| `delete_with_tag(tag, max)` | Bounded relation-drop: delete up to `max` chunks of `tag`; returns `TagDropProgress` |
 | `set_root_name(name, handle)` | Bind a name to a handle in the named-root table |
 | `get_root_name(name)` | Look up a named root (takes `&self`) |
 | `clear_root_name(name)` | Remove a named root |
@@ -244,7 +275,7 @@ let options = Options {
 
 **Operational errors** — the database is healthy; the caller made a mistake. Catch and continue.
 
-`InvalidHandle`, `NoActiveTransaction`, `TransactionAlreadyActive`, `SavepointNotFound`, `DuplicateSavepoint`, `ReadOnlyMode`, `FileNotFound`, `InvalidRootName`, `RootNameTableFull`, `InvalidSuperblockCount`, `CacheFull`, `SpillwayFull`.
+`InvalidHandle`, `TagMismatch`, `NoActiveTransaction`, `TransactionAlreadyActive`, `SavepointNotFound`, `DuplicateSavepoint`, `ReadOnlyMode`, `FileNotFound`, `InvalidRootName`, `RootNameTableFull`, `InvalidSuperblockCount`, `CacheFull`, `SpillwayFull`.
 
 **Fatal errors** — storage integrity is in question. Drop the handle and reopen.
 
@@ -278,11 +309,11 @@ The poison model is mandatory because Linux `fsync` semantics (post-2018 "fsyncg
 
 Versioning is two-tiered.
 
-**File level** — each superblock carries a packed `format_version` u32: upper 16 bits = MAJOR, lower 16 bits = MINOR. The open-time gate compares MAJOR only. A 1.3 binary opens a 1.7 file cleanly, but a 1.3 binary rejects a 2.0 file. Minor bumps within a major are reserved for additive changes, so older binaries can safely *read* newer-minor files.
+**File level** — each superblock carries a packed `format_version` u32: upper 16 bits = MAJOR, lower 16 bits = MINOR. The open-time gate compares MAJOR only. A 1.3 binary opens a 1.7 file cleanly, but a 1.3 binary rejects a 2.0 file. Minor bumps within a major are reserved for additive changes, so older binaries can safely *read* newer-minor files. The chunk-tags feature is the first such additive minor bump (MINOR 0 → 1): it adds a per-chunk tag and a membership index, and pre-tag files open cleanly with every chunk untagged.
 
 **Page level** — each non-superblock page carries a one-byte `page_format_version` in its header, letting individual page layouts evolve within a major without a file-wide format bump. The post-1.0 upgrade story is lazy migration: on read, the page-type module dispatches on its page's declared version; on write, it always produces the current version; cold pages stay in the old layout until an opt-in `db.upgrade()` sweep rewrites them. An additional 8 bytes are reserved in every non-superblock page header for future common-header fields.
 
-Write safety across minors is a narrower guarantee: a binary at MINOR = *m* opening a file at MINOR = *m' > m* cannot safely commit without risking overwriting fields it doesn't know about. Starting with the first minor bump after 1.0, the open path will refuse writes in that direction (read-only on the newer-minor file); until then the check is a no-op because no minor variants exist. The post-1.0 cross-minor read-compatibility guarantee is absolute; write-compatibility requires binary MINOR ≥ file MINOR.
+Write safety across minors is a narrower guarantee: a binary at MINOR = *m* opening a file at MINOR = *m' > m* cannot safely commit without risking overwriting fields it doesn't know about. The open gate is MAJOR-only by design, so minor variants coexist — same-major files of any minor open successfully, and the chunk-tags MINOR = 1 variant is the first such case. The write-refusal arm (refuse writes when file MINOR > binary MINOR, leaving the newer-minor file read-only) is not yet wired up; it lands with the first post-1.0 minor bump that makes the direction observable. The post-1.0 cross-minor read-compatibility guarantee is absolute; write-compatibility requires binary MINOR ≥ file MINOR.
 
 ### Pre-1.0 caveat
 

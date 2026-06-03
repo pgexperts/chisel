@@ -61,6 +61,7 @@ flowchart BT
     data_page["data_page.rs<br/>slotted page (R1 packing)"]
     overflow["overflow.rs<br/>large-value chains"]
     handle_table["handle_table.rs<br/>radix tree, per-module COW"]
+    membership_index["membership_index.rs<br/>RadixU64 + two-level<br/>MembershipIndex (tag→handles)"]
     transaction["transaction.rs<br/>TransactionManager:<br/>orchestrates everything below"]
     defrag["defrag.rs<br/>sparse-page consolidation"]
     stats["stats.rs<br/>Stats snapshot type"]
@@ -75,15 +76,18 @@ flowchart BT
     page --> data_page
     page --> overflow
     page --> handle_table
+    page --> membership_index
     page_cache --> freemap
     page_cache --> data_page
     page_cache --> overflow
     page_cache --> handle_table
+    page_cache --> membership_index
     superblock --> transaction
     freemap --> transaction
     data_page --> transaction
     overflow --> transaction
     handle_table --> transaction
+    membership_index --> transaction
     error --> transaction
     transaction --> defrag
     transaction --> stats
@@ -105,6 +109,7 @@ Why bottom-up matters: it means you can read the codebase in dependency order an
 | 4 | `data_page.rs` | Slotted page layout (R1): slot directory grows forward, packed value data grows backward, dead-slot tombstones reclaimed only by `compact()`. | Slot indices are stable until compact; compact returns an old→new mapping for callers to rewrite. |
 | 4 | `overflow.rs` | Singly-linked overflow chains for values > inline threshold. | `total_length` repeated on every chain page; `next_page == 0` terminates; cycle detection bounded by `total_length / OVERFLOW_PAYLOAD` (I14). |
 | 5 | `handle_table.rs` | Radix tree mapping `u64` handle → `(page_id, slot_index)`. Implements its own copy-on-write atop `PageCache::new_page`. | Capacity = `510 × 1021^depth`; `find_leaf` short-circuits on `handle ≥ capacity` to `Ok(None)` (I26). |
+| 5 | `membership_index.rs` | Reverse index `tag → {handles}` for chunk tags. A generic copy-on-write radix `RadixU64` (u64 key → u64 value, 0 = absent) used twice: an outer tree keyed by tag whose value bit-packs `(inner_depth \| inner_root)`, and per-tag inner trees keyed by handle. Returns the new root id after a COW mutation, like `handle_table`. | Fan-out 1021 per level; `0` is the absent sentinel; outer value packs `inner_root` in low 58 bits, `inner_depth` in top 6. |
 | 6 | `transaction.rs` | `TransactionManager`: orchestrates begin/commit/rollback, savepoints, `persist_freemap`, the commit protocol, the poison flag. | Commit protocol step ordering is load-bearing — see next section. |
 | 7 | `defrag.rs` | Sparse-page consolidation; runs inside an active transaction. | `pages_examined`/`pages_freed` are page-granular (I17). |
 | 7 | `stats.rs` | Two snapshot structs: `Stats` (`handle_count`, `total_pages`, `file_size_bytes`) and `ChiselCounters` (cache hits/misses, pages allocated, fsync calls — cumulative-from-open engine activity). | Both are point-in-time snapshots, not live views. `ChiselCounters` is `#[non_exhaustive]` so future counters can be added without a breaking change. |
@@ -183,6 +188,7 @@ sequenceDiagram
         TM->>TM: I29 gate: format_major check
         TM->>TM: I4: reseed next_page_id<br/>from sb.total_pages
         TM->>IO: read root_freemap_page
+        TM->>TM: re-derive handle-table + membership<br/>outer depth from their roots (I99 / C1)
         TM-->>L: TransactionManager
     else fresh
         L->>IO: PageIo::open
@@ -234,7 +240,8 @@ byte:    0       1       2                  8                          16
        | tag   |       |                  | common-header fields (I31) |
        +-------+-------+------------------+----------------------------+
 
-(*) byte 1 is page_format_version for Data, Overflow, FreeMap;
+(*) byte 1 is page_format_version for Data, Overflow, FreeMap,
+    MembershipInterior, MembershipLeaf;
     FLAG_LEAF/INTERIOR for HandleTable (its version sits at byte 2).
     See page::page_format_version() for the dispatch.
 ```
@@ -412,6 +419,34 @@ The "0 child = unallocated" sentinel relies on page 0 being a superblock and the
 
 The flag byte at position 1 is forensic-only — no runtime code reads `FLAG_LEAF`/`FLAG_INTERIOR`; the depth walk uses child-pointer presence instead. The flag is kept because a hex-dump reader can use it to tell leaf from interior at a glance.
 
+### Membership index pages (chunk tags)
+
+The membership index (the reverse `tag → {handles}` map behind chunk tags) is built from one generic radix structure — `RadixU64`, a copy-on-write tree of `u64` key → `u64` value where `0` means absent — used at two levels. The **outer** tree is keyed by `tag` (widened to u64); each outer leaf slot holds a packed `(inner_depth | inner_root)` value naming a per-tag **inner** tree. Each inner tree is keyed by `handle` and stores `1` at every member's slot (`0` = not a member). The outer root is the superblock's `root_membership_index_page` (field at bytes 312..320); inner roots are never named in the superblock — they are reached only by unpacking an outer slot.
+
+Both levels reuse the same fan-out as handle-table interior pages: 1021 slots per page (`SLOTS_PER_PAGE = (8184 − 16) / 8`), every slot an 8-byte little-endian u64. There is **no FLAG byte** — leaf and interior pages are distinguished by their PageType tag (`0x06` MembershipLeaf vs `0x05` MembershipInterior), so the per-page format version sits at byte 1 (unlike the handle table, which spends byte 1 on its forensic flag and pushes the version to byte 2). `init_page` zero-fills the page, writes the type tag at byte 0 and `page_format_version` at byte 1, and stamps the checksum; a freshly zeroed page therefore reads as all-absent, the same tombstone trick the handle table uses. The interior/leaf split is by depth: at depth 0 the root is itself a leaf; `grow()` stacks a new interior root above the old root (installed at child 0), which is what `RadixU64::recover_depth` relies on to re-derive depth from the root alone (see [In-memory radix depth is re-derived from the root](#in-memory-radix-depth-is-re-derived-from-the-root-never-stored)).
+
+Both page types share the identical byte layout (the type tag at byte 0 is the only structural difference — a leaf's slots are membership values, an interior's slots are child page ids):
+
+```text
+Membership index page (PageType = 0x05 interior / 0x06 leaf)
+
+bytes              | field                         | type
+-------------------|-------------------------------|----------
+0                  | PageType (0x05 or 0x06)       | u8
+1                  | page_format_version (I31)     | u8  (NO flag byte)
+2..8               | reserved (type-specific)      | [u8; 6]
+8..16              | reserved (I31 common region)  | [u8; 8]
+16..16+1021*8      | 1021 slots                    | 1021 × u64 LE
+                   |   interior: child page ids    |
+                   |   leaf:     packed values     |
+                   |   (0 = absent / no child;     |
+                   |    safe sentinel because page |
+                   |    0 is always a superblock)  |
+8184..8192         | XXH3 checksum                 | u64 LE
+```
+
+The `0`-means-absent sentinel relies, like the handle table, on page 0 always being a superblock and therefore never a membership-index page. An outer leaf slot's non-zero value is a `pack_inner(inner_root, inner_depth)`: the inner page id in the low 58 bits, the inner tree's depth in the top 6 bits (a u64 key needs depth < 7, so 6 bits suffice, and page ids never approach 2^58). Packing the inner depth into the outer value is what lets readers descend an inner tree the correct number of levels without storing inner depths anywhere else — only the *outer* depth is an in-memory field that must be recovered on open/rollback.
+
 ### Freemap pages
 
 A freemap page is a bitmap: each bit represents one page in the file (`1` = free, `0` = in use). One freemap page tracks `PAGE_BODY_SIZE × 8 = 65,344` pages (~512 MB at 8 KB pages); a multi-page freemap is not yet implemented but the layout is forward-compatible (a future extension would chain freemap pages or store an index page).
@@ -452,6 +487,27 @@ The radix-tree indirection means values can move freely on disk — `update()` t
 Chisel does not have a centralized COW abstraction. Each layer-4 / layer-5 module that mutates pages (handle_table, freemap during persist) implements COW by allocating fresh pages via `PageCache::new_page`, writing the new state into the new pages, and returning the new root id to the caller. The previously-committed page is left untouched on disk; it remains valid and reachable through the previously-committed superblock for the entire duration of the new transaction.
 
 This per-module pattern is deliberate. A monolithic COW abstraction was considered and rejected — it would have forced every page-type module to express its mutations through a uniform interface, and the modules' actual COW shapes are different enough (handle table walks a tree; freemap rewrites one page; data pages reuse the same page across multiple commits via `claim_page`) that a generic interface would have leaked detail.
+
+### In-memory radix depth is re-derived from the root, never stored
+
+Both radix trees — the handle table and the membership index's outer tree — keep their current depth as an in-memory field (`HandleTable.depth`, `MembershipIndex.outer_depth`) that is NOT carried in `Roots` and so not in the superblock; it is derivable by walking the left spine from the root (each `grow()` installs the old root at child 0). `RadixU64::recover_depth` / `HandleTable::recover_depth` are those walks. Every path that restores a root must re-derive the depth or the in-memory descent depth disagrees with the page it descends: on OPEN (seed both depths from the roots) and on ROLLBACK / rollback_to (after `current_roots` rewinds, re-derive both from the restored roots — a rolled-back `grow()` shrinks the tree by a level; a stale-deep depth would mis-descend and return `InvalidHandle` for committed handles, or mis-enumerate a tag). This was a real silent-corruption bug: it surfaced first in the membership index during chunk-tags development and was recognized as the same root cause in the handle table. The handle-table half is **I99**, the membership half **C1**; both fixes extract the open-time spine walk into a reusable `recover_depth` called from both rollback paths.
+
+### Chunk tags (the membership index in use)
+
+A chunk tag is an immutable `u32` grouping label fixed on a value at allocation time. The transaction layer exposes a small set of operations over it, splitting the *forward* map (handle → tag, stored in `HandleEntry.tag`) from the *reverse* map (tag → {handles}, the membership index):
+
+- **`allocate_tagged(value, tag)`** — like `allocate`, but stamps `tag` into the new `HandleEntry` and registers the handle in the membership index under that tag. Tag `0` means "untagged" and is never indexed (no reverse-map work).
+- **`tag(handle)`** (`&self`) — returns the handle's tag by reading `HandleEntry.tag` from the handle table. A read, valid inside or outside an active transaction.
+- **`handles_with_tag(tag)`** (`&self`) — returns every handle carrying `tag`, by enumerating the tag's inner tree in the membership index. Tag `0` (or any tag with no members) returns an empty `Vec`.
+- **`delete_tagged(handle, tag)`** — verify-before-mutate: looks up the handle's actual tag first and returns `TagMismatch` if it differs from the supplied `tag`, otherwise delegates to `delete`. Guards against deleting the wrong chunk when the caller's tag expectation is stale.
+- **`delete_with_tag(tag, max)`** — bounded relation drop: deletes up to `max` of the tag's members in one call and reports a `TagDropProgress { deleted, complete }`. Because dropping a whole tag can be unbounded work, the caller loops `begin → delete_with_tag → commit` until `complete` is true, keeping each transaction's page footprint bounded.
+
+The index is **self-maintaining**, so the forward and reverse maps never drift:
+
+- `delete` removes the handle from its tag's set (another COW root swap on the membership index), reading the tag off the entry being tombstoned — no tag argument needed, and tag `0` is a no-op.
+- `update` preserves the immutable tag: it carries the old `HandleEntry.tag` onto the relocated entry, and since neither the handle nor its tag changes, the index needs no edit at all (only the value's storage moves).
+
+The tag is therefore fixed at `allocate_tagged` and never changes — there is no retag operation.
 
 ### Spillway
 
@@ -619,7 +675,7 @@ Three engineering lessons surfaced during the spillway PR that are worth remembe
 - **Shadow paging** — the durability technique Chisel uses: writes go to new pages; commit swaps a superblock pointer; old state stays intact for crash recovery.
 - **Slot packing (R1)** — multiple values per data page. Each value occupies one slot; the slot directory grows forward and value data grows backward from the page's checksum.
 - **Slot tombstone** — a slot directory entry with `SLOT_FLAG_DEAD`. Reclaimed by `compact()`, not reused by `insert()`.
-- **Superblock** — the page (one of N slots at the file head) that names the current handle-table root, freemap root, named roots, and durability metadata. Picked by `Superblock::select` on open.
+- **Superblock** — the page (one of N slots at the file head) that names the current handle-table root, freemap root, membership-index root, named roots, and durability metadata. Picked by `Superblock::select` on open. The membership-index root is a fourth root that swaps atomically with the others on each commit.
 - **Tombstone (handle)** — a `HandleEntry` with `HandleFlags::Deleted`. The slot stays allocated; the handle is permanently retired (never reused). See "permanent-burn policy" in [Handle stability](#handle-stability).
 - **txn_counter** — monotonically-increasing u64 in every committed superblock. Used by `select` to pick the winner across slots and by the round-robin to decide which slot to write next.
-- **Watermark rollback (I3)** — the rollback strategy: cache + file are truncated to `committed_roots.total_pages`. Pages allocated during the transaction (id ≥ watermark) get dropped; freemap-reused pages (id < watermark) get their dirty cache entries discarded. No undo log.
+- **Watermark rollback (I3)** — the rollback strategy: cache + file are truncated to `committed_roots.total_pages`. Pages allocated during the transaction (id ≥ watermark) get dropped; freemap-reused pages (id < watermark) get their dirty cache entries discarded. No undo log. Rollback also re-derives the handle-table and membership-index depths from the restored roots (those in-memory radix depths are not part of the snapshot; I99 / C1).

@@ -117,7 +117,58 @@ with db.transaction() as tx:
     tx.delete_many([h1, h2, h3])
 ```
 
+To drop chunks by tag instead of by explicit handle list, see [Tags](#tags) -- `delete_with_tag` handles large tagged sets in bounded batches.
+
 `db.handles()` enumerates every live handle (order unspecified).
+
+## Tags
+
+Each chunk can carry an immutable `u32` *tag* assigned at allocation. The engine
+keeps a reverse membership index (tag -> handles), so you can enumerate or
+bulk-drop every chunk sharing a tag without scanning. Tag `0` is the "untagged"
+sentinel: it is never indexed, so `handles_with_tag(0)` is always empty -- use
+plain `allocate()` for untagged values.
+
+Tags are **immutable**. They are fixed at `allocate_tagged()` time; `update()`
+preserves the tag while replacing the value. There is no "set tag" operation.
+
+The five tag methods live on both the `Chisel` object and the `Transaction`
+context manager:
+
+```python
+with db.transaction() as tx:
+    h = tx.allocate_tagged(b"row-payload", tag=42)
+    assert tx.tag(h) == 42                     # 0 if untagged
+    assert tx.handles_with_tag(42) == [h]      # reverse-index lookup
+
+    tx.update(h, b"new-payload")               # tag stays 42
+    assert tx.tag(h) == 42
+```
+
+`delete_tagged(handle, tag)` deletes only if the stored tag matches, raising
+`TagMismatchError` otherwise (the chunk is left intact):
+
+```python
+with db.transaction() as tx:
+    tx.delete_tagged(h, 42)        # raises TagMismatchError if h's tag != 42
+```
+
+`delete_with_tag(tag, max)` is a **bounded** relation-drop. It deletes up to
+`max` chunks carrying `tag` and returns `(deleted_handles, complete)`. Loop
+`transaction -> delete_with_tag -> commit` until `complete` is `True` to drop a
+large tagged set in fixed-size, separately-committed batches (`max == 0` is a
+no-op returning `complete == False`):
+
+```python
+while True:
+    with db.transaction() as tx:
+        deleted, complete = tx.delete_with_tag(42, max=1000)
+    if complete:
+        break
+```
+
+All five methods are also available on the bare `Chisel` object between
+`db.begin()` and `db.commit()`.
 
 ## Named roots
 
@@ -260,6 +311,7 @@ Catch and continue.
 | `InvalidSuperblockCountError` | `superblock_count` outside `2..=16` |
 | `CacheFullError` | Page cache hit its strict `cache_max_bytes` cap with every cached page dirty (no clean page available for eviction) AND the spillway is disabled (`spillway_max_bytes=0`); commit or roll back to drain. When the spillway is enabled (default), the cache overflows into it instead and you'll see `SpillwayFullError` only if the spillway also fills. |
 | `SpillwayFullError` | Spillway sidecar's `spillway_max_bytes` cap was reached during a transaction; commit or roll back to drain the spillway. Database is intact. |
+| `TagMismatchError` | `delete_tagged(handle, tag)` was passed a `tag` that doesn't match the handle's stored tag; the chunk and membership index are left untouched |
 | `ClosedError` | Call through a `Transaction` / `Savepoint` after `db.close()` |
 | `AlreadyFinishedError` | Second explicit drive on a transaction or savepoint |
 
