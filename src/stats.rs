@@ -56,7 +56,7 @@ pub struct Stats {
 ///
 /// Intended use: the bench harness reads `counters()` before and after each
 /// measurement, reports the delta. General-purpose introspection (debugging,
-/// observability) is also supported — the counters are cheap (Cell<u64>
+/// observability) is also supported — the counters are cheap (`Cell<u64>`
 /// increment in single-writer code paths).
 ///
 /// Fields:
