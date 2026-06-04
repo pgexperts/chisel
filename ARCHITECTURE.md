@@ -482,6 +482,8 @@ A handle is a `u64` returned by `allocate()`. Handles are assigned monotonically
 
 The radix-tree indirection means values can move freely on disk — `update()` to a larger value, `defrag()` consolidation, future page-format upgrades — without changing the handle the caller holds.
 
+Within-session iteration stability follows from that same handle identity. `handles()` and `handles_with_tag()` walk arithmetic radix trees in a structure-only traversal, so within one open instance repeated scans return an identical `Vec` — same handles, same order — as long as the live set is unchanged and no `defrag` has run. This is a *repeatability* guarantee only: the order itself is unspecified (it is not promised to be sorted, and may differ after a reopen or `defrag`, or across versions), which keeps the index internals free to change. The guarantee is deliberately scoped to a single session and does not survive reopen or `defrag`; it rests on the radix-depth re-derivation invariant (see [In-memory radix depth is re-derived from the root](#in-memory-radix-depth-is-re-derived-from-the-root-never-stored)) — a rolled-back grow must restore depth or a later scan would mis-enumerate.
+
 ### Per-module copy-on-write
 
 Chisel does not have a centralized COW abstraction. Each layer-4 / layer-5 module that mutates pages (handle_table, freemap during persist) implements COW by allocating fresh pages via `PageCache::new_page`, writing the new state into the new pages, and returning the new root id to the caller. The previously-committed page is left untouched on disk; it remains valid and reachable through the previously-committed superblock for the entire duration of the new transaction.

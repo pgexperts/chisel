@@ -190,7 +190,7 @@ let _b = db.allocate_tagged(b"row-b", 42)?;
 db.commit()?;
 
 assert_eq!(db.tag(a)?, 42);
-let members = db.handles_with_tag(42)?; // both handles, order unspecified
+let members = db.handles_with_tag(42)?; // both handles; order unspecified, but repeatable within a session
 assert_eq!(members.len(), 2);
 
 // Bounded relation-drop: loop until the tag is fully drained.
@@ -237,13 +237,13 @@ For tuned options (cache size, superblock count), use `Chisel::open_in_memory_wi
 | `delete(handle)` | Remove a handle |
 | `delete_many(handles)` | Batch-delete in the current transaction |
 | `tag(handle)` | Read a handle's tag, `0` if untagged (takes `&self`) |
-| `handles_with_tag(tag)` | Enumerate live handles carrying `tag` (takes `&self`) |
+| `handles_with_tag(tag)` | Enumerate live handles carrying `tag`; repeatable within a session, order unspecified (takes `&self`) |
 | `delete_tagged(handle, tag)` | Delete only if the handle's tag matches; else `TagMismatch` |
 | `delete_with_tag(tag, max)` | Bounded relation-drop: delete up to `max` chunks of `tag`; returns `TagDropProgress` |
 | `set_root_name(name, handle)` | Bind a name to a handle in the named-root table |
 | `get_root_name(name)` | Look up a named root (takes `&self`) |
 | `clear_root_name(name)` | Remove a named root |
-| `handles()` | Enumerate all live handles (takes `&self`) |
+| `handles()` | Enumerate all live handles; repeatable within a session, order unspecified (takes `&self`) |
 | `stats()` | Handle count, page count, file size (takes `&self`) |
 | `counters()` | Engine-activity counters: cache hits/misses, fsync calls, pages allocated (takes `&self`) |
 | `defrag(options)` | Consolidate sparse pages |

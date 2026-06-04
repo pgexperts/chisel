@@ -251,8 +251,12 @@ impl RadixU64 {
         }
     }
 
-    /// Enumerate all `(key, value)` pairs with a non-zero value. Order is
-    /// unspecified.
+    /// Enumerate all `(key, value)` pairs with a non-zero value. The walk is a
+    /// deterministic function of the tree's structure: for a fixed tree it
+    /// returns the same pairs in the same order on every call, which is what
+    /// backs the public within-session iteration-stability contract on
+    /// `Chisel::handles_with_tag`. The order itself (currently ascending key) is
+    /// unspecified and must not be relied upon.
     pub fn iter(&self, cache: &mut PageCache, root: u64) -> Result<Vec<(u64, u64)>> {
         if root == PAGE_ID_NONE {
             return Ok(Vec::new());

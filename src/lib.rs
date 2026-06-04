@@ -461,6 +461,11 @@ impl Chisel {
     /// Enumerate all live handles that carry `tag`. Returns an empty Vec if
     /// no handles with that tag exist. Tag 0 always returns an empty Vec
     /// (the membership index is not updated for untagged values). Takes `&self` (F3).
+    ///
+    /// Stability: the same within-session repeatability contract as `handles` —
+    /// repeated calls return an identical `Vec` while the set of live handles
+    /// carrying `tag` is unchanged and no `defrag` has run. The order is
+    /// unspecified and may differ after a reopen or `defrag`.
     pub fn handles_with_tag(&self, tag: u32) -> Result<Vec<u64>> {
         self.txm.handles_with_tag(tag)
     }
@@ -555,8 +560,15 @@ impl Chisel {
 
     /// Enumerate all live handles. Walks the handle-table radix tree; cost
     /// is proportional to the number of live handles, not to the historical
-    /// maximum. Order is unspecified and callers must not depend on it.
-    /// Takes `&self` for the same reason `read` does (F3).
+    /// maximum. Takes `&self` for the same reason `read` does (F3).
+    ///
+    /// Stability: within a single open instance, repeated calls return an
+    /// identical `Vec` — the same handles in the same order — as long as the
+    /// live set is unchanged between calls (changed only by `allocate*` /
+    /// `delete*`; `read` and `update` do not change it) and no `defrag` has run.
+    /// The order itself is unspecified: it is not sorted, not insertion order,
+    /// and may differ after a reopen or `defrag`, or across Chisel versions.
+    /// Rely on within-session repeatability; do not rely on the order.
     pub fn handles(&self) -> Result<Vec<u64>> {
         self.txm.handles()
     }
