@@ -160,6 +160,17 @@ impl PyTransaction {
         self.db.bind(py).borrow().tag_internal(py, handle)
     }
 
+    fn client_byte(&self, py: Python<'_>, handle: u64) -> PyResult<u8> {
+        self.db.bind(py).borrow().client_byte_internal(py, handle)
+    }
+
+    fn set_client_byte(&self, py: Python<'_>, handle: u64, byte: u8) -> PyResult<()> {
+        self.db
+            .bind(py)
+            .borrow()
+            .set_client_byte_internal(py, handle, byte)
+    }
+
     fn handles_with_tag(&self, py: Python<'_>, tag: u32) -> PyResult<Vec<u64>> {
         self.db.bind(py).borrow().handles_with_tag_internal(py, tag)
     }

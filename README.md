@@ -238,6 +238,8 @@ For tuned options (cache size, superblock count), use `Chisel::open_in_memory_wi
 | `delete_many(handles)` | Batch-delete in the current transaction |
 | `tag(handle)` | Read a handle's tag, `0` if untagged (takes `&self`) |
 | `handles_with_tag(tag)` | Enumerate live handles carrying `tag`; repeatable within a session, order unspecified (takes `&self`) |
+| `client_byte(handle)` | Read the handle's opaque client byte, `0` if unset (takes `&self`) |
+| `set_client_byte(handle, byte)` | Set the opaque client byte; mutable, transactional; `update()` preserves it |
 | `delete_tagged(handle, tag)` | Delete only if the handle's tag matches; else `TagMismatch` |
 | `delete_with_tag(tag, max)` | Bounded relation-drop: delete up to `max` chunks of `tag`; returns `TagDropProgress` |
 | `set_root_name(name, handle)` | Bind a name to a handle in the named-root table |

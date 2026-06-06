@@ -1195,6 +1195,7 @@ impl TransactionManager {
                 slot_index: 0,
                 flags: HandleFlags::Overflow,
                 tag,
+                client_byte: 0,
             }
         } else {
             let (data_page_id, slot) = self.insert_into_data_page(value)?;
@@ -1203,6 +1204,7 @@ impl TransactionManager {
                 slot_index: slot,
                 flags: HandleFlags::Live,
                 tag,
+                client_byte: 0,
             }
         };
 
@@ -1259,6 +1261,75 @@ impl TransactionManager {
             .lookup(&mut cache, root, handle)?
             .ok_or(ChiselError::InvalidHandle(handle))?;
         Ok(entry.tag)
+    }
+
+    /// Return the opaque client byte stored in `handle`'s entry. Returns 0 if
+    /// never set (including every chunk created before this feature). Mirrors
+    /// the read-path root selection. Rejects deleted handles with
+    /// `InvalidHandle` (following `read()`; this is stricter than `tag()`'s
+    /// unguarded read of a tombstone — a pre-existing `tag()` quirk tracked
+    /// separately). Takes `&self`.
+    pub fn client_byte(&self, handle: u64) -> Result<u8> {
+        self.check_alive()?;
+        let result = self.client_byte_inner(handle);
+        self.poison_on_fatal(result)
+    }
+
+    fn client_byte_inner(&self, handle: u64) -> Result<u8> {
+        let root = if self.active_txn {
+            self.current_roots.handle_table_page
+        } else {
+            self.committed_roots.handle_table_page
+        };
+        if root == PAGE_ID_NONE {
+            return Err(ChiselError::InvalidHandle(handle));
+        }
+        let mut cache = self.cache.borrow_mut();
+        let entry = self
+            .handle_table
+            .lookup(&mut cache, root, handle)?
+            .ok_or(ChiselError::InvalidHandle(handle))?;
+        match entry.flags {
+            HandleFlags::Deleted => Err(ChiselError::InvalidHandle(handle)),
+            _ => Ok(entry.client_byte),
+        }
+    }
+
+    /// Set the opaque client byte for `handle`. Requires an active
+    /// transaction; durable on commit, reverted on rollback. Any `u8` is
+    /// valid. COWs only the handle-table leaf — no data-page, overflow, or
+    /// membership-index work. Takes `&mut self`.
+    pub fn set_client_byte(&mut self, handle: u64, byte: u8) -> Result<()> {
+        self.check_alive()?;
+        let result = self.set_client_byte_inner(handle, byte);
+        self.poison_on_fatal(result)
+    }
+
+    fn set_client_byte_inner(&mut self, handle: u64, byte: u8) -> Result<()> {
+        if !self.active_txn {
+            return Err(ChiselError::NoActiveTransaction);
+        }
+        let mut entry = {
+            let mut cache = self.cache.borrow_mut();
+            self.handle_table
+                .lookup(&mut cache, self.current_roots.handle_table_page, handle)?
+                .ok_or(ChiselError::InvalidHandle(handle))?
+        };
+        if matches!(entry.flags, HandleFlags::Deleted) {
+            return Err(ChiselError::InvalidHandle(handle));
+        }
+        entry.client_byte = byte;
+        let new_root = {
+            let mut cache = self.cache.borrow_mut();
+            self.handle_table.insert(
+                &mut cache,
+                self.current_roots.handle_table_page,
+                handle,
+                &entry,
+            )?
+        };
+        self.current_roots.handle_table_page = new_root;
+        Ok(())
     }
 
     pub fn handles_with_tag(&self, tag: u32) -> Result<Vec<u64>> {
@@ -1400,10 +1471,9 @@ impl TransactionManager {
             HandleFlags::Deleted => {}
         }
 
-        // Tags are immutable: update relocates the value but must carry the old
-        // entry's tag forward, keeping HandleEntry.tag and the membership index
-        // in agreement (the handle and its tag are unchanged, so the index needs
-        // no edit — only the value's storage moves).
+        // Tags and the client byte are entry-resident: update relocates the
+        // value but must carry both forward (the handle is unchanged, so the
+        // membership index needs no edit — only the value's storage moves).
         let new_entry = if value.len() > MAX_INLINE_VALUE {
             let first_page = {
                 let mut cache = self.cache.borrow_mut();
@@ -1414,6 +1484,7 @@ impl TransactionManager {
                 slot_index: 0,
                 flags: HandleFlags::Overflow,
                 tag: entry.tag,
+                client_byte: entry.client_byte,
             }
         } else {
             let (data_page_id, slot) = self.insert_into_data_page(value)?;
@@ -1422,6 +1493,7 @@ impl TransactionManager {
                 slot_index: slot,
                 flags: HandleFlags::Live,
                 tag: entry.tag,
+                client_byte: entry.client_byte,
             }
         };
 
@@ -2237,6 +2309,11 @@ mod tests {
         assert!(matches!(tm.delete_tagged(0, 1), Err(ChiselError::Poisoned)));
         assert!(matches!(
             tm.delete_with_tag(1, 10),
+            Err(ChiselError::Poisoned)
+        ));
+        assert!(matches!(tm.client_byte(0), Err(ChiselError::Poisoned)));
+        assert!(matches!(
+            tm.set_client_byte(0, 1),
             Err(ChiselError::Poisoned)
         ));
     }

@@ -458,6 +458,20 @@ impl Chisel {
         self.txm.tag(handle)
     }
 
+    /// Return the opaque client byte stored in the handle-table entry for
+    /// `handle`. Returns 0 for chunks whose byte was never set (including all
+    /// chunks created before this feature). Chisel never interprets it. Takes
+    /// `&self` (F3).
+    pub fn client_byte(&self, handle: u64) -> Result<u8> {
+        self.txm.client_byte(handle)
+    }
+
+    /// Set the opaque client byte for `handle`. Requires an active
+    /// transaction; durable on commit, reverted on rollback.
+    pub fn set_client_byte(&mut self, handle: u64, byte: u8) -> Result<()> {
+        self.txm.set_client_byte(handle, byte)
+    }
+
     /// Enumerate all live handles that carry `tag`. Returns an empty Vec if
     /// no handles with that tag exist. Tag 0 always returns an empty Vec
     /// (the membership index is not updated for untagged values). Takes `&self` (F3).
