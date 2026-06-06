@@ -1195,6 +1195,7 @@ impl TransactionManager {
                 slot_index: 0,
                 flags: HandleFlags::Overflow,
                 tag,
+                client_byte: 0,
             }
         } else {
             let (data_page_id, slot) = self.insert_into_data_page(value)?;
@@ -1203,6 +1204,7 @@ impl TransactionManager {
                 slot_index: slot,
                 flags: HandleFlags::Live,
                 tag,
+                client_byte: 0,
             }
         };
 
@@ -1400,10 +1402,9 @@ impl TransactionManager {
             HandleFlags::Deleted => {}
         }
 
-        // Tags are immutable: update relocates the value but must carry the old
-        // entry's tag forward, keeping HandleEntry.tag and the membership index
-        // in agreement (the handle and its tag are unchanged, so the index needs
-        // no edit — only the value's storage moves).
+        // Tags and the client byte are entry-resident: update relocates the
+        // value but must carry both forward (the handle is unchanged, so the
+        // membership index needs no edit — only the value's storage moves).
         let new_entry = if value.len() > MAX_INLINE_VALUE {
             let first_page = {
                 let mut cache = self.cache.borrow_mut();
@@ -1414,6 +1415,7 @@ impl TransactionManager {
                 slot_index: 0,
                 flags: HandleFlags::Overflow,
                 tag: entry.tag,
+                client_byte: entry.client_byte,
             }
         } else {
             let (data_page_id, slot) = self.insert_into_data_page(value)?;
@@ -1422,6 +1424,7 @@ impl TransactionManager {
                 slot_index: slot,
                 flags: HandleFlags::Live,
                 tag: entry.tag,
+                client_byte: entry.client_byte,
             }
         };
 

@@ -121,6 +121,10 @@ pub struct HandleEntry {
     /// entry's reserved bytes [11..15). See
     /// docs/specs/2026-06-02-chunk-tags-design.md.
     pub tag: u32,
+    /// Opaque client-owned byte; 0 = unset. Stored in entry byte [15].
+    /// Chisel never interprets it (no search/filter). Mutable via
+    /// `set_client_byte`. See docs/specs/2026-06-05-client-byte-design.md.
+    pub client_byte: u8,
 }
 
 /// `HandleTable` owns only the tree's depth; the actual pages live in the
@@ -300,6 +304,7 @@ impl HandleTable {
                         slot_index: 0,
                         flags: HandleFlags::Deleted,
                         tag: 0,
+                        client_byte: 0,
                     };
                     {
                         let new_buf = cache.get_mut(new_leaf)?;
@@ -685,6 +690,7 @@ impl HandleTable {
             slot_index: u16::from_le_bytes(buf[base + 8..base + 10].try_into().unwrap()),
             flags: HandleFlags::from_u8(buf[base + 10]),
             tag: u32::from_le_bytes(buf[base + 11..base + 15].try_into().unwrap()),
+            client_byte: buf[base + 15],
         }
     }
 
@@ -693,14 +699,14 @@ impl HandleTable {
     //   [8..10)  slot_index (u16 LE)
     //   [10]     flags (HandleFlags u8)
     //   [11..15) tag (u32 LE)
-    //   [15]     reserved (always zeroed for forward compatibility)
+    //   [15]     client_byte (u8) — opaque, see docs/specs/2026-06-05-client-byte-design.md
     fn write_entry(buf: &mut [u8; PAGE_SIZE], index: usize, entry: &HandleEntry) {
         let base = DATA_PAGE_HEADER_SIZE + index * ENTRY_SIZE;
         buf[base..base + 8].copy_from_slice(&entry.page_id.to_le_bytes());
         buf[base + 8..base + 10].copy_from_slice(&entry.slot_index.to_le_bytes());
         buf[base + 10] = entry.flags.to_u8();
         buf[base + 11..base + 15].copy_from_slice(&entry.tag.to_le_bytes());
-        buf[base + 15] = 0; // remaining reserved byte
+        buf[base + 15] = entry.client_byte;
     }
 }
 
@@ -750,6 +756,7 @@ mod tests {
             slot_index: 7,
             flags: HandleFlags::Live,
             tag: 0,
+            client_byte: 0,
         };
         // Insert handle 0 (fits in depth-0 root leaf).
         let root1 = ht.insert(&mut cache, root0, 0, &entry).unwrap();
@@ -794,6 +801,7 @@ mod tests {
             slot_index: 7,
             flags: HandleFlags::Live,
             tag: 0,
+            client_byte: 0,
         };
         let root_after_insert = ht.insert(&mut cache, root, 100, &live_entry).unwrap();
 
@@ -821,6 +829,7 @@ mod tests {
             slot_index: 0,
             flags: HandleFlags::Overflow,
             tag: 0,
+            client_byte: 0,
         };
         let root_after_insert = ht.insert(&mut cache, root, 200, &overflow_entry).unwrap();
 
@@ -846,6 +855,7 @@ mod tests {
             slot_index: 7,
             flags: HandleFlags::Live,
             tag: 0,
+            client_byte: 0,
         };
         let root_after_insert = ht.insert(&mut cache, root, 100, &live_entry).unwrap();
 
@@ -881,6 +891,7 @@ mod tests {
             slot_index: 7,
             flags: HandleFlags::Live,
             tag: 0,
+            client_byte: 0,
         };
         let root_after_insert = ht.insert(&mut cache, root, 100, &live_entry).unwrap();
 
@@ -947,6 +958,7 @@ mod tests {
             slot_index: 7,
             flags: HandleFlags::Live,
             tag: 0,
+            client_byte: 0,
         };
         // Grow to depth=1: handle 0 fits in the initial leaf; the second
         // insert at ENTRIES_PER_LEAF forces `grow()`.
@@ -1013,6 +1025,7 @@ mod tests {
             slot_index: 3,
             flags: HandleFlags::Live,
             tag: 0,
+            client_byte: 0,
         };
         let new_root = ht.insert(&mut cache, root, 0, &entry).unwrap();
         let found = ht.lookup(&mut cache, new_root, 0).unwrap().unwrap();
@@ -1031,6 +1044,7 @@ mod tests {
                 slot_index: i as u16,
                 flags: HandleFlags::Live,
                 tag: 0,
+                client_byte: 0,
             };
             root = ht.insert(&mut cache, root, i, &entry).unwrap();
         }
@@ -1051,6 +1065,7 @@ mod tests {
             slot_index: 0,
             flags: HandleFlags::Live,
             tag: 0,
+            client_byte: 0,
         };
         let root2 = ht.insert(&mut cache, root1, 0, &entry).unwrap();
         assert_ne!(root1, root2);
@@ -1072,6 +1087,7 @@ mod tests {
                 slot_index: 0,
                 flags: HandleFlags::Live,
                 tag: 0,
+                client_byte: 0,
             };
             root = ht.insert(&mut cache, root, i, &entry).unwrap();
         }
@@ -1091,6 +1107,7 @@ mod tests {
             slot_index: 0,
             flags: HandleFlags::Live,
             tag: 0,
+            client_byte: 0,
         };
         root = ht.insert(&mut cache, root, 0, &entry).unwrap();
         let (new_root, prev) = ht.delete(&mut cache, root, 0).unwrap();
@@ -1101,6 +1118,27 @@ mod tests {
     }
 
     #[test]
+    fn insert_lookup_roundtrips_client_byte() {
+        // The client byte must survive the on-disk entry encoding (write_entry
+        // -> [15]) and decode (read_entry <- [15]) without disturbing its tag
+        // neighbor in [11..15).
+        let mut cache = make_cache();
+        let mut ht = HandleTable::new();
+        let root = ht.create_root(&mut cache).unwrap();
+        let e = HandleEntry {
+            page_id: 42,
+            slot_index: 3,
+            flags: HandleFlags::Live,
+            tag: 9,
+            client_byte: 200,
+        };
+        let root = ht.insert(&mut cache, root, 1, &e).unwrap();
+        let got = ht.lookup(&mut cache, root, 1).unwrap().unwrap();
+        assert_eq!(got.client_byte, 200);
+        assert_eq!(got.tag, 9, "tag neighbor must be undisturbed");
+    }
+
+    #[test]
     fn handle_entry_tag_round_trips_through_a_leaf_slot() {
         let mut buf = [0u8; PAGE_SIZE];
         let entry = HandleEntry {
@@ -1108,6 +1146,7 @@ mod tests {
             slot_index: 7,
             flags: HandleFlags::Live,
             tag: 0xDEADBEEF,
+            client_byte: 0,
         };
         HandleTable::write_entry(&mut buf, 3, &entry);
         let read = HandleTable::read_entry(&buf, 3);
