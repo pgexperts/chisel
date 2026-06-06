@@ -198,6 +198,7 @@ with db.transaction() as tx:
 ```
 
 Both methods raise `InvalidHandleError` for a deleted or unknown handle.
+`set_client_byte` also raises `OverflowError` if `byte` is outside the valid range `0–255`.
 
 Both methods are also available on the bare `Chisel` object between `db.begin()`
 and `db.commit()`.
