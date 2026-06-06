@@ -46,7 +46,7 @@ use crate::page::{
 };
 use crate::page_cache::PageCache;
 
-// A HandleEntry on disk is {u64 page_id, u16 slot_index, u8 flags, 5 reserved}.
+// A HandleEntry on disk is {u64 page_id, u16 slot_index, u8 flags, u32 tag, u8 client_byte}.
 // Kept at 16 bytes both for alignment and to leave room for future fields
 // (e.g. generation counter) without changing on-disk layout math.
 const ENTRY_SIZE: usize = 16;

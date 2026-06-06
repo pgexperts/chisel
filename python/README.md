@@ -170,6 +170,38 @@ while True:
 All five methods are also available on the bare `Chisel` object between
 `db.begin()` and `db.commit()`.
 
+## Client byte
+
+Each chunk can carry a mutable opaque `int` (0–255) "client byte". Chisel stores
+it but never interprets it — no search, no filter, no index. It is independent of
+the tag: the tag is immutable and carries membership semantics; the client byte is
+freely mutable and carries whatever meaning the caller assigns.
+
+- `client_byte(handle) -> int` — read the byte; `0` if never set. Valid inside or
+  outside a transaction (takes `self`).
+- `set_client_byte(handle, byte)` — write the byte. Transactional: reverts on
+  rollback. `update()` preserves the client byte (same carry-forward as the tag).
+
+```python
+with db.transaction() as tx:
+    h = tx.allocate(b"payload")
+    assert tx.client_byte(h) == 0          # default
+    tx.set_client_byte(h, 7)
+    assert tx.client_byte(h) == 7
+
+# client_byte persists across transactions
+assert db.client_byte(h) == 7
+
+with db.transaction() as tx:
+    tx.update(h, b"new-payload")           # byte stays 7
+    assert tx.client_byte(h) == 7
+```
+
+Both methods raise `InvalidHandleError` for a deleted or unknown handle.
+
+Both methods are also available on the bare `Chisel` object between `db.begin()`
+and `db.commit()`.
+
 ## Named roots
 
 A small fixed-size table mapping short names to handles, stored in the superblock. Intended for long-lived entry points such as a meta-B-tree root. Changes are transactional.

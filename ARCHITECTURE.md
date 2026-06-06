@@ -389,7 +389,7 @@ bytes              | field                         | type
                    |                               |     8..10 slot_index   (u16)
                    |                               |     10    flags        (u8)
                    |                               |     11..15 tag         (u32 LE; 0 = untagged)
-                   |                               |     15    reserved
+                   |                               |     15    client_byte  (u8; opaque; 0 = unset)
 8176..8184         | reserved padding              | [u8; 8]
 8184..8192         | XXH3 checksum                 | u64 LE
 ```
@@ -510,6 +510,15 @@ The index is **self-maintaining**, so the forward and reverse maps never drift:
 - `update` preserves the immutable tag: it carries the old `HandleEntry.tag` onto the relocated entry, and since neither the handle nor its tag changes, the index needs no edit at all (only the value's storage moves).
 
 The tag is therefore fixed at `allocate_tagged` and never changes — there is no retag operation.
+
+### Client byte
+
+The client byte is a single opaque `u8` stored in entry byte `[15]`. Chisel stores it but never interprets it — no search, no filter, no index. It complements the tag: where the tag is immutable and carries membership semantics, the client byte is mutable and carries whatever meaning the caller assigns.
+
+- **`client_byte(handle)`** (`&self`) — returns the client byte, `0` if unset. Returns `InvalidHandle` for a deleted or unknown handle. Valid inside or outside an active transaction.
+- **`set_client_byte(handle, byte)`** (`&mut self`) — sets the client byte. Transactional: COWs only the handle-table leaf holding the entry; reverts on rollback. Returns `InvalidHandle` for a deleted or unknown handle.
+
+`update()` preserves the client byte exactly as it preserves the tag: the old entry is carried forward onto the new entry after the value is relocated. There is no `clear_client_byte` — write `0` explicitly.
 
 ### Spillway
 
