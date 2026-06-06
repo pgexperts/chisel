@@ -1,12 +1,14 @@
 //! Integration tests for the per-chunk client byte: in-session set/read (both
 //! backings), default 0, transactional revert (rollback + savepoint),
 //! preservation across update() and across the inline->overflow transition,
-//! durability across reopen, independence from the tag, and the
-//! invalid/deleted-handle error contracts.
+//! durability across reopen (including overflow-resident values updated before
+//! commit), independence from the tag, and the invalid/deleted-handle error
+//! contracts.
 //!
 //! Poison-path coverage lives in the in-crate unit test
 //! `poisoned_manager_rejects_every_public_entry_point` (src/transaction.rs),
-//! which has access to the `#[cfg(test)]`-gated `force_poison_for_test` hook.
+//! which has access to the `#[cfg(test)]`-gated `force_poison_for_test` hook;
+//! that hook is unreachable from integration tests.
 mod common;
 
 use chisel::{Chisel, ChiselError};
@@ -88,6 +90,36 @@ fn durable_and_independent_of_tag_across_reopen() {
         let db = Chisel::open(&path, Default::default()).unwrap();
         assert_eq!(db.client_byte(h).unwrap(), 0xC9, "client byte durable");
         assert_eq!(db.tag(h).unwrap(), 1234, "tag undisturbed by client byte");
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn tagged_overflow_value_byte_and_tag_durable_across_update_and_reopen() {
+    // Spec items 6 + 7: an overflow-resident entry whose value was relocated by
+    // update() must persist BOTH the client byte and the tag across a full
+    // close/reopen (serialize -> deserialize) cycle.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    let h;
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        h = db.allocate_tagged(b"small", 4321).unwrap();
+        db.set_client_byte(h, 0x5E).unwrap();
+        // Grow past the inline limit so update() relocates the value to an
+        // overflow chain and rewrites the entry — exercising carry-forward of
+        // both tag and client_byte, then durability of an overflow entry.
+        let big = vec![b'z'; 64 * 1024];
+        db.update(h, &big).unwrap();
+        db.commit().unwrap();
+        db.close().unwrap();
+    }
+    {
+        let db = Chisel::open(&path, Default::default()).unwrap();
+        assert_eq!(db.client_byte(h).unwrap(), 0x5E, "client byte durable for overflow value");
+        assert_eq!(db.tag(h).unwrap(), 4321, "tag durable across update + reopen");
+        assert_eq!(db.read(h).unwrap(), vec![b'z'; 64 * 1024]);
         db.close().unwrap();
     }
 }
