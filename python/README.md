@@ -178,8 +178,9 @@ the tag: the tag is immutable and carries membership semantics; the client byte 
 freely mutable and carries whatever meaning the caller assigns.
 
 - `client_byte(handle) -> int` — read the byte; `0` if never set. Valid inside or
-  outside a transaction (takes `self`).
-- `set_client_byte(handle, byte)` — write the byte. Transactional: reverts on
+  outside a transaction.
+- `set_client_byte(handle, byte)` — write the byte. Requires an active transaction;
+  raises `NoActiveTransactionError` if called outside one. Transactional: reverts on
   rollback. `update()` preserves the client byte (same carry-forward as the tag).
 
 ```python
@@ -198,7 +199,8 @@ with db.transaction() as tx:
 ```
 
 Both methods raise `InvalidHandleError` for a deleted or unknown handle.
-`set_client_byte` also raises `OverflowError` if `byte` is outside the valid range `0–255`.
+`set_client_byte` also raises `NoActiveTransactionError` if called outside a transaction,
+and `OverflowError` if `byte` is outside the valid range `0–255`.
 
 Both methods are also available on the bare `Chisel` object between `db.begin()`
 and `db.commit()`.

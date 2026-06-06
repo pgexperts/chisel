@@ -47,8 +47,9 @@ use crate::page::{
 use crate::page_cache::PageCache;
 
 // A HandleEntry on disk is {u64 page_id, u16 slot_index, u8 flags, u32 tag, u8 client_byte}.
-// Kept at 16 bytes both for alignment and to leave room for future fields
-// (e.g. generation counter) without changing on-disk layout math.
+// Kept at 16 bytes for alignment and stable on-disk layout math. Every byte
+// is now assigned (page_id 8, slot_index 2, flags 1, tag 4, client_byte 1);
+// adding a field would require growing the entry (a format change).
 const ENTRY_SIZE: usize = 16;
 // 510 entries per leaf = (8192 - header - checksum) / 16. This is the branching
 // factor at the bottom of the tree and also the radix divisor at level 0.
