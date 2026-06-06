@@ -319,6 +319,14 @@ impl PyChisel {
         self.handles_with_tag_internal(py, tag)
     }
 
+    fn client_byte(&self, py: Python<'_>, handle: u64) -> PyResult<u8> {
+        self.client_byte_internal(py, handle)
+    }
+
+    fn set_client_byte(&self, py: Python<'_>, handle: u64, byte: u8) -> PyResult<()> {
+        self.set_client_byte_internal(py, handle, byte)
+    }
+
     fn delete_tagged(&self, py: Python<'_>, handle: u64, tag: u32) -> PyResult<()> {
         self.delete_tagged_internal(py, handle, tag)
     }
@@ -524,6 +532,19 @@ impl PyChisel {
 
     pub(crate) fn tag_internal(&self, py: Python<'_>, handle: u64) -> PyResult<u32> {
         self.with_inner_io(py, |c| c.tag(handle))
+    }
+
+    pub(crate) fn client_byte_internal(&self, py: Python<'_>, handle: u64) -> PyResult<u8> {
+        self.with_inner_io(py, |c| c.client_byte(handle))
+    }
+
+    pub(crate) fn set_client_byte_internal(
+        &self,
+        py: Python<'_>,
+        handle: u64,
+        byte: u8,
+    ) -> PyResult<()> {
+        self.with_inner_mut_io(py, |c| c.set_client_byte(handle, byte))
     }
 
     pub(crate) fn handles_with_tag_internal(&self, py: Python<'_>, tag: u32) -> PyResult<Vec<u64>> {
