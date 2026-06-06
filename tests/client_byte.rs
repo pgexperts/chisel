@@ -140,3 +140,20 @@ fn invalid_and_deleted_handles_error() {
     db.rollback().unwrap();
     db.close().unwrap();
 }
+
+#[test]
+fn set_client_byte_outside_transaction_errors() {
+    // set_client_byte is a mutation: with no active transaction it must return
+    // NoActiveTransaction (client_byte, a read, works outside a txn and is
+    // covered elsewhere). Completes the error-contract coverage.
+    let file = NamedTempFile::new().unwrap();
+    let mut db = Chisel::open(file.path(), Default::default()).unwrap();
+    db.begin().unwrap();
+    let h = db.allocate(b"row").unwrap();
+    db.commit().unwrap(); // no active transaction after commit
+    assert!(matches!(
+        db.set_client_byte(h, 1),
+        Err(ChiselError::NoActiveTransaction)
+    ));
+    db.close().unwrap();
+}
