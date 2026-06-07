@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "chisel"
 version = "0.1.0"
 description = "Python binding for the Chisel transactional storage engine"
-readme = "../README.md"
+readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Christophe Pettus" }]
