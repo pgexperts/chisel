@@ -22,13 +22,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release
 
+  # One native runner per target arch -- no QEMU, no cross-compilation.
+  # Each runner builds only its own architecture (cibuildwheel's default
+  # CIBW_ARCHS=auto), which removes the two failure modes the old single
+  # ubuntu+macos matrix hit: x86_64-on-arm64-macOS cross-builds needed a
+  # rustup target that was not installed, and aarch64-Linux under QEMU
+  # emulation ran for 6h and was killed. Linux wheels build inside a
+  # manylinux container that ships no Rust, so CIBW_BEFORE_ALL_LINUX
+  # installs a native toolchain there; macOS builds on the host and uses
+  # the host toolchain from rust-toolchain below.
   wheels:
     needs: cargo-test-gate
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - runner: ubuntu-latest     # Linux x86_64
+          - runner: ubuntu-24.04-arm  # Linux aarch64 (native ARM runner)
+          - runner: macos-13          # macOS x86_64 (Intel)
+          - runner: macos-latest      # macOS arm64 (Apple Silicon)
     steps:
       - uses: actions/checkout@v5
 
@@ -42,11 +55,13 @@ jobs:
         uses: pypa/cibuildwheel@v2.19
         env:
           CIBW_BUILD: "cp311-* cp312-* cp313-*"
-          CIBW_ARCHS_LINUX: "x86_64 aarch64"
-          CIBW_ARCHS_MACOS: "x86_64 arm64"
-          CIBW_SKIP: "*-musllinux_* *-win_*"
-          CIBW_BEFORE_BUILD: "pip install maturin"
+          CIBW_SKIP: "*-musllinux_*"
           CIBW_BUILD_FRONTEND: "build"
+          CIBW_BEFORE_BUILD: "pip install maturin"
+          # manylinux containers ship no Rust; install a native toolchain
+          # (fast -- native arch, no emulation) and put cargo on PATH.
+          CIBW_BEFORE_ALL_LINUX: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+          CIBW_ENVIRONMENT_LINUX: 'PATH="$HOME/.cargo/bin:$PATH"'
           CIBW_TEST_REQUIRES: "pytest hypothesis"
           CIBW_TEST_COMMAND: "pytest {package}/tests"
         with:
@@ -54,7 +69,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: wheels-${{ matrix.os }}
+          name: wheels-${{ matrix.runner }}
           path: wheelhouse/*.whl
 
   sdist:
