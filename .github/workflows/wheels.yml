@@ -6,14 +6,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  # I59 (ISSUES.md, 2026-05-22): early cargo test gate. Without this,
-  # a tagged commit that's broken would still build wheels (cibuildwheel
-  # only runs pytest after the long wheel-build step) and fail very late.
-  # This job runs first, blocks both `wheels` and `sdist` via `needs:`,
-  # and adds ~30s of latency to a tag build in exchange for failing fast
-  # if the underlying Rust is broken. Bench-test the bench subcrate is
-  # already covered on every push by ci.yml's bench-tests job; we only
-  # gate the root crate here.
+  # I59 (ISSUES.md, 2026-05-22): early cargo test gate so a broken tagged
+  # commit fails fast instead of after the long wheel build.
   cargo-test-gate:
     runs-on: ubuntu-latest
     steps:
@@ -22,15 +16,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release
 
-  # One native runner per target arch -- no QEMU, no cross-compilation.
-  # Each runner builds only its own architecture (cibuildwheel's default
-  # CIBW_ARCHS=auto), which removes the two failure modes the old single
-  # ubuntu+macos matrix hit: x86_64-on-arm64-macOS cross-builds needed a
-  # rustup target that was not installed, and aarch64-Linux under QEMU
-  # emulation ran for 6h and was killed. Linux wheels build inside a
-  # manylinux container that ships no Rust, so CIBW_BEFORE_ALL_LINUX
-  # installs a native toolchain there; macOS builds on the host and uses
-  # the host toolchain from rust-toolchain below.
+  # One runner per native platform, no QEMU and no 32-bit:
+  #   * Linux x86_64 and aarch64 each on their own native runner.
+  #   * macOS builds BOTH arches on the arm64 runner -- arm64 native and
+  #     x86_64 cross-compiled -- because Intel macOS hosted runners are not
+  #     reliably available (macos-13 sat queued for hours).
+  # CIBW_ARCHS_LINUX=auto64 keeps each Linux runner to its native 64-bit arch
+  # and excludes i686 (its manylinux image's rustup-init fails on a missing
+  # libatomic.so.1). Linux wheels build inside a manylinux container that ships
+  # no Rust, so CIBW_BEFORE_ALL_LINUX installs a native toolchain there; macOS
+  # builds on the host and uses the rust-toolchain targets below.
   wheels:
     needs: cargo-test-gate
     runs-on: ${{ matrix.runner }}
@@ -40,8 +35,7 @@ jobs:
         include:
           - runner: ubuntu-latest     # Linux x86_64
           - runner: ubuntu-24.04-arm  # Linux aarch64 (native ARM runner)
-          - runner: macos-13          # macOS x86_64 (Intel)
-          - runner: macos-latest      # macOS arm64 (Apple Silicon)
+          - runner: macos-latest      # macOS arm64 native + x86_64 cross
     steps:
       - uses: actions/checkout@v5
 
@@ -50,16 +44,24 @@ jobs:
           python-version: "3.12"
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.19
         env:
           CIBW_BUILD: "cp311-* cp312-* cp313-*"
           CIBW_SKIP: "*-musllinux_*"
+          # native 64-bit per runner: x86_64 on ubuntu-latest, aarch64 on
+          # ubuntu-24.04-arm. Excludes i686.
+          CIBW_ARCHS_LINUX: "auto64"
+          # both mac arches on the arm64 runner; x86_64 is cross-compiled.
+          CIBW_ARCHS_MACOS: "arm64 x86_64"
+          # the cross-built x86_64 mac wheel cannot be import-tested on an
+          # arm64 host -- build it, skip its test.
+          CIBW_TEST_SKIP: "*-macosx_x86_64"
           CIBW_BUILD_FRONTEND: "build"
           CIBW_BEFORE_BUILD: "pip install maturin"
-          # manylinux containers ship no Rust; install a native toolchain
-          # (fast -- native arch, no emulation) and put cargo on PATH.
           CIBW_BEFORE_ALL_LINUX: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
           CIBW_ENVIRONMENT_LINUX: 'PATH="$HOME/.cargo/bin:$PATH"'
           CIBW_TEST_REQUIRES: "pytest hypothesis"
