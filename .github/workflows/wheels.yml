@@ -60,6 +60,10 @@ jobs:
           # the cross-built x86_64 mac wheel cannot be import-tested on an
           # arm64 host -- build it, skip its test.
           CIBW_TEST_SKIP: "*-macosx_x86_64"
+          # rustc's x86_64-apple-darwin floor is 10.12, above cibuildwheel's
+          # default 10.9 tag, so delocate rejected the wheel. Pin both mac
+          # arches to 11.0 (arm64's floor) so the wheel tag matches the .so.
+          CIBW_ENVIRONMENT_MACOS: "MACOSX_DEPLOYMENT_TARGET=11.0"
           CIBW_BUILD_FRONTEND: "build"
           CIBW_BEFORE_BUILD: "pip install maturin"
           CIBW_BEFORE_ALL_LINUX: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
