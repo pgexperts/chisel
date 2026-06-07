@@ -49,7 +49,11 @@ fn reverts_on_rollback_and_savepoint() {
     db.savepoint("sp").unwrap();
     db.set_client_byte(h, 30).unwrap();
     db.rollback_to("sp").unwrap();
-    assert_eq!(db.client_byte(h).unwrap(), 20, "rollback_to reverts to savepoint");
+    assert_eq!(
+        db.client_byte(h).unwrap(),
+        20,
+        "rollback_to reverts to savepoint"
+    );
     db.commit().unwrap();
     assert_eq!(db.client_byte(h).unwrap(), 20);
     db.close().unwrap();
@@ -68,7 +72,11 @@ fn preserved_across_update_including_overflow_growth() {
     let big = vec![b'x'; 64 * 1024];
     db.update(h, &big).unwrap();
     db.commit().unwrap();
-    assert_eq!(db.client_byte(h).unwrap(), 0x7F, "preserved across update + overflow");
+    assert_eq!(
+        db.client_byte(h).unwrap(),
+        0x7F,
+        "preserved across update + overflow"
+    );
     assert_eq!(db.read(h).unwrap(), big);
     db.close().unwrap();
 }
@@ -117,8 +125,16 @@ fn tagged_overflow_value_byte_and_tag_durable_across_update_and_reopen() {
     }
     {
         let db = Chisel::open(&path, Default::default()).unwrap();
-        assert_eq!(db.client_byte(h).unwrap(), 0x5E, "client byte durable for overflow value");
-        assert_eq!(db.tag(h).unwrap(), 4321, "tag durable across update + reopen");
+        assert_eq!(
+            db.client_byte(h).unwrap(),
+            0x5E,
+            "client byte durable for overflow value"
+        );
+        assert_eq!(
+            db.tag(h).unwrap(),
+            4321,
+            "tag durable across update + reopen"
+        );
         assert_eq!(db.read(h).unwrap(), vec![b'z'; 64 * 1024]);
         db.close().unwrap();
     }
@@ -129,14 +145,26 @@ fn invalid_and_deleted_handles_error() {
     let file = NamedTempFile::new().unwrap();
     let mut db = Chisel::open(file.path(), Default::default()).unwrap();
     // Unknown handle without any transaction.
-    assert!(matches!(db.client_byte(999), Err(ChiselError::InvalidHandle(999))));
+    assert!(matches!(
+        db.client_byte(999),
+        Err(ChiselError::InvalidHandle(999))
+    ));
     db.begin().unwrap();
-    assert!(matches!(db.set_client_byte(999, 1), Err(ChiselError::InvalidHandle(999))));
+    assert!(matches!(
+        db.set_client_byte(999, 1),
+        Err(ChiselError::InvalidHandle(999))
+    ));
     // Deleted handle (tombstone) is rejected like read(), not read as a stale value.
     let h = db.allocate(b"row").unwrap();
     db.delete(h).unwrap();
-    assert!(matches!(db.client_byte(h), Err(ChiselError::InvalidHandle(_))));
-    assert!(matches!(db.set_client_byte(h, 1), Err(ChiselError::InvalidHandle(_))));
+    assert!(matches!(
+        db.client_byte(h),
+        Err(ChiselError::InvalidHandle(_))
+    ));
+    assert!(matches!(
+        db.set_client_byte(h, 1),
+        Err(ChiselError::InvalidHandle(_))
+    ));
     db.rollback().unwrap();
     db.close().unwrap();
 }
