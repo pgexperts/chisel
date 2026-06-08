@@ -73,15 +73,14 @@ jobs:
   # accumulate silently.
   audit:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-      checks: write
     steps:
       - uses: actions/checkout@v5
-      - uses: rustsec/audit-check@v1.4.1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      # Run cargo audit directly rather than rustsec/audit-check, which is
+      # pinned to the deprecated Node 20 runtime (it has no Node 24 release).
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - run: cargo audit
 
   # I55 (ISSUES.md, 2026-05-22): pin MSRV in CI. Cargo.toml declares
   # rust-version = "1.82" (the floor stabilized by Option::is_none_or in
