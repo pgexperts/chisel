@@ -156,7 +156,9 @@ pub struct Superblock {
     // Total allocated pages in the file, including both superblock slots.
     // Used to detect truncation (see FileSizeMismatch).
     pub total_pages: u64,
-    // Next u64 handle id to hand out. Handles are never reused.
+    // Next u64 handle id to hand out. Handles are never reused. Handle 0 is
+    // reserved as the "no handle" sentinel and is never minted — a fresh store
+    // seeds this at 1 (see new_empty), so the first handle handed out is 1.
     pub next_handle: u64,
     // Stored so a future page-size change can be detected at open time
     // rather than silently misreading.
@@ -347,7 +349,10 @@ impl Superblock {
             root_handle_table_page: page::PAGE_ID_NONE,
             root_freemap_page: page::PAGE_ID_NONE,
             total_pages: superblock_count as u64,
-            next_handle: 0,
+            // Handle 0 is reserved as the "no handle" sentinel and is never
+            // minted, so a fresh store seeds the counter at 1. Must match the
+            // in-memory Roots in TransactionManager's create path.
+            next_handle: 1,
             page_size: PAGE_SIZE as u32,
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
             superblock_count,
@@ -360,6 +365,14 @@ impl Superblock {
 mod tests {
     use super::*;
     use proptest::prop_assert_eq;
+
+    #[test]
+    fn new_empty_reserves_handle_zero() {
+        // Handle 0 is the reserved "no handle" sentinel: a fresh store's
+        // superblock seeds next_handle at 1 so the allocator never mints 0.
+        let sb = Superblock::new_empty(2);
+        assert_eq!(sb.next_handle, 1);
+    }
 
     /// A superblock whose count field is outside [MIN, MAX] must be
     /// rejected by `deserialize`. Otherwise the recovered count would

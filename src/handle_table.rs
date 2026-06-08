@@ -36,7 +36,8 @@
 //        swap in phase 2 — this is what makes shadow paging crash-safe.
 //
 // Handle allocation policy (enforced by transaction.rs, not this module):
-// handles are monotonic from `next_handle` and never reused. Delete writes
+// handles are monotonic from `next_handle` and never reused, starting at 1
+// (handle 0 is reserved as the "no handle" sentinel). Delete writes
 // a tombstone entry (HandleFlags::Deleted) in place; the leaf slot is not
 // freed. This keeps handles stable forever but means the tree only grows.
 

@@ -272,7 +272,11 @@ impl TransactionManager {
         let roots = Roots {
             handle_table_page: PAGE_ID_NONE,
             freemap_page: PAGE_ID_NONE,
-            next_handle: 0,
+            // Start at 1: handle 0 is reserved as the "no handle" sentinel and is
+            // never minted (see Superblock::new_empty, which seeds the persisted
+            // superblock the same way). Must match new_empty so the in-memory
+            // roots and the on-disk superblock of a fresh store agree.
+            next_handle: 1,
             total_pages: superblock_count as u64,
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
             membership_index_page: PAGE_ID_NONE,
@@ -1157,7 +1161,9 @@ impl TransactionManager {
 
     /// Insert a value and return a stable handle.
     ///
-    /// Handles are dense u64s drawn from current_roots.next_handle. Large values
+    /// Handles are dense u64s drawn from current_roots.next_handle, starting at
+    /// 1 — handle 0 is reserved as the "no handle" sentinel and is never
+    /// returned. Large values
     /// (> MAX_INLINE_VALUE) go to an overflow chain and the HandleEntry records
     /// the first overflow page directly; small values get a slot in a freshly
     /// allocated data page. Either way the handle_table.insert() COWs the spine
@@ -2982,12 +2988,15 @@ mod tests {
     #[test]
     fn handle_table_depth_restored_after_rolled_back_grow() {
         // I99 regression: a rolled-back handle-table grow must not leave the
-        // in-memory depth too deep. 510 handles (ENTRIES_PER_LEAF) fill depth 0;
-        // the 511th grows to depth 1. Roll that back, then a committed handle must
-        // still read (it returned InvalidHandle before the fix).
+        // in-memory depth too deep. A leaf holds ENTRIES_PER_LEAF (510) ids
+        // 0..=509; handle 0 is the reserved "no handle" sentinel, so allocation
+        // starts at id 1. Allocating ids 1..=509 (509 handles) stays at depth 0,
+        // and the next handle (id 510, where `id >= cap` triggers the grow) goes
+        // to depth 1. Roll that back, then a committed handle must still read (it
+        // returned InvalidHandle before the fix).
         let mut tm = fresh_manager();
         tm.begin().unwrap();
-        for i in 0..510u64 {
+        for i in 0..509u64 {
             tm.allocate(format!("v{i}").as_bytes()).unwrap();
         }
         tm.commit().unwrap();
@@ -3011,15 +3020,20 @@ mod tests {
     fn handle_table_depth_restored_after_rollback_to_savepoint() {
         let mut tm = fresh_manager();
         tm.begin().unwrap();
-        for i in 0..510u64 {
+        // Handle 0 is the reserved "no handle" sentinel, so allocation starts at
+        // id 1: ids 1..=509 (509 handles) stay at depth 0, and the "grow" below
+        // (id 510, where `id >= ENTRIES_PER_LEAF` triggers the grow) is the one
+        // that crosses to depth 1, past the savepoint. Handle h holds "v{h-1}".
+        for i in 0..509u64 {
             tm.allocate(format!("v{i}").as_bytes()).unwrap();
         }
         tm.savepoint("sp").unwrap();
         tm.allocate(b"grow").unwrap(); // grows depth 0 -> 1 past the savepoint
         tm.rollback_to("sp").unwrap();
         // A handle present at the savepoint must still read within the active txn.
-        assert_eq!(tm.read(5).unwrap(), b"v5");
+        // Handle 5 was the i=4 allocation, so it holds "v4".
+        assert_eq!(tm.read(5).unwrap(), b"v4");
         tm.commit().unwrap();
-        assert_eq!(tm.read(5).unwrap(), b"v5");
+        assert_eq!(tm.read(5).unwrap(), b"v4");
     }
 }

@@ -69,3 +69,27 @@ fn test_chisel_stats_body(b: &Backing) {
 }
 
 dual_backing_test!(test_chisel_stats, test_chisel_stats_body);
+
+// Handle 0 is reserved as the "no handle" sentinel; the allocator must never
+// mint it. On a fresh store the first handle is 1, and ids increase from there.
+// Dual-backed so both the on-disk superblock (file) and the in-memory roots
+// (memory) seed the counter past the reserved value.
+fn test_handle_zero_is_reserved_body(b: &Backing) {
+    let mut db = open_chisel(b);
+    db.begin().unwrap();
+    let h1 = db.allocate(b"first").unwrap();
+    let h2 = db.allocate(b"second").unwrap();
+    db.commit().unwrap();
+    assert_ne!(
+        h1, 0,
+        "handle 0 is the reserved no-handle sentinel and must never be minted"
+    );
+    assert_eq!(h1, 1, "the first handle on a fresh store must be 1");
+    assert_eq!(h2, 2, "handles increase monotonically from 1");
+    db.close().unwrap();
+}
+
+dual_backing_test!(
+    test_handle_zero_is_reserved,
+    test_handle_zero_is_reserved_body
+);
