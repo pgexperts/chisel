@@ -4,17 +4,20 @@
 // FreeMap page. Each bit represents one page in the database file.
 //   1 = free (available for reuse), 0 = in use.
 //
-// The freemap is wired into the data-page allocator (ISSUES.md R2):
-// `TransactionManager::allocate_data_page` prefers
-// `FreeMap::allocate_first` and falls back to extending the file only
-// when the freemap has no free id to hand out. Reclamation happens
-// during commit via `persist_freemap`, which merges `txn_freed_pages`
-// into `current_freemap` BEFORE writing the new freemap snapshot
-// (I18 ordering) so `allocate_data_page` cannot reuse a page the
-// last-durable superblock still references. Overflow and handle-table
-// pages still extend directly — they go through `PageCache::new_page`
-// not through `allocate_data_page` — but their frees do feed the
-// freemap on commit.
+// The freemap is wired into page allocation (ISSUES.md R2) via the shared
+// `cow_alloc` helper in transaction.rs: data-page allocation AND the
+// handle-table / membership-index COW paths prefer `FreeMap::allocate_first`
+// (reusing a page freed by a prior committed transaction) and fall back to
+// extending the file only when the freemap has no free id to hand out.
+// Reclamation happens during commit via `persist_freemap`, which merges
+// `txn_freed_pages` into `current_freemap` BEFORE writing the new freemap
+// snapshot (I18 ordering) so allocation cannot reuse a page the last-durable
+// superblock still references. The handle table and membership index both feed
+// their COW-superseded pages into `txn_freed_pages` and allocate through
+// `cow_alloc`, so they reach a bounded steady-state page count rather than
+// growing one page per mutation. Overflow pages still extend directly (call
+// `PageCache::new_page`), but their frees do feed the freemap on commit, so a
+// later data/handle-table allocation can reclaim them.
 //
 // On-disk layout of a freemap page:
 //   byte 0        : PageType tag (0x04 = FreeMap)

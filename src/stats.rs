@@ -63,9 +63,14 @@ pub struct Stats {
 /// - `cache_hits` — `PageCache::get` returned a cached page without disk I/O.
 /// - `cache_misses` — `PageCache::get` had to load from disk (and validate
 ///   checksum). Hit rate is `hits / (hits + misses)`.
-/// - `pages_allocated` — `PageCache::new_page` invocations. Each is one new
-///   page id past the prior high-water mark; the actual disk write happens
-///   on the next `flush()`.
+/// - `pages_allocated` — page allocations, counting BOTH file extensions
+///   (`PageCache::new_page`, a new id past the high-water mark) AND freemap
+///   reuses (`PageCache::claim_page`, a page id freed by a prior committed
+///   transaction and handed back out). Reuse is the common case once the
+///   handle table / membership index allocate COW pages through the
+///   freemap-aware path, so a counter that ignored it would read ~0 for a
+///   steady-state mutating workload. The actual disk write happens on the
+///   next `flush()`.
 /// - `fsync_calls` — `PageIo::fsync` invocations that SUCCEEDED. Two per
 ///   Chisel commit (data pages, then superblock); zero between commits in
 ///   a normal txn. A failed fsync poisons the engine (I1 / fsyncgate) and

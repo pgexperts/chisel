@@ -743,6 +743,12 @@ impl PageCache {
         };
         self.entries.insert(page_id, entry);
         self.dirty_count += 1;
+        // Reusing a freed page is an allocation too: count it so
+        // `pages_allocated` reflects total allocation activity, not just file
+        // extensions. With the handle table / membership index now allocating
+        // COW pages through the freemap (reuse-before-extend), the bulk of a
+        // steady-state workload's allocations arrive here, not via `new_page`.
+        self.pages_allocated.set(self.pages_allocated.get() + 1);
         self.lru.push_front(page_id);
         self.maybe_evict()?;
         Ok(())
@@ -1282,10 +1288,24 @@ mod tests {
             crate::SpillwayLocation::InMemory,
         );
         assert_eq!(cache.pages_allocated_count(), 0);
-        cache.new_page().unwrap();
-        cache.new_page().unwrap();
-        cache.new_page().unwrap();
+        for _ in 0..3 {
+            let id = cache.new_page().unwrap();
+            crate::page::stamp_checksum(cache.get_mut(id).unwrap());
+        }
         assert_eq!(cache.pages_allocated_count(), 3);
+
+        // Flush so the pages are clean; claim_page asserts the reused id is not
+        // dirty (the freemap never hands back an id with pending writes).
+        cache.flush().unwrap();
+
+        // Reuse via claim_page also counts as an allocation: it is the same
+        // allocation work (cache insert + maybe_evict), just reusing a freed
+        // page id instead of extending the file. Once the handle table and
+        // membership index allocate COW pages through the freemap-aware path,
+        // most allocations are reuses; a counter that ignored them would read
+        // ~0 for a steady-state mutating workload.
+        cache.claim_page(0).unwrap();
+        assert_eq!(cache.pages_allocated_count(), 4);
     }
 
     #[test]
