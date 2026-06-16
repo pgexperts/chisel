@@ -334,10 +334,27 @@ fn test_recovery_truncated_file_is_rejected() {
         let f = fs::OpenOptions::new().write(true).open(&path).unwrap();
         f.set_len(PAGE_SIZE as u64).unwrap();
     }
-    let result = Chisel::open(&path, Default::default());
+    // `Chisel` is not `Debug`, so unwrap_err/expect_err won't compile — match.
+    let err = match Chisel::open(&path, Default::default()) {
+        Ok(_) => panic!("truncated file was accepted by Chisel::open"),
+        Err(e) => e,
+    };
+    // Pin the failure mode, not just "some error": a truncated file must be
+    // rejected with a *fatal*, typed integrity error — not an operational
+    // error and not a panic-y generic IoError. The exact variant depends on
+    // which read fails first.
     assert!(
-        result.is_err(),
-        "truncated file was accepted by Chisel::open"
+        matches!(
+            err,
+            ChiselError::InvalidPageId { .. }
+                | ChiselError::CorruptSuperblock
+                | ChiselError::FileSizeMismatch { .. }
+        ),
+        "expected a typed integrity error, got {err:?}"
+    );
+    assert!(
+        err.is_fatal(),
+        "truncation rejection must be a fatal error, got {err:?}"
     );
 }
 

@@ -973,8 +973,16 @@ impl PageCache {
                 .remove(&victim_id)
                 .ok_or(ChiselError::CorruptPage { page_id: victim_id })?;
             self.lru.remove(victim_id);
-            // entry was dirty; preserve dirty_count's invariant.
-            self.dirty_count -= 1;
+            // The victim is dirty here (Phase B runs only when every entry is
+            // dirty), so this decrement always fires today. Guard it on
+            // `entry.dirty` anyway — matching every other decrement site
+            // (`discard`/`truncate`/`set_cache_max_bytes`) — so a future change
+            // that let a clean page sit at the LRU tail during a spill would
+            // no-op here instead of underflowing `dirty_count` (a debug panic /
+            // release wrap that would silently break the cap-eviction logic).
+            if entry.dirty {
+                self.dirty_count -= 1;
+            }
 
             // Spill (may return SpillwayFull, in which case we DO NOT
             // re-insert — the entry is dropped and the caller will

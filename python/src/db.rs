@@ -230,7 +230,7 @@ impl PyChisel {
         // Chisel::close method. An in-flight transaction is silently
         // discarded by shadow paging; the last committed state remains
         // durable on disk.
-        let _ = self.inner.lock().unwrap().take();
+        let _ = self.inner.lock().unwrap_or_else(|e| e.into_inner()).take();
         Ok(())
     }
 
@@ -247,7 +247,7 @@ impl PyChisel {
 
     #[getter]
     fn is_poisoned(&self) -> bool {
-        let guard = self.inner.lock().unwrap();
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
             Some(c) => c.is_poisoned(),
             None => true, // closed == poisoned from the caller's POV
@@ -617,7 +617,14 @@ impl PyChisel {
         _py: Python<'_>,
         f: impl FnOnce(&Chisel) -> chisel::Result<R>,
     ) -> PyResult<R> {
-        let guard = self.inner.lock().unwrap();
+        // Recover from a poisoned Mutex rather than panicking. The engine never
+        // panics while holding the lock (fatal conditions return
+        // ChiselError::Poisoned, surfaced to Python as PoisonedError), so the
+        // Mutex should never poison; but if some future engine debug_assert or
+        // panic ever did fire under the lock, `into_inner()` degrades to the
+        // normal poisoned-engine path instead of bricking every subsequent call
+        // (including close() and is_poisoned()) with a PanicException.
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let c = guard.as_ref().ok_or_else(closed_err)?;
         f(c).map_err(to_py_err)
     }
@@ -627,7 +634,7 @@ impl PyChisel {
         _py: Python<'_>,
         f: impl FnOnce(&mut Chisel) -> chisel::Result<R>,
     ) -> PyResult<R> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let c = guard.as_mut().ok_or_else(closed_err)?;
         f(c).map_err(to_py_err)
     }
