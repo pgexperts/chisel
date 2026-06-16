@@ -8,7 +8,7 @@
 //! Like the handle table, this module returns the new root page id after a COW
 //! mutation; all page dirtiness lives in `PageCache`, flushed at commit.
 
-use crate::error::Result;
+use crate::error::{ChiselError, Result};
 use crate::page::{
     self, PageType, CHECKSUM_OFFSET, DATA_PAGE_HEADER_SIZE, PAGE_ID_NONE, PAGE_SIZE,
 };
@@ -18,6 +18,14 @@ use crate::page_cache::PageCache;
 // so one constant is the fan-out at every level. 1021 = (8184 - 16) / 8.
 const SLOT_SIZE: usize = 8;
 const SLOTS_PER_PAGE: usize = (CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE) / SLOT_SIZE; // 1021
+
+// Maximum valid radix depth. capacity(depth) = SLOTS_PER_PAGE^(depth+1); for
+// SLOTS_PER_PAGE = 1021, 1021^6 ≈ 1.1e18 < u64::MAX < 1021^7, so a tree keyed by
+// u64 values is never deeper than 6 (a key in (capacity(5), u64::MAX] forces one
+// final grow to depth 6, whose capacity saturates to u64::MAX). Any spine or
+// packed inner-depth claiming a deeper tree is corrupt — used by recover_depth's
+// cap (which also bounds a cyclic spine) and the unpack_inner range check.
+const MAX_DEPTH: u32 = 6;
 
 fn read_slot(buf: &[u8; PAGE_SIZE], index: usize) -> u64 {
     let off = DATA_PAGE_HEADER_SIZE + index * SLOT_SIZE;
@@ -60,10 +68,15 @@ impl RadixU64 {
         init_page(cache, PageType::MembershipLeaf)
     }
 
+    // saturating_mul (not `*=`): a valid tree never exceeds MAX_DEPTH (capacity
+    // fits u64), but a corrupt-but-checksummed page can supply an out-of-range
+    // depth (via recover_depth on a bad spine, or unpack_inner's 6-bit field).
+    // Saturating to u64::MAX keeps `key >= capacity()` in find_leaf correctly
+    // true (rejecting the descent) instead of a debug panic / release wrap.
     fn capacity(&self) -> u64 {
         let mut cap = SLOTS_PER_PAGE as u64;
         for _ in 0..self.depth {
-            cap *= SLOTS_PER_PAGE as u64;
+            cap = cap.saturating_mul(SLOTS_PER_PAGE as u64);
         }
         cap
     }
@@ -71,7 +84,7 @@ impl RadixU64 {
     fn span_at_level(&self, level: u32) -> u64 {
         let mut span = SLOTS_PER_PAGE as u64;
         for _ in 1..level {
-            span *= SLOTS_PER_PAGE as u64;
+            span = span.saturating_mul(SLOTS_PER_PAGE as u64);
         }
         span
     }
@@ -82,7 +95,13 @@ impl RadixU64 {
         root: u64,
         key: u64,
     ) -> Result<Option<(u64, usize)>> {
-        if self.depth > 0 && key >= self.capacity() {
+        // Reject keys past the tree's reach (I26). When capacity() SATURATED to
+        // u64::MAX (depth 6, where the real capacity exceeds u64::MAX), every u64
+        // key is in reach, so the guard is skipped — otherwise the single key
+        // u64::MAX would be wrongly reported absent. The child_idx bound below
+        // still protects the descent.
+        let cap = self.capacity();
+        if self.depth > 0 && cap != u64::MAX && key >= cap {
             return Ok(None);
         }
         if self.depth == 0 {
@@ -93,6 +112,13 @@ impl RadixU64 {
         for level in (1..=self.depth).rev() {
             let span = self.span_at_level(level);
             let child_idx = (remaining / span) as usize;
+            // Defense-in-depth: a validated depth (≤ MAX_DEPTH) guarantees
+            // child_idx < SLOTS_PER_PAGE, but guard the slot index directly so a
+            // bad index reads as "absent" rather than slicing past the page
+            // (read_slot would index buf[16 + child_idx*8 ..] out of bounds).
+            if child_idx >= SLOTS_PER_PAGE {
+                return Ok(None);
+            }
             remaining %= span;
             let child = read_slot(cache.get(current)?, child_idx);
             if child == 0 {
@@ -330,7 +356,7 @@ impl RadixU64 {
             for i in 0..SLOTS_PER_PAGE {
                 let v = read_slot(buf, i);
                 if v != 0 {
-                    out.push((base + i as u64, v));
+                    out.push((base.saturating_add(i as u64), v));
                 }
             }
         } else {
@@ -343,7 +369,11 @@ impl RadixU64 {
                     .collect()
             };
             for (i, child) in children {
-                self.iter_recursive(cache, child, base + i as u64 * span, level - 1, out)?;
+                // saturating: with a validated depth this never saturates, but a
+                // bad depth makes `span` saturate to u64::MAX and `i as u64 * span`
+                // would overflow-panic — saturate the prefix accumulation instead.
+                let next_base = base.saturating_add((i as u64).saturating_mul(span));
+                self.iter_recursive(cache, child, next_base, level - 1, out)?;
             }
         }
         Ok(())
@@ -385,7 +415,7 @@ impl RadixU64 {
                 }
                 let v = read_slot(buf, i);
                 if v != 0 {
-                    out.push((base + i as u64, v));
+                    out.push((base.saturating_add(i as u64), v));
                 }
             }
         } else {
@@ -401,14 +431,12 @@ impl RadixU64 {
                 if out.len() >= limit {
                     break;
                 }
-                self.iter_bounded_recursive(
-                    cache,
-                    child,
-                    base + i as u64 * span,
-                    level - 1,
-                    limit,
-                    out,
-                )?;
+                // saturating: matches iter_recursive — a corrupt depth of exactly
+                // MAX_DEPTH (which passes the unpack_inner check) makes `span`
+                // large enough that `i as u64 * span` overflow-panics for a
+                // non-zero child slot i >= 17. Saturate the prefix instead.
+                let next_base = base.saturating_add((i as u64).saturating_mul(span));
+                self.iter_bounded_recursive(cache, child, next_base, level - 1, limit, out)?;
             }
         }
         Ok(())
@@ -465,6 +493,14 @@ impl RadixU64 {
                 break;
             }
             depth += 1;
+            // Cap the walk at MAX_DEPTH. A valid spine is never deeper; a corrupt
+            // (but checksum-valid) spine that is over-deep OR cyclic (a child-0
+            // cycle revisits interior pages and grows depth without bound) is
+            // caught here as a typed CorruptPage instead of an infinite loop.
+            // This is the cycle guard too — no visited-set needed.
+            if depth > MAX_DEPTH {
+                return Err(ChiselError::CorruptPage { page_id: current });
+            }
             let child = read_slot(buf, 0);
             if child == 0 {
                 break;
@@ -543,6 +579,15 @@ impl MembershipIndex {
             outer_root
         };
         let (mut inner_root, inner_depth) = unpack_inner(outer.lookup(cache, root, tag as u64)?);
+        // A corrupt outer-leaf packed value can claim an out-of-range inner
+        // depth (6-bit field). Reject it as a typed CorruptPage before building
+        // a bogus-depth descent. (inner_root == 0 means the tag is absent — a
+        // fresh inner tree at depth 0, validated by construction.)
+        if inner_root != 0 && inner_depth > MAX_DEPTH {
+            return Err(ChiselError::CorruptPage {
+                page_id: inner_root,
+            });
+        }
         let mut inner = RadixU64 { depth: inner_depth };
         if inner_root == 0 {
             inner_root = inner.create_root(cache)?;
@@ -573,6 +618,13 @@ impl MembershipIndex {
             depth: self.outer_depth,
         };
         let (inner_root, inner_depth) = unpack_inner(outer.lookup(cache, outer_root, tag as u64)?);
+        // Reject a corrupt out-of-range inner depth as a typed CorruptPage
+        // (skip when the tag is absent: inner_root == 0).
+        if inner_root != 0 && inner_depth > MAX_DEPTH {
+            return Err(ChiselError::CorruptPage {
+                page_id: inner_root,
+            });
+        }
         if inner_root == 0 {
             return Ok((outer_root, false));
         }
@@ -617,6 +669,13 @@ impl MembershipIndex {
             depth: self.outer_depth,
         };
         let (inner_root, inner_depth) = unpack_inner(outer.lookup(cache, outer_root, tag as u64)?);
+        // Reject a corrupt out-of-range inner depth as a typed CorruptPage
+        // (skip when the tag is absent: inner_root == 0).
+        if inner_root != 0 && inner_depth > MAX_DEPTH {
+            return Err(ChiselError::CorruptPage {
+                page_id: inner_root,
+            });
+        }
         if inner_root == 0 {
             return Ok(false);
         }
@@ -637,6 +696,13 @@ impl MembershipIndex {
             depth: self.outer_depth,
         };
         let (inner_root, inner_depth) = unpack_inner(outer.lookup(cache, outer_root, tag as u64)?);
+        // Reject a corrupt out-of-range inner depth as a typed CorruptPage
+        // (skip when the tag is absent: inner_root == 0).
+        if inner_root != 0 && inner_depth > MAX_DEPTH {
+            return Err(ChiselError::CorruptPage {
+                page_id: inner_root,
+            });
+        }
         if inner_root == 0 {
             return Ok(Vec::new());
         }
@@ -667,6 +733,13 @@ impl MembershipIndex {
             depth: self.outer_depth,
         };
         let (inner_root, inner_depth) = unpack_inner(outer.lookup(cache, outer_root, tag as u64)?);
+        // Reject a corrupt out-of-range inner depth as a typed CorruptPage
+        // (skip when the tag is absent: inner_root == 0).
+        if inner_root != 0 && inner_depth > MAX_DEPTH {
+            return Err(ChiselError::CorruptPage {
+                page_id: inner_root,
+            });
+        }
         if inner_root == 0 {
             return Ok(Vec::new());
         }
@@ -833,6 +906,101 @@ mod tests {
         assert_eq!(prev, 99);
         assert_eq!(t.lookup(&mut c, r2, 5).unwrap(), 0);
         assert!(!t.any_present(&mut c, r2).unwrap());
+    }
+
+    // --- Corrupt-input robustness (deepdive review finding #3) ---------------
+    // A corrupt-but-checksummed page is only stopped by the XXH3 checksum on
+    // load; its page-type / slot / packed-value bytes are NOT validated. These
+    // tests pin that such input yields a typed CorruptPage (or a bounded,
+    // non-panicking result) rather than a panic (OOB slice), a hang (cyclic
+    // recover_depth spine), or an arithmetic overflow.
+
+    // capacity()/span_at_level() must SATURATE on an out-of-range depth (the
+    // unpack_inner 6-bit field can be up to 63) instead of overflowing — a
+    // debug-build multiply panic, or a release wrap to a small value that would
+    // defeat find_leaf's `key >= capacity()` bounds guard.
+    #[test]
+    fn capacity_and_span_saturate_on_out_of_range_depth() {
+        let r = RadixU64 { depth: 30 };
+        assert_eq!(r.capacity(), u64::MAX);
+        assert_eq!(r.span_at_level(30), u64::MAX);
+    }
+
+    // recover_depth must reject a corrupt (checksum-valid) interior spine whose
+    // child-0 forms a cycle — pre-fix this loops forever (open-time hang); the
+    // depth cap returns a typed CorruptPage instead.
+    #[test]
+    fn recover_depth_rejects_cyclic_spine() {
+        let mut c = cache(64);
+        let id = c.new_page().unwrap();
+        {
+            let buf = c.get_mut(id).unwrap();
+            buf.fill(0);
+            buf[0] = PageType::MembershipInterior as u8;
+            buf[1] = page::PAGE_FORMAT_VERSION_CURRENT;
+            write_slot(buf, 0, id); // child-0 -> self: a cycle
+            page::stamp_checksum(buf);
+        }
+        let err = match RadixU64::recover_depth(&mut c, id) {
+            Ok(d) => panic!("recover_depth accepted a cyclic spine (depth {d})"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ChiselError::CorruptPage { .. }),
+            "expected CorruptPage, got {err:?}"
+        );
+    }
+
+    // A corrupt outer-leaf packed value can claim an out-of-range inner-tree
+    // depth (the field is 6 bits, 0..=63). The MembershipIndex methods must
+    // reject it as a typed CorruptPage rather than descending a bogus-depth
+    // inner tree (which lands on a wrong page id and surfaces a misleading
+    // ChecksumMismatch — or, without the capacity saturation, would panic).
+    #[test]
+    fn corrupt_inner_depth_is_corrupt_page() {
+        let mut c = cache(64);
+        let mut idx = MembershipIndex::new();
+        let root = idx.insert_t(&mut c, PAGE_ID_NONE, 7, 5).unwrap();
+        // Outer tree is depth 0 (one tag): `root` is the outer leaf, and outer
+        // slot (7 % 1021 = 7) packs tag 7's inner (depth, root).
+        {
+            let buf = c.get_mut(root).unwrap();
+            let packed = read_slot(buf, 7);
+            assert_ne!(packed, 0, "tag 7 should occupy outer slot 7");
+            // Overwrite the 6-bit depth field with 30 (> MAX_DEPTH).
+            let corrupt = (packed & INNER_ROOT_MASK) | (30u64 << INNER_ROOT_BITS);
+            write_slot(buf, 7, corrupt);
+            page::stamp_checksum(buf);
+        }
+        let err = match idx.handles_for_tag(&mut c, root, 7) {
+            Ok(hs) => panic!("handles_for_tag accepted a corrupt inner depth: {hs:?}"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ChiselError::CorruptPage { .. }),
+            "expected CorruptPage, got {err:?}"
+        );
+    }
+
+    // iter_bounded's prefix multiply must saturate like iter's: a corrupt inner
+    // depth of exactly MAX_DEPTH PASSES the unpack_inner check (6 is not > 6),
+    // and a non-zero child at slot i >= 17 makes `i * span_at_level(6)` overflow
+    // without saturation. Must not panic (it descends depth-bounded levels).
+    #[test]
+    fn iter_bounded_saturates_prefix_on_corrupt_max_depth() {
+        let mut c = cache(64);
+        let id = c.new_page().unwrap();
+        {
+            let buf = c.get_mut(id).unwrap();
+            buf.fill(0);
+            buf[0] = PageType::MembershipInterior as u8;
+            buf[1] = page::PAGE_FORMAT_VERSION_CURRENT;
+            write_slot(buf, 20, id); // non-zero child at slot 20 (>= 17)
+            page::stamp_checksum(buf);
+        }
+        let t = RadixU64 { depth: MAX_DEPTH };
+        // Pre-fix: `20 * span_at_level(6)` overflow-panics. Post-fix: saturates.
+        let _ = t.iter_bounded(&mut c, id, 8).unwrap();
     }
 
     #[test]
