@@ -12,7 +12,7 @@
 //! concern these tests guard is orphan-handle integrity, which is deterministic.
 mod common;
 
-use chisel::Chisel;
+use chisel::{Chisel, ChiselError};
 use common::{open_chisel, Backing};
 use tempfile::NamedTempFile;
 
@@ -48,6 +48,56 @@ fn tag_and_index_survive_reopen() {
         assert_eq!(db.handles_with_tag(9).unwrap().len(), 2);
         db.close().unwrap();
     }
+}
+
+// delete_tagged is the ownership-asserting single delete. Its mismatch arm has
+// an in-crate unit test, but the public-API success path (correct tag -> chunk
+// gone AND removed from the reverse index) and the public TagMismatch were
+// untested — a mis-wired delegation would pass everything else. Cover both arms.
+#[test]
+fn delete_tagged_verifies_tag_then_self_maintains_index() {
+    let mut db = Chisel::open_in_memory().unwrap();
+    db.begin().unwrap();
+    let a = db.allocate_tagged(b"a", 42).unwrap();
+    let b = db.allocate_tagged(b"b", 42).unwrap();
+    db.commit().unwrap();
+
+    // Wrong tag: TagMismatch, and the chunk + reverse index are left untouched.
+    db.begin().unwrap();
+    let err = match db.delete_tagged(a, 99) {
+        Ok(()) => panic!("delete_tagged with a non-matching tag must fail"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err,
+            ChiselError::TagMismatch { handle, expected, actual }
+                if handle == a && expected == 99 && actual == 42
+        ),
+        "expected TagMismatch {{handle: a, expected: 99, actual: 42}}, got {err:?}"
+    );
+    db.commit().unwrap();
+    assert_eq!(
+        db.read(a).unwrap(),
+        b"a",
+        "chunk untouched after TagMismatch"
+    );
+    assert_eq!(
+        db.handles_with_tag(42).unwrap().len(),
+        2,
+        "reverse index untouched after TagMismatch"
+    );
+
+    // Correct tag: the chunk is deleted AND drops out of the reverse index.
+    db.begin().unwrap();
+    db.delete_tagged(a, 42).unwrap();
+    db.commit().unwrap();
+    assert!(db.read(a).is_err(), "chunk gone after delete_tagged");
+    assert_eq!(
+        db.handles_with_tag(42).unwrap(),
+        vec![b],
+        "a removed from the reverse index; b remains"
+    );
 }
 
 #[test]

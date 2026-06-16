@@ -50,8 +50,15 @@ fn test_defrag_reclaims_space_after_deletes_body(b: &Backing) {
     let result = db.defrag(Default::default()).unwrap();
     db.commit().unwrap();
 
-    for &h in &handles[..5] {
-        assert!(db.read(h).is_ok());
+    // Defrag relocates surviving values between data pages and rewrites their
+    // handle-table entries — assert the BYTES survive, not just that the handle
+    // still resolves. handles[i] was allocated as [i; 200].
+    for (i, &h) in handles[..5].iter().enumerate() {
+        assert_eq!(
+            db.read(h).unwrap(),
+            vec![i as u8; 200],
+            "handle {h} (index {i}) lost or corrupted its value across defrag"
+        );
     }
     assert!(result.pages_freed > 0);
 }

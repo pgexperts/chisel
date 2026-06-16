@@ -93,3 +93,43 @@ dual_backing_test!(
     test_handle_zero_is_reserved,
     test_handle_zero_is_reserved_body
 );
+
+// next_handle must persist across a close/reopen: it rides the superblock, not
+// a handle-table scan, so a regression that reset it (or read it from a stale
+// slot) would re-mint a still-live or retired handle — silent corruption. This
+// guards that a post-reopen allocation strictly exceeds every pre-reopen handle
+// and is never 0. File-backed only (reopen is meaningless for the in-memory
+// backing, which loses all state on drop).
+#[test]
+fn next_handle_persists_across_reopen() {
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    let max_before;
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        let mut hs = Vec::new();
+        for i in 0u8..10 {
+            hs.push(db.allocate(&[i]).unwrap());
+        }
+        db.commit().unwrap();
+        // Retire a couple — retired handles must not be reused either.
+        db.begin().unwrap();
+        db.delete(hs[3]).unwrap();
+        db.delete(hs[7]).unwrap();
+        db.commit().unwrap();
+        max_before = *hs.iter().max().unwrap();
+        db.close().unwrap();
+    }
+    let mut db = Chisel::open(&path, Default::default()).unwrap();
+    db.begin().unwrap();
+    let h = db.allocate(b"after-reopen").unwrap();
+    db.commit().unwrap();
+    assert_ne!(h, 0, "handle 0 is the reserved no-handle sentinel");
+    assert!(
+        h > max_before,
+        "next_handle must persist across reopen: got {h}, but the max handle \
+         before reopen was {max_before} — re-minting a live or retired handle \
+         is silent corruption"
+    );
+}
