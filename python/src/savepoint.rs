@@ -65,9 +65,9 @@ impl PySavepoint {
     fn __exit__(
         &self,
         py: Python<'_>,
-        exc_type: PyObject,
-        _exc: PyObject,
-        _tb: PyObject,
+        exc_type: Py<PyAny>,
+        _exc: Py<PyAny>,
+        _tb: Py<PyAny>,
     ) -> PyResult<bool> {
         if self.finished.load(Ordering::SeqCst) {
             return Ok(false);

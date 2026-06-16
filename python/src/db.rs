@@ -87,7 +87,13 @@ pub struct PyChisel {
 // and the Rust source stays mechanical. `eq` / `eq_int` give Python users
 // `chisel.DrainInsertion.LruTail == chisel.DrainInsertion.LruTail` and
 // efficient int-based comparison under the hood.
-#[pyclass(eq, eq_int, module = "chisel._chisel", name = "DrainInsertion")]
+#[pyclass(
+    eq,
+    eq_int,
+    from_py_object,
+    module = "chisel._chisel",
+    name = "DrainInsertion"
+)]
 #[derive(Clone, Copy, PartialEq)]
 pub enum PyDrainInsertion {
     LruTail,
@@ -139,7 +145,7 @@ impl From<PyDrainInsertion> for chisel::DrainInsertion {
 #[allow(clippy::too_many_arguments)]
 pub fn open(
     py: Python<'_>,
-    path: Option<PyObject>,
+    path: Option<Py<PyAny>>,
     cache_max_bytes: u64,
     spillway_max_bytes: Option<u64>,
     drain_insertion: PyDrainInsertion,
@@ -158,7 +164,7 @@ pub fn open(
         None => None,
         Some(obj) => {
             let bound = obj.bind(py);
-            let s: String = if let Ok(py_str) = bound.downcast::<PyString>() {
+            let s: String = if let Ok(py_str) = bound.cast::<PyString>() {
                 py_str.to_str()?.to_owned()
             } else {
                 let os = py.import("os")?;
@@ -198,8 +204,8 @@ pub fn open(
 
     // Engine calls can block on I/O (flock, fsync, file creation), so
     // release the GIL while they run. Chisel is Send (single-threaded
-    // but owns no !Send primitives), which satisfies allow_threads.
-    let result = py.allow_threads(|| -> chisel::Result<Chisel> {
+    // but owns no !Send primitives), which satisfies detach.
+    let result = py.detach(|| -> chisel::Result<Chisel> {
         match path_buf {
             None => Chisel::open_in_memory_with_options(options),
             Some(pb) => Chisel::open(&pb, options),
@@ -234,7 +240,7 @@ impl PyChisel {
         slf
     }
 
-    fn __exit__(&self, _exc_type: PyObject, _exc: PyObject, _tb: PyObject) -> PyResult<bool> {
+    fn __exit__(&self, _exc_type: Py<PyAny>, _exc: Py<PyAny>, _tb: Py<PyAny>) -> PyResult<bool> {
         self.close()?;
         Ok(false) // do not suppress exceptions
     }
@@ -352,7 +358,7 @@ impl PyChisel {
     // immutable borrow path is sufficient. We materialize a
     // `chisel.Stats` dataclass rather than a pyclass so users get the
     // standard dataclass ergonomics (repr, eq, frozen).
-    fn stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let s = self.with_inner_io(py, |c| c.stats())?;
         let module = py.import("chisel")?;
         let cls = module.getattr("Stats")?;
@@ -372,7 +378,7 @@ impl PyChisel {
     // counters() is read-only on the engine side (`&self`), so the usual
     // immutable borrow path is sufficient. We materialize a
     // `chisel.Counters` dataclass — same shape as stats().
-    fn counters(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn counters(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let c = self.with_inner_io(py, |c| c.counters())?;
         let module = py.import("chisel")?;
         let cls = module.getattr("Counters")?;
@@ -394,7 +400,7 @@ impl PyChisel {
     // class, so a user-defined options-shaped object will also work
     // — the dataclass is just the nice ergonomic default.
     #[pyo3(signature = (options=None))]
-    fn defrag(&self, py: Python<'_>, options: Option<&Bound<'_, PyAny>>) -> PyResult<PyObject> {
+    fn defrag(&self, py: Python<'_>, options: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let rust_opts = match options {
             None => chisel::DefragOptions::default(),
             Some(obj) => {
