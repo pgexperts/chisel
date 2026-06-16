@@ -242,7 +242,7 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
             let errno = io_err.raw_os_error();
             let kind = format!("{:?}", io_err.kind());
             let py_err = IoError::new_err(msg);
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let val = py_err.value(py);
                 let _ = val.setattr("errno", errno);
                 let _ = val.setattr("kind", kind);
