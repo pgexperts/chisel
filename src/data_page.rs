@@ -45,7 +45,9 @@
 // argument. None of them stamp the checksum — callers (transaction layer) are
 // responsible for calling page::stamp_checksum before the page is flushed.
 // init_page() does not preserve prior contents; compact() rebuilds the page
-// but preserves bytes 8..16 (txn_counter).
+// but preserves bytes 8..16 (the I31 reserved common-header region — currently
+// universally zero, but saved/restored so a future common-header field placed
+// there survives a compaction).
 
 use crate::page::{self, PageType, CHECKSUM_OFFSET, DATA_PAGE_HEADER_SIZE, PAGE_SIZE};
 
@@ -87,7 +89,7 @@ impl DataPage {
     // implicitly at 0 via the fill.
     //
     // Does NOT preserve any existing bytes — compact() must save/restore the
-    // txn_counter itself if it wants to keep that metadata.
+    // reserved common-header bytes (8..16) itself if it wants to keep them.
     pub fn init_page(buf: &mut [u8; PAGE_SIZE]) {
         buf.fill(0);
         buf[0] = PageType::Data as u8;
@@ -346,10 +348,12 @@ impl DataPage {
             }
         }
 
-        // Save txn_counter across the re-init (init_page fills the whole buf).
-        let txn_counter_bytes: [u8; 8] = buf[8..16].try_into().unwrap();
+        // Preserve the I31 reserved common-header bytes (8..16) across the
+        // re-init (init_page zero-fills the whole buf). Universally zero today,
+        // but saved/restored so a future common-header field survives compaction.
+        let reserved_header_bytes: [u8; 8] = buf[8..16].try_into().unwrap();
         Self::init_page(buf);
-        buf[8..16].copy_from_slice(&txn_counter_bytes);
+        buf[8..16].copy_from_slice(&reserved_header_bytes);
 
         let mut mapping = Vec::new();
         for (old_slot, data) in &live_entries {

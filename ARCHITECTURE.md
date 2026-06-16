@@ -394,7 +394,7 @@ bytes              | field                         | type
 8184..8192         | XXH3 checksum                 | u64 LE
 ```
 
-`HandleFlags` (the byte at entry-relative offset 10): `Live = 0x01` (page_id points to a data-page slot), `Overflow = 0x02` (page_id points to the first overflow chain page), `Deleted = 0x03` (tombstone — the slot stays allocated, but `lookup` reports the handle as absent). Tombstones are why handles are never reused: the slot is "burned" forever.
+`HandleFlags` (the byte at entry-relative offset 10): `Live = 0x01` (page_id points to a data-page slot), `Overflow = 0x02` (page_id points to the first overflow chain page), `Deleted = 0x00` (tombstone — the slot stays allocated, but `lookup` reports the handle as absent). `Deleted == 0x00` is deliberate and load-bearing: a freshly zeroed leaf page reads as all-tombstone, so `create_root`/`grow` can simply zero-fill a page, and a zero child pointer in an interior page is unambiguously "no child" (any flags byte that is not `0x01` or `0x02` decodes as `Deleted`). Tombstones are why handles are never reused: the slot is "burned" forever.
 
 #### Interior page layout
 

@@ -277,7 +277,7 @@ let options = Options {
 
 **Operational errors** — the database is healthy; the caller made a mistake. Catch and continue.
 
-`InvalidHandle`, `TagMismatch`, `NoActiveTransaction`, `TransactionAlreadyActive`, `SavepointNotFound`, `DuplicateSavepoint`, `ReadOnlyMode`, `FileNotFound`, `InvalidRootName`, `RootNameTableFull`, `InvalidSuperblockCount`, `CacheFull`, `SpillwayFull`.
+`InvalidHandle`, `TagMismatch`, `NoActiveTransaction`, `TransactionAlreadyActive`, `TransactionInProgress`, `SavepointNotFound`, `DuplicateSavepoint`, `ReadOnlyMode`, `FileNotFound`, `InvalidRootName`, `RootNameTableFull`, `InvalidSuperblockCount`, `CacheFull`, `SpillwayFull`.
 
 **Fatal errors** — storage integrity is in question. Drop the handle and reopen.
 
