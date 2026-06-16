@@ -245,6 +245,23 @@ pub struct TransactionManager {
     // AtomicBool because TransactionManager is !Sync by design (see
     // lib.rs); there is no cross-thread access to synchronize against.
     poisoned: Cell<bool>,
+
+    // Test-only fault injection (BUG#2 atomic-staging regression tests). When
+    // armed, the NEXT reverse-map (membership-index) update in
+    // `allocate_inner`/`delete_inner` returns a non-fatal `CacheFull` BEFORE
+    // touching the index, simulating a mid-operation resource-exhaustion strike
+    // at exactly the forward/reverse divergence window. Gated `#[cfg(test)]` so
+    // it carries no production code (mirrors `force_poison_for_test`). Cell so
+    // the in-crate tests can arm it through `&self`.
+    #[cfg(test)]
+    fail_next_membership_op: Cell<bool>,
+
+    // Companion to `fail_next_membership_op` for the FORWARD step: when armed,
+    // the next `allocate_inner` handle-table insert returns a non-fatal
+    // `CacheFull`, so tests can exercise the prepare-abort/unwind path of the
+    // step that carries the eager depth bump (HandleTable::grow). `#[cfg(test)]`.
+    #[cfg(test)]
+    fail_next_handle_table_op: Cell<bool>,
 }
 
 impl TransactionManager {
@@ -342,6 +359,10 @@ impl TransactionManager {
             current_live_slots: HashMap::new(),
             insert_cursor: None,
             poisoned: Cell::new(false),
+            #[cfg(test)]
+            fail_next_membership_op: Cell::new(false),
+            #[cfg(test)]
+            fail_next_handle_table_op: Cell::new(false),
         })
     }
 
@@ -529,6 +550,10 @@ impl TransactionManager {
             current_live_slots,
             insert_cursor: None,
             poisoned: Cell::new(false),
+            #[cfg(test)]
+            fail_next_membership_op: Cell::new(false),
+            #[cfg(test)]
+            fail_next_handle_table_op: Cell::new(false),
         })
     }
 
@@ -1239,14 +1264,136 @@ impl TransactionManager {
         self.poison_on_fatal(result)
     }
 
+    /// Compute the membership-index root produced by inserting `(tag, handle)`
+    /// WITHOUT installing it into `current_roots`; superseded pages are appended
+    /// to `freed`. Split out so `allocate_inner` can stage the forward- and
+    /// reverse-map updates and install them atomically (BUG#2). On error,
+    /// `MembershipIndex::insert` leaves `self.outer_depth` unchanged (it writes
+    /// back only on success), so the caller need not restore any reverse-map
+    /// in-memory depth.
+    fn membership_insert_candidate(
+        &mut self,
+        tag: u32,
+        handle: u64,
+        freed: &mut Vec<u64>,
+    ) -> Result<u64> {
+        let mut cache = self.cache.borrow_mut();
+        let reuse = self.savepoints.is_empty();
+        let fm = &mut *self.current_freemap;
+        let mut alloc = |c: &mut PageCache| cow_alloc(c, fm, reuse);
+        self.membership_index.insert(
+            &mut cache,
+            self.current_roots.membership_index_page,
+            tag,
+            handle,
+            &mut alloc,
+            freed,
+        )
+    }
+
+    /// Compute the handle-table root produced by inserting `entry` for `handle`
+    /// WITHOUT installing it into `current_roots`; superseded spine pages are
+    /// appended to `freed`. The forward-map counterpart to
+    /// `membership_insert_candidate` for `allocate_inner`'s atomic staging
+    /// (BUG#2). NOTE: `HandleTable::insert` may `grow`, which bumps the
+    /// in-memory descent depth eagerly — the caller captures and restores that
+    /// depth on the prepare-abort path.
+    fn handle_table_insert_candidate(
+        &mut self,
+        handle: u64,
+        entry: &HandleEntry,
+        freed: &mut Vec<u64>,
+    ) -> Result<u64> {
+        let mut cache = self.cache.borrow_mut();
+        let reuse = self.savepoints.is_empty();
+        let fm = &mut *self.current_freemap;
+        let mut alloc = |c: &mut PageCache| cow_alloc(c, fm, reuse);
+        self.handle_table.insert(
+            &mut cache,
+            self.current_roots.handle_table_page,
+            handle,
+            entry,
+            &mut alloc,
+            freed,
+        )
+    }
+
+    /// Unwind the in-memory side effects of a partially-completed
+    /// `allocate_inner` PREPARE phase so a non-fatal failure is a true no-op.
+    /// Restores the handle-table root pointer (an empty DB reverts to
+    /// `PAGE_ID_NONE`, undoing any lazy `ensure_handle_table` materialization)
+    /// and the eagerly-bumped descent depth, and releases the inline value's
+    /// data slot so `current_live_slots` / the insert cursor stay consistent
+    /// with the un-installed root — a page allocated solely for this value goes
+    /// to zero and is queued for reclamation, while a shared cursor page keeps a
+    /// defrag-reclaimable dead slot (exactly like a normal delete). Overflow
+    /// value storage has no live-slot/cursor side effects, so its pages are left
+    /// as the bounded commit-after-error leak class. `next_handle` was never
+    /// consumed (it is bumped only on success), so there is nothing to undo there.
+    fn abort_allocate_prepare(
+        &mut self,
+        saved_root: u64,
+        saved_depth: u32,
+        inline_page: Option<u64>,
+    ) {
+        self.current_roots.handle_table_page = saved_root;
+        self.handle_table.set_depth(saved_depth);
+        if let Some(page_id) = inline_page {
+            self.release_data_slot(page_id);
+        }
+    }
+
+    /// Compute the membership-index root produced by removing `(tag, handle)`
+    /// WITHOUT installing it; returns `(new_root, was_present)`. Counterpart to
+    /// `membership_insert_candidate` for `delete_inner`'s atomic staging (BUG#2).
+    fn membership_remove_candidate(
+        &mut self,
+        tag: u32,
+        handle: u64,
+        freed: &mut Vec<u64>,
+    ) -> Result<(u64, bool)> {
+        let mut cache = self.cache.borrow_mut();
+        let reuse = self.savepoints.is_empty();
+        let fm = &mut *self.current_freemap;
+        let mut alloc = |c: &mut PageCache| cow_alloc(c, fm, reuse);
+        self.membership_index.remove(
+            &mut cache,
+            self.current_roots.membership_index_page,
+            tag,
+            handle,
+            &mut alloc,
+            freed,
+        )
+    }
+
     fn allocate_inner(&mut self, value: &[u8], tag: u32) -> Result<u64> {
         if !self.active_txn {
             return Err(ChiselError::NoActiveTransaction);
         }
 
+        // BUG#2 atomic staging: the FORWARD map (the chunk's HandleEntry.tag in
+        // the handle table) and the REVERSE map (tag -> handles in the
+        // membership index, powering handles_with_tag / delete-by-tag) must
+        // become durable together. We compute both candidate roots in a fallible
+        // PREPARE phase that never installs into `current_roots`, then install
+        // them together in an infallible phase. A non-fatal CacheFull/
+        // SpillwayFull mid-prepare is unwound by `abort_allocate_prepare` into a
+        // COMPLETE no-op: neither map changes, the eagerly-bumped handle-table
+        // depth and any lazily-created root are restored, the inline value's data
+        // slot is released (keeping live-slot / cursor accounting consistent),
+        // and the handle id is not consumed (next_handle is bumped only on
+        // success). The lone residue is bounded allocated-but-unreferenced
+        // overflow/COW pages on a commit-after-error — the same pre-existing leak
+        // class as any post-allocation failure, fully reclaimed by the expected
+        // rollback.
         let handle = self.current_roots.next_handle;
-        self.current_roots.next_handle += 1;
 
+        // Value storage (PREPARE). For an inline value this also bumps
+        // current_live_slots and may set the insert cursor; capture its page id
+        // so a later prepare failure can release it via `abort_allocate_prepare`,
+        // keeping that bookkeeping consistent with the un-installed root.
+        // Overflow storage has no live-slot/cursor side effects.
+        let mut inline_page: Option<u64> = None;
         let entry = if value.len() > MAX_INLINE_VALUE {
             let first_page = {
                 let mut cache = self.cache.borrow_mut();
@@ -1261,6 +1408,7 @@ impl TransactionManager {
             }
         } else {
             let (data_page_id, slot) = self.insert_into_data_page(value)?;
+            inline_page = Some(data_page_id);
             HandleEntry {
                 page_id: data_page_id,
                 slot_index: slot,
@@ -1270,31 +1418,83 @@ impl TransactionManager {
             }
         };
 
+        // Capture the handle-table root/depth BEFORE `ensure_handle_table` may
+        // lazily materialize an empty root, so a prepare failure restores
+        // current_roots to its true pre-allocate state (an empty DB reverts to
+        // PAGE_ID_NONE). The depth capture also covers `HandleTable::grow`, which
+        // bumps the in-memory descent depth EAGERLY (before its fallible leaf
+        // COW) while we defer the root install. The membership index needs no
+        // such save: MembershipIndex::insert writes its outer_depth back only on
+        // the success path, so a failed reverse-map op never advances it.
+        let saved_ht_root = self.current_roots.handle_table_page;
+        let saved_ht_depth = self.handle_table.depth();
         self.ensure_handle_table()?;
-        self.ht_insert(handle, &entry)?;
 
-        // Tagged chunks join the reverse membership index (tag 0 = untagged, no
-        // index work). The forward handle->tag mapping is the HandleEntry.tag
-        // written above; this is the reverse tag->handles mapping that powers
-        // handles_with_tag / delete-by-tag. Both must agree at all times.
+        // FORWARD map: compute the new handle-table root; do NOT install yet.
+        let mut ht_freed: Vec<u64> = Vec::new();
+        // Test-only injection (see `fail_next_handle_table_op`): simulate a
+        // non-fatal CacheFull at the FORWARD step — the one carrying the eager
+        // depth bump — so the regression test exercises the real abort/unwind.
+        // No production artifact: the non-test binding is the only one compiled.
+        #[cfg(test)]
+        let ht_new_root: Result<u64> = if self.fail_next_handle_table_op.replace(false) {
+            Err(ChiselError::CacheFull { limit: 0 })
+        } else {
+            self.handle_table_insert_candidate(handle, &entry, &mut ht_freed)
+        };
+        #[cfg(not(test))]
+        let ht_new_root: Result<u64> =
+            self.handle_table_insert_candidate(handle, &entry, &mut ht_freed);
+
+        let ht_new_root = match ht_new_root {
+            Ok(r) => r,
+            Err(e) => {
+                self.abort_allocate_prepare(saved_ht_root, saved_ht_depth, inline_page);
+                return Err(e);
+            }
+        };
+
+        // REVERSE map: compute the new membership-index root; do NOT install
+        // yet. tag 0 = untagged (never indexed).
+        let mut mi_new_root: Option<u64> = None;
+        let mut mi_freed: Vec<u64> = Vec::new();
         if tag != 0 {
-            let mut freed: Vec<u64> = Vec::new();
-            let new_index_root = {
-                let mut cache = self.cache.borrow_mut();
-                let reuse = self.savepoints.is_empty();
-                let fm = &mut *self.current_freemap;
-                let mut alloc = |c: &mut PageCache| cow_alloc(c, fm, reuse);
-                self.membership_index.insert(
-                    &mut cache,
-                    self.current_roots.membership_index_page,
-                    tag,
-                    handle,
-                    &mut alloc,
-                    &mut freed,
-                )?
+            // Test-only injection (see `fail_next_membership_op`): simulate a
+            // non-fatal CacheFull at the reverse-map step so the regression test
+            // exercises the REAL failure handling below. No production artifact:
+            // the non-test `let res` is the only one compiled outside tests.
+            #[cfg(test)]
+            let res: Result<u64> = if self.fail_next_membership_op.replace(false) {
+                Err(ChiselError::CacheFull { limit: 0 })
+            } else {
+                self.membership_insert_candidate(tag, handle, &mut mi_freed)
             };
-            self.current_roots.membership_index_page = new_index_root;
-            self.txn_freed_pages.append(&mut freed);
+            #[cfg(not(test))]
+            let res: Result<u64> = self.membership_insert_candidate(tag, handle, &mut mi_freed);
+
+            match res {
+                Ok(r) => mi_new_root = Some(r),
+                Err(e) => {
+                    // The handle-table insert above already succeeded and may
+                    // have grown the tree (bumping the in-memory depth) and
+                    // produced a candidate root we are now discarding. Unwind the
+                    // whole prepare so current_roots, the depth, and the inline
+                    // value's slot all return to their pre-allocate state.
+                    self.abort_allocate_prepare(saved_ht_root, saved_ht_depth, inline_page);
+                    return Err(e);
+                }
+            }
+        }
+
+        // INSTALL phase (infallible): both maps move together, and only now is
+        // the handle id consumed and the superseded spine pages queued for
+        // reclamation at commit.
+        self.current_roots.next_handle += 1;
+        self.current_roots.handle_table_page = ht_new_root;
+        self.txn_freed_pages.append(&mut ht_freed);
+        if let Some(root) = mi_new_root {
+            self.current_roots.membership_index_page = root;
+            self.txn_freed_pages.append(&mut mi_freed);
         }
 
         Ok(handle)
@@ -1572,13 +1772,27 @@ impl TransactionManager {
             return Err(ChiselError::NoActiveTransaction);
         }
 
-        // Single tree walk (I32): writes the tombstone AND returns the
-        // previous entry. Returns Some(entry) if a Live/Overflow handle
-        // was tombstoned; None if the handle was absent or already a
-        // tombstone. We escalate None to InvalidHandle here at the
-        // caller layer to preserve the public-API behavior.
+        // BUG#2 atomic staging (see allocate_inner): the FORWARD map (the
+        // handle-table tombstone) and the REVERSE map (membership-index removal)
+        // must become durable together. We compute both candidate roots — plus
+        // the fallible part of value-storage release — in a PREPARE phase that
+        // never touches `current_roots`, then install everything in an
+        // infallible phase. A non-fatal CacheFull/SpillwayFull mid-prepare
+        // leaves the delete a complete no-op, so the reverse index can never
+        // retain a member for a tombstoned handle — the stale entry that would
+        // otherwise later escalate to a fatal CorruptPage.
+        //
+        // No in-memory depth save is needed here (unlike allocate): handle-table
+        // DELETE never grows the tree, and MembershipIndex::remove writes its
+        // outer_depth back only on the success path.
+
+        // FORWARD map: compute the tombstoned root; do NOT install yet. A single
+        // tree walk (I32) COWs the leaf with a tombstone and returns the
+        // previous entry. Returns (root, None) — unchanged root, no COW — if the
+        // handle was absent or already a tombstone; we escalate None to
+        // InvalidHandle to preserve the public-API behavior.
         let mut ht_freed: Vec<u64> = Vec::new();
-        let (new_root, prev_entry) = {
+        let (ht_new_root, prev_entry) = {
             let mut cache = self.cache.borrow_mut();
             let reuse = self.savepoints.is_empty();
             let fm = &mut *self.current_freemap;
@@ -1593,72 +1807,78 @@ impl TransactionManager {
         };
         let entry = prev_entry.ok_or(ChiselError::InvalidHandle(handle))?;
 
-        // Tombstone is now in current_roots; release the value's
-        // storage. Order vs. the tombstone write doesn't matter for
-        // correctness — both halves become durable (or rolled back)
-        // atomically at commit. Tombstone-first is simpler than the
-        // historical lookup-release-tombstone shape and avoids the
-        // redundant lookup walk.
-        match entry.flags {
-            HandleFlags::Live => {
-                self.release_data_slot(entry.page_id);
-            }
+        // Stage the value-storage release. The only FALLIBLE part — walking an
+        // overflow chain to collect its page ids — runs here in prepare;
+        // `Overflow::delete` is a read-only walk that mutates no freemap state,
+        // so discarding its result on a later failure is safe (the still-current
+        // old entry keeps referencing the chain). The actual free-queueing /
+        // slot release is deferred to the install phase below. Order vs. the
+        // tombstone write does not matter for correctness — both become durable
+        // (or roll back) atomically at commit.
+        enum PendingRelease {
+            Inline(u64),
+            Overflow(Vec<u64>),
+        }
+        let release = match entry.flags {
+            HandleFlags::Live => PendingRelease::Inline(entry.page_id),
             HandleFlags::Overflow => {
                 let freed = {
                     let mut cache = self.cache.borrow_mut();
                     Overflow::delete(&mut cache, entry.page_id)?
                 };
-                self.txn_freed_pages.extend_from_slice(&freed);
+                PendingRelease::Overflow(freed)
             }
             HandleFlags::Deleted => {
-                // I45 (ISSUES.md, 2026-05-22): translate to a typed
-                // CorruptPage error instead of panicking. Reaching this
-                // arm means the handle table returned a Deleted entry
-                // (a tombstone) that ok_or didn't catch — i.e., the
-                // in-memory state contradicts itself. handle_table::delete
-                // is supposed to return None for already-tombstoned
-                // entries, and the `ok_or(InvalidHandle)` above is
-                // supposed to convert None into the typed error. If
-                // we got here, the cross-module contract broke (most
-                // likely a future refactor of handle_table::delete);
-                // that's genuinely a corruption signal worth surfacing
-                // typed rather than aborting the library caller's
-                // process.
+                // I45 (ISSUES.md, 2026-05-22): a Deleted entry that `ok_or`
+                // didn't catch means the in-memory state contradicts itself —
+                // handle_table::delete returns None for already-tombstoned
+                // handles and the ok_or above converts None into the typed
+                // error, so reaching this arm signals a broken cross-module
+                // contract (most likely a future refactor of delete). Surface
+                // it typed rather than aborting the caller's process. Returned
+                // BEFORE any install, so current_roots stays untouched.
                 return Err(ChiselError::CorruptPage {
                     page_id: entry.page_id,
                 });
             }
+        };
+
+        // REVERSE map: compute the membership-removed root; do NOT install yet.
+        // The tag comes from the tombstoned entry. Tag 0 (untagged) is never in
+        // the index, so there is nothing to remove.
+        let mut mi_new_root: Option<u64> = None;
+        let mut idx_freed: Vec<u64> = Vec::new();
+        if entry.tag != 0 {
+            // Test-only injection (see `fail_next_membership_op`): simulate a
+            // non-fatal CacheFull at the reverse-map step so the regression test
+            // exercises the REAL failure handling below. No production artifact:
+            // the non-test `let res` is the only one compiled outside tests.
+            #[cfg(test)]
+            let res: Result<(u64, bool)> = if self.fail_next_membership_op.replace(false) {
+                Err(ChiselError::CacheFull { limit: 0 })
+            } else {
+                self.membership_remove_candidate(entry.tag, handle, &mut idx_freed)
+            };
+            #[cfg(not(test))]
+            let res: Result<(u64, bool)> =
+                self.membership_remove_candidate(entry.tag, handle, &mut idx_freed);
+
+            let (new_index_root, _removed) = res?;
+            mi_new_root = Some(new_index_root);
         }
 
-        self.current_roots.handle_table_page = new_root;
-        // Now that the tombstone root is installed, the COW-superseded spine
-        // pages are genuinely unreachable from current_roots — return them to
-        // the freemap at commit. (Appended only here, post-install, so a fatal
-        // value-release error above leaves them referenced by the old tree.)
+        // INSTALL phase (infallible): tombstone + value release + reverse-map
+        // removal all become visible together. The superseded handle-table
+        // spine pages are queued only now, post-install, so an early prepare
+        // failure leaves them referenced by the still-current old tree.
+        self.current_roots.handle_table_page = ht_new_root;
         self.txn_freed_pages.append(&mut ht_freed);
-
-        // Self-maintaining: a tagged chunk must leave the reverse membership
-        // index when it's deleted, so handles_with_tag no longer returns it and
-        // the forward (HandleEntry.tag) / reverse (index) maps stay in agreement.
-        // The tag comes from the entry being tombstoned -- no tag argument needed.
-        // Tag 0 (untagged) is never in the index, so there is nothing to remove.
-        if entry.tag != 0 {
-            let mut idx_freed: Vec<u64> = Vec::new();
-            let (new_index_root, _removed) = {
-                let mut cache = self.cache.borrow_mut();
-                let reuse = self.savepoints.is_empty();
-                let fm = &mut *self.current_freemap;
-                let mut alloc = |c: &mut PageCache| cow_alloc(c, fm, reuse);
-                self.membership_index.remove(
-                    &mut cache,
-                    self.current_roots.membership_index_page,
-                    entry.tag,
-                    handle,
-                    &mut alloc,
-                    &mut idx_freed,
-                )?
-            };
-            self.current_roots.membership_index_page = new_index_root;
+        match release {
+            PendingRelease::Inline(page_id) => self.release_data_slot(page_id),
+            PendingRelease::Overflow(freed) => self.txn_freed_pages.extend_from_slice(&freed),
+        }
+        if let Some(root) = mi_new_root {
+            self.current_roots.membership_index_page = root;
             self.txn_freed_pages.append(&mut idx_freed);
         }
 
@@ -2836,6 +3056,300 @@ mod tests {
         assert!(
             !tm.is_poisoned(),
             "I28: CacheFull during commit must not poison — it's operational by design"
+        );
+    }
+
+    // ===================================================================
+    // BUG#2 (2026-06-16 deepdive): forward/reverse tag-map atomic staging.
+    //
+    // `allocate_tagged` maintains two maps that must stay in lockstep: the
+    // FORWARD map (each chunk's `HandleEntry.tag`, in the handle table) and
+    // the REVERSE map (tag -> handles, in the membership index, powering
+    // `handles_with_tag`/delete-by-tag). Before the fix the two roots were
+    // installed sequentially, so a NON-FATAL `CacheFull`/`SpillwayFull`
+    // striking between them committed a half-update:
+    //   * allocate: the forward map gained the tag but the reverse did not
+    //     (a tagged chunk invisible to `handles_with_tag`);
+    //   * delete:   the tombstone landed but the reverse entry stayed (a
+    //     stale member that later escalates to a FATAL CorruptPage when
+    //     surfaced and acted upon).
+    // Because those errors are non-fatal they do NOT poison the manager, so
+    // the half-update survives to `commit()` and onto disk.
+    //
+    // Atomic staging computes BOTH candidate roots in a fallible prepare
+    // phase and installs them together in an infallible phase, so a mid-op
+    // failure is a complete no-op. The `fail_next_membership_op` hook fires
+    // a simulated CacheFull at exactly the reverse-map step — the precise
+    // divergence window — so these are deterministic, not timing-dependent.
+
+    #[test]
+    fn allocate_membership_failure_leaves_maps_consistent() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        // The id the about-to-fail allocate will (try to) use.
+        let ghost = tm.current_roots.next_handle;
+
+        tm.fail_next_membership_op.set(true);
+        let err = tm.allocate_tagged(b"payload", 7).unwrap_err();
+        assert!(
+            matches!(err, ChiselError::CacheFull { .. }),
+            "expected the injected CacheFull, got {err:?}"
+        );
+        assert!(!tm.is_poisoned(), "a non-fatal CacheFull must not poison");
+
+        // The forward (tag) and reverse (membership) maps MUST agree. Pre-fix
+        // the forward map carried tag 7 for `ghost` while the reverse index
+        // did not — a committed-out-of-sync divergence.
+        let in_reverse = tm.handles_with_tag(7).unwrap().contains(&ghost);
+        let in_forward = matches!(tm.tag(ghost), Ok(7));
+        assert_eq!(
+            in_forward, in_reverse,
+            "forward/reverse tag maps diverged after a failed tagged allocate"
+        );
+
+        // Atomic staging makes the failed allocate a COMPLETE no-op: neither
+        // map changed and the handle id was not even burned.
+        assert!(
+            !in_forward,
+            "failed allocate must not install the forward entry"
+        );
+        assert_eq!(
+            tm.current_roots.next_handle, ghost,
+            "failed allocate must not burn the handle id"
+        );
+
+        // ...and the no-op extends to the R1 packing bookkeeping: the inline
+        // value's data slot was released, so no phantom live-slot count or ghost
+        // insert cursor survives to skew later packing / defrag density / page
+        // reclamation. (Pre-fix this leaked `{page: 1}` and `Some(page)`.)
+        assert!(
+            tm.current_live_slots.is_empty(),
+            "failed allocate left a phantom live-slot count: {:?}",
+            tm.current_live_slots
+        );
+        assert_eq!(
+            tm.insert_cursor, None,
+            "failed allocate left a ghost insert cursor"
+        );
+
+        // The manager is still fully usable: a disarmed retry reuses the same
+        // id and is consistent across BOTH maps, in-session and after commit.
+        let h = tm.allocate_tagged(b"payload", 7).unwrap();
+        assert_eq!(h, ghost, "retry should reuse the un-burned handle id");
+        assert_eq!(tm.tag(h).unwrap(), 7);
+        assert!(tm.handles_with_tag(7).unwrap().contains(&h));
+        tm.commit().unwrap();
+        assert!(tm.handles_with_tag(7).unwrap().contains(&h));
+        // C1: no page reachable from committed_roots may be free in the
+        // committed freemap — pins that the dropped prepare freed-lists never
+        // queued a still-referenced page.
+        assert_no_reachable_page_is_free(&tm);
+    }
+
+    // The FORWARD-step counterpart: a non-fatal CacheFull during the
+    // handle-table insert (the step that eagerly bumps the descent depth via
+    // HandleTable::grow, and on a fresh DB lazily materializes the root). The
+    // prepare-abort must restore BOTH the depth and the handle-table root
+    // pointer and release the inline slot — a true no-op.
+    #[test]
+    fn allocate_handle_table_failure_leaves_maps_consistent() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        // Fresh DB: the handle table has never been materialized.
+        let saved_root = tm.current_roots.handle_table_page;
+        assert_eq!(saved_root, PAGE_ID_NONE, "precondition: empty handle table");
+        let ghost = tm.current_roots.next_handle;
+
+        tm.fail_next_handle_table_op.set(true);
+        let err = tm.allocate_tagged(b"payload", 7).unwrap_err();
+        assert!(
+            matches!(err, ChiselError::CacheFull { .. }),
+            "expected the injected CacheFull, got {err:?}"
+        );
+        assert!(!tm.is_poisoned(), "a non-fatal CacheFull must not poison");
+
+        // Complete no-op: the lazily-created root is reverted (back to
+        // PAGE_ID_NONE), the handle id is not burned, neither map has content,
+        // and the R1 packing state is clean.
+        assert_eq!(
+            tm.current_roots.handle_table_page, saved_root,
+            "failed forward step left a lazily-materialized handle-table root installed"
+        );
+        assert_eq!(tm.current_roots.next_handle, ghost);
+        assert!(tm.tag(ghost).is_err(), "no forward entry should exist");
+        assert!(tm.handles_with_tag(7).unwrap().is_empty());
+        assert!(
+            tm.current_live_slots.is_empty(),
+            "failed forward step left a phantom live-slot count: {:?}",
+            tm.current_live_slots
+        );
+        assert_eq!(tm.insert_cursor, None);
+
+        // Disarmed retry succeeds and is consistent across both maps.
+        let h = tm.allocate_tagged(b"payload", 7).unwrap();
+        assert_eq!(h, ghost, "retry should reuse the un-burned handle id");
+        assert_eq!(tm.tag(h).unwrap(), 7);
+        assert!(tm.handles_with_tag(7).unwrap().contains(&h));
+        tm.commit().unwrap();
+        assert_no_reachable_page_is_free(&tm);
+    }
+
+    #[test]
+    fn delete_membership_failure_leaves_maps_consistent() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let h = tm.allocate_tagged(b"payload", 7).unwrap();
+        tm.commit().unwrap();
+
+        tm.begin().unwrap();
+        tm.fail_next_membership_op.set(true);
+        let err = tm.delete(h).unwrap_err();
+        assert!(
+            matches!(err, ChiselError::CacheFull { .. }),
+            "expected the injected CacheFull, got {err:?}"
+        );
+        assert!(!tm.is_poisoned(), "a non-fatal CacheFull must not poison");
+
+        // Pre-fix the tombstone (forward) was installed but the reverse entry
+        // stayed, so `read(h)` failed while `handles_with_tag` still listed
+        // `h` — exactly the divergence that later escalates to CorruptPage.
+        let in_reverse = tm.handles_with_tag(7).unwrap().contains(&h);
+        let still_live = tm.read(h).is_ok();
+        assert_eq!(
+            still_live, in_reverse,
+            "forward/reverse tag maps diverged after a failed tagged delete"
+        );
+        // Atomic staging makes the failed delete a COMPLETE no-op.
+        assert!(still_live, "failed delete must not install the tombstone");
+        assert!(in_reverse, "failed delete must not drop the reverse entry");
+
+        // A disarmed retry succeeds and removes `h` from BOTH maps.
+        tm.delete(h).unwrap();
+        assert!(tm.read(h).is_err());
+        assert!(!tm.handles_with_tag(7).unwrap().contains(&h));
+        tm.commit().unwrap();
+        assert!(!tm.handles_with_tag(7).unwrap().contains(&h));
+        assert_no_reachable_page_is_free(&tm);
+    }
+
+    // Delete's durability guard (delete is the more dangerous direction: a
+    // stale reverse member for a tombstoned handle later escalates to a FATAL
+    // CorruptPage). Fail the reverse-map step, COMMIT, then REOPEN: the failed
+    // delete must have committed NOTHING — `h` is still live AND still a tagged
+    // member on disk. Pre-fix the tombstone committed while the reverse member
+    // stayed, so the reopened DB would read `h` as deleted yet still list it.
+    #[test]
+    fn delete_membership_failure_survives_reopen_consistently() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bug2-del.chisel");
+
+        let open = |create: bool| -> TransactionManager {
+            let io = PageIo::open(&path, false).unwrap();
+            let cache = PageCache::new(
+                io,
+                1024 * PAGE_SIZE as u64,
+                0,
+                crate::DrainInsertion::LruTail,
+                crate::SpillwayLocation::InMemory,
+            );
+            if create {
+                TransactionManager::create_new(cache, 2).unwrap()
+            } else {
+                TransactionManager::open_existing(cache).unwrap()
+            }
+        };
+
+        let h = {
+            let mut tm = open(true);
+            tm.begin().unwrap();
+            let h = tm.allocate_tagged(b"payload", 9).unwrap();
+            tm.commit().unwrap();
+
+            tm.begin().unwrap();
+            tm.fail_next_membership_op.set(true);
+            assert!(matches!(
+                tm.delete(h).unwrap_err(),
+                ChiselError::CacheFull { .. }
+            ));
+            // Commit the post-failure state: pre-fix this durably tombstones the
+            // forward map while the reverse keeps `h`; post-fix it is a no-op.
+            tm.commit().unwrap();
+            h
+        };
+
+        // Reopen: the forward (read) and reverse (handles_with_tag) views must
+        // agree, and since the delete was a no-op both must still see `h`.
+        let tm = open(false);
+        let still_live = tm.read(h).is_ok();
+        let in_reverse = tm.handles_with_tag(9).unwrap().contains(&h);
+        assert_eq!(
+            still_live, in_reverse,
+            "reopened forward/reverse views diverged for the failed delete's handle"
+        );
+        assert!(
+            still_live && in_reverse,
+            "a failed tagged delete must commit nothing: h should survive in both maps \
+             (read ok = {still_live}, in reverse index = {in_reverse})"
+        );
+    }
+
+    // The headline durability guard: a failed tagged allocate, then COMMIT,
+    // then REOPEN from the last durable superblock. Pre-fix this persisted a
+    // forward-map ghost (a committed `HandleEntry.tag` with no reverse-index
+    // member); post-fix the failed allocate committed nothing.
+    #[test]
+    fn allocate_membership_failure_survives_reopen_consistently() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bug2.chisel");
+
+        let open = |create: bool| -> TransactionManager {
+            let io = PageIo::open(&path, false).unwrap();
+            let cache = PageCache::new(
+                io,
+                1024 * PAGE_SIZE as u64,
+                0,
+                crate::DrainInsertion::LruTail,
+                crate::SpillwayLocation::InMemory,
+            );
+            if create {
+                TransactionManager::create_new(cache, 2).unwrap()
+            } else {
+                TransactionManager::open_existing(cache).unwrap()
+            }
+        };
+
+        let ghost = {
+            let mut tm = open(true);
+            tm.begin().unwrap();
+            tm.commit().unwrap();
+
+            tm.begin().unwrap();
+            let ghost = tm.current_roots.next_handle;
+            tm.fail_next_membership_op.set(true);
+            assert!(matches!(
+                tm.allocate_tagged(b"payload", 9).unwrap_err(),
+                ChiselError::CacheFull { .. }
+            ));
+            // Commit the post-failure state: pre-fix this makes the forward-map
+            // ghost durable; post-fix it commits a clean no-op.
+            tm.commit().unwrap();
+            ghost
+        };
+
+        // Reopen and verify the FORWARD map carries no ghost tag-9 entry that
+        // the REVERSE map is missing. `handles_with_tag(9)` reads the reverse
+        // map (empty under both code paths); the discriminating check is the
+        // forward map via `tag(ghost)`.
+        let tm = open(false);
+        let forward = tm.tag(ghost);
+        assert!(
+            forward.is_err() || forward.as_ref().unwrap() != &9,
+            "reopened forward map has a ghost tag-9 entry (tag({ghost}) = {forward:?}) \
+             with no matching reverse-index member — the maps committed out of sync"
+        );
+        assert!(
+            tm.handles_with_tag(9).unwrap().is_empty(),
+            "tag 9 should have no committed members"
         );
     }
 
