@@ -262,6 +262,14 @@ pub struct TransactionManager {
     // step that carries the eager depth bump (HandleTable::grow). `#[cfg(test)]`.
     #[cfg(test)]
     fail_next_handle_table_op: Cell<bool>,
+
+    // For `update_inner`: when armed, the next update returns a non-fatal
+    // `CacheFull` at the NEW-value-write step. With the fix this is the first
+    // fallible step (a clean no-op); pre-fix it lands AFTER the old location was
+    // already freed, so the regression test can prove the old value is not
+    // prematurely freed before the new entry installs. `#[cfg(test)]`.
+    #[cfg(test)]
+    fail_next_update_value_write: Cell<bool>,
 }
 
 impl TransactionManager {
@@ -363,6 +371,8 @@ impl TransactionManager {
             fail_next_membership_op: Cell::new(false),
             #[cfg(test)]
             fail_next_handle_table_op: Cell::new(false),
+            #[cfg(test)]
+            fail_next_update_value_write: Cell::new(false),
         })
     }
 
@@ -554,6 +564,8 @@ impl TransactionManager {
             fail_next_membership_op: Cell::new(false),
             #[cfg(test)]
             fail_next_handle_table_op: Cell::new(false),
+            #[cfg(test)]
+            fail_next_update_value_write: Cell::new(false),
         })
     }
 
@@ -1304,6 +1316,15 @@ impl TransactionManager {
         entry: &HandleEntry,
         freed: &mut Vec<u64>,
     ) -> Result<u64> {
+        // Test-only injection (see `fail_next_handle_table_op`): simulate a
+        // non-fatal CacheFull at the forward / handle-table step — the one
+        // carrying the eager depth bump for allocate. Lives here so BOTH
+        // allocate_inner and update_inner exercise the real abort/unwind. No
+        // production artifact under `#[cfg(not(test))]`.
+        #[cfg(test)]
+        if self.fail_next_handle_table_op.replace(false) {
+            return Err(ChiselError::CacheFull { limit: 0 });
+        }
         let mut cache = self.cache.borrow_mut();
         let reuse = self.savepoints.is_empty();
         let fm = &mut *self.current_freemap;
@@ -1431,22 +1452,10 @@ impl TransactionManager {
         self.ensure_handle_table()?;
 
         // FORWARD map: compute the new handle-table root; do NOT install yet.
+        // (handle_table_insert_candidate carries the #[cfg(test)] forward-step
+        // fault injection, shared with update_inner's handle-table step.)
         let mut ht_freed: Vec<u64> = Vec::new();
-        // Test-only injection (see `fail_next_handle_table_op`): simulate a
-        // non-fatal CacheFull at the FORWARD step — the one carrying the eager
-        // depth bump — so the regression test exercises the real abort/unwind.
-        // No production artifact: the non-test binding is the only one compiled.
-        #[cfg(test)]
-        let ht_new_root: Result<u64> = if self.fail_next_handle_table_op.replace(false) {
-            Err(ChiselError::CacheFull { limit: 0 })
-        } else {
-            self.handle_table_insert_candidate(handle, &entry, &mut ht_freed)
-        };
-        #[cfg(not(test))]
-        let ht_new_root: Result<u64> =
-            self.handle_table_insert_candidate(handle, &entry, &mut ht_freed);
-
-        let ht_new_root = match ht_new_root {
+        let ht_new_root = match self.handle_table_insert_candidate(handle, &entry, &mut ht_freed) {
             Ok(r) => r,
             Err(e) => {
                 self.abort_allocate_prepare(saved_ht_root, saved_ht_depth, inline_page);
@@ -1695,36 +1704,35 @@ impl TransactionManager {
                 .ok_or(ChiselError::InvalidHandle(handle))?
         };
 
-        // Free the OLD location.
+        // Atomic staging (same discipline as delete_inner): do NOT retire the
+        // OLD value's storage until the NEW entry is durably installed. The
+        // previous "free old first" ordering meant a non-fatal CacheFull during
+        // the new-value write or the handle-table install left the committed
+        // handle still pointing at pages already queued for reclamation — a
+        // reachable-but-free page that commit then frees, corrupting the live
+        // value on the next freemap reuse. We compute the new value, the new
+        // handle-table root, and the old-location free set in a fallible PREPARE
+        // phase that touches no installed state, then install the new entry and
+        // retire the old location together in an infallible INSTALL phase. A
+        // mid-prepare failure is a complete no-op.
         //
-        // For Live (inline) entries: decrement the live-slot count for
-        // the old data page. If it drops to zero, the entire page is
-        // now dead weight and can be returned to the freemap. If it
-        // doesn't, the slot becomes a tombstone — dead space within a
-        // still-live page, recoverable only via defrag (R3). This is
-        // the cost of R1 packing: we can't rewrite a committed page
-        // to compact it without rewriting every handle_table entry
-        // pointing into it.
-        //
-        // For Overflow entries: delete the whole chain; all its pages
-        // go straight to txn_freed_pages (no packing on overflow).
-        match entry.flags {
-            HandleFlags::Live => {
-                self.release_data_slot(entry.page_id);
-            }
-            HandleFlags::Overflow => {
-                let freed = {
-                    let mut cache = self.cache.borrow_mut();
-                    Overflow::delete(&mut cache, entry.page_id)?
-                };
-                self.txn_freed_pages.extend_from_slice(&freed);
-            }
-            HandleFlags::Deleted => {}
+        // `update` replaces an EXISTING handle, so handle_table.insert never
+        // grows (handle < capacity) — no in-memory depth save is needed (unlike
+        // allocate_inner).
+
+        // Test-only injection (see `fail_next_update_value_write`): now the FIRST
+        // fallible step, so a simulated failure here retires nothing.
+        #[cfg(test)]
+        if self.fail_next_update_value_write.replace(false) {
+            return Err(ChiselError::CacheFull { limit: 0 });
         }
 
-        // Tags and the client byte are entry-resident: update relocates the
-        // value but must carry both forward (the handle is unchanged, so the
-        // membership index needs no edit — only the value's storage moves).
+        // PREPARE: write the new value storage. Tags and the client byte are
+        // entry-resident and carried forward unchanged (the handle is unchanged,
+        // so the membership index needs no edit — only the value's storage
+        // moves). Capture the inline data page so a later prepare failure can
+        // release it, keeping live-slot / cursor bookkeeping consistent.
+        let mut new_inline_page: Option<u64> = None;
         let new_entry = if value.len() > MAX_INLINE_VALUE {
             let first_page = {
                 let mut cache = self.cache.borrow_mut();
@@ -1739,6 +1747,7 @@ impl TransactionManager {
             }
         } else {
             let (data_page_id, slot) = self.insert_into_data_page(value)?;
+            new_inline_page = Some(data_page_id);
             HandleEntry {
                 page_id: data_page_id,
                 slot_index: slot,
@@ -1748,7 +1757,64 @@ impl TransactionManager {
             }
         };
 
-        self.ht_insert(handle, &new_entry)?;
+        // PREPARE: compute the new handle-table root (no install). On failure,
+        // release the just-reserved inline slot so live-slot accounting stays
+        // consistent with the un-installed root (overflow new-value pages are the
+        // bounded commit-after-error leak class); the OLD location is untouched.
+        let mut ht_freed: Vec<u64> = Vec::new();
+        let ht_new_root =
+            match self.handle_table_insert_candidate(handle, &new_entry, &mut ht_freed) {
+                Ok(r) => r,
+                Err(e) => {
+                    if let Some(page_id) = new_inline_page {
+                        self.release_data_slot(page_id);
+                    }
+                    return Err(e);
+                }
+            };
+
+        // PREPARE: compute the OLD location's free set without applying it. For
+        // Overflow this is a read-only walk of the old chain (a fallible
+        // cold-page load); for Live the page id is released in the install phase;
+        // Deleted carries no storage. On the overflow-walk failure, unwind the
+        // new inline slot — the old chain is untouched (the walk frees nothing).
+        enum OldRelease {
+            Inline(u64),
+            Overflow(Vec<u64>),
+            Nothing,
+        }
+        let old_release = match entry.flags {
+            HandleFlags::Live => OldRelease::Inline(entry.page_id),
+            HandleFlags::Overflow => {
+                let walked = {
+                    let mut cache = self.cache.borrow_mut();
+                    Overflow::delete(&mut cache, entry.page_id)
+                };
+                match walked {
+                    Ok(freed) => OldRelease::Overflow(freed),
+                    Err(e) => {
+                        if let Some(page_id) = new_inline_page {
+                            self.release_data_slot(page_id);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            HandleFlags::Deleted => OldRelease::Nothing,
+        };
+
+        // INSTALL phase (infallible): install the NEW entry first so the handle
+        // points at the new storage, THEN retire the OLD location (now genuinely
+        // unreferenced). For Live, release_data_slot does R1 slot accounting
+        // (freeing the page only when its last live slot goes); for Overflow, the
+        // walked chain pages are queued for reclamation.
+        self.current_roots.handle_table_page = ht_new_root;
+        self.txn_freed_pages.append(&mut ht_freed);
+        match old_release {
+            OldRelease::Inline(page_id) => self.release_data_slot(page_id),
+            OldRelease::Overflow(freed) => self.txn_freed_pages.extend_from_slice(&freed),
+            OldRelease::Nothing => {}
+        }
 
         Ok(())
     }
@@ -2519,13 +2585,23 @@ mod tests {
     }
 
     /// C1 invariant: after a commit, NO page reachable from `committed_roots`
-    /// (handle-table spine + membership-index outer/inner spines) may be marked
-    /// free in `committed_freemap`. A correct COW frees only superseded pages;
-    /// freeing a still-referenced page (the textbook C1 violation — e.g. `grow`
-    /// freeing the reparented old root) shows up here as a page that is both
-    /// reachable and free. This is deterministic regardless of the freemap's
-    /// lowest-id-first selection order, which makes black-box reopen tests
-    /// unreliable for catching C1.
+    /// may be marked free in `committed_freemap`. A correct COW frees only
+    /// superseded pages; freeing a still-referenced page (the textbook C1
+    /// violation — e.g. `grow` freeing the reparented old root, or `update`
+    /// freeing the OLD value before the new entry is installed) shows up here as
+    /// a page that is both reachable and free. This is deterministic regardless
+    /// of the freemap's lowest-id-first selection order, which makes black-box
+    /// reopen tests unreliable for catching C1.
+    ///
+    /// Reachability covers BOTH the index spines (handle-table + membership
+    /// outer/inner) AND the value storage every live handle points at (its
+    /// inline data page or its full overflow chain). The value-storage half is
+    /// essential: a spine-only walk cannot catch a value-page premature-free.
+    ///
+    /// PRECONDITION: call only between transactions (right after a commit), where
+    /// `committed_roots == current_roots` and the in-memory `handle_table.depth`
+    /// matches the committed root. `iter_live` descends with that live depth, so
+    /// calling this mid-transaction after a grow would mis-descend.
     fn assert_no_reachable_page_is_free(tm: &TransactionManager) {
         let mut reachable = Vec::new();
         {
@@ -2544,12 +2620,33 @@ mod tests {
                     &mut reachable,
                 )
                 .unwrap();
+
+            // Value storage reachable through each live HandleEntry.
+            if tm.committed_roots.handle_table_page != PAGE_ID_NONE {
+                let live = tm
+                    .handle_table
+                    .iter_live(&mut cache, tm.committed_roots.handle_table_page)
+                    .unwrap();
+                for (_handle, entry) in live {
+                    match entry.flags {
+                        HandleFlags::Live => reachable.push(entry.page_id),
+                        HandleFlags::Overflow => {
+                            // `Overflow::delete` is a read-only chain walk that
+                            // returns the chain's page ids (it frees nothing
+                            // itself); reuse it to enumerate the whole chain.
+                            let chain = Overflow::delete(&mut cache, entry.page_id).unwrap();
+                            reachable.extend(chain);
+                        }
+                        HandleFlags::Deleted => {}
+                    }
+                }
+            }
         }
         for id in reachable {
             assert!(
                 !FreeMap::is_free(&tm.committed_freemap, id),
                 "page {id} is reachable from committed_roots but marked FREE in \
-                 committed_freemap — a still-referenced COW page was freed (C1 violation)"
+                 committed_freemap — a still-referenced page was freed (C1 violation)"
             );
         }
     }
@@ -3290,6 +3387,159 @@ mod tests {
             still_live && in_reverse,
             "a failed tagged delete must commit nothing: h should survive in both maps \
              (read ok = {still_live}, in reverse index = {in_reverse})"
+        );
+    }
+
+    // CRITICAL durable-corruption regression (surfaced by the BUG#2 adversarial
+    // review): `update_inner` must not free the OLD value's pages before the new
+    // entry is durably installed. A non-fatal CacheFull at the new-value-write
+    // step — which pre-fix runs AFTER the old free — left the committed handle
+    // still pointing at pages already queued for reclamation, so commit freed a
+    // reachable page and a later reuse silently corrupted the live value.
+    #[test]
+    fn update_value_write_failure_does_not_free_old_value_pages() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        // Overflow-sized old value, so the whole chain is at stake.
+        let big = vec![0xABu8; MAX_INLINE_VALUE * 3];
+        let h = tm.allocate(&big).unwrap();
+        tm.commit().unwrap();
+        assert_eq!(tm.read(h).unwrap(), big, "precondition: old value readable");
+
+        tm.begin().unwrap();
+        tm.fail_next_update_value_write.set(true);
+        let err = tm.update(h, b"replacement").unwrap_err();
+        assert!(
+            matches!(err, ChiselError::CacheFull { .. }),
+            "expected the injected CacheFull, got {err:?}"
+        );
+        assert!(!tm.is_poisoned(), "a non-fatal CacheFull must not poison");
+
+        // The failed update is a no-op in-session: the old value is intact.
+        assert_eq!(
+            tm.read(h).unwrap(),
+            big,
+            "failed update lost the old value in-session"
+        );
+
+        // Commit the post-failure state, then assert C1: no page the committed
+        // handle still references may be free. Pre-fix the old overflow chain was
+        // queued into txn_freed_pages and freed here while `h` still points at it.
+        tm.commit().unwrap();
+        assert_no_reachable_page_is_free(&tm);
+        assert_eq!(
+            tm.read(h).unwrap(),
+            big,
+            "failed update lost the old value after commit"
+        );
+
+        // End-to-end: churn allocations to force the freemap to hand out any
+        // wrongly-freed pages, then confirm the old value survived. Pre-fix the
+        // reachable-but-free chain pages would be reused and overwritten, turning
+        // read(h) into a CorruptPage / wrong bytes.
+        tm.begin().unwrap();
+        for i in 0..40u8 {
+            tm.allocate(&[i; 64]).unwrap();
+        }
+        tm.commit().unwrap();
+        assert_eq!(
+            tm.read(h).unwrap(),
+            big,
+            "old value corrupted after its prematurely-freed pages were reused"
+        );
+    }
+
+    // Same guarantee for an INLINE old value (the Live old-release path). When
+    // the old page held only this value, the pre-fix code released it to the
+    // freemap before the new write, so a failed update committed a
+    // reachable-but-free data page just like the overflow case.
+    #[test]
+    fn update_value_write_failure_does_not_free_old_inline_page() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let old = b"inline-original-value";
+        let h = tm.allocate(old).unwrap();
+        tm.commit().unwrap();
+
+        tm.begin().unwrap();
+        tm.fail_next_update_value_write.set(true);
+        assert!(matches!(
+            tm.update(h, b"replacement").unwrap_err(),
+            ChiselError::CacheFull { .. }
+        ));
+        assert!(!tm.is_poisoned());
+        assert_eq!(
+            tm.read(h).unwrap(),
+            old,
+            "failed update lost the inline value"
+        );
+
+        tm.commit().unwrap();
+        assert_no_reachable_page_is_free(&tm);
+        assert_eq!(tm.read(h).unwrap(), old);
+
+        // Force reuse, then confirm the old inline value survived.
+        tm.begin().unwrap();
+        for i in 0..40u8 {
+            tm.allocate(&[i; 64]).unwrap();
+        }
+        tm.commit().unwrap();
+        assert_eq!(
+            tm.read(h).unwrap(),
+            old,
+            "old inline value corrupted after a prematurely-freed page was reused"
+        );
+    }
+
+    // Highest-value coverage for the post-write prepare-unwind contract: the new
+    // value is ALREADY written when the handle-table install fails. The fix must
+    // (a) leave the OLD location referenced (never freed) and (b) release the
+    // just-written NEW inline slot so no phantom live-slot / ghost cursor
+    // survives. Driven via the shared fail_next_handle_table_op hook, which
+    // handle_table_insert_candidate honors for both allocate and update. (The
+    // old-overflow-walk failure exit runs the identical new-inline-slot release,
+    // so this test covers that contract too.)
+    #[test]
+    fn update_handle_table_failure_preserves_old_value_and_releases_new_slot() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let old = b"inline-original-value";
+        let h = tm.allocate(old).unwrap();
+        tm.commit().unwrap();
+
+        tm.begin().unwrap();
+        tm.fail_next_handle_table_op.set(true);
+        let err = tm.update(h, b"small-new").unwrap_err();
+        assert!(
+            matches!(err, ChiselError::CacheFull { .. }),
+            "expected the injected CacheFull, got {err:?}"
+        );
+        assert!(!tm.is_poisoned());
+
+        // (a) The old value is untouched — the old location was never freed.
+        assert_eq!(tm.read(h).unwrap(), old, "failed update lost the old value");
+        // (b) The new value's inline slot was released: the committed baseline
+        // had exactly one live slot (for `old`), and the failed update must
+        // leave precisely that — no phantom count for the abandoned new value.
+        assert_eq!(
+            tm.current_live_slots.values().sum::<u32>(),
+            1,
+            "failed update left a phantom live-slot: {:?}",
+            tm.current_live_slots
+        );
+
+        // Durability: commit, assert C1, force reuse, re-read the old value.
+        tm.commit().unwrap();
+        assert_no_reachable_page_is_free(&tm);
+        tm.begin().unwrap();
+        for i in 0..40u8 {
+            tm.allocate(&[i; 64]).unwrap();
+        }
+        tm.commit().unwrap();
+        assert_eq!(
+            tm.read(h).unwrap(),
+            old,
+            "old value corrupted after reuse following a failed update"
         );
     }
 
