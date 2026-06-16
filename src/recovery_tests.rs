@@ -63,6 +63,81 @@ fn rewrite_page_with_valid_checksum(
     f.sync_all().unwrap();
 }
 
+/// Read the superblock slots (default layout: 2) and return the winning one,
+/// so a corruption test can target the LIVE root page rather than a stale COW
+/// copy that `find_page_of_type` might return.
+fn active_superblock(path: &std::path::Path) -> Superblock {
+    let mut f = fs::File::open(path).unwrap();
+    let mut bufs = [[0u8; PAGE_SIZE]; crate::superblock::DEFAULT_SUPERBLOCK_COUNT as usize];
+    for (i, b) in bufs.iter_mut().enumerate() {
+        f.seek(SeekFrom::Start(i as u64 * PAGE_SIZE as u64))
+            .unwrap();
+        f.read_exact(b).unwrap();
+    }
+    Superblock::select(&bufs).expect("a valid winning superblock")
+}
+
+// A corrupt (checksum-valid) handle-table interior root whose child-0 cycles
+// must NOT hang Chisel::open — open_existing calls HandleTable::recover_depth,
+// whose depth cap turns the cycle into a typed fatal error. Regression for the
+// deepdive review's radix corrupt-page finding (open-time hang vector).
+#[test]
+fn test_recovery_cyclic_handle_table_spine_is_rejected_not_hung() {
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        // > ENTRIES_PER_LEAF (510) handles forces the handle table to depth >= 1,
+        // so its root is an interior page with a child-0 spine.
+        for i in 0..600u64 {
+            db.allocate(&i.to_le_bytes()).unwrap();
+        }
+        db.commit().unwrap();
+    }
+    let root = active_superblock(&path).root_handle_table_page;
+    // Point the live root's child-0 at itself: a cyclic interior spine.
+    rewrite_page_with_valid_checksum(&path, root, |buf| {
+        buf[page::DATA_PAGE_HEADER_SIZE..page::DATA_PAGE_HEADER_SIZE + 8]
+            .copy_from_slice(&root.to_le_bytes());
+    });
+    // Pre-fix: open hangs forever in recover_depth. Post-fix: it returns a fatal
+    // typed error promptly.
+    match Chisel::open(&path, Default::default()) {
+        Err(e) => assert!(e.is_fatal(), "expected a fatal error, got {e:?}"),
+        Ok(_) => panic!("Chisel::open accepted a cyclic handle-table spine"),
+    }
+}
+
+// A corrupt (checksum-valid) outer-leaf packed value claiming an out-of-range
+// inner-tree depth must surface a typed CorruptPage from the read path, not a
+// panic / misleading downstream error.
+#[test]
+fn test_recovery_corrupt_membership_inner_depth_is_corrupt_page() {
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        db.allocate_tagged(b"row", 7).unwrap();
+        db.commit().unwrap();
+    }
+    // The outer (tag) tree is depth 0: its root IS the outer leaf, packing tag
+    // 7's inner (depth:6 | root:58) at slot (7 % 1021 = 7).
+    let outer = active_superblock(&path).root_membership_index_page;
+    rewrite_page_with_valid_checksum(&path, outer, |buf| {
+        let off = page::DATA_PAGE_HEADER_SIZE + 7 * 8;
+        let packed = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+        let corrupt = (packed & ((1u64 << 58) - 1)) | (30u64 << 58); // inner depth = 30
+        buf[off..off + 8].copy_from_slice(&corrupt.to_le_bytes());
+    });
+    let db = Chisel::open(&path, Default::default()).unwrap();
+    match db.handles_with_tag(7) {
+        Err(ChiselError::CorruptPage { .. }) => {}
+        other => panic!("expected CorruptPage, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_recovery_after_clean_close() {
     let file = NamedTempFile::new().unwrap();

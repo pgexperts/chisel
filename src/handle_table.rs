@@ -50,7 +50,7 @@
 // a tombstone entry (HandleFlags::Deleted) in place; the leaf slot is not
 // freed. This keeps handles stable forever but means the tree only grows.
 
-use crate::error::Result;
+use crate::error::{ChiselError, Result};
 use crate::page::{
     self, PageType, CHECKSUM_OFFSET, DATA_PAGE_HEADER_SIZE, PAGE_ID_NONE, PAGE_SIZE,
 };
@@ -71,6 +71,14 @@ const CHILD_PTR_SIZE: usize = 8;
 // intentional: using 1024 would waste 24 bytes; using exact division gets
 // the maximum fan-out the page format allows.
 const PTRS_PER_INTERIOR: usize = (CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE) / CHILD_PTR_SIZE; // 1021
+
+// Maximum valid tree depth. capacity(depth) = ENTRIES_PER_LEAF * PTRS_PER_INTERIOR^depth;
+// for 510 * 1021^depth, capacity(5) ≈ 5.7e17 < u64::MAX < capacity(6), so a tree
+// keyed by u64 handles is never deeper than 6 (a handle in (capacity(5), u64::MAX]
+// forces one final grow to depth 6, whose capacity saturates to u64::MAX). Any
+// spine claiming a deeper tree is corrupt — used by recover_depth's cap, which
+// also bounds a cyclic spine.
+const MAX_DEPTH: u32 = 6;
 
 // Page flags byte (buf[1]): distinguishes leaf from interior. Stored in the
 // page header so `open_existing` can walk the tree to recover depth without
@@ -430,6 +438,13 @@ impl HandleTable {
                 break;
             }
             depth += 1;
+            // Cap the walk at MAX_DEPTH. A valid spine is never deeper; a corrupt
+            // (but checksum-valid) spine that is over-deep OR cyclic (a child-0
+            // cycle revisits interior pages, growing depth without bound) is
+            // caught here as a typed CorruptPage instead of an infinite loop.
+            if depth > MAX_DEPTH {
+                return Err(ChiselError::CorruptPage { page_id: current });
+            }
             let child_offset = page::DATA_PAGE_HEADER_SIZE;
             let child = u64::from_le_bytes(buf[child_offset..child_offset + 8].try_into().unwrap());
             if child == 0 {
@@ -456,9 +471,14 @@ impl HandleTable {
     /// of growth multiplies by 1021, so depth 3 already addresses ~543M
     /// handles. In practice the tree rarely exceeds depth 2-3.
     fn capacity(&self) -> u64 {
+        // saturating_mul: a valid tree never exceeds MAX_DEPTH (capacity fits
+        // u64), but a corrupt-but-checksummed spine can drive an out-of-range
+        // depth. Saturating to u64::MAX keeps `handle >= capacity()` in find_leaf
+        // correctly true (rejecting the descent) instead of a debug panic /
+        // release wrap-to-small.
         let mut cap = ENTRIES_PER_LEAF as u64;
         for _ in 0..self.depth {
-            cap *= PTRS_PER_INTERIOR as u64;
+            cap = cap.saturating_mul(PTRS_PER_INTERIOR as u64);
         }
         cap
     }
@@ -654,7 +674,12 @@ impl HandleTable {
         // delete) needs the guard. At depth 0 `handle % ENTRIES_PER_LEAF`
         // is already total, so the check is only needed when we actually
         // descend.
-        if self.depth > 0 && handle >= self.capacity() {
+        // When capacity() SATURATED to u64::MAX (depth 6, real capacity exceeds
+        // u64::MAX), every u64 handle is in reach, so skip the guard — otherwise
+        // the single handle u64::MAX would be wrongly reported absent. The
+        // child_idx bound during descent still protects against a corrupt depth.
+        let cap = self.capacity();
+        if self.depth > 0 && cap != u64::MAX && handle >= cap {
             return Ok(None);
         }
 
@@ -669,6 +694,14 @@ impl HandleTable {
         for level in (1..=self.depth).rev() {
             let child_span = self.span_at_level(level);
             let child_idx = (remaining / child_span) as usize;
+            // Defense-in-depth: a validated depth (≤ MAX_DEPTH) guarantees
+            // child_idx < PTRS_PER_INTERIOR, but guard it directly so a bad index
+            // reads as "absent" rather than reading the page's checksum bytes as
+            // a child pointer (child_idx == PTRS_PER_INTERIOR) or slicing past
+            // the page (child_idx > PTRS_PER_INTERIOR).
+            if child_idx >= PTRS_PER_INTERIOR {
+                return Ok(None);
+            }
             remaining %= child_span;
 
             let buf = cache.get(current)?;
@@ -689,9 +722,11 @@ impl HandleTable {
     // Level 2 interior → each child is a level-1 interior covering 510*1021.
     // In general: 510 * 1021^(level - 1).
     fn span_at_level(&self, level: u32) -> u64 {
+        // saturating_mul: see capacity() — a corrupt out-of-range depth must not
+        // overflow-panic / wrap here.
         let mut span = ENTRIES_PER_LEAF as u64;
         for _ in 1..level {
-            span *= PTRS_PER_INTERIOR as u64;
+            span = span.saturating_mul(PTRS_PER_INTERIOR as u64);
         }
         span
     }
@@ -714,7 +749,7 @@ impl HandleTable {
             for i in 0..ENTRIES_PER_LEAF {
                 let entry = Self::read_entry(buf, i);
                 if entry.flags != HandleFlags::Deleted {
-                    result.push((base_handle + i as u64, entry));
+                    result.push((base_handle.saturating_add(i as u64), entry));
                 }
             }
         } else {
@@ -734,13 +769,11 @@ impl HandleTable {
                     .collect()
             };
             for (i, child) in children {
-                self.iter_recursive(
-                    cache,
-                    child,
-                    base_handle + (i as u64) * child_span,
-                    level - 1,
-                    result,
-                )?;
+                // saturating: with a validated depth this never saturates, but a
+                // bad depth makes `child_span` saturate to u64::MAX and
+                // `(i as u64) * child_span` would overflow-panic.
+                let next_base = base_handle.saturating_add((i as u64).saturating_mul(child_span));
+                self.iter_recursive(cache, child, next_base, level - 1, result)?;
             }
         }
         Ok(())
@@ -872,6 +905,48 @@ mod tests {
         // HandleTable::create_root.
         cache.set_next_page_id(2);
         cache
+    }
+
+    // --- Corrupt-input robustness (deepdive review finding #3) ---------------
+    // A corrupt-but-checksummed page is only stopped by the XXH3 checksum on
+    // load; its page-type / child-pointer bytes are NOT validated. These tests
+    // pin that such input yields a typed CorruptPage rather than a panic (OOB
+    // slice) or a hang (cyclic recover_depth spine).
+
+    // capacity()/span_at_level() must SATURATE on an out-of-range depth instead
+    // of overflowing — a debug-build multiply panic, or a release wrap to a
+    // small value that would defeat find_leaf's `handle >= capacity()` guard.
+    #[test]
+    fn capacity_and_span_saturate_on_out_of_range_depth() {
+        let ht = HandleTable { depth: 30 };
+        assert_eq!(ht.capacity(), u64::MAX);
+        assert_eq!(ht.span_at_level(30), u64::MAX);
+    }
+
+    // recover_depth must reject a corrupt (checksum-valid) interior spine whose
+    // child-0 cycles, returning a typed CorruptPage instead of hanging at open.
+    #[test]
+    fn recover_depth_rejects_cyclic_spine() {
+        let mut cache = make_cache();
+        let id = cache.new_page().unwrap();
+        {
+            let buf = cache.get_mut(id).unwrap();
+            buf.fill(0);
+            buf[0] = PageType::HandleTable as u8;
+            buf[1] = FLAG_INTERIOR;
+            buf[2] = page::PAGE_FORMAT_VERSION_CURRENT;
+            buf[DATA_PAGE_HEADER_SIZE..DATA_PAGE_HEADER_SIZE + 8]
+                .copy_from_slice(&id.to_le_bytes()); // child-0 -> self
+            page::stamp_checksum(buf);
+        }
+        let err = match HandleTable::recover_depth(&mut cache, id) {
+            Ok(d) => panic!("recover_depth accepted a cyclic spine (depth {d})"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ChiselError::CorruptPage { .. }),
+            "expected CorruptPage, got {err:?}"
+        );
     }
 
     // Regression test for ISSUES.md I6. Constructs a depth-1 handle table,
