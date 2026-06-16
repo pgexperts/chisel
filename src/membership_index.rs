@@ -117,8 +117,16 @@ impl RadixU64 {
         Ok(read_slot(cache.get(leaf)?, idx))
     }
 
-    fn grow(&mut self, cache: &mut PageCache, old_root: u64) -> Result<u64> {
-        let new_root = cache.new_page()?;
+    // `old_root` is reparented as child 0 (not cloned), so it is NOT
+    // superseded and contributes nothing to the freed list — `grow` allocates
+    // via the freemap-aware `alloc` but frees nothing.
+    fn grow(
+        &mut self,
+        cache: &mut PageCache,
+        old_root: u64,
+        alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+    ) -> Result<u64> {
+        let new_root = alloc(cache)?;
         debug_assert_ne!(new_root, 0);
         let buf = cache.get_mut(new_root)?;
         buf.fill(0);
@@ -131,21 +139,31 @@ impl RadixU64 {
     }
 
     /// Insert `value` (must be non-zero) at `key`. Returns the new root.
+    /// `alloc` is the transaction layer's freemap-aware page allocator (reuses
+    /// prior-transaction freed pages before extending); `freed` collects the
+    /// page ids this call supersedes so the caller can return them to the
+    /// freemap on commit. Threading both is what keeps the membership index at
+    /// a bounded steady-state page count under churn.
     pub fn insert(
         &mut self,
         cache: &mut PageCache,
         root: u64,
         key: u64,
         value: u64,
+        alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+        freed: &mut Vec<u64>,
     ) -> Result<u64> {
         debug_assert_ne!(value, 0, "0 is the absent sentinel; cannot be stored");
         let mut current_root = root;
         while key >= self.capacity() {
-            current_root = self.grow(cache, current_root)?;
+            current_root = self.grow(cache, current_root, alloc)?;
         }
-        self.insert_recursive(cache, current_root, key, value, self.depth)
+        self.insert_recursive(cache, current_root, key, value, self.depth, alloc, freed)
     }
 
+    // Args are the recursion state plus the two reclamation channels
+    // (`alloc`/`freed`), which travel together at every level.
+    #[allow(clippy::too_many_arguments)]
     fn insert_recursive(
         &self,
         cache: &mut PageCache,
@@ -153,13 +171,17 @@ impl RadixU64 {
         key: u64,
         value: u64,
         level: u32,
+        alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+        freed: &mut Vec<u64>,
     ) -> Result<u64> {
-        let new_page = cache.new_page()?;
+        let new_page = alloc(cache)?;
         debug_assert_ne!(new_page, 0);
         {
             let old: [u8; PAGE_SIZE] = *cache.get(page)?;
             cache.get_mut(new_page)?.copy_from_slice(&old);
         }
+        // `page` is superseded by `new_page`; queue it for reclamation.
+        freed.push(page);
         if level == 0 {
             let idx = (key % SLOTS_PER_PAGE as u64) as usize;
             let buf = cache.get_mut(new_page)?;
@@ -176,14 +198,29 @@ impl RadixU64 {
                 } else {
                     PageType::MembershipInterior
                 };
-                // A fresh child here is immediately re-COWed by the recursive call
-                // below (orphaning this scratch page); benign, first-touch only.
-                init_page(cache, pt)?
+                // A fresh child here is immediately re-COWed by the recursive
+                // call below (it becomes that frame's superseded `page` and is
+                // pushed to `freed` there); benign, first-touch only. Allocated
+                // via the freemap-aware `alloc` like every other COW page.
+                let id = alloc(cache)?;
+                let buf = cache.get_mut(id)?;
+                buf.fill(0);
+                buf[0] = pt as u8;
+                buf[1] = page::PAGE_FORMAT_VERSION_CURRENT;
+                page::stamp_checksum(buf);
+                id
             } else {
                 child
             };
-            let new_child =
-                self.insert_recursive(cache, actual_child, key % span, value, level - 1)?;
+            let new_child = self.insert_recursive(
+                cache,
+                actual_child,
+                key % span,
+                value,
+                level - 1,
+                alloc,
+                freed,
+            )?;
             let buf = cache.get_mut(new_page)?;
             write_slot(buf, child_idx, new_child);
             page::stamp_checksum(buf);
@@ -193,11 +230,18 @@ impl RadixU64 {
 
     /// Set `key` to absent. Returns `(new_root, prev_value)`; `prev_value == 0`
     /// means it was already absent and no COW happened.
-    pub fn delete(&mut self, cache: &mut PageCache, root: u64, key: u64) -> Result<(u64, u64)> {
+    pub fn delete(
+        &mut self,
+        cache: &mut PageCache,
+        root: u64,
+        key: u64,
+        alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+        freed: &mut Vec<u64>,
+    ) -> Result<(u64, u64)> {
         if root == PAGE_ID_NONE || key >= self.capacity() {
             return Ok((root, 0));
         }
-        self.delete_recursive(cache, root, key, self.depth)
+        self.delete_recursive(cache, root, key, self.depth, alloc, freed)
     }
 
     fn delete_recursive(
@@ -206,6 +250,8 @@ impl RadixU64 {
         page: u64,
         key: u64,
         level: u32,
+        alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+        freed: &mut Vec<u64>,
     ) -> Result<(u64, u64)> {
         if level == 0 {
             let idx = (key % SLOTS_PER_PAGE as u64) as usize;
@@ -213,7 +259,7 @@ impl RadixU64 {
             if prev == 0 {
                 return Ok((page, 0));
             }
-            let new_leaf = cache.new_page()?;
+            let new_leaf = alloc(cache)?;
             debug_assert_ne!(new_leaf, 0);
             {
                 let old: [u8; PAGE_SIZE] = *cache.get(page)?;
@@ -224,6 +270,8 @@ impl RadixU64 {
                 write_slot(buf, idx, 0);
                 page::stamp_checksum(buf);
             }
+            // Old leaf superseded by `new_leaf`; queue it.
+            freed.push(page);
             Ok((new_leaf, prev))
         } else {
             let span = self.span_at_level(level);
@@ -232,11 +280,12 @@ impl RadixU64 {
             if child == 0 {
                 return Ok((page, 0));
             }
-            let (new_child, prev) = self.delete_recursive(cache, child, key % span, level - 1)?;
+            let (new_child, prev) =
+                self.delete_recursive(cache, child, key % span, level - 1, alloc, freed)?;
             if prev == 0 {
                 return Ok((page, 0));
             }
-            let new_page = cache.new_page()?;
+            let new_page = alloc(cache)?;
             debug_assert_ne!(new_page, 0);
             {
                 let old: [u8; PAGE_SIZE] = *cache.get(page)?;
@@ -247,6 +296,8 @@ impl RadixU64 {
                 write_slot(buf, child_idx, new_child);
                 page::stamp_checksum(buf);
             }
+            // Old interior `page` superseded by `new_page`; queue it.
+            freed.push(page);
             Ok((new_page, prev))
         }
     }
@@ -480,6 +531,8 @@ impl MembershipIndex {
         outer_root: u64,
         tag: u32,
         handle: u64,
+        alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+        freed: &mut Vec<u64>,
     ) -> Result<u64> {
         let mut outer = RadixU64 {
             depth: self.outer_depth,
@@ -494,9 +547,9 @@ impl MembershipIndex {
         if inner_root == 0 {
             inner_root = inner.create_root(cache)?;
         }
-        let new_inner_root = inner.insert(cache, inner_root, handle, 1)?;
+        let new_inner_root = inner.insert(cache, inner_root, handle, 1, alloc, freed)?;
         let packed = pack_inner(new_inner_root, inner.depth);
-        let new_outer_root = outer.insert(cache, root, tag as u64, packed)?;
+        let new_outer_root = outer.insert(cache, root, tag as u64, packed, alloc, freed)?;
         self.outer_depth = outer.depth;
         Ok(new_outer_root)
     }
@@ -510,6 +563,8 @@ impl MembershipIndex {
         outer_root: u64,
         tag: u32,
         handle: u64,
+        alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+        freed: &mut Vec<u64>,
     ) -> Result<(u64, bool)> {
         if outer_root == PAGE_ID_NONE {
             return Ok((outer_root, false));
@@ -522,7 +577,7 @@ impl MembershipIndex {
             return Ok((outer_root, false));
         }
         let mut inner = RadixU64 { depth: inner_depth };
-        let (new_inner_root, prev) = inner.delete(cache, inner_root, handle)?;
+        let (new_inner_root, prev) = inner.delete(cache, inner_root, handle, alloc, freed)?;
         if prev == 0 {
             return Ok((outer_root, false));
         }
@@ -532,9 +587,15 @@ impl MembershipIndex {
                 outer_root,
                 tag as u64,
                 pack_inner(new_inner_root, inner.depth),
+                alloc,
+                freed,
             )?
         } else {
-            let (r, _) = outer.delete(cache, outer_root, tag as u64)?;
+            // The tag's last member is gone: drop the outer entry. NOTE: the
+            // now-orphaned inner tree (`new_inner_root` and its pages) is NOT
+            // reclaimed here — that is the separate emptied-subtree compaction
+            // concern, out of scope for COW-supersession reclamation.
+            let (r, _) = outer.delete(cache, outer_root, tag as u64, alloc, freed)?;
             r
         };
         self.outer_depth = outer.depth;
@@ -618,6 +679,124 @@ impl MembershipIndex {
     }
 }
 
+// Test-only convenience wrappers (extend-only allocator, discarded freed list):
+// the unit tests exercise radix-tree shape and two-level composition, not
+// freemap reclamation.
+#[cfg(test)]
+impl RadixU64 {
+    fn insert_t(&mut self, cache: &mut PageCache, root: u64, key: u64, value: u64) -> Result<u64> {
+        self.insert(
+            cache,
+            root,
+            key,
+            value,
+            &mut |c| c.new_page(),
+            &mut Vec::new(),
+        )
+    }
+    fn delete_t(&mut self, cache: &mut PageCache, root: u64, key: u64) -> Result<(u64, u64)> {
+        self.delete(cache, root, key, &mut |c| c.new_page(), &mut Vec::new())
+    }
+
+    /// Test-only: collect every page id in this radix spine reachable from `root`.
+    pub(crate) fn collect_page_ids(
+        &self,
+        cache: &mut PageCache,
+        root: u64,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        if root == PAGE_ID_NONE {
+            return Ok(());
+        }
+        self.collect_recursive(cache, root, self.depth, out)
+    }
+
+    fn collect_recursive(
+        &self,
+        cache: &mut PageCache,
+        page: u64,
+        level: u32,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        out.push(page);
+        if level > 0 {
+            let children: Vec<u64> = {
+                let buf = cache.get(page)?;
+                (0..SLOTS_PER_PAGE)
+                    .map(|i| read_slot(buf, i))
+                    .filter(|c| *c != 0)
+                    .collect()
+            };
+            for child in children {
+                self.collect_recursive(cache, child, level - 1, out)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl MembershipIndex {
+    fn insert_t(
+        &mut self,
+        cache: &mut PageCache,
+        outer_root: u64,
+        tag: u32,
+        handle: u64,
+    ) -> Result<u64> {
+        self.insert(
+            cache,
+            outer_root,
+            tag,
+            handle,
+            &mut |c| c.new_page(),
+            &mut Vec::new(),
+        )
+    }
+    fn remove_t(
+        &mut self,
+        cache: &mut PageCache,
+        outer_root: u64,
+        tag: u32,
+        handle: u64,
+    ) -> Result<(u64, bool)> {
+        self.remove(
+            cache,
+            outer_root,
+            tag,
+            handle,
+            &mut |c| c.new_page(),
+            &mut Vec::new(),
+        )
+    }
+
+    /// Test-only: collect every page id reachable from the outer root — the
+    /// outer (tag) tree spine PLUS every per-tag inner (handle) tree spine.
+    pub(crate) fn collect_page_ids(
+        &self,
+        cache: &mut PageCache,
+        outer_root: u64,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        if outer_root == PAGE_ID_NONE {
+            return Ok(());
+        }
+        let outer = RadixU64 {
+            depth: self.outer_depth,
+        };
+        outer.collect_page_ids(cache, outer_root, out)?;
+        // Each outer leaf value packs an inner tree's (depth, root); walk each.
+        for (_tag, packed) in outer.iter(cache, outer_root)? {
+            let (inner_root, inner_depth) = unpack_inner(packed);
+            if inner_root != 0 {
+                let inner = RadixU64 { depth: inner_depth };
+                inner.collect_page_ids(cache, inner_root, out)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,10 +826,10 @@ mod tests {
         let mut t = RadixU64::new();
         let root = t.create_root(&mut c).unwrap();
         assert_eq!(t.lookup(&mut c, root, 5).unwrap(), 0);
-        let r = t.insert(&mut c, root, 5, 99).unwrap();
+        let r = t.insert_t(&mut c, root, 5, 99).unwrap();
         assert_eq!(t.lookup(&mut c, r, 5).unwrap(), 99);
         assert!(t.any_present(&mut c, r).unwrap());
-        let (r2, prev) = t.delete(&mut c, r, 5).unwrap();
+        let (r2, prev) = t.delete_t(&mut c, r, 5).unwrap();
         assert_eq!(prev, 99);
         assert_eq!(t.lookup(&mut c, r2, 5).unwrap(), 0);
         assert!(!t.any_present(&mut c, r2).unwrap());
@@ -662,7 +841,7 @@ mod tests {
         let mut t = RadixU64::new();
         let mut root = t.create_root(&mut c).unwrap();
         for k in [0u64, 1, 1021, 2000, 1_000_000] {
-            root = t.insert(&mut c, root, k, k + 7).unwrap();
+            root = t.insert_t(&mut c, root, k, k + 7).unwrap();
         }
         assert!(t.depth >= 1, "tree should have grown");
         for k in [0u64, 1, 1021, 2000, 1_000_000] {
@@ -688,7 +867,7 @@ mod tests {
         let mut t = RadixU64::new();
         let mut root = t.create_root(&mut c).unwrap();
         for k in 0..50u64 {
-            root = t.insert(&mut c, root, k, k + 1).unwrap();
+            root = t.insert_t(&mut c, root, k, k + 1).unwrap();
         }
         assert_eq!(t.iter_bounded(&mut c, root, 10).unwrap().len(), 10);
         assert_eq!(t.iter_bounded(&mut c, root, 100).unwrap().len(), 50);
@@ -699,7 +878,7 @@ mod tests {
         let mut c = cache(64);
         let mut t = RadixU64::new();
         let root = t.create_root(&mut c).unwrap();
-        let (r, prev) = t.delete(&mut c, root, 42).unwrap();
+        let (r, prev) = t.delete_t(&mut c, root, 42).unwrap();
         assert_eq!(prev, 0);
         assert_eq!(r, root, "no COW for an absent key");
     }
@@ -709,7 +888,7 @@ mod tests {
         let mut c = cache(8192);
         let mut t = RadixU64::new();
         let mut root = t.create_root(&mut c).unwrap();
-        root = t.insert(&mut c, root, 5_000_000, 1).unwrap();
+        root = t.insert_t(&mut c, root, 5_000_000, 1).unwrap();
         let recovered = RadixU64::recover_depth(&mut c, root).unwrap();
         assert_eq!(recovered, t.depth);
     }
@@ -719,9 +898,9 @@ mod tests {
         let mut c = cache(8192);
         let mut idx = MembershipIndex::new();
         let mut root = PAGE_ID_NONE;
-        root = idx.insert(&mut c, root, 7, 100).unwrap();
-        root = idx.insert(&mut c, root, 7, 200).unwrap();
-        root = idx.insert(&mut c, root, 9, 300).unwrap();
+        root = idx.insert_t(&mut c, root, 7, 100).unwrap();
+        root = idx.insert_t(&mut c, root, 7, 200).unwrap();
+        root = idx.insert_t(&mut c, root, 9, 300).unwrap();
         assert!(idx.contains(&mut c, root, 7, 100).unwrap());
         assert!(idx.contains(&mut c, root, 7, 200).unwrap());
         assert!(!idx.contains(&mut c, root, 7, 300).unwrap());
@@ -730,11 +909,11 @@ mod tests {
         assert_eq!(h7, vec![100, 200]);
         assert_eq!(idx.handles_for_tag(&mut c, root, 9).unwrap(), vec![300]);
 
-        let (root2, removed) = idx.remove(&mut c, root, 7, 100).unwrap();
+        let (root2, removed) = idx.remove_t(&mut c, root, 7, 100).unwrap();
         assert!(removed);
         assert!(!idx.contains(&mut c, root2, 7, 100).unwrap());
         assert!(idx.contains(&mut c, root2, 7, 200).unwrap());
-        let (_root3, removed_again) = idx.remove(&mut c, root2, 7, 100).unwrap();
+        let (_root3, removed_again) = idx.remove_t(&mut c, root2, 7, 100).unwrap();
         assert!(!removed_again, "removing an absent member reports false");
     }
 
@@ -744,7 +923,7 @@ mod tests {
         let mut idx = MembershipIndex::new();
         let mut root = PAGE_ID_NONE;
         for h in 0..10u64 {
-            root = idx.insert(&mut c, root, 3, 1000 + h).unwrap();
+            root = idx.insert_t(&mut c, root, 3, 1000 + h).unwrap();
         }
         assert_eq!(
             idx.handles_for_tag_bounded(&mut c, root, 3, 4)
@@ -777,13 +956,13 @@ mod tests {
         let mut root = PAGE_ID_NONE;
         let n = 1100u64;
         for h in 0..n {
-            root = idx.insert(&mut c, root, 7, h).unwrap();
+            root = idx.insert_t(&mut c, root, 7, h).unwrap();
         }
         let mut got = idx.handles_for_tag(&mut c, root, 7).unwrap();
         got.sort();
         assert_eq!(got, (0..n).collect::<Vec<_>>());
         for h in 0..n {
-            let (r, removed) = idx.remove(&mut c, root, 7, h).unwrap();
+            let (r, removed) = idx.remove_t(&mut c, root, 7, h).unwrap();
             root = r;
             assert!(removed);
         }

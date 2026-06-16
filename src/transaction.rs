@@ -65,6 +65,36 @@ use crate::superblock::{
 // Derived from PAGE_SIZE minus DataPage header/slot overhead; keep in sync with data_page.rs.
 const MAX_INLINE_VALUE: usize = 8162;
 
+/// Freemap-aware page allocator shared by data-page allocation and the
+/// handle-table / membership-index COW paths.
+///
+/// When `reuse_enabled`, it first tries to reuse a page freed by a *prior*
+/// committed transaction (a free bit in `current_freemap`), falling back to
+/// extending the file via `PageCache::new_page`. `reuse_enabled` is false while
+/// savepoints are active (R2: savepoint scopes disable freemap reuse to keep
+/// `rollback_to` semantics simple) — matching the historical `allocate_data_page`
+/// behavior, which this now also routes through.
+///
+/// Pages freed during the CURRENT transaction live in `txn_freed_pages` and are
+/// NOT in `current_freemap` until commit, so `allocate_first` can never hand
+/// back a page still referenced by the live tree (the I18 invariant). Routing
+/// handle-table and membership COW allocation through here — rather than the
+/// monotonic `new_page` — is what lets those structures reach a bounded
+/// steady-state page count instead of leaking one page per mutation.
+fn cow_alloc(
+    cache: &mut PageCache,
+    freemap: &mut [u8; PAGE_SIZE],
+    reuse_enabled: bool,
+) -> Result<u64> {
+    if reuse_enabled {
+        if let Some(id) = FreeMap::allocate_first(freemap) {
+            cache.claim_page(id)?;
+            return Ok(id);
+        }
+    }
+    cache.new_page()
+}
+
 /// Snapshot of the mutable "pointers" that define a consistent database state.
 /// A commit succeeds by writing a superblock that references exactly these roots;
 /// a rollback succeeds by reverting current_roots back to committed_roots.
@@ -609,22 +639,48 @@ impl TransactionManager {
     //      `current_freemap` during commit, after the new roots have
     //      been computed.
     //
-    // Overflow pages and handle-table COW pages do NOT go through this
-    // path (they still call `cache.new_page()` directly and always
-    // extend). Freeing those pages still feeds the freemap — so
-    // delete-heavy workloads reach equilibrium via data-page reuse even
-    // though overflow itself doesn't consume from the freemap. Routing
-    // overflow through the freemap would require an allocator callback
-    // or trait object at the overflow module boundary; noted as a v1
-    // simplification.
+    // Handle-table and membership-index COW pages now share this same
+    // freemap-aware allocator via `cow_alloc` (each `insert`/`delete` takes an
+    // `alloc` closure that calls it), so they reuse freed pages before
+    // extending — that is what bounds their steady-state page count. Overflow
+    // pages still call `cache.new_page()` directly and always extend, but their
+    // frees feed the freemap, so a later data- or handle-table allocation can
+    // reclaim them. Routing overflow through the freemap too would need the
+    // same allocator-closure plumbing at the overflow module boundary; left as
+    // a v1 simplification since overflow churn is far smaller than HT churn.
     fn allocate_data_page(&mut self) -> Result<u64> {
-        if self.savepoints.is_empty() {
-            if let Some(id) = FreeMap::allocate_first(&mut self.current_freemap) {
-                self.cache.borrow_mut().claim_page(id)?;
-                return Ok(id);
-            }
-        }
-        self.cache.borrow_mut().new_page()
+        let reuse = self.savepoints.is_empty();
+        let mut cache = self.cache.borrow_mut();
+        cow_alloc(&mut cache, &mut self.current_freemap, reuse)
+    }
+
+    /// COW `handle`'s handle-table entry to `entry`, installing the new root
+    /// and queuing the superseded spine pages for freemap reclamation at
+    /// commit. Shared by `allocate`, `update`, and `set_client_byte`.
+    ///
+    /// The superseded pages are appended to `txn_freed_pages` ONLY after the
+    /// new root is installed in `current_roots`: if the COW fails partway
+    /// (e.g. `CacheFull`), the local `freed` list is dropped and the still-
+    /// current old tree keeps all its pages — never freeing a live page.
+    fn ht_insert(&mut self, handle: u64, entry: &HandleEntry) -> Result<()> {
+        let mut freed: Vec<u64> = Vec::new();
+        let new_root = {
+            let mut cache = self.cache.borrow_mut();
+            let reuse = self.savepoints.is_empty();
+            let fm = &mut *self.current_freemap;
+            let mut alloc = |c: &mut PageCache| cow_alloc(c, fm, reuse);
+            self.handle_table.insert(
+                &mut cache,
+                self.current_roots.handle_table_page,
+                handle,
+                entry,
+                &mut alloc,
+                &mut freed,
+            )?
+        };
+        self.current_roots.handle_table_page = new_root;
+        self.txn_freed_pages.append(&mut freed);
+        Ok(())
     }
 
     // Persist the freemap at commit time (ISSUES.md R2 / I11 / I18).
@@ -1215,32 +1271,30 @@ impl TransactionManager {
         };
 
         self.ensure_handle_table()?;
-        let new_root = {
-            let mut cache = self.cache.borrow_mut();
-            self.handle_table.insert(
-                &mut cache,
-                self.current_roots.handle_table_page,
-                handle,
-                &entry,
-            )?
-        };
-        self.current_roots.handle_table_page = new_root;
+        self.ht_insert(handle, &entry)?;
 
         // Tagged chunks join the reverse membership index (tag 0 = untagged, no
         // index work). The forward handle->tag mapping is the HandleEntry.tag
         // written above; this is the reverse tag->handles mapping that powers
         // handles_with_tag / delete-by-tag. Both must agree at all times.
         if tag != 0 {
+            let mut freed: Vec<u64> = Vec::new();
             let new_index_root = {
                 let mut cache = self.cache.borrow_mut();
+                let reuse = self.savepoints.is_empty();
+                let fm = &mut *self.current_freemap;
+                let mut alloc = |c: &mut PageCache| cow_alloc(c, fm, reuse);
                 self.membership_index.insert(
                     &mut cache,
                     self.current_roots.membership_index_page,
                     tag,
                     handle,
+                    &mut alloc,
+                    &mut freed,
                 )?
             };
             self.current_roots.membership_index_page = new_index_root;
+            self.txn_freed_pages.append(&mut freed);
         }
 
         Ok(handle)
@@ -1325,16 +1379,7 @@ impl TransactionManager {
             return Err(ChiselError::InvalidHandle(handle));
         }
         entry.client_byte = byte;
-        let new_root = {
-            let mut cache = self.cache.borrow_mut();
-            self.handle_table.insert(
-                &mut cache,
-                self.current_roots.handle_table_page,
-                handle,
-                &entry,
-            )?
-        };
-        self.current_roots.handle_table_page = new_root;
+        self.ht_insert(handle, &entry)?;
         Ok(())
     }
 
@@ -1503,16 +1548,7 @@ impl TransactionManager {
             }
         };
 
-        let new_root = {
-            let mut cache = self.cache.borrow_mut();
-            self.handle_table.insert(
-                &mut cache,
-                self.current_roots.handle_table_page,
-                handle,
-                &new_entry,
-            )?
-        };
-        self.current_roots.handle_table_page = new_root;
+        self.ht_insert(handle, &new_entry)?;
 
         Ok(())
     }
@@ -1541,10 +1577,19 @@ impl TransactionManager {
         // was tombstoned; None if the handle was absent or already a
         // tombstone. We escalate None to InvalidHandle here at the
         // caller layer to preserve the public-API behavior.
+        let mut ht_freed: Vec<u64> = Vec::new();
         let (new_root, prev_entry) = {
             let mut cache = self.cache.borrow_mut();
-            self.handle_table
-                .delete(&mut cache, self.current_roots.handle_table_page, handle)?
+            let reuse = self.savepoints.is_empty();
+            let fm = &mut *self.current_freemap;
+            let mut alloc = |c: &mut PageCache| cow_alloc(c, fm, reuse);
+            self.handle_table.delete(
+                &mut cache,
+                self.current_roots.handle_table_page,
+                handle,
+                &mut alloc,
+                &mut ht_freed,
+            )?
         };
         let entry = prev_entry.ok_or(ChiselError::InvalidHandle(handle))?;
 
@@ -1586,6 +1631,11 @@ impl TransactionManager {
         }
 
         self.current_roots.handle_table_page = new_root;
+        // Now that the tombstone root is installed, the COW-superseded spine
+        // pages are genuinely unreachable from current_roots — return them to
+        // the freemap at commit. (Appended only here, post-install, so a fatal
+        // value-release error above leaves them referenced by the old tree.)
+        self.txn_freed_pages.append(&mut ht_freed);
 
         // Self-maintaining: a tagged chunk must leave the reverse membership
         // index when it's deleted, so handles_with_tag no longer returns it and
@@ -1593,16 +1643,23 @@ impl TransactionManager {
         // The tag comes from the entry being tombstoned -- no tag argument needed.
         // Tag 0 (untagged) is never in the index, so there is nothing to remove.
         if entry.tag != 0 {
+            let mut idx_freed: Vec<u64> = Vec::new();
             let (new_index_root, _removed) = {
                 let mut cache = self.cache.borrow_mut();
+                let reuse = self.savepoints.is_empty();
+                let fm = &mut *self.current_freemap;
+                let mut alloc = |c: &mut PageCache| cow_alloc(c, fm, reuse);
                 self.membership_index.remove(
                     &mut cache,
                     self.current_roots.membership_index_page,
                     entry.tag,
                     handle,
+                    &mut alloc,
+                    &mut idx_freed,
                 )?
             };
             self.current_roots.membership_index_page = new_index_root;
+            self.txn_freed_pages.append(&mut idx_freed);
         }
 
         Ok(())
@@ -2239,6 +2296,98 @@ mod tests {
         tm.begin().unwrap();
         tm.commit().unwrap();
         tm
+    }
+
+    /// C1 invariant: after a commit, NO page reachable from `committed_roots`
+    /// (handle-table spine + membership-index outer/inner spines) may be marked
+    /// free in `committed_freemap`. A correct COW frees only superseded pages;
+    /// freeing a still-referenced page (the textbook C1 violation — e.g. `grow`
+    /// freeing the reparented old root) shows up here as a page that is both
+    /// reachable and free. This is deterministic regardless of the freemap's
+    /// lowest-id-first selection order, which makes black-box reopen tests
+    /// unreliable for catching C1.
+    fn assert_no_reachable_page_is_free(tm: &TransactionManager) {
+        let mut reachable = Vec::new();
+        {
+            let mut cache = tm.cache.borrow_mut();
+            tm.handle_table
+                .collect_page_ids(
+                    &mut cache,
+                    tm.committed_roots.handle_table_page,
+                    &mut reachable,
+                )
+                .unwrap();
+            tm.membership_index
+                .collect_page_ids(
+                    &mut cache,
+                    tm.committed_roots.membership_index_page,
+                    &mut reachable,
+                )
+                .unwrap();
+        }
+        for id in reachable {
+            assert!(
+                !FreeMap::is_free(&tm.committed_freemap, id),
+                "page {id} is reachable from committed_roots but marked FREE in \
+                 committed_freemap — a still-referenced COW page was freed (C1 violation)"
+            );
+        }
+    }
+
+    // COW page reclamation must never free a page still referenced by the
+    // committed tree, even after the trees GROW (the reparenting paths). Forces
+    // a handle-table grow (>510 handles) and a membership inner-tree grow
+    // (>1021 members under one tag), then churns with reclamation, asserting the
+    // C1 invariant after every commit.
+    #[test]
+    fn reclamation_never_frees_a_reachable_page_after_grow() {
+        let mut tm = fresh_manager();
+        let tag = 9u32;
+        let mut handles = Vec::new();
+        let mut v: u32 = 0;
+
+        // Build >1021 tagged members in small batches (stay under the 1024-page
+        // cache cap), forcing both trees to grow to depth >= 1.
+        for _ in 0..12 {
+            tm.begin().unwrap();
+            for _ in 0..100 {
+                let h = tm.allocate_tagged(&v.to_le_bytes(), tag).unwrap();
+                handles.push(h);
+                v += 1;
+            }
+            tm.commit().unwrap();
+            assert_no_reachable_page_is_free(&tm);
+        }
+        assert!(
+            handles.len() > 1021,
+            "workload must exceed one membership leaf to force an inner grow"
+        );
+
+        // Churn with reclamation across committed transactions: update relocates
+        // the value and COWs the handle-table spine (freeing the old spine);
+        // set_client_byte COWs only the leaf. Batched per ~100 handles so a
+        // single transaction's dirty COW pages stay under the cache cap (within
+        // a txn, this-txn frees are not yet reusable). Re-check after each commit.
+        for round in 0..12u32 {
+            for (chunk_idx, chunk) in handles.chunks(100).enumerate() {
+                tm.begin().unwrap();
+                for (j, h) in chunk.iter().enumerate() {
+                    if (round as usize + chunk_idx + j) % 2 == 0 {
+                        tm.set_client_byte(*h, round as u8).unwrap();
+                    } else {
+                        tm.update(*h, &round.to_le_bytes()).unwrap();
+                    }
+                }
+                tm.commit().unwrap();
+                assert_no_reachable_page_is_free(&tm);
+            }
+        }
+
+        // Every handle still carries its tag and is enumerable after the churn.
+        for h in &handles {
+            assert_eq!(tm.tag(*h).unwrap(), tag);
+        }
+        assert_eq!(tm.handles_with_tag(tag).unwrap().len(), handles.len());
     }
 
     #[test]

@@ -17,11 +17,20 @@
 // downward. This keeps capacity exact (510 * 1021^depth) rather than rounding
 // up to a power of two.
 //
-// Copy-on-write (per-module): this module implements its own COW on top of
-// `PageCache::new_page()`. Every mutation path (`insert`, `delete`, `grow`)
-// allocates fresh pages for every node it touches and returns a new root
-// page ID; it NEVER writes to a page that was reachable from the
-// previously-committed superblock. Invariants:
+// Copy-on-write (per-module): this module implements its own COW. Every
+// mutation path (`insert`, `delete`, `grow`) allocates fresh pages for every
+// node it touches and returns a new root page ID; it NEVER writes to a page
+// that was reachable from the previously-committed superblock.
+//
+// Page allocation goes through an `alloc` closure the caller injects (the
+// transaction layer's freemap-aware `cow_alloc`), so superseded pages from a
+// prior committed transaction are reused before the file is extended. The pages
+// THIS mutation supersedes are pushed onto the caller's `freed` list; the
+// caller returns them to the freemap at commit (so the table reaches a bounded
+// steady-state page count instead of leaking one page per mutation). `grow`
+// reparents the old root as child 0 — it is not superseded and is never freed.
+//
+// Invariants:
 //
 //   (I1) After `insert`/`delete`, the old root and every page reachable from
 //        it are still byte-identical to what the previous commit sees. A
@@ -212,12 +221,21 @@ impl HandleTable {
     /// current roots — otherwise the mutation is effectively lost at commit
     /// time because the superblock will still point at the old root (see
     /// invariant I2 in the file header).
+    /// `alloc` is a freemap-aware page allocator supplied by the transaction
+    /// layer: it reuses a page freed by a *prior* committed transaction when
+    /// one is available, falling back to extending the file. Routing COW
+    /// allocation through it (instead of `cache.new_page()` directly) is what
+    /// lets the handle table reach a bounded steady-state page count rather
+    /// than growing one page per mutation. `freed` collects the page ids this
+    /// call supersedes so the caller can return them to the freemap on commit.
     pub fn insert(
         &mut self,
         cache: &mut PageCache,
         root: u64,
         handle: u64,
         entry: &HandleEntry,
+        alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+        freed: &mut Vec<u64>,
     ) -> Result<u64> {
         let mut current_root = root;
         // Grow the tree upward until the handle fits. `grow` stacks a new
@@ -225,9 +243,9 @@ impl HandleTable {
         // of the new interior, which preserves addressability of all existing
         // handles (their addresses all fall within the first child's span).
         while handle >= self.capacity() {
-            current_root = self.grow(cache, current_root)?;
+            current_root = self.grow(cache, current_root, alloc)?;
         }
-        self.insert_recursive(cache, current_root, handle, entry, self.depth)
+        self.insert_recursive(cache, current_root, handle, entry, self.depth, alloc, freed)
     }
 
     /// Delete a handle: write a tombstone for it and return the previous
@@ -251,6 +269,8 @@ impl HandleTable {
         cache: &mut PageCache,
         root: u64,
         handle: u64,
+        alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+        freed: &mut Vec<u64>,
     ) -> Result<(u64, Option<HandleEntry>)> {
         // Empty tree: nothing to delete.
         if root == PAGE_ID_NONE {
@@ -261,7 +281,7 @@ impl HandleTable {
         if handle >= self.capacity() {
             return Ok((root, None));
         }
-        self.delete_recursive(cache, root, handle, self.depth)
+        self.delete_recursive(cache, root, handle, self.depth, alloc, freed)
     }
 
     /// Single-pass recursive descent that reads the existing entry at
@@ -275,6 +295,8 @@ impl HandleTable {
         page: u64,
         handle: u64,
         level: u32,
+        alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+        freed: &mut Vec<u64>,
     ) -> Result<(u64, Option<HandleEntry>)> {
         if level == 0 {
             // Leaf: read the entry. Decide whether to write tombstone.
@@ -294,13 +316,15 @@ impl HandleTable {
                 HandleFlags::Live | HandleFlags::Overflow => {
                     // COW the leaf, write tombstone, return Some(entry).
                     // Pattern mirrors insert_recursive's leaf branch.
-                    let new_leaf = cache.new_page()?;
+                    let new_leaf = alloc(cache)?;
                     debug_assert_ne!(new_leaf, 0); // I8
                     {
                         let buf_copy: [u8; PAGE_SIZE] = *cache.get(page)?;
                         let new_buf = cache.get_mut(new_leaf)?;
                         *new_buf = buf_copy;
                     }
+                    // The old leaf is superseded by `new_leaf`; queue it.
+                    freed.push(page);
                     let tombstone = HandleEntry {
                         page_id: 0,
                         slot_index: 0,
@@ -331,8 +355,14 @@ impl HandleTable {
                 // original page id unchanged.
                 return Ok((page, None));
             }
-            let (new_child, prev_entry) =
-                self.delete_recursive(cache, child_page, handle % child_span, level - 1)?;
+            let (new_child, prev_entry) = self.delete_recursive(
+                cache,
+                child_page,
+                handle % child_span,
+                level - 1,
+                alloc,
+                freed,
+            )?;
             if prev_entry.is_none() {
                 // Recursion did not write a tombstone (subtree already
                 // tombstoned or absent at the leaf). No COW at this
@@ -344,13 +374,15 @@ impl HandleTable {
             }
             // Recursion COWed below us. COW this interior page so it
             // points at the new child.
-            let new_page = cache.new_page()?;
+            let new_page = alloc(cache)?;
             debug_assert_ne!(new_page, 0); // I8
             {
                 let buf_copy: [u8; PAGE_SIZE] = *cache.get(page)?;
                 let new_buf = cache.get_mut(new_page)?;
                 *new_buf = buf_copy;
             }
+            // The old interior `page` is superseded by `new_page`; queue it.
+            freed.push(page);
             {
                 let new_buf = cache.get_mut(new_page)?;
                 let offset = DATA_PAGE_HEADER_SIZE + child_idx * CHILD_PTR_SIZE;
@@ -441,9 +473,17 @@ impl HandleTable {
     ///
     /// COW note: we do NOT clone `old_root` here. We only allocate the new
     /// interior page and point it at the unchanged old root. The old root
-    /// remains reachable from the previous superblock, preserving I1.
-    fn grow(&mut self, cache: &mut PageCache, old_root: u64) -> Result<u64> {
-        let new_root = cache.new_page()?;
+    /// remains reachable from the previous superblock (preserving I1) AND is
+    /// reparented as child 0 of the new tree — so it is NOT superseded and
+    /// must NOT be added to the freed list. `grow` therefore allocates (via
+    /// the freemap-aware `alloc`) but frees nothing.
+    fn grow(
+        &mut self,
+        cache: &mut PageCache,
+        old_root: u64,
+        alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+    ) -> Result<u64> {
+        let new_root = alloc(cache)?;
         // I8: interior nodes use 0 as "no child allocated yet"; the
         // new root (which will itself be linked from other interior
         // pages on future growth) must not share that encoding.
@@ -470,6 +510,12 @@ impl HandleTable {
     // hands out exclusive references and we need to read the old page to
     // populate the new one. 8KB on the stack per level is cheap relative to
     // page I/O.
+    //
+    // The parameter list is the recursion's state (page + key bits + entry +
+    // level) plus the two reclamation channels (`alloc`/`freed`); they travel
+    // together at every level, so threading them as separate params is clearer
+    // here than wrapping them in a context struct.
+    #[allow(clippy::too_many_arguments)]
     fn insert_recursive(
         &self,
         cache: &mut PageCache,
@@ -477,9 +523,11 @@ impl HandleTable {
         handle: u64,
         entry: &HandleEntry,
         level: u32,
+        alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+        freed: &mut Vec<u64>,
     ) -> Result<u64> {
         // COW: copy the page.
-        let new_page = cache.new_page()?;
+        let new_page = alloc(cache)?;
         // I8: handle-table pages must never have id 0 (see
         // create_root for context).
         debug_assert_ne!(new_page, 0);
@@ -489,6 +537,12 @@ impl HandleTable {
             let new_buf = cache.get_mut(new_page)?;
             new_buf.copy_from_slice(&old_data);
         }
+        // `page_id` is now superseded: the returned subtree references
+        // `new_page`, never `page_id`. Queue it for reclamation. The caller
+        // only merges `freed` into `txn_freed_pages` AFTER installing the new
+        // root, so a mid-COW allocation failure discards this list and leaves
+        // the still-current old tree's pages referenced (never freed).
+        freed.push(page_id);
 
         if level == 0 {
             // Leaf: the remaining handle bits directly index the slot.
@@ -519,7 +573,7 @@ impl HandleTable {
             // clone — no further copy needed.
             let actual_child = if child_page == 0 {
                 if level == 1 {
-                    let leaf = cache.new_page()?;
+                    let leaf = alloc(cache)?;
                     debug_assert_ne!(leaf, 0); // I8
                     let buf = cache.get_mut(leaf)?;
                     buf.fill(0);
@@ -529,7 +583,7 @@ impl HandleTable {
                     page::stamp_checksum(buf);
                     leaf
                 } else {
-                    let interior = cache.new_page()?;
+                    let interior = alloc(cache)?;
                     debug_assert_ne!(interior, 0); // I8
                     let buf = cache.get_mut(interior)?;
                     buf.fill(0);
@@ -543,8 +597,15 @@ impl HandleTable {
                 child_page
             };
 
-            let new_child =
-                self.insert_recursive(cache, actual_child, handle % child_span, entry, level - 1)?;
+            let new_child = self.insert_recursive(
+                cache,
+                actual_child,
+                handle % child_span,
+                entry,
+                level - 1,
+                alloc,
+                freed,
+            )?;
 
             // Patch the child pointer in our cloned interior page to point
             // at the new subtree, then re-stamp the checksum. This is the
@@ -712,6 +773,81 @@ impl HandleTable {
     }
 }
 
+// Test-only convenience wrappers: the unit tests below exercise tree shape and
+// COW correctness, not freemap reclamation, so they pass a trivial extend-only
+// allocator (`cache.new_page`) and discard the superseded-page list.
+#[cfg(test)]
+impl HandleTable {
+    fn insert_t(
+        &mut self,
+        cache: &mut PageCache,
+        root: u64,
+        handle: u64,
+        entry: &HandleEntry,
+    ) -> Result<u64> {
+        self.insert(
+            cache,
+            root,
+            handle,
+            entry,
+            &mut |c| c.new_page(),
+            &mut Vec::new(),
+        )
+    }
+
+    fn delete_t(
+        &mut self,
+        cache: &mut PageCache,
+        root: u64,
+        handle: u64,
+    ) -> Result<(u64, Option<HandleEntry>)> {
+        self.delete(cache, root, handle, &mut |c| c.new_page(), &mut Vec::new())
+    }
+
+    /// Test-only: collect every page id in the tree spine (root + interiors +
+    /// leaves) reachable from `root`. Used by the COW-reclamation invariant
+    /// test to assert no still-reachable page was freed.
+    pub(crate) fn collect_page_ids(
+        &self,
+        cache: &mut PageCache,
+        root: u64,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        if root == PAGE_ID_NONE {
+            return Ok(());
+        }
+        self.collect_recursive(cache, root, self.depth, out)
+    }
+
+    fn collect_recursive(
+        &self,
+        cache: &mut PageCache,
+        page: u64,
+        level: u32,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        out.push(page);
+        if level > 0 {
+            // Materialize child pointers before recursing (the recursive call
+            // needs &mut PageCache, invalidating the borrow on `page`).
+            let children: Vec<u64> = {
+                let buf = cache.get(page)?;
+                (0..PTRS_PER_INTERIOR)
+                    .map(|i| {
+                        let off = DATA_PAGE_HEADER_SIZE + i * CHILD_PTR_SIZE;
+                        u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+                    })
+                    .filter(|c| *c != 0)
+                    .collect()
+            };
+            for child in children {
+                self.collect_recursive(cache, child, level - 1, out)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,11 +897,11 @@ mod tests {
             client_byte: 0,
         };
         // Insert handle 0 (fits in depth-0 root leaf).
-        let root1 = ht.insert(&mut cache, root0, 0, &entry).unwrap();
+        let root1 = ht.insert_t(&mut cache, root0, 0, &entry).unwrap();
         // Insert handle 510: forces grow() → depth becomes 1. The old leaf
         // becomes child 0 of the new interior root; child 1 is a fresh leaf
         // holding handle 510. Children 2..1021 are zero (sparse).
-        let root2 = ht.insert(&mut cache, root1, 510, &entry).unwrap();
+        let root2 = ht.insert_t(&mut cache, root1, 510, &entry).unwrap();
         assert_eq!(ht.depth(), 1);
 
         // Patch byte 10 of slot 0 in the interior root to 0x01. This byte
@@ -805,10 +941,10 @@ mod tests {
             tag: 0,
             client_byte: 0,
         };
-        let root_after_insert = ht.insert(&mut cache, root, 100, &live_entry).unwrap();
+        let root_after_insert = ht.insert_t(&mut cache, root, 100, &live_entry).unwrap();
 
         // Delete it. Expect (new_root, Some(live_entry-equivalent)).
-        let (new_root, prev_entry) = ht.delete(&mut cache, root_after_insert, 100).unwrap();
+        let (new_root, prev_entry) = ht.delete_t(&mut cache, root_after_insert, 100).unwrap();
 
         assert_ne!(
             new_root, root_after_insert,
@@ -833,9 +969,9 @@ mod tests {
             tag: 0,
             client_byte: 0,
         };
-        let root_after_insert = ht.insert(&mut cache, root, 200, &overflow_entry).unwrap();
+        let root_after_insert = ht.insert_t(&mut cache, root, 200, &overflow_entry).unwrap();
 
-        let (new_root, prev_entry) = ht.delete(&mut cache, root_after_insert, 200).unwrap();
+        let (new_root, prev_entry) = ht.delete_t(&mut cache, root_after_insert, 200).unwrap();
 
         assert_ne!(
             new_root, root_after_insert,
@@ -859,14 +995,15 @@ mod tests {
             tag: 0,
             client_byte: 0,
         };
-        let root_after_insert = ht.insert(&mut cache, root, 100, &live_entry).unwrap();
+        let root_after_insert = ht.insert_t(&mut cache, root, 100, &live_entry).unwrap();
 
         // First delete: returns Some(entry).
-        let (root_after_first_delete, _) = ht.delete(&mut cache, root_after_insert, 100).unwrap();
+        let (root_after_first_delete, _) = ht.delete_t(&mut cache, root_after_insert, 100).unwrap();
 
         // Second delete: handle is now a tombstone. Expect (root, None) with NO COW.
-        let (root_after_second_delete, prev_entry) =
-            ht.delete(&mut cache, root_after_first_delete, 100).unwrap();
+        let (root_after_second_delete, prev_entry) = ht
+            .delete_t(&mut cache, root_after_first_delete, 100)
+            .unwrap();
 
         assert_eq!(
             prev_entry, None,
@@ -895,9 +1032,9 @@ mod tests {
             tag: 0,
             client_byte: 0,
         };
-        let root_after_insert = ht.insert(&mut cache, root, 100, &live_entry).unwrap();
+        let root_after_insert = ht.insert_t(&mut cache, root, 100, &live_entry).unwrap();
 
-        let (new_root, prev_entry) = ht.delete(&mut cache, root_after_insert, 200).unwrap();
+        let (new_root, prev_entry) = ht.delete_t(&mut cache, root_after_insert, 200).unwrap();
 
         assert_eq!(
             prev_entry, None,
@@ -918,7 +1055,7 @@ mod tests {
         // Tree is at depth 0 (capacity = 510). u64::MAX is far beyond.
         assert_eq!(ht.depth(), 0);
 
-        let (new_root, prev_entry) = ht.delete(&mut cache, root, u64::MAX).unwrap();
+        let (new_root, prev_entry) = ht.delete_t(&mut cache, root, u64::MAX).unwrap();
 
         assert_eq!(prev_entry, None);
         assert_eq!(
@@ -964,9 +1101,9 @@ mod tests {
         };
         // Grow to depth=1: handle 0 fits in the initial leaf; the second
         // insert at ENTRIES_PER_LEAF forces `grow()`.
-        let root1 = ht.insert(&mut cache, root0, 0, &entry).unwrap();
+        let root1 = ht.insert_t(&mut cache, root0, 0, &entry).unwrap();
         let root2 = ht
-            .insert(&mut cache, root1, ENTRIES_PER_LEAF as u64, &entry)
+            .insert_t(&mut cache, root1, ENTRIES_PER_LEAF as u64, &entry)
             .unwrap();
         assert_eq!(ht.depth(), 1);
 
@@ -1029,7 +1166,7 @@ mod tests {
             tag: 0,
             client_byte: 0,
         };
-        let new_root = ht.insert(&mut cache, root, 0, &entry).unwrap();
+        let new_root = ht.insert_t(&mut cache, root, 0, &entry).unwrap();
         let found = ht.lookup(&mut cache, new_root, 0).unwrap().unwrap();
         assert_eq!(found.page_id, 10);
         assert_eq!(found.slot_index, 3);
@@ -1048,7 +1185,7 @@ mod tests {
                 tag: 0,
                 client_byte: 0,
             };
-            root = ht.insert(&mut cache, root, i, &entry).unwrap();
+            root = ht.insert_t(&mut cache, root, i, &entry).unwrap();
         }
         for i in 0..10u64 {
             let found = ht.lookup(&mut cache, root, i).unwrap().unwrap();
@@ -1069,7 +1206,7 @@ mod tests {
             tag: 0,
             client_byte: 0,
         };
-        let root2 = ht.insert(&mut cache, root1, 0, &entry).unwrap();
+        let root2 = ht.insert_t(&mut cache, root1, 0, &entry).unwrap();
         assert_ne!(root1, root2);
     }
 
@@ -1091,7 +1228,7 @@ mod tests {
                 tag: 0,
                 client_byte: 0,
             };
-            root = ht.insert(&mut cache, root, i, &entry).unwrap();
+            root = ht.insert_t(&mut cache, root, i, &entry).unwrap();
         }
         for i in 0..(ENTRIES_PER_LEAF as u64 + 10) {
             let found = ht.lookup(&mut cache, root, i).unwrap().unwrap();
@@ -1111,8 +1248,8 @@ mod tests {
             tag: 0,
             client_byte: 0,
         };
-        root = ht.insert(&mut cache, root, 0, &entry).unwrap();
-        let (new_root, prev) = ht.delete(&mut cache, root, 0).unwrap();
+        root = ht.insert_t(&mut cache, root, 0, &entry).unwrap();
+        let (new_root, prev) = ht.delete_t(&mut cache, root, 0).unwrap();
         root = new_root;
         assert!(prev.is_some(), "delete of a live entry must return Some");
         let found = ht.lookup(&mut cache, root, 0).unwrap();
@@ -1134,7 +1271,7 @@ mod tests {
             tag: 9,
             client_byte: 200,
         };
-        let root = ht.insert(&mut cache, root, 1, &e).unwrap();
+        let root = ht.insert_t(&mut cache, root, 1, &e).unwrap();
         let got = ht.lookup(&mut cache, root, 1).unwrap().unwrap();
         assert_eq!(got.client_byte, 200);
         assert_eq!(got.tag, 9, "tag neighbor must be undisturbed");
