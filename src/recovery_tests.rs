@@ -238,6 +238,108 @@ fn test_recovery_tagged_index_recovers_from_prior_superblock() {
 }
 
 #[test]
+fn test_recovery_crash_between_data_fsync_and_superblock_fsync() {
+    // commit_inner fsyncs ALL of a transaction's data pages (step 1) BEFORE it
+    // writes and fsyncs the new superblock (steps 3-4). A crash in that window
+    // leaves the new transaction's data pages fully durable on disk while the
+    // superblock still points at the PRIOR committed state. The shadow-paging
+    // contract: recovery returns cleanly to that prior state — the in-flight
+    // transaction is lost ATOMICALLY (never half-applied), and the
+    // written-but-unreferenced data pages are harmless orphans that the file's
+    // larger-than-total_pages length is explicitly designed to tolerate
+    // (open_existing rewinds next_page_id so they are overwritten, not leaked).
+    //
+    // We reproduce that exact on-disk state without a fault-injecting IO layer:
+    // snapshot the superblock region after committing state A, run commit B
+    // (which durably writes B's data pages AND advances the superblock to B),
+    // then roll the superblock region back to A's bytes — leaving B's data
+    // pages behind exactly as a crash before the superblock fsync would. This is
+    // the inverse of test_recovery_superblock_pointing_past_eof_is_rejected (a
+    // superblock ahead of the data is rejected; data ahead of the superblock
+    // recovers cleanly).
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+
+    let ha;
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        ha = db.allocate(b"state-A-value").unwrap();
+        db.commit().unwrap();
+    }
+
+    // Snapshot the superblock region (the first `superblock_count` pages — read
+    // the count from the winning slot rather than hardcoding the default).
+    let sb_pages = active_superblock(&path).superblock_count as usize;
+    let sb_region = {
+        let mut f = fs::File::open(&path).unwrap();
+        let mut buf = vec![0u8; sb_pages * PAGE_SIZE];
+        f.read_exact(&mut buf).unwrap();
+        buf
+    };
+
+    let hb;
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        hb = db.allocate(b"state-B-value-must-be-lost").unwrap();
+        db.commit().unwrap();
+    }
+    // Sanity: B genuinely extended the file past A's watermark (so the recovered
+    // open really does face a longer-than-total_pages file, the orphan case).
+    let len_after_b = fs::metadata(&path).unwrap().len();
+    assert!(
+        len_after_b > (sb_pages as u64 + 1) * PAGE_SIZE as u64,
+        "B should have written data pages past the superblock region"
+    );
+
+    // Roll the superblock region back to A, keeping B's data pages on disk —
+    // the precise state a crash between the data fsync and the superblock fsync
+    // leaves behind.
+    {
+        let mut f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&sb_region).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    // Recovery must land on state A: ha intact, B's transaction gone, and a
+    // single live handle (B's handle never entered the recovered table).
+    {
+        let db = Chisel::open(&path, Default::default()).unwrap();
+        assert_eq!(db.read(ha).unwrap(), b"state-A-value");
+        assert!(
+            db.read(hb).is_err(),
+            "state-B transaction must be lost atomically, not half-applied"
+        );
+        assert_eq!(
+            db.handles().unwrap().len(),
+            1,
+            "recovered table must hold only state A's handle"
+        );
+    }
+
+    // The database is fully usable after recovery — a fresh commit succeeds and
+    // survives a reopen, proving B's orphaned pages did not corrupt the freemap
+    // or the allocator. next_handle rewound to A, so the new handle reuses B's
+    // id (and overwrites B's now-orphaned data page).
+    let hc;
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        hc = db.allocate(b"state-C-after-recovery").unwrap();
+        db.commit().unwrap();
+        assert_eq!(
+            hc, hb,
+            "next_handle must have rewound to state A on recovery"
+        );
+    }
+    let db = Chisel::open(&path, Default::default()).unwrap();
+    assert_eq!(db.read(ha).unwrap(), b"state-A-value");
+    assert_eq!(db.read(hc).unwrap(), b"state-C-after-recovery");
+}
+
+#[test]
 fn test_recovery_torn_first_commit() {
     // Regression test for ISSUES.md I2: historically `create_new` left
     // superblock slot 1 as an all-zero buffer. The very first user commit
