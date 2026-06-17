@@ -356,7 +356,7 @@ Drop the handle and reopen.
 
 | Class | When it fires |
 |---|---|
-| `IoError` | Underlying filesystem I/O error. Carries `.errno` (the raw OS error code, or `None` if unavailable) and `.kind` (the Rust `io::ErrorKind` name, e.g. `"PermissionDenied"`), so callers can branch on the cause without parsing the message. |
+| `IoError` | Underlying filesystem I/O error. Also subclasses the builtin `OSError`, so it is catchable as `except OSError` and `.errno` is `OSError`'s native attribute (with `.strerror` set when an errno exists). Carries `.errno` (the raw OS error code, or `None` if unavailable) and `.kind` (the Rust `io::ErrorKind` name, e.g. `"PermissionDenied"`), so callers can branch on the cause without parsing the message. |
 | `ChecksumMismatchError` | A page's XXH3 checksum did not validate on load |
 | `CorruptSuperblockError` | No readable superblock slot found |
 | `FileSizeMismatchError` | File size inconsistent with the superblock's claim |

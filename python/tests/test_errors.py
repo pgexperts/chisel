@@ -135,6 +135,26 @@ def test_io_error_carries_kind_attribute(tmp_path):
     assert e.kind != "", "kind should not be empty"
 
 
+def test_io_error_is_oserror_subclass():
+    # Idiomatic Python expects disk-level failures to be catchable as OSError
+    # and to expose .errno through OSError's native slot. IoError must subclass
+    # BOTH chisel.FatalError (the two-tier poison contract — see
+    # test_fatal_hierarchy) AND the builtin OSError.
+    assert issubclass(chisel.IoError, OSError)
+    assert issubclass(chisel.IoError, chisel.FatalError)
+
+
+def test_io_error_catchable_as_oserror(tmp_path):
+    # The whole point of the OSError base: `except OSError as e: if e.errno ==
+    # errno.ENOSPC` catches a Chisel disk-level error and reads errno natively.
+    with pytest.raises(OSError) as exc_info:
+        chisel.open(str(tmp_path))  # opening a directory triggers EISDIR
+    e = exc_info.value
+    assert isinstance(e, chisel.IoError)
+    assert isinstance(e, chisel.FatalError)
+    assert isinstance(e.errno, int) and e.errno > 0
+
+
 def test_non_io_error_does_not_carry_errno(tmp_db):
     # Sanity: errno/kind are IoError-specific. Other ChiselError
     # subclasses do NOT get them attached — to_py_err's match is

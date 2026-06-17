@@ -33,7 +33,7 @@
 //         ClosedError              (I25: db.close() raced a live txn/sp)
 //         AlreadyFinishedError     (I22/I24: double-drive a finished txn/sp)
 //       FatalError                       (drop-and-reopen recovery only)
-//         IoError
+//         IoError                  (ALSO subclasses builtin OSError — see register)
 //         ChecksumMismatchError
 //         CorruptSuperblockError
 //         FileSizeMismatchError
@@ -46,8 +46,39 @@
 
 use chisel::ChiselError as RustChiselError;
 use pyo3::create_exception;
-use pyo3::exceptions::PyException;
+use pyo3::exceptions::{PyException, PyOSError};
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyType};
+use std::sync::OnceLock;
+
+// IoError is the one exception that needs TWO bases — chisel.FatalError (the
+// two-tier poison contract) AND the builtin OSError (idiomatic disk-error
+// handling, native `.errno`) — which `create_exception!` (single base) cannot
+// express. We build it at module init via Python's 3-arg `type()` and cache the
+// class here so `to_py_err` raises instances of THAT multiply-inherited class
+// rather than a single-base macro type. `Py<PyType>` is Send+Sync, so a plain
+// std OnceLock suffices (no GIL token needed to read it back).
+static IO_ERROR_CLASS: OnceLock<Py<PyType>> = OnceLock::new();
+
+/// Build the `IoError` class with bases `(FatalError, OSError)`. The MRO is
+/// consistent (C3 succeeds): FatalError's chain (ChiselError -> Exception) and
+/// OSError's chain (Exception) share only Exception/BaseException as a tail.
+fn build_io_error_class<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyType>> {
+    let bases = (py.get_type::<FatalError>(), py.get_type::<PyOSError>());
+    let namespace = PyDict::new(py);
+    namespace.set_item("__module__", "_chisel")?;
+    namespace.set_item(
+        "__doc__",
+        "Fatal I/O error. Subclasses both chisel.FatalError and the builtin \
+         OSError, so it is catchable as either; `.errno` is OSError's native \
+         attribute and `.kind` is the std::io::ErrorKind debug string.",
+    )?;
+    let type_ctor = py.import("builtins")?.getattr("type")?;
+    type_ctor
+        .call1(("IoError", bases, namespace))?
+        .cast_into::<PyType>()
+        .map_err(PyErr::from)
+}
 
 create_exception!(_chisel, ChiselError, PyException);
 create_exception!(_chisel, OperationalError, ChiselError);
@@ -95,7 +126,8 @@ create_exception!(_chisel, ClosedError, OperationalError);
 create_exception!(_chisel, AlreadyFinishedError, OperationalError);
 
 // Fatal — matches ChiselError::is_fatal() in src/error.rs exactly.
-create_exception!(_chisel, IoError, FatalError);
+// IoError is NOT declared here: it needs two bases (FatalError + OSError) and is
+// built in `register` via `build_io_error_class` / cached in `IO_ERROR_CLASS`.
 create_exception!(_chisel, ChecksumMismatchError, FatalError);
 create_exception!(_chisel, CorruptSuperblockError, FatalError);
 create_exception!(_chisel, FileSizeMismatchError, FatalError);
@@ -163,7 +195,12 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("TagMismatchError", py.get_type::<TagMismatchError>())?;
 
-    m.add("IoError", py.get_type::<IoError>())?;
+    // IoError multiply-inherits (FatalError, OSError); register that class and
+    // cache it so `to_py_err` constructs instances of it (not a single-base
+    // type). `set` is a no-op if a prior init already cached it.
+    let io_error = build_io_error_class(py)?;
+    m.add("IoError", &io_error)?;
+    let _ = IO_ERROR_CLASS.set(io_error.unbind());
     m.add(
         "ChecksumMismatchError",
         py.get_type::<ChecksumMismatchError>(),
@@ -241,13 +278,29 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
         RustChiselError::IoError(io_err) => {
             let errno = io_err.raw_os_error();
             let kind = format!("{:?}", io_err.kind());
-            let py_err = IoError::new_err(msg);
             Python::attach(|py| {
-                let val = py_err.value(py);
-                let _ = val.setattr("errno", errno);
-                let _ = val.setattr("kind", kind);
-            });
-            py_err
+                let cls = IO_ERROR_CLASS
+                    .get()
+                    .expect("IoError class is cached during module init")
+                    .bind(py);
+                // Construct via OSError's 2-arg (errno, strerror) form when we
+                // have an errno so CPython populates `.errno`/`.strerror`
+                // natively; otherwise the message-only form (.errno -> None).
+                let instance = match errno {
+                    Some(n) => cls.call1((n, &msg)),
+                    None => cls.call1((&msg,)),
+                };
+                match instance {
+                    Ok(value) => {
+                        // `.kind` is Chisel-specific — no OSError native slot.
+                        let _ = value.setattr("kind", &kind);
+                        PyErr::from_value(value)
+                    }
+                    // Constructing the exception itself failed (should not
+                    // happen): surface that error rather than masking it.
+                    Err(e) => e,
+                }
+            })
         }
         RustChiselError::ChecksumMismatch { .. } => ChecksumMismatchError::new_err(msg),
         RustChiselError::CorruptSuperblock => CorruptSuperblockError::new_err(msg),
