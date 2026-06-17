@@ -29,7 +29,8 @@ pub struct Stats {
     /// that could cause a transient divergence.
     pub file_size_bytes: u64,
     /// I74 (ISSUES.md, 2026-05-22): current spillway logical-bytes in
-    /// flight (sum of `PAGE_SIZE` × resident spilled pages). `None`
+    /// flight (`PAGE_SIZE` × LIVE resident spilled pages — a page read back
+    /// and respilled within a transaction is not double-counted). `None`
     /// when the spillway has never been opened — it is lazily
     /// constructed on the first overflow spill, so `None` means "no
     /// overflow has happened yet on this handle." `Some(0)` means

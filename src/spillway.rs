@@ -54,13 +54,19 @@ pub struct Spillway {
     /// page_id -> slot index. Built up by `spill`; consulted by
     /// `is_resident` and `rehydrate`; cleared by `truncate`.
     slots: HashMap<u64, u64>,
-    /// High-water mark for slot allocation. Bumped by every new spill;
-    /// reused on re-spill of an already-resident page id (no bump).
-    /// Reset to 0 on truncate.
+    /// Monotonic on-disk WRITE CURSOR — the next free slot offset. Bumped by
+    /// every new spill; reused on re-spill of an already-resident page id (no
+    /// bump); reset to 0 on truncate. NOT the capacity accounting basis: it
+    /// never decrements on `forget`, so a forget/respill cycle climbs it past
+    /// the live set. Capacity (`logical_bytes` / `SpillwayFull`) is charged
+    /// against `slots.len()` instead; the cursor's tail garbage past the live
+    /// set is reclaimed by `truncate`.
     next_slot_index: u64,
-    /// Strict upper bound on the spillway file's logical size in bytes,
-    /// excluding per-slot headers. Captured at construction; runtime-
-    /// mutable via PageCache::set_spillway_max_bytes.
+    /// Strict upper bound on the LIVE resident set's logical size in bytes,
+    /// excluding per-slot headers (`slots.len() * PAGE_SIZE`). Captured at
+    /// construction; runtime-mutable via PageCache::set_spillway_max_bytes. The
+    /// physical backing file may transiently exceed this by the unforgotten
+    /// write-cursor tail, which `truncate` reclaims at commit/rollback.
     max_bytes: u64,
 }
 
@@ -118,15 +124,19 @@ impl Spillway {
         self.slots.len() as u64
     }
 
-    /// Logical size in bytes (excludes per-slot headers).
+    /// Logical size of the LIVE resident set in bytes (excludes per-slot
+    /// headers). Charged against `slots.len()`, not the monotonic write cursor
+    /// `next_slot_index`: a spill-then-`forget`-then-respill cycle advances the
+    /// cursor every time but the live set may stay small, so the cursor would
+    /// over-report. This is the figure `SpillwayFull` is judged against, so the
+    /// two must agree (see `spill`). The physical backing file can be larger
+    /// than this — the unforgotten tail is garbage reclaimed by `truncate`.
     ///
-    /// I74 (ISSUES.md, 2026-05-22): `#[cfg(test)]` because there is no
-    /// production caller today. Worth exposing via `Chisel::stats` /
-    /// `ChiselCounters` so operators can monitor spillway capacity
-    /// use — wired to `Chisel::stats` via I74. The exposure point
-    /// is the new `spillway_logical_bytes` field on `Stats`.
+    /// I74 (ISSUES.md, 2026-05-22): exposed via `Chisel::stats` /
+    /// `Stats::spillway_logical_bytes` so operators can monitor spillway
+    /// capacity use and predict `SpillwayFull` before it fires.
     pub fn logical_bytes(&self) -> u64 {
-        self.next_slot_index * PAGE_SIZE as u64
+        self.slots.len() as u64 * PAGE_SIZE as u64
     }
 
     /// Strict upper bound on logical size, settable at construction or
@@ -150,13 +160,18 @@ impl Spillway {
     /// page is already resident, overwrites its existing slot in place
     /// (no slot-count growth, no max_bytes check). Otherwise allocates
     /// a new slot at `next_slot_index` — but first checks that the
-    /// post-write logical size stays within `max_bytes`.
+    /// post-write LIVE size stays within `max_bytes`.
     pub fn spill(&mut self, page_id: u64, page_bytes: &[u8; PAGE_SIZE]) -> Result<()> {
         let slot_index = if let Some(&existing) = self.slots.get(&page_id) {
             existing
         } else {
-            // New slot would push logical size past the cap?
-            let post_write_bytes = (self.next_slot_index + 1) * PAGE_SIZE as u64;
+            // Adding a new live page push the LIVE resident set past the cap?
+            // Charge the cap against `slots.len()` (live residency), not the
+            // monotonic write cursor: a forget/respill cycle climbs the cursor
+            // without growing the live set, so a cursor-based cap would trip
+            // spuriously. `next_slot_index` still advances (no slot reuse
+            // mid-transaction); its tail garbage is reclaimed by `truncate`.
+            let post_write_bytes = (self.slots.len() as u64 + 1) * PAGE_SIZE as u64;
             if post_write_bytes > self.max_bytes {
                 return Err(ChiselError::SpillwayFull {
                     limit_bytes: self.max_bytes,
@@ -410,6 +425,38 @@ mod tests {
                 assert_eq!(limit_bytes, max_bytes);
             }
             other => panic!("expected SpillwayFull, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spill_cap_and_logical_bytes_track_live_residency_not_cumulative_volume() {
+        // A long transaction that reads a spilled page back (`forget`) and
+        // respills a different page under pressure consumes a fresh on-disk
+        // slot each cycle. The `SpillwayFull` admission test and
+        // `logical_bytes()` must be charged against the LIVE resident set
+        // (`slots.len()`), not the monotonic write cursor (`next_slot_index`):
+        // otherwise the cap trips while live occupancy is far below max_bytes,
+        // and the reported logical size over-counts. `next_slot_index` stays
+        // monotonic (the file tail is reclaimed at `truncate`), so this is an
+        // accounting fix only — no slot reuse, no double-free.
+        let max_bytes = (PAGE_SIZE * 2) as u64; // room for 2 LIVE pages
+        let mut spw = Spillway::open_memory(max_bytes);
+        // Spill-then-forget far more than 2 distinct pages: live residency
+        // never exceeds 1, so the 2-page cap is never reached.
+        for id in 0..100u64 {
+            spw.spill(id, &page(id as u8))
+                .expect("a single live page is far below the cap; must not trip SpillwayFull");
+            assert_eq!(
+                spw.logical_bytes(),
+                PAGE_SIZE as u64,
+                "one live page must report exactly one page of logical bytes"
+            );
+            spw.forget(id);
+            assert_eq!(
+                spw.logical_bytes(),
+                0,
+                "forgetting the only live page must drop logical bytes to zero"
+            );
         }
     }
 
