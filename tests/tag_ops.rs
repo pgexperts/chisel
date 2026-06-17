@@ -155,6 +155,30 @@ fn dropping_a_relation_removes_all_handles_no_orphans() {
     assert_eq!(db.tag(keep).unwrap(), 2);
     assert_eq!(db.handles_with_tag(2).unwrap(), vec![keep]);
     db.close().unwrap();
+
+    // Durability: the drop mutated the membership-index root via COW. Reopen
+    // from the persisted superblock and re-assert — a drop that updated the
+    // in-memory root but mis-persisted the COW'd index pages would resurrect the
+    // dropped handles here, which the in-session checks above cannot catch (the
+    // additive path is covered by tag_and_index_survive_reopen; this is the
+    // drop path).
+    let db = Chisel::open(&path, Default::default()).unwrap();
+    assert_eq!(
+        db.handles_with_tag(1).unwrap(),
+        Vec::<u64>::new(),
+        "dropped tag-1 relation must stay empty across reopen (no resurrection)"
+    );
+    for h in &hs {
+        assert!(
+            db.read(*h).is_err(),
+            "dropped chunk {h} must be unreadable after reopen"
+        );
+    }
+    // The other relation survives the reopen with its value intact.
+    assert_eq!(db.tag(keep).unwrap(), 2);
+    assert_eq!(db.handles_with_tag(2).unwrap(), vec![keep]);
+    assert_eq!(db.read(keep).unwrap(), b"other relation");
+    db.close().unwrap();
 }
 
 #[test]

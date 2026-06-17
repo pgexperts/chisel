@@ -526,9 +526,21 @@ impl Chisel {
     /// this pass and whether the tag is now fully drained (`complete`). Loop
     /// `begin -> delete_with_tag -> commit` until `complete` for an incremental,
     /// bounded-time relation drop. `max == 0` is a no-op (`complete == false`).
-    /// On an error mid-pass the handles already deleted remain tombstoned in the
-    /// current transaction (same posture as `delete_many`) — roll back or commit;
-    /// a fatal error additionally poisons the manager.
+    ///
+    /// Error semantics: a mid-pass error returns only `Err` — the
+    /// [`TagDropProgress`] is NOT produced, so the set of handles already
+    /// dropped this pass is not reported and is unrecoverable from the return
+    /// value. Each individual delete is atomic (a non-fatal `CacheFull`/
+    /// `SpillwayFull` leaves that one chunk untouched in both the handle table
+    /// and the membership index — see the I-series / shadow-paging invariants),
+    /// so the in-transaction state after the error is always consistent: every
+    /// chunk dropped before the failure is fully tombstoned, the failed one is
+    /// untouched. The caller therefore has two safe recoveries — `rollback()`
+    /// (discard the whole pass) or `commit()` (keep the consistent partial
+    /// drop) — and can simply re-enumerate via `handles_with_tag`/re-run the
+    /// bounded loop to finish. A fatal error additionally poisons the manager
+    /// (drop and reopen). To learn exactly which handles were dropped, commit
+    /// in single-element passes (`max == 1`) and read each success's progress.
     pub fn delete_with_tag(&mut self, tag: u32, max: usize) -> Result<TagDropProgress> {
         self.txm.delete_with_tag(tag, max)
     }

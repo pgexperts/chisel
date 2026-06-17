@@ -51,16 +51,36 @@ fn large_transaction_with_spill_produces_identical_state() {
         db_b.commit().unwrap();
     }
 
-    // Both runs should produce identical handle→payload mappings.
-    // The central spec claim: spillway lets a transaction touch a working
-    // set larger than the cache without semantic difference.
-    for (h, expected) in &handles_a {
-        let bytes = db_a.read(*h).unwrap();
-        assert_eq!(bytes, *expected, "handle {h} content corrupt after spill");
-    }
-    for (h, expected) in &handles_b {
-        let bytes = db_b.read(*h).unwrap();
-        assert_eq!(bytes, *expected, "control run handle {h} content corrupt");
+    // Both runs must produce IDENTICAL handle→payload mappings — the central
+    // spec claim that the spillway lets a transaction touch a working set larger
+    // than the cache with no semantic difference. Handle ids are deterministic
+    // (monotonic next_handle, same untagged insertion order), so the spill run
+    // and the control run allocate the same ids in the same order; we
+    // cross-compare pairwise rather than only checking each run against its own
+    // inputs (which would pass even if the spill path produced a different-but-
+    // internally-consistent mapping).
+    assert_eq!(
+        handles_a.len(),
+        handles_b.len(),
+        "both runs must allocate the same number of chunks"
+    );
+    assert_eq!(handles_a.len(), 200, "sanity: the full workload ran");
+    for (i, (h_a, expected)) in handles_a.iter().enumerate() {
+        let (h_b, _) = handles_b[i];
+        // Same id in both runs: spilling must not perturb allocation.
+        assert_eq!(
+            *h_a, h_b,
+            "handle id diverged between the spill run and the control run at index {i}"
+        );
+        let a = db_a.read(*h_a).unwrap();
+        let b = db_b.read(h_b).unwrap();
+        // Per-run correctness AND the load-bearing cross-run equivalence.
+        assert_eq!(a, *expected, "spill-run handle {h_a} content corrupt");
+        assert_eq!(
+            a, b,
+            "spill run and control run disagree on handle {h_a} — \
+             the spill path produced a different mapping"
+        );
     }
 }
 

@@ -530,7 +530,11 @@ fn unpack_inner(packed: u64) -> (u64, u32) {
     (packed & INNER_ROOT_MASK, (packed >> INNER_ROOT_BITS) as u32)
 }
 
-/// Progress report from a bounded `delete_with_tag` pass.
+/// Progress report from a bounded `delete_with_tag` pass. Produced ONLY on the
+/// success path: a mid-pass error returns `Err` and no `TagDropProgress`, so
+/// the handles dropped before the failure are not reported (the per-delete
+/// state stays consistent — see `Chisel::delete_with_tag` — only the reporting
+/// is lost).
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct TagDropProgress {
