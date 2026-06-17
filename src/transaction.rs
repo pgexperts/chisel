@@ -270,6 +270,14 @@ pub struct TransactionManager {
     // prematurely freed before the new entry installs. `#[cfg(test)]`.
     #[cfg(test)]
     fail_next_update_value_write: Cell<bool>,
+
+    // Countdown variant of `fail_next_membership_op` for multi-delete passes
+    // (e.g. delete_with_tag): when set to K, the Kth subsequent membership-index
+    // op fails with a non-fatal CacheFull (the first K-1 succeed). Lets a test
+    // fail a LATER delete in a loop so earlier deletes commit first. 0 disables.
+    // `#[cfg(test)]`.
+    #[cfg(test)]
+    fail_membership_op_after: Cell<u32>,
 }
 
 impl TransactionManager {
@@ -373,6 +381,8 @@ impl TransactionManager {
             fail_next_handle_table_op: Cell::new(false),
             #[cfg(test)]
             fail_next_update_value_write: Cell::new(false),
+            #[cfg(test)]
+            fail_membership_op_after: Cell::new(0),
         })
     }
 
@@ -566,6 +576,8 @@ impl TransactionManager {
             fail_next_handle_table_op: Cell::new(false),
             #[cfg(test)]
             fail_next_update_value_write: Cell::new(false),
+            #[cfg(test)]
+            fail_membership_op_after: Cell::new(0),
         })
     }
 
@@ -1387,6 +1399,24 @@ impl TransactionManager {
         )
     }
 
+    /// Test-only fault decision for the reverse-map (membership-index) step,
+    /// shared by `allocate_inner` and `delete_inner`. Returns true (inject a
+    /// non-fatal CacheFull) if the one-shot `fail_next_membership_op` is armed,
+    /// or if the `fail_membership_op_after` countdown reaches this op. Consuming
+    /// here keeps the injection logic in one place.
+    #[cfg(test)]
+    fn inject_membership_failure(&self) -> bool {
+        if self.fail_next_membership_op.replace(false) {
+            return true;
+        }
+        let remaining = self.fail_membership_op_after.get();
+        if remaining == 0 {
+            return false;
+        }
+        self.fail_membership_op_after.set(remaining - 1);
+        remaining == 1
+    }
+
     fn allocate_inner(&mut self, value: &[u8], tag: u32) -> Result<u64> {
         if !self.active_txn {
             return Err(ChiselError::NoActiveTransaction);
@@ -1473,7 +1503,7 @@ impl TransactionManager {
             // exercises the REAL failure handling below. No production artifact:
             // the non-test `let res` is the only one compiled outside tests.
             #[cfg(test)]
-            let res: Result<u64> = if self.fail_next_membership_op.replace(false) {
+            let res: Result<u64> = if self.inject_membership_failure() {
                 Err(ChiselError::CacheFull { limit: 0 })
             } else {
                 self.membership_insert_candidate(tag, handle, &mut mi_freed)
@@ -1915,12 +1945,12 @@ impl TransactionManager {
         let mut mi_new_root: Option<u64> = None;
         let mut idx_freed: Vec<u64> = Vec::new();
         if entry.tag != 0 {
-            // Test-only injection (see `fail_next_membership_op`): simulate a
-            // non-fatal CacheFull at the reverse-map step so the regression test
-            // exercises the REAL failure handling below. No production artifact:
+            // Test-only injection (see `inject_membership_failure`): simulate a
+            // non-fatal CacheFull at the reverse-map step so regression tests
+            // exercise the REAL failure handling below. No production artifact:
             // the non-test `let res` is the only one compiled outside tests.
             #[cfg(test)]
-            let res: Result<(u64, bool)> = if self.fail_next_membership_op.replace(false) {
+            let res: Result<(u64, bool)> = if self.inject_membership_failure() {
                 Err(ChiselError::CacheFull { limit: 0 })
             } else {
                 self.membership_remove_candidate(entry.tag, handle, &mut idx_freed)
@@ -1929,7 +1959,21 @@ impl TransactionManager {
             let res: Result<(u64, bool)> =
                 self.membership_remove_candidate(entry.tag, handle, &mut idx_freed);
 
-            let (new_index_root, _removed) = res?;
+            let (new_index_root, removed) = res?;
+            // A tagged live handle always carries a reverse-index entry:
+            // allocate_tagged installs it atomically (BUG#2 / PR #40) and tags
+            // are immutable. So its removal must report present; a false here
+            // means the forward and reverse maps diverged from some OTHER
+            // source. Debug-only on purpose: a file committed while BUG#2 was
+            // still live (pre-#40) could carry a real on-disk divergence, and
+            // the open path gates MAJOR version only — such a legacy file must
+            // stay openable and a delete of its diverged handle must remain
+            // recoverable, so this never gates release builds.
+            debug_assert!(
+                removed,
+                "membership index diverged: tagged handle {handle} (tag {}) had no reverse entry",
+                entry.tag
+            );
             mi_new_root = Some(new_index_root);
         }
 
@@ -1985,6 +2029,12 @@ impl TransactionManager {
         self.delete_inner(handle)
     }
 
+    /// Bounded relation drop. See `Chisel::delete_with_tag` for the full
+    /// contract. Error semantics: a mid-pass `delete_inner` failure propagates
+    /// `Err` and the partial `TagDropProgress` is dropped — the deleted-this-
+    /// pass set is not reported. Each `delete_inner` is atomic (BUG#2 staging),
+    /// so the surviving in-transaction state is consistent (rollback or commit
+    /// are both safe); only the progress *reporting* is lost on error.
     pub fn delete_with_tag(&mut self, tag: u32, max: usize) -> Result<TagDropProgress> {
         self.check_alive()?;
         let result = self.delete_with_tag_inner(tag, max);
@@ -3388,6 +3438,72 @@ mod tests {
             "a failed tagged delete must commit nothing: h should survive in both maps \
              (read ok = {still_live}, in reverse index = {in_reverse})"
         );
+    }
+
+    // Pins the documented `delete_with_tag` error contract: a mid-pass failure
+    // returns Err (NO TagDropProgress — the dropped-this-pass set is not
+    // reported), is non-fatal/recoverable, and leaves a CONSISTENT partial
+    // state because each delete_inner is atomic (BUG#2 staging) — so exactly the
+    // members processed before the failure are gone from BOTH maps, and the
+    // partial drop is committable and resumable.
+    #[test]
+    fn delete_with_tag_mid_pass_failure_is_consistent_and_drops_progress() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let members = [
+            tm.allocate_tagged(b"m0", 5).unwrap(),
+            tm.allocate_tagged(b"m1", 5).unwrap(),
+            tm.allocate_tagged(b"m2", 5).unwrap(),
+        ];
+        tm.commit().unwrap();
+
+        tm.begin().unwrap();
+        // Let the 1st delete in the pass commit, fail the 2nd's membership op.
+        tm.fail_membership_op_after.set(2);
+        let err = tm.delete_with_tag(5, 3).unwrap_err();
+        assert!(
+            matches!(err, ChiselError::CacheFull { .. }),
+            "expected the injected CacheFull, got {err:?}"
+        );
+        assert!(
+            !tm.is_poisoned(),
+            "a non-fatal mid-pass error must not poison"
+        );
+
+        // Exactly one member dropped before the failure (delete_inner is atomic,
+        // so the failed 2nd delete is a no-op). Don't assume index iteration
+        // order — count instead.
+        let live: Vec<u64> = members
+            .into_iter()
+            .filter(|&h| tm.read(h).is_ok())
+            .collect();
+        assert_eq!(
+            live.len(),
+            2,
+            "exactly one member dropped before the failure"
+        );
+        // Forward (read-ok set) and reverse (membership index) agree exactly.
+        let mut idx = tm.handles_with_tag(5).unwrap();
+        let mut live_sorted = live.clone();
+        idx.sort_unstable();
+        live_sorted.sort_unstable();
+        assert_eq!(
+            live_sorted, idx,
+            "forward/reverse maps consistent after a failed delete_with_tag pass"
+        );
+
+        // The consistent partial drop is committable...
+        tm.commit().unwrap();
+        assert_eq!(tm.handles_with_tag(5).unwrap().len(), 2);
+        assert_no_reachable_page_is_free(&tm);
+
+        // ...and the bounded loop finishes cleanly on a disarmed retry.
+        tm.begin().unwrap();
+        let progress = tm.delete_with_tag(5, 3).unwrap();
+        assert!(progress.complete, "retry must drain the tag");
+        tm.commit().unwrap();
+        assert!(tm.handles_with_tag(5).unwrap().is_empty());
+        assert_no_reachable_page_is_free(&tm);
     }
 
     // CRITICAL durable-corruption regression (surfaced by the BUG#2 adversarial
