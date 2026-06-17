@@ -84,15 +84,20 @@ use transaction::TransactionManager;
 /// callers think in MB/GB, not 8KB units. Default 8 MiB = 1024 pages
 /// (matches the previous default).
 ///
-/// `spillway_max_bytes` is a strict upper bound on the spillway sidecar
-/// file, in bytes (excluding per-slot 16-byte headers). When the cache
+/// `spillway_max_bytes` is a strict upper bound on the spillway's LIVE
+/// resident set, in bytes (excluding per-slot 16-byte headers). When the cache
 /// is full and dirty, overflow dirty pages are written to the spillway
-/// rather than aborting; exceeding this limit trips
-/// `ChiselError::SpillwayFull`. Default `1024 * cache_max_bytes` (8 GiB
-/// at the default cache size). Setting to 0 disables the spillway
-/// entirely — overflow then trips `ChiselError::CacheFull` at the
-/// strict cache cap, with no 8× elasticity (the previous
-/// `HARD_CEILING_MULTIPLIER` is removed).
+/// rather than aborting; exceeding this limit (live spilled pages ×
+/// `PAGE_SIZE`) trips `ChiselError::SpillwayFull`. The cap is charged against
+/// LIVE residency, not cumulative spill volume: a page read back and respilled
+/// within a transaction does not count twice, so the limit is predictable for
+/// long transactions. The physical sidecar FILE may transiently grow past this
+/// cap (the write cursor is monotonic within a transaction); that tail is
+/// reclaimed when the spillway is truncated at commit/rollback. Default
+/// `1024 * cache_max_bytes` (8 GiB at the default cache size). Setting to 0
+/// disables the spillway entirely — overflow then trips
+/// `ChiselError::CacheFull` at the strict cache cap, with no 8× elasticity (the
+/// previous `HARD_CEILING_MULTIPLIER` is removed).
 ///
 /// `drain_insertion` controls where commit-drain rehydrated pages land
 /// in the LRU. `LruTail` (default) makes them first eviction candidates
