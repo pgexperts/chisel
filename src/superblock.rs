@@ -105,27 +105,6 @@ impl NamedRoot {
     pub fn is_empty(&self) -> bool {
         self.name[0] == 0
     }
-
-    /// Returns the slot's name as a str, trimming trailing NULs. Returns
-    /// None if the stored bytes are not valid UTF-8 (should never happen
-    /// for names written through the public API, since set_root_name
-    /// rejects non-UTF-8 input).
-    ///
-    /// `#[allow(dead_code)]`: the production read path
-    /// (`get_root_name_inner`) compares the requested name byte-for-byte
-    /// against the stored padded form without ever decoding it as a
-    /// str. `name_str` is the convenience for forensic / debug-print
-    /// callers — kept so any future "list all named roots" tool has the
-    /// canonical decode in one spot.
-    #[allow(dead_code)]
-    pub fn name_str(&self) -> Option<&str> {
-        let end = self
-            .name
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(self.name.len());
-        std::str::from_utf8(&self.name[..end]).ok()
-    }
 }
 
 /// In-memory superblock. The on-disk encoding is a fixed little-endian layout:

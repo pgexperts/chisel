@@ -17,7 +17,7 @@ use chisel_bench::runner::{
     CACHE_SIZE_PAGES,
 };
 use chisel_bench::workload::{
-    gen_allocate, gen_delete_many, gen_delete_random, gen_read_random, gen_update_random, Workload,
+    gen_allocate, gen_delete_random, gen_read_random, gen_update_random, Workload,
 };
 use chisel_bench::Engine;
 use criterion::{
@@ -66,13 +66,12 @@ fn seed_for(row_name: &str) -> u64 {
         "update-1000pertx" => 0x4006,
         "delete-1pertx" => 0x4007,
         "delete-1000pertx" => 0x4008,
-        "delete_many" => 0x4009,
         _ => panic!("unknown row name: {row_name}"),
     }
 }
 
-/// Snapshot-restore cell-runner — used by 8 of 9 rows (allocate, cold-read,
-/// update, delete, delete_many). Each iteration copies the pre-built
+/// Snapshot-restore cell-runner — used by every row except warm-read
+/// (allocate, cold-read, update, delete). Each iteration copies the pre-built
 /// snapshot, opens a fresh engine, runs the workload's ops grouped into
 /// transactions of `ops_per_tx`, then drops engine + tempfile.
 fn run_snapshot_restore_cell(
@@ -383,60 +382,6 @@ fn bench_row_delete_n_per_tx(
     group.finish();
 }
 
-/// Row 9: delete_many bulk. One DeleteMany op per iteration carrying
-/// 1000 distinct ids. Throughput::Elements(1000) since one bulk call
-/// deletes 1000 records.
-///
-/// Currently unused: 1000-id bulk deletes pin ~1000 dirty data pages
-/// against the 2048-page cache ceiling, exceeding it once handle-table
-/// COW pages are added in. Kept around so the row can be re-enabled
-/// once the harness gains a configurable larger cache.
-#[allow(dead_code)]
-fn bench_row_delete_many(c: &mut Criterion, aux: &mut AuxMetricsWriter) {
-    let mut group = c.benchmark_group("delete_many");
-    group.throughput(Throughput::Elements(1000));
-
-    for (size_bytes, size_label, prepop_count) in SIZES {
-        let batch_size = 1000.min(prepop_count);
-        if batch_size == 0 {
-            continue;
-        }
-        let workload = gen_delete_many(
-            seed_for("delete_many"),
-            prepop_count,
-            /*batches*/ 1,
-            batch_size,
-        );
-        for mode in EngineMode::ALL {
-            let snap = populate_snapshot(mode, size_bytes, prepop_count).unwrap();
-            run_snapshot_restore_cell(
-                &mut group,
-                mode,
-                size_label,
-                snap.path(),
-                snap.ids(),
-                &workload,
-                /*ops_per_tx*/ 1,
-            );
-            aux.append(&capture_aux_metrics_snapshot_restore(
-                CellId {
-                    row: "delete_many",
-                    mode: mode.label(),
-                    size: size_label,
-                },
-                mode,
-                snap.path(),
-                snap.ids(),
-                &workload,
-                1,
-            ))
-            .unwrap();
-        }
-    }
-
-    group.finish();
-}
-
 /// `CellId.row` is `&'static str`. The two allocate rows have group names
 /// passed in dynamically as a parameter — we leak them to satisfy the
 /// `'static` requirement. There are exactly 2 such leaks per process
@@ -457,11 +402,11 @@ fn micro_grid(c: &mut Criterion) {
     bench_row_read_warm(c, &mut aux);
     bench_row_read_cold(c, &mut aux);
     bench_row_update_n_per_tx(c, &mut aux, "update-1pertx", 1);
-    // update-1000pertx, delete-1000pertx, and delete_many all skipped:
-    // 1000 random updates/deletes (or one bulk delete of 1000 ids) pin
-    // ~1000 distinct dirty data pages, exceeding Chisel's 2048-page cache
-    // ceiling. The cells are not measurable under default cache settings;
-    // revisit with a larger CACHE_SIZE_PAGES in a future PR.
+    // update-1000pertx and delete-1000pertx skipped: 1000 random
+    // updates/deletes pin ~1000 distinct dirty data pages, exceeding
+    // Chisel's 2048-page cache ceiling. The cells are not measurable
+    // under default cache settings; revisit with a larger
+    // CACHE_SIZE_PAGES in a future PR.
     bench_row_delete_n_per_tx(c, &mut aux, "delete-1pertx", 1);
 }
 

@@ -54,20 +54,18 @@ const BITMAP_OFFSET: usize = DATA_PAGE_HEADER_SIZE;
 
 pub struct FreeMap;
 
-// I35 reshape note: capacity, is_free, mark_used, and allocate_near are
-// reached only from src-tests today (capacity from src/freemap.rs's own
-// tests; is_free from src/transaction.rs's I27/I28 regression tests; the
-// other two from the same migrated freemap suite). The production
-// allocator path uses `allocate_first` + `mark_free`. Keeping the rest
-// behind `#[allow(dead_code)]` rather than deleting them: locality-aware
-// allocation (`allocate_near`) and the symmetric mark_used are useful
-// for any future freemap-aware placement strategy, and is_free is the
-// natural predicate any future health-check tool would call.
+// I35 reshape note: capacity and is_free are reached only from src-tests
+// today (capacity from src/freemap.rs's own tests; is_free from
+// src/transaction.rs's I27/I28 regression tests). The production allocator
+// path uses `allocate_first` + `mark_free`. They stay behind
+// `#[allow(dead_code)]` rather than being deleted: is_free is the natural
+// predicate any future health-check tool would call, and capacity is its
+// companion bound.
 #[allow(dead_code)]
 impl FreeMap {
     /// Maximum number of pages one freemap page can track.
     //
-    // Invariant: any page_id passed to is_free/mark_free/mark_used/allocate_*
+    // Invariant: any page_id passed to is_free/mark_free/allocate_first
     // must be < capacity(). Out-of-range IDs are silently ignored by the
     // mutators and treated as "not free" by is_free — this is defensive, not
     // a contract to rely on.
@@ -116,25 +114,14 @@ impl FreeMap {
         }
     }
 
-    /// Mark a page as in-use (clear bit to 0).
-    //
-    // Counterpart to mark_free. Same out-of-range handling and same checksum
-    // re-stamping requirement.
-    pub fn mark_used(buf: &mut [u8; PAGE_SIZE], page_id: u64) {
-        let (byte_idx, bit_idx) = Self::bit_position(page_id);
-        if byte_idx < PAGE_BODY_SIZE {
-            buf[BITMAP_OFFSET + byte_idx] &= !(1 << bit_idx);
-        }
-    }
-
     /// Allocate the first free page. Clears its bit and returns the page ID.
     //
     // Linear scan; returns the lowest free page_id. `trailing_zeros` finds the
     // lowest-set bit within the first non-zero byte, which matches the
     // bit_position() convention (LSB = lowest page_id within a byte).
     //
-    // Allocation combines two effects: (1) locate a free page, (2) atomically
-    // flip its bit to "in use". Callers must not separately call mark_used.
+    // Allocation combines two effects: (1) locate a free page, (2) flip its
+    // bit to "in use" in the same pass — callers get an already-claimed id.
     pub fn allocate_first(buf: &mut [u8; PAGE_SIZE]) -> Option<u64> {
         for byte_idx in 0..PAGE_BODY_SIZE {
             let byte = buf[BITMAP_OFFSET + byte_idx];
@@ -143,49 +130,6 @@ impl FreeMap {
                 let page_id = (byte_idx * 8 + bit_idx) as u64;
                 buf[BITMAP_OFFSET + byte_idx] &= !(1 << bit_idx);
                 return Some(page_id);
-            }
-        }
-        None
-    }
-
-    /// Allocate a free page near `target`, searching outward with an
-    /// expanding radius. Returns None only if the whole bitmap has no
-    /// free bits.
-    //
-    // Locality hint for reducing fragmentation: when COW'ing a page, the
-    // allocator can request a replacement near the original so related pages
-    // stay clustered on disk. The radius loop is O(n) worst-case but typically
-    // short because the target is usually close to a free slot.
-    //
-    // ISSUES.md C2: the earlier doc comment said "then falls back to
-    // allocate_first", but the implementation is a single radius scan
-    // that returns None if no free bit exists anywhere in the bitmap —
-    // there is no separate fallback call. The two strategies are
-    // behaviorally equivalent (both find the only free page if one
-    // exists), but the phrasing was misleading. Fixed to describe what
-    // actually happens.
-    pub fn allocate_near(buf: &mut [u8; PAGE_SIZE], target: u64) -> Option<u64> {
-        let target = target as usize;
-        let max_page = PAGE_BODY_SIZE * 8;
-
-        // Search outward from target in expanding radius.
-        for radius in 0..max_page {
-            if target + radius < max_page {
-                let page_id = (target + radius) as u64;
-                if Self::is_free(buf, page_id) {
-                    Self::mark_used(buf, page_id);
-                    return Some(page_id);
-                }
-            }
-            // Guard `target >= radius` prevents underflow when searching below
-            // target. `radius > 0` avoids re-testing the target itself (already
-            // handled by the forward branch at radius == 0).
-            if radius > 0 && target >= radius {
-                let page_id = (target - radius) as u64;
-                if Self::is_free(buf, page_id) {
-                    Self::mark_used(buf, page_id);
-                    return Some(page_id);
-                }
             }
         }
         None
@@ -206,30 +150,8 @@ mod tests {
     // ── Migrated 2026-05-22 from tests/basic_ops.rs (I35 reshape) ──
     //
     // Freemap had no prior in-module test mod; this is a fresh one. All
-    // four tests are pure bitmap manipulation — no PageCache, no I/O.
+    // tests are pure bitmap manipulation — no PageCache, no I/O.
     use super::*;
-
-    #[test]
-    fn test_freemap_allocate_and_free() {
-        let mut buf = [0u8; PAGE_SIZE];
-        FreeMap::init_page(&mut buf);
-        FreeMap::mark_free(&mut buf, 10);
-        assert!(FreeMap::is_free(&buf, 10));
-        let alloc = FreeMap::allocate_near(&mut buf, 10);
-        assert_eq!(alloc, Some(10));
-        assert!(!FreeMap::is_free(&buf, 10));
-    }
-
-    #[test]
-    fn test_freemap_allocate_near_locality() {
-        let mut buf = [0u8; PAGE_SIZE];
-        FreeMap::init_page(&mut buf);
-        FreeMap::mark_free(&mut buf, 100);
-        FreeMap::mark_free(&mut buf, 101);
-        FreeMap::mark_free(&mut buf, 200);
-        let alloc = FreeMap::allocate_near(&mut buf, 99);
-        assert_eq!(alloc, Some(100));
-    }
 
     #[test]
     fn test_freemap_allocate_first_free() {

@@ -95,9 +95,9 @@ impl PyTransaction {
         self.finished.store(true, Ordering::SeqCst);
         let db = self.db.bind(py).borrow();
         if !exc_type.is_none(py) {
-            db.rollback_internal(py)?;
+            db.rollback()?;
         } else {
-            db.commit_internal(py)?;
+            db.commit()?;
         }
         Ok(false)
     }
@@ -111,7 +111,7 @@ impl PyTransaction {
             return Err(already_finished_err());
         }
         self.finished.store(true, Ordering::SeqCst);
-        self.db.bind(py).borrow().commit_internal(py)
+        self.db.bind(py).borrow().commit()
     }
 
     // Explicit rollback() — same `finished` semantics as commit(). Useful
@@ -122,11 +122,11 @@ impl PyTransaction {
             return Err(already_finished_err());
         }
         self.finished.store(true, Ordering::SeqCst);
-        self.db.bind(py).borrow().rollback_internal(py)
+        self.db.bind(py).borrow().rollback()
     }
 
     fn allocate(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<u64> {
-        self.db.bind(py).borrow().allocate_internal(py, value)
+        self.db.bind(py).borrow().allocate(value)
     }
 
     fn read<'py>(
@@ -134,74 +134,59 @@ impl PyTransaction {
         py: Python<'py>,
         handle: u64,
     ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        self.db.bind(py).borrow().read_internal(py, handle)
+        self.db.bind(py).borrow().read(py, handle)
     }
 
     fn update(&self, py: Python<'_>, handle: u64, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.db.bind(py).borrow().update_internal(py, handle, value)
+        self.db.bind(py).borrow().update(handle, value)
     }
 
     fn delete(&self, py: Python<'_>, handle: u64) -> PyResult<()> {
-        self.db.bind(py).borrow().delete_internal(py, handle)
+        self.db.bind(py).borrow().delete(handle)
     }
 
     fn delete_many(&self, py: Python<'_>, handles: Vec<u64>) -> PyResult<()> {
-        self.db.bind(py).borrow().delete_many_internal(py, &handles)
+        self.db.bind(py).borrow().delete_many(handles)
     }
 
     fn allocate_tagged(&self, py: Python<'_>, value: &Bound<'_, PyAny>, tag: u32) -> PyResult<u64> {
-        self.db
-            .bind(py)
-            .borrow()
-            .allocate_tagged_internal(py, value, tag)
+        self.db.bind(py).borrow().allocate_tagged(value, tag)
     }
 
     fn tag(&self, py: Python<'_>, handle: u64) -> PyResult<u32> {
-        self.db.bind(py).borrow().tag_internal(py, handle)
+        self.db.bind(py).borrow().tag(handle)
     }
 
     fn client_byte(&self, py: Python<'_>, handle: u64) -> PyResult<u8> {
-        self.db.bind(py).borrow().client_byte_internal(py, handle)
+        self.db.bind(py).borrow().client_byte(handle)
     }
 
     fn set_client_byte(&self, py: Python<'_>, handle: u64, byte: u8) -> PyResult<()> {
-        self.db
-            .bind(py)
-            .borrow()
-            .set_client_byte_internal(py, handle, byte)
+        self.db.bind(py).borrow().set_client_byte(handle, byte)
     }
 
     fn handles_with_tag(&self, py: Python<'_>, tag: u32) -> PyResult<Vec<u64>> {
-        self.db.bind(py).borrow().handles_with_tag_internal(py, tag)
+        self.db.bind(py).borrow().handles_with_tag(tag)
     }
 
     fn delete_tagged(&self, py: Python<'_>, handle: u64, tag: u32) -> PyResult<()> {
-        self.db
-            .bind(py)
-            .borrow()
-            .delete_tagged_internal(py, handle, tag)
+        self.db.bind(py).borrow().delete_tagged(handle, tag)
     }
 
     fn delete_with_tag(&self, py: Python<'_>, tag: u32, max: usize) -> PyResult<(Vec<u64>, bool)> {
-        self.db
-            .bind(py)
-            .borrow()
-            .delete_with_tag_internal(py, tag, max)
+        self.db.bind(py).borrow().delete_with_tag(tag, max)
     }
 
     fn set_root_name(&self, py: Python<'_>, name: &str, handle: u64) -> PyResult<()> {
-        self.db
-            .bind(py)
-            .borrow()
-            .set_root_name_internal(py, name, handle)
+        self.db.bind(py).borrow().set_root_name(name, handle)
     }
 
     fn get_root_name(&self, py: Python<'_>, name: &str) -> PyResult<Option<u64>> {
-        self.db.bind(py).borrow().get_root_name_internal(py, name)
+        self.db.bind(py).borrow().get_root_name(name)
     }
 
     fn clear_root_name(&self, py: Python<'_>, name: &str) -> PyResult<()> {
-        self.db.bind(py).borrow().clear_root_name_internal(py, name)
+        self.db.bind(py).borrow().clear_root_name(name)
     }
 
     // PySavepoint takes its OWN Py<PyChisel> (via clone_ref, which
@@ -210,7 +195,7 @@ impl PyTransaction {
     // objects route through PyChisel, and the engine rejects
     // savepoint ops outside an active transaction.
     fn savepoint(&self, py: Python<'_>, name: &str) -> PyResult<Py<crate::savepoint::PySavepoint>> {
-        self.db.bind(py).borrow().savepoint_internal(py, name)?;
+        self.db.bind(py).borrow().savepoint_internal(name)?;
         Py::new(
             py,
             crate::savepoint::PySavepoint::new(self.db.clone_ref(py), name.to_string()),

@@ -89,8 +89,8 @@ const MAX_DEPTH: u32 = 6;
 //
 // NOTE on per-page version byte (I31): handle-table pages keep the flag at
 // byte 1 and put the I31 per-page format version at byte 2. Every other
-// page type puts its version at byte 1; `page::page_format_version`
-// dispatches on PageType to read from the right offset.
+// page type puts its version at byte 1 (the offset is dispatched on
+// PageType wherever a reader needs it).
 const FLAG_LEAF: u8 = 0x01;
 // I50 (ISSUES.md, 2026-05-22): `pub(crate)` so transaction.rs's
 // open_existing depth-walk can match against the named constant
@@ -455,12 +455,11 @@ impl HandleTable {
         Ok(depth)
     }
 
-    /// `#[allow(dead_code)]`: companion to `set_depth`. Production code
-    /// reconstructs depth via `recover_depth` (at open and on each rollback)
-    /// and stores it via `set_depth`, but no current reader queries it
-    /// back. Kept for forensic / debug-print use and so the
-    /// set_depth/depth pair stays symmetric.
-    #[allow(dead_code)]
+    /// Companion to `set_depth`. Production code reconstructs depth via
+    /// `recover_depth` (at open and on each rollback) and stores it via
+    /// `set_depth`; the handle-table insert path in transaction.rs reads
+    /// it back to snapshot the pre-mutation descent depth for rollback
+    /// (see `saved_ht_depth`). Also handy for forensic / debug-print use.
     pub fn depth(&self) -> u32 {
         self.depth
     }

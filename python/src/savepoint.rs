@@ -75,9 +75,9 @@ impl PySavepoint {
         self.finished.store(true, Ordering::SeqCst);
         let db = self.db.bind(py).borrow();
         if !exc_type.is_none(py) {
-            db.rollback_to_internal(py, &self.name)?;
+            db.rollback_to_internal(&self.name)?;
         } else {
-            db.release_internal(py, &self.name)?;
+            db.release_internal(&self.name)?;
         }
         Ok(false)
     }
@@ -93,7 +93,7 @@ impl PySavepoint {
             return Err(already_finished_err());
         }
         self.finished.store(true, Ordering::SeqCst);
-        self.db.bind(py).borrow().release_internal(py, &self.name)
+        self.db.bind(py).borrow().release_internal(&self.name)
     }
 
     // Explicit rollback_to(): same idempotency-as-error policy as
@@ -107,10 +107,7 @@ impl PySavepoint {
             return Err(already_finished_err());
         }
         self.finished.store(true, Ordering::SeqCst);
-        self.db
-            .bind(py)
-            .borrow()
-            .rollback_to_internal(py, &self.name)
+        self.db.bind(py).borrow().rollback_to_internal(&self.name)
     }
 }
 

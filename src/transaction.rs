@@ -1545,12 +1545,23 @@ impl TransactionManager {
         self.poison_on_fatal(result)
     }
 
-    fn tag_inner(&self, handle: u64) -> Result<u32> {
-        let root = if self.active_txn {
+    /// The handle-table root for the *current read view*: the in-progress
+    /// `current_roots` while a transaction is active (read-your-own-writes),
+    /// otherwise the last durably-committed `committed_roots`. Returns
+    /// `PAGE_ID_NONE` for an empty database — read paths guard on that
+    /// before walking the tree. Centralizes the snapshot selection shared
+    /// by every read-path helper (`tag`, `client_byte`, `read`, `handles`,
+    /// `handle_live_page_id`).
+    fn live_handle_table_root(&self) -> u64 {
+        if self.active_txn {
             self.current_roots.handle_table_page
         } else {
             self.committed_roots.handle_table_page
-        };
+        }
+    }
+
+    fn tag_inner(&self, handle: u64) -> Result<u32> {
+        let root = self.live_handle_table_root();
         if root == PAGE_ID_NONE {
             return Err(ChiselError::InvalidHandle(handle));
         }
@@ -1575,11 +1586,7 @@ impl TransactionManager {
     }
 
     fn client_byte_inner(&self, handle: u64) -> Result<u8> {
-        let root = if self.active_txn {
-            self.current_roots.handle_table_page
-        } else {
-            self.committed_roots.handle_table_page
-        };
+        let root = self.live_handle_table_root();
         if root == PAGE_ID_NONE {
             return Err(ChiselError::InvalidHandle(handle));
         }
@@ -1662,11 +1669,7 @@ impl TransactionManager {
     }
 
     fn read_inner(&self, handle: u64) -> Result<Vec<u8>> {
-        let root = if self.active_txn {
-            self.current_roots.handle_table_page
-        } else {
-            self.committed_roots.handle_table_page
-        };
+        let root = self.live_handle_table_root();
 
         if root == PAGE_ID_NONE {
             return Err(ChiselError::InvalidHandle(handle));
@@ -2120,11 +2123,7 @@ impl TransactionManager {
     }
 
     fn handles_inner(&self) -> Result<Vec<u64>> {
-        let root = if self.active_txn {
-            self.current_roots.handle_table_page
-        } else {
-            self.committed_roots.handle_table_page
-        };
+        let root = self.live_handle_table_root();
         if root == PAGE_ID_NONE {
             return Ok(Vec::new());
         }
@@ -2343,26 +2342,12 @@ impl TransactionManager {
         Ok(sparse)
     }
 
-    /// Number of data pages currently tracked in the in-transaction
-    /// view.
-    ///
-    /// `#[allow(dead_code)]`: referenced in `defrag.rs` and this
-    /// module's own doc comments as the wrong-metric example (the I17
-    /// fix uses `data_page_ids_snapshot` instead). Kept as the named
-    /// counter to make the contrast explicit; any future caller
-    /// wanting a coarse "how many data pages are in play" number has
-    /// the obvious accessor.
-    #[allow(dead_code)]
-    pub fn data_page_count(&self) -> usize {
-        self.current_live_slots.len()
-    }
-
     /// Snapshot of the page ids currently tracked as holding at least
     /// one live slot. Used by `defrag::defrag` for the I17 stat: after
     /// the sweep, `pages_freed` is the count of ids that were in this
     /// snapshot and are no longer in `current_live_slots` — i.e.,
     /// pages that the sweep fully drained and returned to the freemap.
-    /// Net change in `data_page_count` is the wrong metric here
+    /// Net change in the live data-page count is the wrong metric here
     /// because a relocation simultaneously drains a sparse page and
     /// creates a dense one; the former should count as "reclaimed"
     /// even when the latter offsets the net count.
@@ -2385,11 +2370,7 @@ impl TransactionManager {
     }
 
     fn handle_live_page_id_inner(&self, handle: u64) -> Result<Option<u64>> {
-        let root = if self.active_txn {
-            self.current_roots.handle_table_page
-        } else {
-            self.committed_roots.handle_table_page
-        };
+        let root = self.live_handle_table_root();
         if root == PAGE_ID_NONE {
             return Ok(None);
         }

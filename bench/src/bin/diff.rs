@@ -20,13 +20,6 @@ struct Cli {
     /// Path to the PR HEAD results.json.
     #[arg(long)]
     pr: PathBuf,
-
-    /// Reserved for when micro-grid diffing is added in a future PR.
-    /// Currently a no-op; included so the workflow YAML doesn't need
-    /// to change when that future PR lands.
-    #[arg(long, default_value_t = false)]
-    #[allow(dead_code)]
-    scenarios_only: bool,
 }
 
 fn main() -> std::process::ExitCode {

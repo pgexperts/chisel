@@ -11,10 +11,9 @@
 //     (covers empty, too-long, embedded NUL, and a happy-path max-length
 //     name).
 //
-// Page-module tests (checksum, PageType::from_u8, layout constants)
-// moved into src/page.rs's test mod on 2026-05-22 as part of the I35
-// pub→pub(crate) reshape; they no longer needed the crate-public
-// `chisel::page::*` re-exports.
+// Page-module tests (checksum, layout constants) moved into src/page.rs's
+// test mod on 2026-05-22 as part of the I35 pub→pub(crate) reshape; they
+// no longer needed the crate-public `chisel::page::*` re-exports.
 //
 // Named-root tests that exercise the public API through a live Chisel
 // handle run under dual_backing_test! (file + memory). Tests relying on

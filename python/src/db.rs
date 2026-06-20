@@ -254,16 +254,16 @@ impl PyChisel {
         }
     }
 
-    fn begin(&self, py: Python<'_>) -> PyResult<()> {
-        self.with_inner_mut_io(py, |c| c.begin())
+    fn begin(&self) -> PyResult<()> {
+        self.with_inner_mut_io(|c| c.begin())
     }
 
-    fn commit(&self, py: Python<'_>) -> PyResult<()> {
-        self.commit_internal(py)
+    pub(crate) fn commit(&self) -> PyResult<()> {
+        self.with_inner_mut_io(|c| c.commit())
     }
 
-    fn rollback(&self, py: Python<'_>) -> PyResult<()> {
-        self.rollback_internal(py)
+    pub(crate) fn rollback(&self) -> PyResult<()> {
+        self.with_inner_mut_io(|c| c.rollback())
     }
 
     // `transaction()` is a factory: it calls begin() first, then
@@ -281,77 +281,81 @@ impl PyChisel {
         slf: Py<Self>,
         py: Python<'_>,
     ) -> PyResult<Py<crate::transaction::PyTransaction>> {
-        slf.bind(py).borrow().begin(py)?;
+        slf.bind(py).borrow().begin()?;
         Py::new(py, crate::transaction::PyTransaction::new(slf))
     }
 
-    fn allocate(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<u64> {
-        self.allocate_internal(py, value)
+    pub(crate) fn allocate(&self, value: &Bound<'_, PyAny>) -> PyResult<u64> {
+        let bytes = crate::convert::coerce_value(value)?;
+        self.with_inner_mut_io(|c| c.allocate(&bytes))
     }
 
-    fn read<'py>(
+    pub(crate) fn read<'py>(
         &self,
         py: Python<'py>,
         handle: u64,
     ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        self.read_internal(py, handle)
+        let data = self.with_inner_io(|c| c.read(handle))?;
+        Ok(pyo3::types::PyBytes::new(py, &data))
     }
 
-    fn update(&self, py: Python<'_>, handle: u64, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.update_internal(py, handle, value)
+    pub(crate) fn update(&self, handle: u64, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let bytes = crate::convert::coerce_value(value)?;
+        self.with_inner_mut_io(|c| c.update(handle, &bytes))
     }
 
-    fn delete(&self, py: Python<'_>, handle: u64) -> PyResult<()> {
-        self.delete_internal(py, handle)
+    pub(crate) fn delete(&self, handle: u64) -> PyResult<()> {
+        self.with_inner_mut_io(|c| c.delete(handle))
     }
 
-    fn delete_many(&self, py: Python<'_>, handles: Vec<u64>) -> PyResult<()> {
-        self.delete_many_internal(py, &handles)
+    pub(crate) fn delete_many(&self, handles: Vec<u64>) -> PyResult<()> {
+        self.with_inner_mut_io(|c| c.delete_many(&handles))
     }
 
-    fn handles(&self, py: Python<'_>) -> PyResult<Vec<u64>> {
-        self.with_inner_io(py, |c| c.handles())
+    fn handles(&self) -> PyResult<Vec<u64>> {
+        self.with_inner_io(|c| c.handles())
     }
 
-    fn allocate_tagged(&self, py: Python<'_>, value: &Bound<'_, PyAny>, tag: u32) -> PyResult<u64> {
-        self.allocate_tagged_internal(py, value, tag)
+    pub(crate) fn allocate_tagged(&self, value: &Bound<'_, PyAny>, tag: u32) -> PyResult<u64> {
+        let bytes = crate::convert::coerce_value(value)?;
+        self.with_inner_mut_io(|c| c.allocate_tagged(&bytes, tag))
     }
 
-    fn tag(&self, py: Python<'_>, handle: u64) -> PyResult<u32> {
-        self.tag_internal(py, handle)
+    pub(crate) fn tag(&self, handle: u64) -> PyResult<u32> {
+        self.with_inner_io(|c| c.tag(handle))
     }
 
-    fn handles_with_tag(&self, py: Python<'_>, tag: u32) -> PyResult<Vec<u64>> {
-        self.handles_with_tag_internal(py, tag)
+    pub(crate) fn handles_with_tag(&self, tag: u32) -> PyResult<Vec<u64>> {
+        self.with_inner_io(|c| c.handles_with_tag(tag))
     }
 
-    fn client_byte(&self, py: Python<'_>, handle: u64) -> PyResult<u8> {
-        self.client_byte_internal(py, handle)
+    pub(crate) fn client_byte(&self, handle: u64) -> PyResult<u8> {
+        self.with_inner_io(|c| c.client_byte(handle))
     }
 
-    fn set_client_byte(&self, py: Python<'_>, handle: u64, byte: u8) -> PyResult<()> {
-        self.set_client_byte_internal(py, handle, byte)
+    pub(crate) fn set_client_byte(&self, handle: u64, byte: u8) -> PyResult<()> {
+        self.with_inner_mut_io(|c| c.set_client_byte(handle, byte))
     }
 
-    fn delete_tagged(&self, py: Python<'_>, handle: u64, tag: u32) -> PyResult<()> {
-        self.delete_tagged_internal(py, handle, tag)
+    pub(crate) fn delete_tagged(&self, handle: u64, tag: u32) -> PyResult<()> {
+        self.with_inner_mut_io(|c| c.delete_tagged(handle, tag))
     }
 
     /// Returns (deleted: list[int], complete: bool).
-    fn delete_with_tag(&self, py: Python<'_>, tag: u32, max: usize) -> PyResult<(Vec<u64>, bool)> {
-        self.delete_with_tag_internal(py, tag, max)
+    pub(crate) fn delete_with_tag(&self, tag: u32, max: usize) -> PyResult<(Vec<u64>, bool)> {
+        self.with_inner_mut_io(|c| c.delete_with_tag(tag, max).map(|p| (p.deleted, p.complete)))
     }
 
-    fn set_root_name(&self, py: Python<'_>, name: &str, handle: u64) -> PyResult<()> {
-        self.set_root_name_internal(py, name, handle)
+    pub(crate) fn set_root_name(&self, name: &str, handle: u64) -> PyResult<()> {
+        self.with_inner_mut_io(|c| c.set_root_name(name, handle))
     }
 
-    fn get_root_name(&self, py: Python<'_>, name: &str) -> PyResult<Option<u64>> {
-        self.get_root_name_internal(py, name)
+    pub(crate) fn get_root_name(&self, name: &str) -> PyResult<Option<u64>> {
+        self.with_inner_io(|c| c.get_root_name(name))
     }
 
-    fn clear_root_name(&self, py: Python<'_>, name: &str) -> PyResult<()> {
-        self.clear_root_name_internal(py, name)
+    pub(crate) fn clear_root_name(&self, name: &str) -> PyResult<()> {
+        self.with_inner_mut_io(|c| c.clear_root_name(name))
     }
 
     // stats() is read-only on the engine side (`&self`), so the usual
@@ -359,7 +363,7 @@ impl PyChisel {
     // `chisel.Stats` dataclass rather than a pyclass so users get the
     // standard dataclass ergonomics (repr, eq, frozen).
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let s = self.with_inner_io(py, |c| c.stats())?;
+        let s = self.with_inner_io(|c| c.stats())?;
         let module = py.import("chisel")?;
         let cls = module.getattr("Stats")?;
         let kwargs = pyo3::types::PyDict::new(py);
@@ -379,7 +383,7 @@ impl PyChisel {
     // immutable borrow path is sufficient. We materialize a
     // `chisel.Counters` dataclass — same shape as stats().
     fn counters(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let c = self.with_inner_io(py, |c| c.counters())?;
+        let c = self.with_inner_io(|c| c.counters())?;
         let module = py.import("chisel")?;
         let cls = module.getattr("Counters")?;
         let kwargs = pyo3::types::PyDict::new(py);
@@ -414,7 +418,7 @@ impl PyChisel {
             }
         };
 
-        let stats = self.with_inner_mut_io(py, |c| c.defrag(rust_opts.clone()))?;
+        let stats = self.with_inner_mut_io(|c| c.defrag(rust_opts))?;
 
         let module = py.import("chisel")?;
         let cls = module.getattr("DefragStats")?;
@@ -438,155 +442,43 @@ impl PyChisel {
     // All three flow through with_inner_mut_io, so a closed handle
     // raises ClosedError uniformly with every other mutating method.
 
-    fn set_cache_max_bytes(&self, py: Python<'_>, bytes: u64) -> PyResult<()> {
-        self.with_inner_mut_io(py, |c| c.set_cache_max_bytes(bytes))
+    fn set_cache_max_bytes(&self, bytes: u64) -> PyResult<()> {
+        self.with_inner_mut_io(|c| c.set_cache_max_bytes(bytes))
     }
 
-    fn set_spillway_max_bytes(&self, py: Python<'_>, bytes: u64) -> PyResult<()> {
-        self.with_inner_mut_io(py, |c| c.set_spillway_max_bytes(bytes))
+    fn set_spillway_max_bytes(&self, bytes: u64) -> PyResult<()> {
+        self.with_inner_mut_io(|c| c.set_spillway_max_bytes(bytes))
     }
 
-    fn set_drain_insertion(&self, py: Python<'_>, policy: PyDrainInsertion) -> PyResult<()> {
-        self.with_inner_mut_io(py, |c| c.set_drain_insertion(policy.into()))
+    fn set_drain_insertion(&self, policy: PyDrainInsertion) -> PyResult<()> {
+        self.with_inner_mut_io(|c| c.set_drain_insertion(policy.into()))
     }
 }
 
-// Internal helpers — NOT exposed to Python. PyTransaction reaches into
-// these pub(crate) methods to share the same engine-access code path as
-// the direct PyChisel pymethods. The with_inner_io / with_inner_mut_io
-// wrappers are the ONE place the closed/poisoned check lives.
+// Internal helpers shared with PyTransaction / PySavepoint. The public
+// pymethods on PyChisel are also ordinary inherent Rust methods, so the
+// transaction and savepoint wrappers call them directly (e.g.
+// `db.borrow().commit()`). Only the three savepoint operations below have
+// no public PyChisel pymethod — they are reached through the PySavepoint
+// object, not `db.<op>()` — so they keep a pub(crate) entry point here.
+// The with_inner_io / with_inner_mut_io wrappers are the ONE place the
+// closed/poisoned check lives.
 //
 // Rationale: every method that mutates or reads the engine must go
 // through one of these two helpers, so there is exactly one site where
 // "closed" collapses into PoisonedError. Bypassing them would create a
 // path where `self.inner.lock().unwrap().as_ref().unwrap()` panics a closed db.
 impl PyChisel {
-    pub(crate) fn commit_internal(&self, py: Python<'_>) -> PyResult<()> {
-        self.with_inner_mut_io(py, |c| c.commit())
+    pub(crate) fn savepoint_internal(&self, name: &str) -> PyResult<()> {
+        self.with_inner_mut_io(|c| c.savepoint(name))
     }
 
-    pub(crate) fn rollback_internal(&self, py: Python<'_>) -> PyResult<()> {
-        self.with_inner_mut_io(py, |c| c.rollback())
+    pub(crate) fn release_internal(&self, name: &str) -> PyResult<()> {
+        self.with_inner_mut_io(|c| c.release(name))
     }
 
-    pub(crate) fn allocate_internal(
-        &self,
-        py: Python<'_>,
-        value: &Bound<'_, PyAny>,
-    ) -> PyResult<u64> {
-        let bytes = crate::convert::coerce_value(value)?;
-        self.with_inner_mut_io(py, |c| c.allocate(&bytes))
-    }
-
-    pub(crate) fn read_internal<'py>(
-        &self,
-        py: Python<'py>,
-        handle: u64,
-    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        let data = self.with_inner_io(py, |c| c.read(handle))?;
-        Ok(pyo3::types::PyBytes::new(py, &data))
-    }
-
-    pub(crate) fn update_internal(
-        &self,
-        py: Python<'_>,
-        handle: u64,
-        value: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        let bytes = crate::convert::coerce_value(value)?;
-        self.with_inner_mut_io(py, |c| c.update(handle, &bytes))
-    }
-
-    pub(crate) fn delete_internal(&self, py: Python<'_>, handle: u64) -> PyResult<()> {
-        self.with_inner_mut_io(py, |c| c.delete(handle))
-    }
-
-    pub(crate) fn delete_many_internal(&self, py: Python<'_>, handles: &[u64]) -> PyResult<()> {
-        self.with_inner_mut_io(py, |c| c.delete_many(handles))
-    }
-
-    pub(crate) fn set_root_name_internal(
-        &self,
-        py: Python<'_>,
-        name: &str,
-        handle: u64,
-    ) -> PyResult<()> {
-        self.with_inner_mut_io(py, |c| c.set_root_name(name, handle))
-    }
-
-    pub(crate) fn get_root_name_internal(
-        &self,
-        py: Python<'_>,
-        name: &str,
-    ) -> PyResult<Option<u64>> {
-        self.with_inner_io(py, |c| c.get_root_name(name))
-    }
-
-    pub(crate) fn clear_root_name_internal(&self, py: Python<'_>, name: &str) -> PyResult<()> {
-        self.with_inner_mut_io(py, |c| c.clear_root_name(name))
-    }
-
-    pub(crate) fn allocate_tagged_internal(
-        &self,
-        py: Python<'_>,
-        value: &Bound<'_, PyAny>,
-        tag: u32,
-    ) -> PyResult<u64> {
-        let bytes = crate::convert::coerce_value(value)?;
-        self.with_inner_mut_io(py, |c| c.allocate_tagged(&bytes, tag))
-    }
-
-    pub(crate) fn tag_internal(&self, py: Python<'_>, handle: u64) -> PyResult<u32> {
-        self.with_inner_io(py, |c| c.tag(handle))
-    }
-
-    pub(crate) fn client_byte_internal(&self, py: Python<'_>, handle: u64) -> PyResult<u8> {
-        self.with_inner_io(py, |c| c.client_byte(handle))
-    }
-
-    pub(crate) fn set_client_byte_internal(
-        &self,
-        py: Python<'_>,
-        handle: u64,
-        byte: u8,
-    ) -> PyResult<()> {
-        self.with_inner_mut_io(py, |c| c.set_client_byte(handle, byte))
-    }
-
-    pub(crate) fn handles_with_tag_internal(&self, py: Python<'_>, tag: u32) -> PyResult<Vec<u64>> {
-        self.with_inner_io(py, |c| c.handles_with_tag(tag))
-    }
-
-    pub(crate) fn delete_tagged_internal(
-        &self,
-        py: Python<'_>,
-        handle: u64,
-        tag: u32,
-    ) -> PyResult<()> {
-        self.with_inner_mut_io(py, |c| c.delete_tagged(handle, tag))
-    }
-
-    pub(crate) fn delete_with_tag_internal(
-        &self,
-        py: Python<'_>,
-        tag: u32,
-        max: usize,
-    ) -> PyResult<(Vec<u64>, bool)> {
-        self.with_inner_mut_io(py, |c| {
-            c.delete_with_tag(tag, max).map(|p| (p.deleted, p.complete))
-        })
-    }
-
-    pub(crate) fn savepoint_internal(&self, py: Python<'_>, name: &str) -> PyResult<()> {
-        self.with_inner_mut_io(py, |c| c.savepoint(name))
-    }
-
-    pub(crate) fn release_internal(&self, py: Python<'_>, name: &str) -> PyResult<()> {
-        self.with_inner_mut_io(py, |c| c.release(name))
-    }
-
-    pub(crate) fn rollback_to_internal(&self, py: Python<'_>, name: &str) -> PyResult<()> {
-        self.with_inner_mut_io(py, |c| c.rollback_to(name))
+    pub(crate) fn rollback_to_internal(&self, name: &str) -> PyResult<()> {
+        self.with_inner_mut_io(|c| c.rollback_to(name))
     }
 
     // These two helpers are the ONLY place the closed/poisoned
@@ -603,20 +495,13 @@ impl PyChisel {
     // Consequence: long-running engine calls (e.g. a large commit's
     // fsync, a big defrag) will block ALL other Python threads in this
     // process. `open()` itself does release the GIL around the initial
-    // filesystem setup — see the `allow_threads` there — but per-op
-    // calls do not. If future work wants to overlap Python work with
-    // Chisel I/O, the fix is (a) make Chisel's interior state Sync-
-    // safe, or (b) move the GIL release into the engine layer.
-    //
-    // The `_py: Python<'_>` parameter on both helpers is an unused
-    // token; it exists to make the GIL-held precondition explicit at
-    // the call sites and to leave room for a future `allow_threads`
-    // insertion without changing every caller signature.
-    fn with_inner_io<R>(
-        &self,
-        _py: Python<'_>,
-        f: impl FnOnce(&Chisel) -> chisel::Result<R>,
-    ) -> PyResult<R> {
+    // filesystem setup — see the `py.detach` there — but per-op calls do
+    // not. If future work wants to overlap Python work with Chisel I/O,
+    // the fix is (a) make Chisel's interior state Sync-safe and release
+    // the GIL here via `Python::detach`, or (b) move the GIL release into
+    // the engine layer. The GIL is held at every call site today, so these
+    // helpers take no `Python` token.
+    fn with_inner_io<R>(&self, f: impl FnOnce(&Chisel) -> chisel::Result<R>) -> PyResult<R> {
         // Recover from a poisoned Mutex rather than panicking. The engine never
         // panics while holding the lock (fatal conditions return
         // ChiselError::Poisoned, surfaced to Python as PoisonedError), so the
@@ -631,7 +516,6 @@ impl PyChisel {
 
     fn with_inner_mut_io<R>(
         &self,
-        _py: Python<'_>,
         f: impl FnOnce(&mut Chisel) -> chisel::Result<R>,
     ) -> PyResult<R> {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());

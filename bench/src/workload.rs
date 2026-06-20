@@ -58,16 +58,16 @@ pub struct Workload {
     pub ops: Vec<Operation>,
 }
 
-/// Tag for the four mutating-or-reading operation kinds, used by
-/// `mix_operations` to pick which `Operation` variant to emit.
-/// `DeleteMany` is intentionally absent — scenarios use the single
-/// `Delete` variant per master spec §4.3.
+/// Tag for the operation kinds `mix_operations` samples by weight to
+/// pick which `Operation` variant to emit. Deletions (`Operation::Delete`
+/// and bulk `Operation::DeleteMany`) are not weight-mixed — they come
+/// from the dedicated `gen_delete_random` generator per master spec
+/// §4.3 — so they have no `OpKind` tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpKind {
     Allocate,
     Read,
     Update,
-    Delete,
 }
 
 /// Zipfian-distributed random indices into [0, prepop_count). `theta`
@@ -209,40 +209,17 @@ pub fn mix_operations(
                     .expect("mix_operations: not enough sizes for Update ops");
                 Operation::Update { alloc_index, size }
             }
-            OpKind::Delete => {
-                let alloc_index = *access_iter
-                    .next()
-                    .expect("mix_operations: not enough access entries for Delete ops");
-                Operation::Delete { alloc_index }
-            }
         };
         out.push(op);
     }
     out
 }
 
-/// Pre-population: `count` Allocate ops of `size` bytes each.
-/// No randomness — the Workload is fully determined by its arguments.
-/// `seed` is fixed at 0 and `name` at "prepopulate" so that
-/// pre-population does not appear as a varying axis in Criterion ids.
-/// `prepop_count` is 0 because the workload itself does the populating
-/// — it does not assume any pre-existing records.
-pub fn gen_prepopulate(count: usize, size: usize) -> Workload {
-    let ops = (0..count).map(|_| Operation::Allocate { size }).collect();
-    Workload {
-        name: "prepopulate".to_string(),
-        seed: 0,
-        prepop_count: 0,
-        ops,
-    }
-}
-
 /// Row 1/2 of the micro grid (allocate, 1 op/tx and 1000 ops/tx).
 /// `count` Allocate ops of `size` bytes. No randomness; takes no
-/// seed (parallels `gen_prepopulate`, where seedless and unambiguous
-/// beats symmetry-with-an-unused-arg). The Workload's `seed` field
-/// is set to 0; `prepop_count` is 0 because rows 1/2 measure
-/// allocate against an empty database.
+/// seed (seedless and unambiguous beats symmetry-with-an-unused-arg).
+/// The Workload's `seed` field is set to 0; `prepop_count` is 0
+/// because rows 1/2 measure allocate against an empty database.
 pub fn gen_allocate(count: usize, size: usize) -> Workload {
     let ops = (0..count).map(|_| Operation::Allocate { size }).collect();
     Workload {
@@ -322,43 +299,6 @@ pub fn gen_delete_random(seed: u64, prepop_count: usize, count: usize) -> Worklo
     }
 }
 
-/// Row 9 of the micro grid (delete_many — bulk-delete primitive).
-/// Each Operation is one DeleteMany carrying `batch_size` distinct
-/// indices; `batches` total. Sampled without replacement across the
-/// entire workload — no index appears in two different batches —
-/// via a single `rand::seq::index::sample` call chunked into batches.
-///
-/// Panics if `batches * batch_size > prepop_count` (same rationale
-/// as `gen_delete_random`: caller bug, fail loud).
-pub fn gen_delete_many(
-    seed: u64,
-    prepop_count: usize,
-    batches: usize,
-    batch_size: usize,
-) -> Workload {
-    let total = batches * batch_size;
-    assert!(
-        total <= prepop_count,
-        "gen_delete_many: batches*batch_size ({}) exceeds prepop_count ({})",
-        total,
-        prepop_count
-    );
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let all = rand::seq::index::sample(&mut rng, prepop_count, total).into_vec();
-    let ops = all
-        .chunks(batch_size)
-        .map(|chunk| Operation::DeleteMany {
-            alloc_indices: chunk.to_vec(),
-        })
-        .collect();
-    Workload {
-        name: "delete_many".to_string(),
-        seed,
-        prepop_count,
-        ops,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,18 +317,6 @@ mod tests {
         };
         assert_eq!(w.name, "test");
         assert_eq!(w.ops.len(), 1);
-    }
-
-    #[test]
-    fn gen_prepopulate_shape() {
-        let w = gen_prepopulate(10, 32);
-        assert_eq!(w.name, "prepopulate");
-        assert_eq!(w.seed, 0);
-        assert_eq!(w.prepop_count, 0);
-        assert_eq!(w.ops.len(), 10);
-        for op in &w.ops {
-            assert!(matches!(op, Operation::Allocate { size: 32 }));
-        }
     }
 
     #[test]
@@ -498,47 +426,6 @@ mod tests {
         // count > prepop_count is a generator-author bug; we panic
         // rather than silently produce an invalid workload.
         let _ = gen_delete_random(0, 10, 11);
-    }
-
-    #[test]
-    fn gen_delete_many_determinism() {
-        let a = gen_delete_many(7, 10_000, 5, 200);
-        let b = gen_delete_many(7, 10_000, 5, 200);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn gen_delete_many_cross_batch_no_replacement() {
-        use std::collections::HashSet;
-        let prepop = 1000;
-        let batches = 5;
-        let batch_size = 100;
-        let w = gen_delete_many(2, prepop, batches, batch_size);
-        assert_eq!(w.name, "delete_many");
-        assert_eq!(w.seed, 2);
-        assert_eq!(w.prepop_count, prepop);
-        assert_eq!(w.ops.len(), batches);
-
-        let mut seen: HashSet<usize> = HashSet::new();
-        for op in &w.ops {
-            match op {
-                Operation::DeleteMany { alloc_indices } => {
-                    assert_eq!(alloc_indices.len(), batch_size);
-                    for &i in alloc_indices {
-                        assert!(i < prepop, "out-of-range index {}", i);
-                        assert!(seen.insert(i), "duplicate index {} across batches", i);
-                    }
-                }
-                other => panic!("expected DeleteMany, got {:?}", other),
-            }
-        }
-        assert_eq!(seen.len(), batches * batch_size);
-    }
-
-    #[test]
-    #[should_panic(expected = "exceeds prepop_count")]
-    fn gen_delete_many_panics_on_overcount() {
-        let _ = gen_delete_many(0, 10, 3, 4); // 3 * 4 = 12 > 10
     }
 
     #[test]
