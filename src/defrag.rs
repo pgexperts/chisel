@@ -38,9 +38,10 @@
 // Stat accuracy (ISSUES.md I17):
 //   `pages_examined` now counts UNIQUE sparse pages touched during the
 //   sweep (via a HashSet) rather than per-value. `pages_freed` is the
-//   net drop in `data_page_count()` from the start to the end of the
-//   sweep — capturing pages that were fully emptied by relocation and
-//   returned to the freemap by the R2 commit path.
+//   net drop in the live data-page count (via `data_page_ids_snapshot`)
+//   from the start to the end of the sweep — capturing pages that were
+//   fully emptied by relocation and returned to the freemap by the R2
+//   commit path.
 
 use std::collections::HashSet;
 

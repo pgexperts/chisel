@@ -308,7 +308,7 @@ use tempfile::NamedTempFile;
 ///
 /// The file is a `tempfile::NamedTempFile` so it auto-deletes on drop.
 /// `ids()` returns the identifiers in allocation order — element `i` is
-/// the engine identifier that the `i`-th `gen_prepopulate` Allocate
+/// the engine identifier that the `i`-th prepopulating Allocate
 /// produced. Workloads reference records by `alloc_index` (per PR 4a's
 /// contract); the cell-runners pass `ids()` through to `apply_op` to
 /// resolve those indices to engine identifiers.

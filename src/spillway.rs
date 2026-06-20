@@ -195,7 +195,7 @@ impl Spillway {
         self.slots.clear();
         self.next_slot_index = 0;
         match &mut self.backing {
-            Backing::File { file, .. } => {
+            Backing::File { file } => {
                 file.set_len(0)?;
                 file.seek(SeekFrom::Start(0))?;
             }
@@ -292,7 +292,7 @@ fn write_slot(
     header[..8].copy_from_slice(&page_id.to_le_bytes());
     header[8..16].copy_from_slice(&checksum.to_le_bytes());
     match backing {
-        Backing::File { file, .. } => {
+        Backing::File { file } => {
             file.seek(SeekFrom::Start(offset))?;
             file.write_all(&header)?;
             file.write_all(page_bytes)?;
@@ -319,7 +319,7 @@ fn read_slot(backing: &mut Backing, slot_index: u64) -> Result<(u64, u64, [u8; P
     let mut header = [0u8; SLOT_HEADER_SIZE];
     let mut page_bytes = [0u8; PAGE_SIZE];
     match backing {
-        Backing::File { file, .. } => {
+        Backing::File { file } => {
             file.seek(SeekFrom::Start(offset))?;
             file.read_exact(&mut header)?;
             file.read_exact(&mut page_bytes)?;
