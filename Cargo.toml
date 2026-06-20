@@ -41,7 +41,7 @@ rust-version = "1.82"
 authors = ["Christophe Pettus <cpettus@pgexperts.com>"]
 description = "Transactional slot-based storage engine with shadow paging"
 license = "MIT"
-repository = "https://github.com/Xof/chisel"
+repository = "https://github.com/pgexperts/chisel"
 readme = "README.md"
 # crates.io enforces ≤5 keywords, ≤20 chars each, ASCII alnum + `-`/`_`,
 # must start with a letter. Picked for findability rather than literal accuracy.

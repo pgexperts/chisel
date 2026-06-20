@@ -9,7 +9,7 @@ rust-version = "1.82"
 authors = ["Christophe Pettus <cpettus@pgexperts.com>"]
 description = "Benchmark harness for Chisel — Engine trait abstraction, workload generators, and cross-engine comparison runners. Internal use only; not published."
 license = "MIT"
-repository = "https://github.com/Xof/chisel"
+repository = "https://github.com/pgexperts/chisel"
 # publish = false because this crate is internal-only (no PyPI/crates.io
 # distribution surface). The license + repository are still set so the
 # subcrate's Cargo.toml is internally consistent with the root.
