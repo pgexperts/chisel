@@ -445,9 +445,9 @@ impl TransactionManager {
         // u32 layout (upper 16 = major, lower 16 = minor) lets same-major
         // files open regardless of minor drift, which is what makes the
         // README's "sacred within a major version" promise enforceable.
-        // Minor-newer files are accepted here but may be unsafe to WRITE
-        // — I29 phase 2 will add a "refuse writes if file minor > my
-        // minor" arm when the first 1.1 release makes this observable.
+        // Minor-newer files are accepted (read-compatible) here but forced
+        // read-only by the I29 write-gate immediately below — writing them
+        // would drop fields this binary doesn't know about.
         //
         // We validate AFTER select() rather than inside deserialize()
         // because the winning superblock's version is what determines
