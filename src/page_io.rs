@@ -138,6 +138,19 @@ impl PageIo {
         self.read_only
     }
 
+    /// Force this handle read-only after open. Used by the I29 format-MINOR
+    /// write-gate: a file whose MINOR exceeds this binary's may be READ (within
+    /// a MAJOR all layout changes are additive, so known fields are at stable
+    /// offsets) but must not be WRITTEN, since this binary would stamp pages at
+    /// its older minor and drop fields it cannot see. Idempotent. The OS file
+    /// handle is unchanged (still O_RDWR) — this only flips the in-memory guard
+    /// that `write_page` / `fsync` / `set_page_count` already honor. See I29.
+    // caller lands in the I29 open-gate task
+    #[allow(dead_code)]
+    pub fn force_read_only(&mut self) {
+        self.read_only = true;
+    }
+
     /// Acquire an exclusive advisory lock (flock). Returns LockFailed if
     /// another process holds it.
     ///
@@ -428,6 +441,19 @@ mod read_only_tests {
         let mut io = PageIo::open(f.path(), true).unwrap();
         let buf = io.read_page(0).unwrap();
         assert_eq!(buf, [0u8; PAGE_SIZE]);
+    }
+
+    #[test]
+    fn force_read_only_blocks_writes_after_a_read_write_open() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut io = PageIo::open(tmp.path(), false).unwrap(); // opened read-WRITE
+        assert!(!io.is_read_only());
+
+        io.force_read_only();
+
+        assert!(io.is_read_only());
+        let buf = [0u8; PAGE_SIZE];
+        assert!(matches!(io.write_page(0, &buf), Err(ChiselError::ReadOnlyMode)));
     }
 
     #[test]
