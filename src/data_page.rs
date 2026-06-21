@@ -504,6 +504,33 @@ mod corruption_tests {
         buf
     }
 
+    // I133 (ISSUES.md, 2026-06-21): the 8..16 common-reserved region must stay
+    // zero on a Data page — the data-page format uses none of it (the slot
+    // directory starts at byte 16 = DATA_PAGE_HEADER_SIZE). If future code ever
+    // writes a field there, this trips so the "8..16 is reserved everywhere"
+    // assumption (which COMMON_HEADER_SIZE == 16 encodes) is revisited
+    // deliberately rather than silently broken.
+    #[test]
+    fn reserved_common_header_bytes_stay_zero() {
+        let mut buf = fresh_page();
+        assert_eq!(
+            &buf[8..16],
+            &[0u8; 8],
+            "init_page must zero the reserved 8..16"
+        );
+        DataPage::insert(&mut buf, b"hello world").unwrap();
+        assert_eq!(
+            &buf[8..16],
+            &[0u8; 8],
+            "insert must not write into the reserved 8..16"
+        );
+        assert_eq!(
+            DataPage::slot_count(&buf),
+            1,
+            "the value should have landed in slot 0"
+        );
+    }
+
     #[test]
     fn read_returns_none_on_corrupt_slot_count() {
         let mut buf = fresh_page();

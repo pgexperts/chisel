@@ -18,9 +18,9 @@
 //
 //   The layout is padded out to DATA_PAGE_HEADER_SIZE (= 16, from page.rs)
 //   so data pages and overflow pages share the same 16-byte header
-//   footprint. This is NOT the same as COMMON_HEADER_SIZE (= 12); the
-//   overflow and data pages share the bigger number, the common header
-//   is only the shared prefix.
+//   footprint — which equals COMMON_HEADER_SIZE (= 16: bytes 0..8
+//   type-specific + 8..16 reserved). The overflow page adds its own two
+//   u64 fields (total_length, next_page) AFTER that common 16-byte header.
 //   bytes 16..24   : total_length (u64 LE) — full value size, REPEATED on every
 //                    page in the chain so any page can answer "how big is this
 //                    value?" without walking to the end

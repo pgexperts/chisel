@@ -29,16 +29,24 @@ pub const CHECKSUM_SIZE: usize = 8;
 // region (bytes 0..CHECKSUM_OFFSET) is a single contiguous hashable slice.
 pub const CHECKSUM_OFFSET: usize = PAGE_SIZE - CHECKSUM_SIZE; // 8184
 
-// Common page header (first 12 bytes) is shared by non-superblock pages so
-// that PageCache can identify a page's type without knowing its concrete
-// module. The superblock uses its own layout and does not carry this header.
+// Common page header (first 16 bytes) is shared by non-superblock pages: bytes
+// 0..8 are page-type-specific (type tag at byte 0, per-page version at byte 1 —
+// or byte 2 for HandleTable — plus any type header fields) and bytes 8..16 are
+// the I31 reserved common-header region (COMMON_RESERVED_OFFSET..+LEN).
+// PageCache identifies a page's type from byte 0 without knowing the concrete
+// module. The superblock uses its own layout and does NOT carry this header (it
+// stores its txn_counter in bytes 8..16).
 //
-// `#[allow(dead_code)]`: documents the layout commitment that every
-// page-type module's `init_page` agrees with — the constant is the
-// single source of truth even though no current call site reads it
-// (each page module knows its own concrete header size).
+// `#[allow(dead_code)]`: documents the layout commitment that every page-type
+// module's `init_page` agrees with — the single source of truth even though no
+// current call site reads it. It MUST equal DATA_PAGE_HEADER_SIZE and
+// COMMON_RESERVED_OFFSET + COMMON_RESERVED_LEN; the const-asserts below lock
+// that. I133 (2026-06-21): this was 12 — a stale value predating the I31 8..16
+// reservation that contradicted its own sibling constants and every comment;
+// corrected to 16. A workflow confirmed no page type stores data in 8..16, so
+// the reserved region is genuine and the common header genuinely runs to 16.
 #[allow(dead_code)]
-pub const COMMON_HEADER_SIZE: usize = 12;
+pub const COMMON_HEADER_SIZE: usize = 16;
 // Data pages carry an extended 16-byte header (common header + slot-array
 // metadata). PAGE_BODY_SIZE is the space available to slot payloads after
 // subtracting that header and the trailing checksum.
@@ -72,6 +80,17 @@ pub const PAGE_FORMAT_VERSION_CURRENT: u8 = 0;
 pub const COMMON_RESERVED_OFFSET: usize = 8;
 #[allow(dead_code)]
 pub const COMMON_RESERVED_LEN: usize = 8;
+
+// I133 (ISSUES.md, 2026-06-21): lock the header-size constants so the 12-vs-16
+// drift cannot recur. The common header spans bytes 0..16 (0..8 type-specific,
+// 8..16 reserved), so it must equal both the reserved region's end and the
+// data-page header — whose slot directory begins at byte 16, leaving no fields
+// in the reserved tail. The per-page version byte (1, or 2 for HandleTable)
+// sits below the reserved window. These are compile-time checks: a future edit
+// that desyncs the constants fails to build.
+const _: () = assert!(COMMON_HEADER_SIZE == COMMON_RESERVED_OFFSET + COMMON_RESERVED_LEN);
+const _: () = assert!(COMMON_HEADER_SIZE == DATA_PAGE_HEADER_SIZE);
+const _: () = assert!(2 < COMMON_RESERVED_OFFSET);
 
 // "CHSL" in ASCII, stored little-endian so it appears as C-H-S-L when you
 // hexdump the first 4 bytes of the file. Used to reject non-Chisel files

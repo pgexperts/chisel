@@ -229,7 +229,7 @@ Every page ends with an 8-byte XXH3 checksum over bytes `0..CHECKSUM_OFFSET` (= 
 
 ### Common page header
 
-Every non-superblock page shares a common 16-byte header. Bytes 0..8 are page-type-specific; bytes 8..16 are reserved for future common-header fields (I31 reservation, 64 bits of headroom).
+Every non-superblock page shares a common 16-byte header (`page::COMMON_HEADER_SIZE`, equal to `DATA_PAGE_HEADER_SIZE`). Bytes 0..8 are page-type-specific; bytes 8..16 are reserved for future common-header fields (I31 reservation, 64 bits of headroom).
 
 ```text
 non-superblock page (16-byte common header)
