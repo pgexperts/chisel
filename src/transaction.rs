@@ -45,7 +45,12 @@
 // in-memory backend.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+// I127 (ISSUES.md, 2026-06-21): FxHashMap (not std SipHash) for the per-op
+// slot-accounting maps below (current/committed_live_slots, Savepoint.live_slots).
+// Keys are trusted local u64 page ids — no DoS surface — so SipHash is pure cost,
+// exactly the I77 rationale; that pass converted the page cache/LRU but missed
+// these. FxHashMap is a drop-in std HashMap with a faster non-DoS-resistant hasher.
+use rustc_hash::FxHashMap;
 
 use crate::data_page::DataPage;
 use crate::error::{ChiselError, Result};
@@ -141,7 +146,7 @@ struct Savepoint {
     roots: Roots,
     watermark: u64,
     freed_pages: Vec<u64>,
-    live_slots: HashMap<u64, u32>,
+    live_slots: FxHashMap<u64, u32>,
     insert_cursor: Option<u64>,
 }
 
@@ -213,8 +218,8 @@ pub struct TransactionManager {
     // page would require rewriting every handle_table entry that
     // points into it — an O(live-slots-in-page) amplification per
     // delete that shadow paging does not handle well.
-    committed_live_slots: HashMap<u64, u32>,
-    current_live_slots: HashMap<u64, u32>,
+    committed_live_slots: FxHashMap<u64, u32>,
+    current_live_slots: FxHashMap<u64, u32>,
     // Per-transaction "insert cursor" (ISSUES.md R1). The id of a data
     // page allocated earlier in the current transaction that still has
     // free space. New values pack into it until it fills, at which
@@ -371,8 +376,8 @@ impl TransactionManager {
             committed_freemap,
             current_freemap,
             // A fresh database has no data pages and no live slots yet.
-            committed_live_slots: HashMap::new(),
-            current_live_slots: HashMap::new(),
+            committed_live_slots: FxHashMap::default(),
+            current_live_slots: FxHashMap::default(),
             insert_cursor: None,
             poisoned: Cell::new(false),
             #[cfg(test)]
@@ -551,7 +556,7 @@ impl TransactionManager {
         // only — the alternative (storing the count on the data page
         // itself) would require COWing pages on every delete, which
         // shadow paging cannot afford.
-        let mut committed_live_slots: HashMap<u64, u32> = HashMap::new();
+        let mut committed_live_slots: FxHashMap<u64, u32> = FxHashMap::default();
         if sb.root_handle_table_page != PAGE_ID_NONE {
             let entries = ht.iter_live(&mut cache, sb.root_handle_table_page)?;
             for (_, entry) in entries {
@@ -859,6 +864,17 @@ impl TransactionManager {
     /// Commit protocol — ORDERING IS LOAD-BEARING. Each numbered step encodes a
     /// specific crash-safety guarantee; reordering any of them can lose data or
     /// expose torn state on recovery.
+    ///
+    /// A commit issues THREE fsyncs, not two: a pre-drain (step 0) plus the two
+    /// numbered below. Both pre-drain and step 1 are part of the "all data
+    /// durable BEFORE the superblock" phase — the pre-drain just moves some of
+    /// that flushing earlier; the superblock fsync (step 4) is the second phase.
+    ///
+    /// 0. Pre-drain the page cache (I28). BEFORE step 1, `commit_inner` flushes
+    ///    the cache once so that `persist_freemap`'s own page allocation cannot
+    ///    trip the spill / `CacheFull` ceiling mid-commit (which would poison on
+    ///    an operational error). This is the FIRST of the three fsyncs. See the
+    ///    I28 comment in `commit_inner` for why it is conditional-safe.
     ///
     /// 1. Flush all dirty data pages to disk AND fsync.
     ///    PageCache::flush() writes every dirty page then calls fsync(). After

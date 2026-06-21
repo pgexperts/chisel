@@ -105,7 +105,7 @@ Why bottom-up matters: it means you can read the codebase in dependency order an
 | 1 | `superblock.rs` | In-memory `Superblock` struct, `serialize`/`deserialize`, `select()` across N candidate slots. | Magic + checksum + `superblock_count ∈ 2..=16` filter slots before tie-breaking by `txn_counter`. |
 | 2 | `page_io.rs` | Raw `pread`/`pwrite` of fixed-size pages, exclusive `flock`, `fsync`, in-memory `Vec<u8>` backing. Tracks cumulative successful `fsync_calls` count via a `Cell<u64>`. | The **only** module that touches the filesystem; everything else uses it through `PageCache`. |
 | 3 | `page_cache.rs` | LRU cache over `PageIo`, dirty tracking, checksum validation on load, spillway overflow, and `CacheFull`/`SpillwayFull` errors. Owns three `Cell<u64>` engine-activity counters (cache hits/misses, pages allocated) and exposes `counters()` aggregating them with `PageIo::fsync_count`. | Soft eviction at `max_pages`; dirty overflow spills to a sidecar Spillway file (cap = `spillway_max_bytes`); `CacheFull` at strict `max_pages` when spillway is disabled (`spillway_max_bytes=0`); checksums verified on disk LOAD only. |
-| 4 | `freemap.rs` | Bitmap of free pages, `allocate_first` / `allocate_near` / `mark_free`. | Pure buffer manipulation; no cache or I/O. |
+| 4 | `freemap.rs` | Bitmap of free pages, `allocate_first` / `mark_free`. | Pure buffer manipulation; no cache or I/O. |
 | 4 | `data_page.rs` | Slotted page layout (R1): slot directory grows forward, packed value data grows backward, dead-slot tombstones reclaimed only by `compact()`. | Slot indices are stable until compact; compact returns an old→new mapping for callers to rewrite. |
 | 4 | `overflow.rs` | Singly-linked overflow chains for values > inline threshold. | `total_length` repeated on every chain page; `next_page == 0` terminates; cycle detection bounded by `total_length / OVERFLOW_PAYLOAD` (I14). |
 | 5 | `handle_table.rs` | Radix tree mapping `u64` handle → `(page_id, slot_index)`. Implements its own copy-on-write atop `PageCache::new_page`. | Capacity = `510 × 1021^depth`; `find_leaf` short-circuits on `handle ≥ capacity` to `Ok(None)` (I26). |
@@ -471,7 +471,7 @@ bytes              | field                         | type
 8184..8192         | XXH3 checksum                 | u64 LE
 ```
 
-`allocate_first` returns the lowest free page id by scanning bytes for non-zero values and using `trailing_zeros` to find the bit. `allocate_near(target)` does an outward radius scan from a hint, useful for keeping logically-related pages spatially close (currently used by data-page allocation only opportunistically).
+`allocate_first` returns the lowest free page id by scanning bytes for non-zero values and using `trailing_zeros` to find the bit. (An `allocate_near(target)` radius-scan variant existed but was removed in the PR #46 dead-code sweep — no caller used it.)
 
 The freemap is consumed during commit's `persist_freemap`: pages freed during the transaction are merged into the bitmap **after** the new freemap page has been allocated (I18 — see commit-protocol section).
 
@@ -580,7 +580,7 @@ The counter set is fixed at four for v1 of the instrumentation (PR 1 of the benc
 Chisel versions its on-disk format at two levels.
 
 - **File level** (I29): the superblock carries a packed `format_version` u32 — upper 16 bits MAJOR, lower 16 bits MINOR. Open-time gate compares MAJOR only. Any same-major file opens regardless of minor; a different-major file is rejected with `UnsupportedFormatVersion`. This is what makes the README's "sacred within a major version" promise enforceable.
-- **Page level** (I31): each non-superblock page carries a one-byte `page_format_version` in its header (byte 1 for Data/Overflow/FreeMap; byte 2 for HandleTable, where byte 1 holds the FLAG byte). This lets individual page layouts evolve within a major without a file-wide bump. The current value is `0` everywhere. The post-1.0 upgrade plan is lazy migration: reads dispatch on the version byte, writes always produce the latest version, and an opt-in eager upgrader (deferred) sweeps remaining old pages.
+- **Page level** (I31): each non-superblock page carries a one-byte `page_format_version` in its header (byte 1 for Data/Overflow/FreeMap; byte 2 for HandleTable, where byte 1 holds the FLAG byte). This lets individual page layouts evolve within a major without a file-wide bump. The current value is `0` everywhere. The post-1.0 upgrade plan is lazy migration: reads *will* dispatch on the version byte (the per-module decode helpers and `page::page_format_version()` exist but are **dormant today** — `PageCache::load_page` validates only the XXH3 checksum and nothing reads the version byte yet), writes always stamp the current version, and an opt-in eager upgrader (deferred) sweeps remaining old pages.
 
 Both schemes leave reserved space for forward compatibility — the superblock has bytes 320..8184 reserved (after the `root_membership_index_page` field at 312..320), and every non-superblock page has bytes 8..16 reserved (8 bytes / 64 bits) for future common-header fields.
 
@@ -588,7 +588,7 @@ Both schemes leave reserved space for forward compatibility — the superblock h
 
 ## Benchmark infrastructure
 
-The `bench/` subcrate is a sibling to `python/`, not a workspace member of the root `chisel` crate. It provides three measurement layers comparing Chisel against [redb](https://github.com/cberner/redb) and SQLite:
+The `bench/` subcrate is a workspace member (listed in `members` and `default-members`, so a root `cargo test` runs it) that path-deps on the root `chisel` crate. It provides three measurement layers comparing Chisel against [redb](https://github.com/cberner/redb) and SQLite:
 
 1. **Cross-engine equivalence tests** — five scenarios × three engines × snapshot/restore checks, asserting that all three engines produce identical observable state for the same workload. Catches semantic divergence in the workload-replay machinery before it contaminates measurement.
 2. **Criterion micro-grid** — six rows of small-scoped operations (single-tx allocate, point-read, single-tx update at small batch sizes), 165 cells of wall-clock + file-size + Chisel-internal-counter metrics. Drives the `Engine` trait through tight loops.
@@ -619,7 +619,7 @@ This section is a date-stamped narrative of the larger pieces of work that lande
 The bench-suite series ran from 2026-04-30 through 2026-05-04 and landed in eight PRs against `main`:
 
 - **PR 1 (2026-04-30)** — counter instrumentation. Added the four `Chisel::counters()` fields (`cache_hits`, `cache_misses`, `pages_allocated`, `fsync_calls`) as `Cell<u64>` increments at the site of each operation. `ChiselCounters` is `#[non_exhaustive]` so future counters can be added without a breaking change. Documented in [Engine-activity counters](#engine-activity-counters).
-- **PR 2 (2026-04-30)** — `bench/` subcrate + `Engine` trait + `ChiselEngine`. The `bench/` directory is a sibling subcrate, not a workspace member; it path-deps on the root `chisel` crate.
+- **PR 2 (2026-04-30)** — `bench/` subcrate + `Engine` trait + `ChiselEngine`. The `bench/` directory was a sibling subcrate at this point (I61 later made it a `default-members` workspace member); it path-deps on the root `chisel` crate.
 - **PR 3 (2026-04-30)** — `RedbEngine` + `SqliteEngine` + cross-engine equivalence tests (five scenarios × three engines = 15 tests). SQLite snapshot-restore required `Engine::flush_for_snapshot()` (default no-op; SQLite override does `journal_mode=DELETE`) because WAL mode leaves committed data in the `-wal` sibling between explicit checkpoints — `std::fs::copy` of the main `.db` alone otherwise yields "database disk image is malformed" on reopen.
 - **PR 4a (2026-04-30)** — workload data layer. `Operation` / `Workload` types plus six seeded generators in `bench/src/workload.rs`, ChaCha8Rng-pinned for cross-version reproducibility.
 - **PR 4b (2026-05-01)** — Runner machinery + 6-row Criterion micro grid in `bench/src/runner.rs` + `bench/benches/micro_grid.rs`. Produces 165 cells of wall-clock + file-size + Chisel-internal-counter metrics into `target/criterion/...` and `bench/results/aux_metrics.jsonl`. The original PR 4 from the master spec was split into 4a + 4b once it became clear ~600 LOC in one PR was less reviewable than two smaller PRs.
@@ -668,7 +668,7 @@ Spec/plan at `docs/superpowers/specs/2026-05-03-chisel-spillway-design.md` + `do
 
 Three engineering lessons surfaced during the spillway PR that are worth remembering for future cross-cutting work:
 
-1. **Per-task `cargo test` from the repo root does NOT run the bench subcrate's tests.** Bench is a sibling crate, not a workspace member. `cd bench && cargo test` is documented separately, but per-task gates skipped it. The final whole-PR review caught the missed bench test failures. Tracked as I58 in ISSUES.md (add bench tests to `ci.yml`).
+1. **Per-task `cargo test` from the repo root did NOT run the bench subcrate's tests (at the time).** Bench was a sibling crate, not a workspace member. `cd bench && cargo test` was documented separately, but per-task gates skipped it. The final whole-PR review caught the missed bench test failures. Tracked as I58 in ISSUES.md and since RESOLVED: I58/I61 made `bench/` a `default-members` workspace member, so a root `cargo test` now covers it.
 2. **A breaking change in cache discipline ripples to every consumer that papered over a different limitation.** The bench engine had been quietly relying on the 8× elasticity as a substitute for proper transaction-overflow handling. Removing the elasticity exposed the missing config; the right fix was to give Chisel the spillway (production parity), not to keep it disabled and lower other budgets.
 3. **No-spill commit cost is 3 fsyncs, not 2.** I28 pre-drain flush + main-pages flush + superblock. The spillway spec called it "two-fsync" because the spec author was thinking only of the spillway's contribution (zero); the actual baseline was already 3. The `no_spill_workload_preserves_two_fsync_commit` test now pins to `== 3` with documentation of the protocol so a future reader knows what each fsync covers.
 
