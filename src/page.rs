@@ -144,9 +144,6 @@ pub enum PageType {
 /// put (ADR-7: per-type evolution). The match is exhaustive on purpose — adding
 /// a `PageType` variant forces a decision here rather than defaulting silently.
 /// See ISSUES.md I31.
-// `#[allow(dead_code)]`: forward-looking API seam — init_page sites will call
-// this once they are updated (I31 follow-on), so no call site exists today.
-#[allow(dead_code)]
 pub const fn current_version(page_type: PageType) -> u8 {
     match page_type {
         PageType::HandleTable

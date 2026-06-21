@@ -97,7 +97,7 @@ impl DataPage {
         // Written explicitly (even though buf.fill(0) already set it) so
         // the layout intent is visible and future `CURRENT` bumps flow
         // through here automatically.
-        buf[1] = page::PAGE_FORMAT_VERSION_CURRENT;
+        buf[1] = page::current_version(page::PageType::Data);
         // slot_count = 0 (bytes 2..4 already zero)
         // free_start = DATA_PAGE_HEADER_SIZE (end of header = start of slot dir area)
         let free_start = DATA_PAGE_HEADER_SIZE as u16;

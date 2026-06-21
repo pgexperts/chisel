@@ -117,7 +117,7 @@ impl Overflow {
             // I31: per-page version at byte 1. Explicit for the same
             // reason as data_page::init_page — intent visible, future
             // CURRENT bumps flow through here automatically.
-            buf[1] = page::PAGE_FORMAT_VERSION_CURRENT;
+            buf[1] = page::current_version(page::PageType::Overflow);
             buf[16..24].copy_from_slice(&total_length.to_le_bytes());
             buf[24..32].copy_from_slice(&next_page.to_le_bytes());
             buf[OVERFLOW_HEADER_END..OVERFLOW_HEADER_END + chunk.len()].copy_from_slice(chunk);

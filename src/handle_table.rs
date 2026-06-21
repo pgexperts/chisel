@@ -188,7 +188,7 @@ impl HandleTable {
         buf.fill(0); // Zero-fill: every slot reads as Deleted (see HandleFlags::from_u8).
         buf[0] = PageType::HandleTable as u8;
         buf[1] = FLAG_LEAF;
-        buf[2] = page::PAGE_FORMAT_VERSION_CURRENT; // I31
+        buf[2] = page::current_version(page::PageType::HandleTable); // I31
         page::stamp_checksum(buf);
         self.depth = 0;
         Ok(page_id)
@@ -512,7 +512,7 @@ impl HandleTable {
         buf.fill(0);
         buf[0] = PageType::HandleTable as u8;
         buf[1] = FLAG_INTERIOR;
-        buf[2] = page::PAGE_FORMAT_VERSION_CURRENT; // I31
+        buf[2] = page::current_version(page::PageType::HandleTable); // I31
         buf[DATA_PAGE_HEADER_SIZE..DATA_PAGE_HEADER_SIZE + 8]
             .copy_from_slice(&old_root.to_le_bytes());
         page::stamp_checksum(buf);
@@ -599,7 +599,7 @@ impl HandleTable {
                     buf.fill(0);
                     buf[0] = PageType::HandleTable as u8;
                     buf[1] = FLAG_LEAF;
-                    buf[2] = page::PAGE_FORMAT_VERSION_CURRENT; // I31
+                    buf[2] = page::current_version(page::PageType::HandleTable); // I31
                     page::stamp_checksum(buf);
                     leaf
                 } else {
@@ -609,7 +609,7 @@ impl HandleTable {
                     buf.fill(0);
                     buf[0] = PageType::HandleTable as u8;
                     buf[1] = FLAG_INTERIOR;
-                    buf[2] = page::PAGE_FORMAT_VERSION_CURRENT; // I31
+                    buf[2] = page::current_version(page::PageType::HandleTable); // I31
                     page::stamp_checksum(buf);
                     interior
                 }

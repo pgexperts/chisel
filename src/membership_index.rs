@@ -44,7 +44,7 @@ fn init_page(cache: &mut PageCache, page_type: PageType) -> Result<u64> {
     let buf = cache.get_mut(id)?;
     buf.fill(0);
     buf[0] = page_type as u8;
-    buf[1] = page::PAGE_FORMAT_VERSION_CURRENT; // version at byte 1 (no FLAG byte)
+    buf[1] = page::current_version(page_type); // version at byte 1 (no FLAG byte)
     page::stamp_checksum(buf);
     Ok(id)
 }
@@ -157,7 +157,7 @@ impl RadixU64 {
         let buf = cache.get_mut(new_root)?;
         buf.fill(0);
         buf[0] = PageType::MembershipInterior as u8;
-        buf[1] = page::PAGE_FORMAT_VERSION_CURRENT;
+        buf[1] = page::current_version(PageType::MembershipInterior);
         write_slot(buf, 0, old_root); // old root becomes child 0
         page::stamp_checksum(buf);
         self.depth += 1;
@@ -232,7 +232,7 @@ impl RadixU64 {
                 let buf = cache.get_mut(id)?;
                 buf.fill(0);
                 buf[0] = pt as u8;
-                buf[1] = page::PAGE_FORMAT_VERSION_CURRENT;
+                buf[1] = page::current_version(pt);
                 page::stamp_checksum(buf);
                 id
             } else {

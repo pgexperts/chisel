@@ -87,7 +87,7 @@ impl FreeMap {
         // I31: per-page version byte at position 1 (same offset as
         // data_page and overflow). Written explicitly even though
         // buf.fill(0) already zeroed it.
-        buf[1] = crate::page::PAGE_FORMAT_VERSION_CURRENT;
+        buf[1] = crate::page::current_version(crate::page::PageType::FreeMap);
     }
 
     /// Check if a page is marked free in the bitmap.
