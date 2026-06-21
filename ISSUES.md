@@ -1340,19 +1340,23 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 ### Error handling and classification
 
-#### I104. `ChiselError::is_fatal()` is fail-open — unlisted future variants classified non-fatal [deepdive 2026-06-21] — **P2**
+#### I104. `ChiselError::is_fatal()` is fail-open — unlisted future variants classified non-fatal [deepdive 2026-06-21] — **P2** ✅ FIXED 2026-06-21
 **Where:** `src/error.rs:168-181`
 
 **Problem:** the `matches!`-based classifier returns `false` for any variant not in its Fatal list, so a future fatal variant a maintainer forgets to add is silently classified *operational* and will NOT poison the manager. For a durability-first engine this is the one function whose default leans the wrong way; the in-code INVARIANT comment already admits it's "a durability hole, not a compile error." All 24 current variants are classified correctly — the gap is latent, not a present bug.
 
 **Direction of fix (NOT a default flip):** the review argues a `_ => true` flip just moves the latent bug (a future *operational* variant would then over-poison and tank availability). Instead add an exhaustiveness test that constructs every `ChiselError` variant and asserts `is_fatal()` matches the value the enum's documented Fatal/Operational block prescribes. Converts the prose invariant into a compile-time-ish signal the `#[non_exhaustive]` enum can't give, catches *both* misclassification directions, changes zero runtime behaviour (~30 lines). See the review's countercase section for the full argument.
 
-#### I105. Blanket `From<io::Error>` makes every `?` on an I/O call produce a *fatal* `IoError` invisibly [deepdive 2026-06-21] — **P2**
+**Fixed (2026-06-21):** added `is_fatal_matches_documented_classification_for_every_variant` to `src/error.rs`'s test module. A test-local `documented_is_fatal` helper classifies every variant via a match with **no `_` arm** — and because the test lives in the defining crate, `#[non_exhaustive]` does NOT suppress the exhaustiveness check, so adding a variant fails to compile until it is placed in the Fatal or Operational block (the compile-time guard `matches!` can't give). The test then asserts `is_fatal()` agrees with the independent documented classification for a constructed instance of all 24 variants, plus a `== 9 fatal` tripwire. No runtime behaviour change; the default was NOT flipped.
+
+#### I105. Blanket `From<io::Error>` makes every `?` on an I/O call produce a *fatal* `IoError` invisibly [deepdive 2026-06-21] — **P2** ✅ FIXED 2026-06-21
 **Where:** `src/error.rs:282-286` (conversion); `:280-281` (the caveat comment)
 
 **Problem:** the blanket conversion means any `?` on an io call silently produces a fatal `IoError` and poisons, even on a benign `NotFound`. The comment concedes callers "must catch and remap" to classify e.g. `NotFound` as operational, but nothing enforces it — the `FileNotFound` operational variant exists *because* the conversion is too coarse. A future `?` on an io call that should be recoverable will poison.
 
 **Direction of fix:** drop the blanket `From` (force explicit classification at each I/O site), or have the conversion inspect `ErrorKind` and route the known-operational kinds (`NotFound`, `AlreadyExists`, …) to operational variants.
+
+**Fixed (2026-06-21, ErrorKind-inspection option, per maintainer decision):** the `From<io::Error>` impl now matches on `e.kind()` and routes `io::ErrorKind::NotFound` → operational `FileNotFound`; every other kind stays fatal `IoError`. Scope was deliberately limited to `NotFound` (not `AlreadyExists`): NotFound can only arise from resolving a missing *path* (open of a non-existent file), never from a read/write on the already-open, flock'd fd, so demoting it is safe — whereas demoting a kind that might signal real corruption would be the same fail-open hazard as I104. `Chisel::open` already pre-checks the missing-file case at `lib.rs:295` and returns `FileNotFound` directly, so the tested open path is unchanged; this makes any *stray* NotFound that reaches a `?` classify consistently instead of poisoning. Full suite green (no test regressed). The stale "every io::Error becomes a fatal IoError" comment was rewritten.
 
 #### I106. `CorruptSuperblock` folds three distinct causes into one nullary fatal variant [deepdive 2026-06-21] — **P3**
 **Where:** `src/error.rs:106`
@@ -1600,12 +1604,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 **Direction of fix:** rewrite both file headers to describe the Mutex model and the deadlock-not-panic re-entry semantics.
 
-#### I138. `errors.rs` catchall routes any future variant to the abstract base, bypassing the Operational/Fatal split [deepdive 2026-06-21] — **P2**
+#### I138. `errors.rs` catchall routes any future variant to the abstract base, bypassing the Operational/Fatal split [deepdive 2026-06-21] — **P2** ✅ FIXED 2026-06-21
 **Where:** `python/src/errors.rs:326` (the `_` arm); the "exhaustive, no silent fallback" header claim at `:11-13`
 
 **Problem:** the same fail-open class as engine I104, on the binding side. A new *fatal* engine variant would surface in Python as a bare `ChiselError`, so `except chisel.FatalError:` poison-recovery handlers silently miss it — breaking the documented `FatalError` contract (`errors.rs:5-7`). The header still claims the match is exhaustive with "no silent fallback", which `#[non_exhaustive]` (I36) made false.
 
 **Direction of fix:** branch the catchall through the Operational/Fatal base class instead of the abstract `ChiselError`; correct the header claim.
+
+**Fixed (2026-06-21):** `to_py_err` now captures `let fatal = err.is_fatal();` before the match consumes `err`, and the `_` catchall routes `if fatal { FatalError } else { OperationalError }` instead of the abstract `ChiselError` base — so a future fatal variant stays catchable via `except chisel.FatalError:`. The stale header claim that the match is compile-time exhaustive (false since I36 added the `_` arm) was rewritten to describe the tiered fallback and to point at the engine-side I104 test as the guard for the classification this fallback relies on. Dormant today (all 24 current variants hit concrete arms); `cargo clippy --workspace` compiles the binding clean and the Python matrix stays green.
 
 #### I139. The typed-exception contract is largely unverified [deepdive 2026-06-21] — **P3**
 **Where:** `python/tests/` (`test_operational_hierarchy`, `test_threading.py`); `python/src/errors.rs::to_py_err`

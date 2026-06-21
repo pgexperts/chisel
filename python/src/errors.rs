@@ -5,12 +5,17 @@
 // captures the same set of "drop-and-reopen" conditions that would
 // poison the Rust TransactionManager.
 //
-// Invariant: every ChiselError variant maps to exactly one concrete
-// exception class. The match in `to_py_err` is exhaustive, so adding a
-// new ChiselError variant produces a compile error here rather than a
-// silent fallback. That is the ONLY safety mechanism keeping the
-// Python exception surface in sync with the Rust error enum — there is
-// no test that enumerates variants.
+// Invariant: every CURRENT ChiselError variant maps to exactly one concrete
+// exception class via an explicit arm in `to_py_err`. ChiselError is
+// #[non_exhaustive] (I36), so the match carries a catchall `_` arm and is NOT
+// compile-time exhaustive. To keep the two-tier contract intact for a future
+// un-enumerated variant, that catchall routes by `is_fatal()` to the correct
+// tier base — OperationalError or FatalError — never the abstract ChiselError
+// base (I138). So a new variant always lands under the right poison-contract
+// parent even before it gets its own concrete class; adding the concrete arm
+// is still preferred. No test enumerates the Python classes (ISSUES.md I139);
+// the engine-side is_fatal() exhaustiveness test (I104) guards the
+// classification this fallback depends on.
 //
 // Class hierarchy (matches both the .pyi stubs and __init__.py re-exports):
 //
@@ -240,6 +245,9 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
     // only cross-boundary contract, and round-tripping back into Rust
     // from Python isn't supported.
     let msg = err.to_string();
+    // Captured before the match consumes `err`; used only by the I138 catchall
+    // below to pick the correct tier base for a future un-enumerated variant.
+    let fatal = err.is_fatal();
     match err {
         // Operational
         RustChiselError::InvalidHandle(_) => InvalidHandleError::new_err(msg),
@@ -313,16 +321,21 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
         RustChiselError::CorruptPage { .. } => CorruptPageError::new_err(msg),
         RustChiselError::InvalidPageId { .. } => InvalidPageIdError::new_err(msg),
         RustChiselError::Poisoned => PoisonedError::new_err(msg),
-        // I36: ChiselError is #[non_exhaustive], so even a path-deps
-        // crate has to keep a catchall arm. Any variant not enumerated
-        // above routes to the abstract `ChiselError` base class with
-        // the Rust-side Display message. The internal compile-time
-        // exhaustiveness check (this match used to enforce it via no `_`
-        // arm) is gone, but the Display impl in src/error.rs is itself
-        // exhaustive, so a new variant is still caught there at compile
-        // time inside the chisel crate. A new ChiselError variant
-        // landed without updating this match will still get a sensible
-        // (if generic) Python exception class.
-        _ => ChiselError::new_err(msg),
+        // I138 (ISSUES.md, 2026-06-21): ChiselError is #[non_exhaustive] (I36),
+        // so this catchall is required for any variant not enumerated above.
+        // Route it through the Operational/Fatal split by is_fatal() — NOT the
+        // abstract ChiselError base it used to use. Previously a future *fatal*
+        // variant landed under the abstract base, so `except chisel.FatalError:`
+        // poison-recovery handlers silently missed it, breaking the documented
+        // FatalError contract — the same fail-open class as engine I104. The
+        // concrete arms above are still preferred; this only fixes the fallback's
+        // parent so a new variant is at least catchable at the correct tier.
+        _ => {
+            if fatal {
+                FatalError::new_err(msg)
+            } else {
+                OperationalError::new_err(msg)
+            }
+        }
     }
 }
