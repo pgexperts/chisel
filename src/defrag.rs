@@ -38,10 +38,13 @@
 // Stat accuracy (ISSUES.md I17):
 //   `pages_examined` now counts UNIQUE sparse pages touched during the
 //   sweep (via a HashSet) rather than per-value. `pages_freed` is the
-//   net drop in the live data-page count (via `data_page_ids_snapshot`)
-//   from the start to the end of the sweep — capturing pages that were
-//   fully emptied by relocation and returned to the freemap by the R2
-//   commit path.
+//   count of pages that held a live slot at the START of the sweep but
+//   none at the END — the set difference of the `data_page_ids_snapshot`
+//   taken before and after, NOT a net count delta. Net count is the wrong
+//   metric here: a relocation drains a sparse source page while filling a
+//   dense destination, so the live-page count can barely move even though a
+//   page was genuinely emptied and returned to the freemap by the R2 commit
+//   path.
 
 use std::collections::HashSet;
 

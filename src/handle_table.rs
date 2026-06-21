@@ -422,7 +422,8 @@ impl HandleTable {
     }
 
     /// Rebuild the tree depth by walking the left spine from `root` until a leaf
-    /// (page type byte != `FLAG_INTERIOR`). Returns 0 for an empty tree
+    /// (the flag byte `buf[1]` != `FLAG_INTERIOR`; the page-type tag lives at
+    /// `buf[0]`, not the byte tested here). Returns 0 for an empty tree
     /// (`PAGE_ID_NONE`) or a leaf root. The in-memory `depth` is NOT carried in
     /// `Roots`, so the transaction layer re-derives it from the restored root both
     /// at open AND after a rollback rewinds to a shallower committed/savepoint root.

@@ -1,11 +1,21 @@
 // RedbEngine — Engine trait impl backed by redb.
 //
 // Schema: a single table mapping caller-generated monotonic u64 keys
-// to byte-blob values. The harness owns the key-allocation policy
-// (next_id starts from max_existing_key + 1 on open, increments
-// monotonically, never reuses) so that identifier semantics match
-// Chisel's "handles never reused after delete" promise — see the
-// Engine::allocate doc comment.
+// to byte-blob values. The harness owns the key-allocation policy: within a
+// single open session next_id only ever increments (see `allocate`), so ids
+// are never reused — matching Chisel's "handles never reused after delete"
+// promise (see the Engine::allocate doc comment) for every workload the
+// bench actually runs.
+//
+// Boundary (latent, not currently hit): the seed is recomputed by
+// `recover_next_id` as max_existing_key + 1 at EACH open — it is NOT
+// persisted as a monotonic high-water mark. So the never-reused property
+// spans a close/reopen only while the highest-keyed records survive: delete
+// the top key(s), reopen, and the allocator reseeds LOWER and can reissue a
+// previously-handed-out id. The bench never deletes-then-reopens the same
+// file, so this never fires today. If a future scenario needs cross-reopen
+// id stability, persist the high-water mark in a dedicated metadata key
+// rather than deriving it from the live max.
 //
 // Transaction state lives on the struct as Option<WriteTransaction>.
 // redb 2.x's WriteTransaction is 'static-suitable (it holds Arc to
