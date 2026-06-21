@@ -104,6 +104,17 @@ pub const fn format_major(version: u32) -> u16 {
     (version >> 16) as u16
 }
 
+/// Extract the minor-version pair from a packed `format_version`. Companion to
+/// `format_major`; used only by the open-time I29 write-gate — a binary whose
+/// MINOR is below the file's must not write the file (it would drop fields it
+/// doesn't know). See ISSUES.md I29.
+// `#[allow(dead_code)]`: forward-looking API seam — the write-gate (I29) is
+// not yet implemented, so no call site exists today.
+#[allow(dead_code)]
+pub const fn format_minor(version: u32) -> u16 {
+    (version & 0xFFFF) as u16
+}
+
 pub const FORMAT_VERSION: u32 = pack_format_version(FORMAT_MAJOR_VERSION, FORMAT_MINOR_VERSION);
 
 /// Sentinel value meaning "not yet allocated" for root page pointers
@@ -124,6 +135,45 @@ pub enum PageType {
     FreeMap = 0x04,
     MembershipInterior = 0x05,
     MembershipLeaf = 0x06,
+}
+
+/// The per-page format version a freshly-initialized page of `page_type`
+/// stamps — the single source of truth for the write side (every `init_page`
+/// site calls this). Returns 0 for every type today. When a page type's layout
+/// gains a version-requiring field, ONLY that type's arm changes; others stay
+/// put (ADR-7: per-type evolution). The match is exhaustive on purpose — adding
+/// a `PageType` variant forces a decision here rather than defaulting silently.
+/// See ISSUES.md I31.
+// `#[allow(dead_code)]`: forward-looking API seam — init_page sites will call
+// this once they are updated (I31 follow-on), so no call site exists today.
+#[allow(dead_code)]
+pub const fn current_version(page_type: PageType) -> u8 {
+    match page_type {
+        PageType::HandleTable
+        | PageType::Data
+        | PageType::Overflow
+        | PageType::FreeMap
+        | PageType::MembershipInterior
+        | PageType::MembershipLeaf => PAGE_FORMAT_VERSION_CURRENT,
+    }
+}
+
+/// Read the per-page format version stamped in `buf`. Dispatches the byte
+/// offset on the page-type tag at byte 0: HandleTable keeps byte 1 for its
+/// leaf/interior flag and stores the version at byte 2; every other
+/// non-superblock page stores it at byte 1. A reader that must distinguish
+/// layouts (an additive field where zero is a legitimate value) branches on
+/// this: `if page_format_version(buf) >= K { read field } else { default }`.
+/// See ISSUES.md I31 and docs/specs/2026-06-21-per-page-format-versioning-design.md.
+// `#[allow(dead_code)]`: forward-looking API seam — read-side version gates
+// (I31 follow-on) are not yet wired in, so no call site exists today.
+#[allow(dead_code)]
+pub fn page_format_version(buf: &[u8; PAGE_SIZE]) -> u8 {
+    if buf[0] == PageType::HandleTable as u8 {
+        buf[2]
+    } else {
+        buf[1]
+    }
 }
 
 // XXH3 was chosen over CRC32C for throughput on modern CPUs. It is a
@@ -284,5 +334,52 @@ mod tests {
         assert_eq!(CHECKSUM_OFFSET + 8, PAGE_SIZE);
         assert_eq!(PAGE_BODY_SIZE + 16 + 8, PAGE_SIZE); // header + body + checksum
         assert_eq!(MAGIC, 0x4348534C);
+    }
+
+    #[test]
+    fn page_format_version_dispatches_offset_on_page_type() {
+        // HandleTable: version at byte 2 (byte 1 holds the leaf/interior flag).
+        let mut buf = [0u8; PAGE_SIZE];
+        buf[0] = PageType::HandleTable as u8;
+        buf[1] = 0x01; // FLAG_LEAF — must be ignored by the version reader
+        buf[2] = 7;
+        assert_eq!(page_format_version(&buf), 7);
+
+        // Every other non-superblock type: version at byte 1.
+        for pt in [
+            PageType::Data,
+            PageType::Overflow,
+            PageType::FreeMap,
+            PageType::MembershipInterior,
+            PageType::MembershipLeaf,
+        ] {
+            let mut buf = [0u8; PAGE_SIZE];
+            buf[0] = pt as u8;
+            buf[1] = 5;
+            buf[2] = 99; // type-specific byte must not leak into the version
+            assert_eq!(page_format_version(&buf), 5, "type {pt:?}");
+        }
+    }
+
+    #[test]
+    fn current_version_is_zero_for_all_types_today() {
+        for pt in [
+            PageType::HandleTable,
+            PageType::Data,
+            PageType::Overflow,
+            PageType::FreeMap,
+            PageType::MembershipInterior,
+            PageType::MembershipLeaf,
+        ] {
+            assert_eq!(current_version(pt), 0, "type {pt:?}");
+        }
+    }
+
+    #[test]
+    fn format_minor_extracts_low_16_bits() {
+        let v = pack_format_version(3, 42);
+        assert_eq!(format_major(v), 3);
+        assert_eq!(format_minor(v), 42);
+        assert_eq!(format_minor(FORMAT_VERSION), FORMAT_MINOR_VERSION);
     }
 }
