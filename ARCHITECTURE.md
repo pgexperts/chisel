@@ -640,7 +640,7 @@ The bench-suite series ran from 2026-04-30 through 2026-05-04 and landed in eigh
 A small followup landed alongside PR 8: `bench.yml` now uploads the PR-side `summarize` output (`cross-engine.md`, `summary.md`, `results.json`) as a workflow artifact `bench-results-pr-<N>` with 90-day retention. Retrieve via:
 
 ```
-gh run download <run-id> --repo Xof/chisel --name bench-results-pr-<N>
+gh run download <run-id> --repo pgexperts/chisel --name bench-results-pr-<N>
 ```
 
 Get `<run-id>` from `gh run list --branch <branch>` or the PR checks page. The `raw/` Criterion archive is intentionally absent from scenario-tier output — scenarios use `Instant::now()` timing rather than Criterion. Main-side output is not uploaded; for absolute README/release-notes numbers, run on dedicated hardware rather than the shared CI runner.

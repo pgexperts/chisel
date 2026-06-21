@@ -326,7 +326,7 @@ Identity: a dedicated machine identity `chisel-bench-bot` keeps automated commit
 
 Failure modes:
 - **Push fails because main moved between fetch and push** (someone merged a PR during the soak window): retry once with `git pull --rebase origin main && git push`. Soak's commits are isolated to `bench-results/soak/<UTC>/`, so there is no merge conflict to worry about. If retry also fails, abort and emit an alert artifact.
-- **Branch protection on main blocks bot commits:** surfaces at first soak run. Operator decides whether to allow `chisel-bench-bot` in the protection bypass list, or relax the protection rule. v1 default: assume no branch protection (Xof/chisel currently has none); design preserves the option to switch to a `bench-results-soak` orphan branch later if protection becomes a problem.
+- **Branch protection on main blocks bot commits:** surfaces at first soak run. Operator decides whether to allow `chisel-bench-bot` in the protection bypass list, or relax the protection rule. v1 default: assume no branch protection (pgexperts/chisel currently has none); design preserves the option to switch to a `bench-results-soak` orphan branch later if protection becomes a problem.
 - **Bench itself fails:** workflow fails; no commit happens; the next scheduled run tries again. Operator triages via Actions UI failure notification.
 
 ### Cross-cutting: what travels vs what stays local
@@ -437,13 +437,13 @@ Eight steps, each independently testable. Sequenced so each step's success crite
 
 - Install `rustup` with stable toolchain.
 - Install `git`, `gh`, `build-essential`, anything else the bench subcrate needs.
-- Clone `Xof/chisel`; `cd bench && cargo build --release` to warm the cargo cache.
+- Clone `pgexperts/chisel`; `cd bench && cargo build --release` to warm the cargo cache.
 - **Success:** `cd bench && cargo test` passes (98/98 tests).
 
 ### Step 3: Self-hosted runner installation plus registration
 
 - Download GitHub's runner agent for Linux x64 from the release page.
-- Register: `./config.sh --url https://github.com/Xof/chisel --token <runner-token>`. Token from repo settings → Actions → Runners → New self-hosted runner.
+- Register: `./config.sh --url https://github.com/pgexperts/chisel --token <runner-token>`. Token from repo settings → Actions → Runners → New self-hosted runner.
 - Add labels: `dedicated-bench`, `bench-v1` (in addition to default `self-hosted`, `linux`, `x64`).
 - Install as systemd service: `sudo ./svc.sh install && sudo ./svc.sh start`.
 - **Success:** Repo settings shows the runner online; `sudo systemctl status actions.runner.*` shows active.

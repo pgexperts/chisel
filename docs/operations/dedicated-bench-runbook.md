@@ -22,14 +22,14 @@ ssh bench-op@chisel-bench-1
 # Confirm what's running first:
 sudo systemctl list-units 'actions.runner.*' --type=service
 # Stop the service (waits for current job to complete naturally):
-sudo systemctl stop actions.runner.Xof-chisel.chisel-bench-1.service
+sudo systemctl stop actions.runner.pgexperts-chisel.chisel-bench-1.service
 ```
 
 While stopped: per-PR work falls through to `ubuntu-latest` automatically (with the offline-warning header on the PR comment). Canonical and soak runs queue in the GitHub Actions UI until the runner returns. After maintenance:
 
 ```bash
-sudo systemctl start actions.runner.Xof-chisel.chisel-bench-1.service
-sudo systemctl status actions.runner.Xof-chisel.chisel-bench-1.service
+sudo systemctl start actions.runner.pgexperts-chisel.chisel-bench-1.service
+sudo systemctl status actions.runner.pgexperts-chisel.chisel-bench-1.service
 ```
 
 ### Re-run the noise gate
@@ -107,7 +107,7 @@ tar xzf actions-runner-linux-x64-2.319.1.tar.gz
 # Re-register with --disableupdate so it stays pinned:
 ./config.sh remove --token <REMOVE-TOKEN>
 ./config.sh \
-  --url https://github.com/Xof/chisel \
+  --url https://github.com/pgexperts/chisel \
   --token <REGISTER-TOKEN> \
   --name chisel-bench-1 \
   --labels dedicated-bench,bench-v1 \
@@ -118,7 +118,7 @@ sudo ./svc.sh install bench-op
 sudo ./svc.sh start
 ```
 
-Get the REMOVE/REGISTER tokens from `https://github.com/Xof/chisel/settings/actions/runners`.
+Get the REMOVE/REGISTER tokens from `https://github.com/pgexperts/chisel/settings/actions/runners`.
 
 ### Triage a soak failure (when Spec 4 ships)
 
@@ -151,7 +151,7 @@ If the runner itself is stuck, restart the service on the VM:
 
 ```bash
 ssh bench-op@chisel-bench-1
-sudo systemctl restart actions.runner.Xof-chisel.chisel-bench-1.service
+sudo systemctl restart actions.runner.pgexperts-chisel.chisel-bench-1.service
 ```
 
 ### VM is unresponsive (SSH hangs)

@@ -334,7 +334,7 @@ Expected: all three commands return version strings.
 
 ```bash
 mkdir -p ~/work && cd ~/work
-git clone https://github.com/Xof/chisel.git
+git clone https://github.com/pgexperts/chisel.git
 cd chisel
 ```
 
@@ -379,7 +379,7 @@ No repo commit yet — the repo on the VM is just a clone.
 
 - [ ] **Step 1: Get the runner-registration token**
 
-In a browser: navigate to `https://github.com/Xof/chisel/settings/actions/runners/new`. The page generates a one-time registration token (valid ~1 hour). Copy it.
+In a browser: navigate to `https://github.com/pgexperts/chisel/settings/actions/runners/new`. The page generates a one-time registration token (valid ~1 hour). Copy it.
 
 - [ ] **Step 2: Download the runner agent on the VM**
 
@@ -396,7 +396,7 @@ tar xzf ./actions-runner-linux-x64-2.319.1.tar.gz
 
 ```bash
 ./config.sh \
-  --url https://github.com/Xof/chisel \
+  --url https://github.com/pgexperts/chisel \
   --token <TOKEN-FROM-STEP-1> \
   --name chisel-bench-1 \
   --labels dedicated-bench,bench-v1 \
@@ -407,11 +407,11 @@ The `--unattended` flag skips interactive prompts and uses defaults for runner g
 
 - [ ] **Step 4: Verify the runner is registered**
 
-In a browser: `https://github.com/Xof/chisel/settings/actions/runners` should now list `chisel-bench-1` with labels `self-hosted`, `linux`, `x64`, `dedicated-bench`, `bench-v1`. Status will be "offline" until Step 5.
+In a browser: `https://github.com/pgexperts/chisel/settings/actions/runners` should now list `chisel-bench-1` with labels `self-hosted`, `linux`, `x64`, `dedicated-bench`, `bench-v1`. Status will be "offline" until Step 5.
 
 ### Task 3.2: Install the runner as a systemd service
 
-**Files:** `/etc/systemd/system/actions.runner.Xof-chisel.chisel-bench-1.service` (created by `svc.sh install`)
+**Files:** `/etc/systemd/system/actions.runner.pgexperts-chisel.chisel-bench-1.service` (created by `svc.sh install`)
 
 - [ ] **Step 1: Install the service**
 
@@ -438,7 +438,7 @@ Expected: `Active: active (running)`.
 
 - [ ] **Step 4: Verify the runner shows online in GitHub UI**
 
-Refresh `https://github.com/Xof/chisel/settings/actions/runners` — `chisel-bench-1` should now show "Idle" (online and ready).
+Refresh `https://github.com/pgexperts/chisel/settings/actions/runners` — `chisel-bench-1` should now show "Idle" (online and ready).
 
 ### Task 3.3: Phase 3 success check
 
@@ -1538,7 +1538,7 @@ gh pr close <PR-NUMBER> --delete-branch
 
 ```bash
 ssh bench-op@chisel-bench-1
-sudo systemctl stop actions.runner.Xof-chisel.chisel-bench-1.service
+sudo systemctl stop actions.runner.pgexperts-chisel.chisel-bench-1.service
 ```
 
 The service name format is `actions.runner.<owner>-<repo>.<runner-name>.service`. Adjust if your registration used different names. Confirm via:
@@ -1549,7 +1549,7 @@ sudo systemctl list-units 'actions.runner.*' --type=service
 
 - [ ] **Step 2: Confirm runner shows offline in GitHub UI**
 
-Browser: `https://github.com/Xof/chisel/settings/actions/runners`. The `chisel-bench-1` runner should show "Offline".
+Browser: `https://github.com/pgexperts/chisel/settings/actions/runners`. The `chisel-bench-1` runner should show "Offline".
 
 - [ ] **Step 3: Create another throwaway PR**
 
@@ -1585,8 +1585,8 @@ Open the PR; confirm the bench-diff comment is prefixed with:
 
 ```bash
 ssh bench-op@chisel-bench-1
-sudo systemctl start actions.runner.Xof-chisel.chisel-bench-1.service
-sudo systemctl status actions.runner.Xof-chisel.chisel-bench-1.service
+sudo systemctl start actions.runner.pgexperts-chisel.chisel-bench-1.service
+sudo systemctl status actions.runner.pgexperts-chisel.chisel-bench-1.service
 ```
 
 Expected: `Active: active (running)`. Refresh the GitHub UI to confirm the runner is back to "Idle".
@@ -1924,14 +1924,14 @@ ssh bench-op@chisel-bench-1
 # Confirm what's running first:
 sudo systemctl list-units 'actions.runner.*' --type=service
 # Stop the service (waits for current job to complete naturally):
-sudo systemctl stop actions.runner.Xof-chisel.chisel-bench-1.service
+sudo systemctl stop actions.runner.pgexperts-chisel.chisel-bench-1.service
 ```
 
 While stopped: per-PR work falls through to `ubuntu-latest` automatically (with the offline-warning header on the PR comment). Canonical and soak runs queue in the GitHub Actions UI until the runner returns. After maintenance:
 
 ```bash
-sudo systemctl start actions.runner.Xof-chisel.chisel-bench-1.service
-sudo systemctl status actions.runner.Xof-chisel.chisel-bench-1.service
+sudo systemctl start actions.runner.pgexperts-chisel.chisel-bench-1.service
+sudo systemctl status actions.runner.pgexperts-chisel.chisel-bench-1.service
 ```
 
 ### Re-run the noise gate
@@ -2009,7 +2009,7 @@ tar xzf actions-runner-linux-x64-2.319.1.tar.gz
 # Re-register with --disableupdate so it stays pinned:
 ./config.sh remove --token <REMOVE-TOKEN>
 ./config.sh \
-  --url https://github.com/Xof/chisel \
+  --url https://github.com/pgexperts/chisel \
   --token <REGISTER-TOKEN> \
   --name chisel-bench-1 \
   --labels dedicated-bench,bench-v1 \
@@ -2020,7 +2020,7 @@ sudo ./svc.sh install bench-op
 sudo ./svc.sh start
 ```
 
-Get the REMOVE/REGISTER tokens from `https://github.com/Xof/chisel/settings/actions/runners`.
+Get the REMOVE/REGISTER tokens from `https://github.com/pgexperts/chisel/settings/actions/runners`.
 
 ### Triage a soak failure (when Spec 4 ships)
 
@@ -2053,7 +2053,7 @@ If the runner itself is stuck, restart the service on the VM:
 
 ```bash
 ssh bench-op@chisel-bench-1
-sudo systemctl restart actions.runner.Xof-chisel.chisel-bench-1.service
+sudo systemctl restart actions.runner.pgexperts-chisel.chisel-bench-1.service
 ```
 
 ### VM is unresponsive (SSH hangs)
@@ -2122,5 +2122,5 @@ for f in .github/workflows/bench*.yml; do
 done
 
 # Runner online?
-gh api repos/Xof/chisel/actions/runners --jq '.runners[] | {name, status, labels: [.labels[].name]}'
+gh api repos/pgexperts/chisel/actions/runners --jq '.runners[] | {name, status, labels: [.labels[].name]}'
 ```
