@@ -326,11 +326,7 @@ impl HandleTable {
                     // Pattern mirrors insert_recursive's leaf branch.
                     let new_leaf = alloc(cache)?;
                     debug_assert_ne!(new_leaf, 0); // I8
-                    {
-                        let buf_copy: [u8; PAGE_SIZE] = *cache.get(page)?;
-                        let new_buf = cache.get_mut(new_leaf)?;
-                        *new_buf = buf_copy;
-                    }
+                    cache.copy_page(page, new_leaf)?;
                     // The old leaf is superseded by `new_leaf`; queue it.
                     freed.push(page);
                     let tombstone = HandleEntry {
@@ -384,11 +380,7 @@ impl HandleTable {
             // points at the new child.
             let new_page = alloc(cache)?;
             debug_assert_ne!(new_page, 0); // I8
-            {
-                let buf_copy: [u8; PAGE_SIZE] = *cache.get(page)?;
-                let new_buf = cache.get_mut(new_page)?;
-                *new_buf = buf_copy;
-            }
+            cache.copy_page(page, new_page)?;
             // The old interior `page` is superseded by `new_page`; queue it.
             freed.push(page);
             {

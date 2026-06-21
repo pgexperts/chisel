@@ -78,7 +78,8 @@ fn test_defrag_preserves_all_data_body(b: &Backing) {
     db.commit().unwrap();
 
     db.begin().unwrap();
-    db.defrag(Default::default()).unwrap();
+    // I121: this test only checks post-defrag readback, not the stats.
+    let _ = db.defrag(Default::default()).unwrap();
     db.commit().unwrap();
 
     assert_eq!(db.read(h1).unwrap(), b"alpha");

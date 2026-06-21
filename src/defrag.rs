@@ -107,6 +107,10 @@ impl DefragOptions {
 /// I36: `#[non_exhaustive]` for symmetry with `DefragOptions` and so a
 /// future bench-friendly stat (e.g. wall-time elapsed inside the sweep)
 /// is not a breaking change.
+// I121 (ISSUES.md, 2026-06-21): #[must_use] so `db.defrag(opts)?;` cannot
+// silently discard the report (pages_examined / pages_freed). Callers who
+// genuinely don't care bind it with `let _ = ...`.
+#[must_use = "DefragStats reports what the sweep did (pages_examined/pages_freed); inspect it or bind with `let _`"]
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DefragStats {
