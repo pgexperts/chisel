@@ -1,5 +1,5 @@
 // db.rs — PyChisel wraps chisel::Chisel and provides the top-level
-// `open()` constructor. The engine is held in a RefCell<Option<Chisel>>
+// `open()` constructor. The engine is held in a `Mutex<Option<Chisel>>`
 // so that close() can deterministically drop it; subsequent mutating
 // or reading calls raise `ClosedError` (ISSUES.md I25, distinct from
 // `PoisonedError` so the user can tell "I closed this" from "Rust-side
@@ -8,25 +8,26 @@
 // are equivalent — the distinct exception class lets code that DOES
 // care about the cause tell them apart.
 //
-// Why RefCell (and not Mutex): Chisel is explicitly a single-client
-// embedded engine (see MEMORY: project_chisel_single_client_design),
-// and the Python GIL already serializes CROSS-THREAD access to this
-// object from Python code. RefCell gives us `&self` pymethods with
-// interior mutability at near-zero cost.
+// Why Mutex (and not RefCell) — I75: the original design used RefCell
+// (Chisel is a single-client embedded engine, see MEMORY:
+// project_chisel_single_client_design, and the Python GIL already
+// serializes cross-thread access), but PyO3 0.24+ requires `#[pyclass]`
+// types to be `Sync` and RefCell is `!Sync`. Mutex provides Sync at
+// near-zero uncontended cost and still allows the cross-thread HANDOFF
+// the engine supports (a handle migrating between threads, one writer at
+// a time — see test_threading.py), which `unsendable` would have
+// forbidden. The full rationale lives on the `inner` field below.
 //
-// What the GIL does NOT protect against (ISSUES.md I21): a
-// SAME-THREAD re-entry — e.g., some future engine API that takes a
-// Python callback, dispatches into Python while holding a borrow_mut
-// on `inner`, and then the callback turns around and calls another
-// PyChisel method on the same thread. The GIL is held throughout
-// (same thread, no yield), but the second borrow_mut hits an already-
-// borrowed RefCell and panics. No such callback API exists in this
-// binding today — every public method takes Python values and returns
-// them; no engine callback escapes back into Python code. If/when a
-// callback API is introduced, either (a) convert `inner` to
-// `Option<Chisel>` behind a `try_borrow_mut` wrapper that raises an
-// explicit reentrancy error, or (b) reshape the engine call so the
-// mutable borrow is released before the Python callback fires.
+// Re-entry hazard (ISSUES.md I21): a SAME-THREAD re-entry — e.g. a future
+// engine API that takes a Python callback, dispatches into Python while
+// holding the lock, and the callback calls back into this PyChisel on the
+// same thread — would DEADLOCK (std::sync::Mutex is non-reentrant), not
+// panic as the old RefCell did. Both are noisy at the point of misuse. No
+// such callback API exists today — every public method takes Python
+// values and returns them; no engine callback escapes back into Python.
+// If one is introduced, either wrap each `lock()` in `try_lock()` and
+// raise an explicit reentrancy error, or release the lock before calling
+// back into Python.
 //
 // Lifetime pinning: PyTransaction and PySavepoint each hold a
 // `Py<PyChisel>` (a strong Python reference), so the Rust-side

@@ -41,10 +41,10 @@ use crate::db::PyChisel;
 pub struct PyTransaction {
     // Owning a `Py<PyChisel>` pins the PyChisel on the Python heap for
     // at least as long as this transaction object is live. Combined
-    // with PyChisel's `RefCell<Option<Chisel>>`, this prevents the
+    // with PyChisel's `Mutex<Option<Chisel>>`, this prevents the
     // engine from being dropped mid-transaction — though the user CAN
     // still call `db.close()`, which nulls out the Option and turns
-    // subsequent transaction calls into PoisonedError.
+    // subsequent transaction calls into ClosedError (ISSUES.md I25).
     db: Py<PyChisel>,
     // I75 (ISSUES.md, 2026-05-22): AtomicBool (not Cell<bool>) because
     // PyO3 0.24+ requires `#[pyclass]` types to be Sync. The original
