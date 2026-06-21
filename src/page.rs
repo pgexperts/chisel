@@ -105,12 +105,9 @@ pub const fn format_major(version: u32) -> u16 {
 }
 
 /// Extract the minor-version pair from a packed `format_version`. Companion to
-/// `format_major`; used only by the open-time I29 write-gate — a binary whose
+/// `format_major`; used by the open-time I29 write-gate — a binary whose
 /// MINOR is below the file's must not write the file (it would drop fields it
 /// doesn't know). See ISSUES.md I29.
-// `#[allow(dead_code)]`: forward-looking API seam — the write-gate (I29) is
-// not yet implemented, so no call site exists today.
-#[allow(dead_code)]
 pub const fn format_minor(version: u32) -> u16 {
     (version & 0xFFFF) as u16
 }

@@ -145,8 +145,6 @@ impl PageIo {
     /// its older minor and drop fields it cannot see. Idempotent. The OS file
     /// handle is unchanged (still O_RDWR) — this only flips the in-memory guard
     /// that `write_page` / `fsync` / `set_page_count` already honor. See I29.
-    // caller lands in the I29 open-gate task
-    #[allow(dead_code)]
     pub fn force_read_only(&mut self) {
         self.read_only = true;
     }

@@ -461,6 +461,18 @@ impl TransactionManager {
             });
         }
 
+        // I29 write-gate: a file whose MINOR exceeds this binary's may contain
+        // version-requiring page layouts we cannot safely write — we would
+        // stamp pages at our older minor and drop the newer fields. Reads ARE
+        // safe (within a MAJOR all layout changes are additive, so known fields
+        // sit at stable offsets), so we open the file but force it read-only;
+        // mutations then return ReadOnlyMode. The complementary I31 per-page
+        // read-dispatch lets a newer binary read these older pages.
+        // See docs/specs/2026-06-21-per-page-format-versioning-design.md.
+        if page::format_minor(sb.format_version) > page::FORMAT_MINOR_VERSION {
+            cache.io_mut().force_read_only();
+        }
+
         let page_count = cache.io_mut().page_count()?;
         if page_count < sb.total_pages {
             return Err(ChiselError::FileSizeMismatch {
@@ -3801,6 +3813,60 @@ mod tests {
                 Ok(_) => panic!("expected UnsupportedFormatVersion, got Ok"),
             }
         }
+    }
+
+    // I29 write-gate: a file whose MINOR exceeds this binary's opens READ-ONLY,
+    // not rejected — within a MAJOR every layout change is additive, so reads
+    // are safe, but writing would drop fields this binary can't see. A
+    // same-or-older minor file opens read-write as normal.
+    #[test]
+    fn file_minor_newer_than_binary_is_forced_read_only() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+
+        // Fresh DB so there are 2 superblock slots (pages 0 and 1) to patch.
+        {
+            let io = PageIo::open(&path, false).unwrap();
+            let cache = PageCache::new(
+                io,
+                1024 * PAGE_SIZE as u64,
+                0,
+                crate::DrainInsertion::LruTail,
+                crate::SpillwayLocation::InMemory,
+            );
+            let _ = TransactionManager::create_new(cache, 2).unwrap();
+        }
+
+        // Patch every slot to (current MAJOR, MINOR + 1) and re-stamp checksums.
+        let newer_minor = page::pack_format_version(
+            page::FORMAT_MAJOR_VERSION,
+            page::FORMAT_MINOR_VERSION + 1,
+        );
+        let mut bytes = std::fs::read(&path).unwrap();
+        for slot in 0..2 {
+            let offset = slot * PAGE_SIZE;
+            bytes[offset + 4..offset + 8].copy_from_slice(&newer_minor.to_le_bytes());
+            let page_arr: &mut [u8; PAGE_SIZE] =
+                (&mut bytes[offset..offset + PAGE_SIZE]).try_into().unwrap();
+            page::stamp_checksum(page_arr);
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Reopen read-WRITE; the gate must force read-only, so begin() fails.
+        let io = PageIo::open(&path, false).unwrap();
+        let cache = PageCache::new(
+            io,
+            1024 * PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
+        let mut tm = TransactionManager::open_existing(cache)
+            .expect("a newer-minor file must still OPEN (reads are additive-safe)");
+        assert!(
+            matches!(tm.begin(), Err(ChiselError::ReadOnlyMode)),
+            "a newer-minor file must be forced read-only"
+        );
     }
 
     #[test]
