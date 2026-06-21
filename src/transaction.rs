@@ -3838,10 +3838,8 @@ mod tests {
         }
 
         // Patch every slot to (current MAJOR, MINOR + 1) and re-stamp checksums.
-        let newer_minor = page::pack_format_version(
-            page::FORMAT_MAJOR_VERSION,
-            page::FORMAT_MINOR_VERSION + 1,
-        );
+        let newer_minor =
+            page::pack_format_version(page::FORMAT_MAJOR_VERSION, page::FORMAT_MINOR_VERSION + 1);
         let mut bytes = std::fs::read(&path).unwrap();
         for slot in 0..2 {
             let offset = slot * PAGE_SIZE;

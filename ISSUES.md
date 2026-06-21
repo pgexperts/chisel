@@ -151,7 +151,7 @@ This directly violated the shadow-paging invariant spelled out in `allocate_data
 
 **Regression test:** `format_version_gate_is_major_only` in `src/transaction.rs`. Creates a fresh database, closes, patches both superblock slots to (a) the current major with a bumped minor — asserts open succeeds (pre-fix this rejected with `UnsupportedFormatVersion`); then patches to a bumped major — asserts open fails with `UnsupportedFormatVersion`. Exercises both halves of the MAJOR-only check.
 
-**Phase 2 (landed 2026-06-21):** the file-MINOR write-gate is live. If the file's MINOR exceeds the binary's MINOR, `PageIo::open_existing` forces the store read-only (`PageIo::force_read_only`) — no writes are permitted. See `docs/specs/2026-06-21-per-page-format-versioning-design.md`.
+**Phase 2 (landed 2026-06-21):** the file-MINOR write-gate is live. If the file's MINOR exceeds the binary's MINOR, the open path forces the store read-only (`TransactionManager::open_existing` calls `PageIo::force_read_only`) — no writes are permitted. See `docs/specs/2026-06-21-per-page-format-versioning-design.md`.
 
 ### I31. Per-page format version byte + reserved common-header space [infrastructure 2026-04-22] — **P1** (pre-1.0 foundation) ✅ PHASE 1 LANDED 2026-04-22
 **Where:** `page.rs` `page_format_version` / `PAGE_FORMAT_VERSION_CURRENT` / `COMMON_RESERVED_*`; every non-superblock page-type module's `init_page` (data_page, overflow, freemap, handle_table)

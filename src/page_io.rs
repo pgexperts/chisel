@@ -451,7 +451,10 @@ mod read_only_tests {
 
         assert!(io.is_read_only());
         let buf = [0u8; PAGE_SIZE];
-        assert!(matches!(io.write_page(0, &buf), Err(ChiselError::ReadOnlyMode)));
+        assert!(matches!(
+            io.write_page(0, &buf),
+            Err(ChiselError::ReadOnlyMode)
+        ));
     }
 
     #[test]
