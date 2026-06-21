@@ -386,10 +386,13 @@ fn bench_row_delete_n_per_tx(
     group.finish();
 }
 
-/// `CellId.row` is `&'static str`. The two allocate rows have group names
-/// passed in dynamically as a parameter — we leak them to satisfy the
-/// `'static` requirement. There are exactly 2 such leaks per process
-/// (one per allocate row); negligible memory.
+/// `CellId.row` is `&'static str`, but the allocate, update, and delete
+/// rows receive their group name as a dynamic `&str` parameter — so each
+/// cell's CellId is built by leaking that name to satisfy the `'static`
+/// bound. leak_str therefore runs once per emitted (size × mode) cell of
+/// those three row kinds (the read rows use `&'static str` literals and do
+/// not leak), not the "2 per process" an earlier note claimed. Each leak is
+/// a short row-name string, so total leaked memory stays negligible.
 fn leak_str(s: &str) -> &'static str {
     Box::leak(s.to_string().into_boxed_str())
 }

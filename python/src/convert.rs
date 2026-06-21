@@ -8,7 +8,7 @@
 // lower-level API on the Rust side.
 //
 // Read path: no symmetric coerce_value is needed — reads always return
-// a fresh Python `bytes` object built by PyBytes::new_bound from the
+// a fresh Python `bytes` object built by PyBytes::new from the
 // Vec<u8> that chisel::Chisel::read returns. The copy there is also
 // unavoidable because the engine's page cache owns the source bytes
 // and may reuse the buffer for other pages. See db.rs::read.

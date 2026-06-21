@@ -206,9 +206,12 @@ impl Spillway {
         Ok(())
     }
 
-    /// Pop a batch of up to `batch_size` page_ids out of the resident
-    /// set without dropping the file content. The PageCache drain reads
-    /// each pair, rehydrates the page, then flushes it to the main
+    /// Return up to `batch_size` page_ids currently in the resident set.
+    /// This is a read-only peek: despite the `&mut self` receiver,
+    /// `drain_batch` removes nothing from the resident set and drops no file
+    /// content — the caller is responsible for removing drained entries
+    /// (`forget()`) and shrinking the spillway (`truncate()`). The PageCache
+    /// drain reads each pair, rehydrates the page, then flushes it to the main
     /// file. After all batches are processed, `truncate()` is called
     /// to shrink the spillway.
     ///
