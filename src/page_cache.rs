@@ -421,6 +421,15 @@ impl PageCache {
         // A crash before Phase 2's fsync is a rolled-back transaction —
         // no main-file bytes are committed without the superblock swap that
         // follows flush().
+        //
+        // Batches are sized to `self.max_pages` (the drain_batch argument
+        // below) so peak resident memory during the drain stays bounded at
+        // ~2× max_pages: each batch re-inserts at most max_pages clean
+        // entries, then the trailing eviction loop trims back to the cap
+        // before the next batch is fetched. Draining the whole spillway in
+        // one shot would instead rehydrate every spilled page into the cache
+        // simultaneously, defeating the strict cap exactly when memory is
+        // already tightest.
         let drain_policy = self.drain_insertion;
         loop {
             let batch = match self.spillway.as_mut() {

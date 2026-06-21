@@ -559,6 +559,12 @@ impl MembershipIndex {
 
     /// Restore the outer depth on open (the engine calls `RadixU64::recover_depth`
     /// on the index root and passes it here).
+    ///
+    /// This is the ONLY depth recovered at open. Per-tag inner depths are never
+    /// reconstructed separately: each inner tree's depth is self-describing,
+    /// `pack_inner`'d into its outer-leaf value and read back via `unpack_inner`
+    /// on every operation. That is why one `u32` suffices to restore a two-level
+    /// structure.
     pub fn set_outer_depth(&mut self, depth: u32) {
         self.outer_depth = depth;
     }

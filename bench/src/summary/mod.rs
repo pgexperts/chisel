@@ -13,6 +13,10 @@
 //   metadata      — Metadata/MachineInfo + git/hostname gathering
 //   render_json   — Vec<Cell> + Metadata -> serde_json::Value
 //   render_md     — Vec<Cell> + Metadata -> String
+//
+// A sixth submodule was added after this list was written:
+//   render_cross_engine — Vec<ScenarioMetrics> + Metadata -> String (PR 8
+//                         cross-engine comparison report; scenario tier only)
 
 pub mod discover;
 pub mod format;

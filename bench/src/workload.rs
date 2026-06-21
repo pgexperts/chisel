@@ -92,6 +92,12 @@ pub fn zipfian_indices(seed: u64, count: usize, prepop_count: usize, theta: f64)
     (0..count)
         .map(|_| {
             // Zipf samples in [1, n], convert to [0, n-1] by subtracting 1.
+            // The trailing `.min(prepop_count - 1)` is a hard bound, not
+            // redundant with the `-1`: `Zipf::sample` returns an f64 and the
+            // `as usize` cast truncates toward zero, so a sample that rounds to
+            // exactly `n` (or any future widening of the distribution's tail)
+            // would otherwise yield an index == prepop_count and panic the
+            // caller's resolve when used to index a `prepop_count`-length set.
             let v = zipf.sample(&mut rng) as usize;
             v.saturating_sub(1).min(prepop_count - 1)
         })

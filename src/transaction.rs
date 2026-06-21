@@ -2061,6 +2061,12 @@ impl TransactionManager {
         // tag complete. The members snapshot is taken BEFORE the deletions, then
         // each is deleted via delete_inner (which removes it from the index and
         // frees its chunk).
+        //
+        // The snapshot must be MATERIALIZED into an owned Vec, not a live
+        // iterator: each delete_inner COWs the membership-index root (via
+        // membership_remove_candidate), so walking the index while deleting from
+        // it would descend a tree being rewritten underneath the walk. Collecting
+        // first decouples enumeration from the mutation it drives.
         let members = {
             let root = self.current_roots.membership_index_page;
             let mut cache = self.cache.borrow_mut();

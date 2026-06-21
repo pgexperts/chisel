@@ -73,6 +73,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Resolve output directory.
     let out_dir = cli.out.unwrap_or_else(|| {
+        // Dashes in the time component (H-M-S, not H:M:S) because this string
+        // becomes a directory name; ':' is illegal in paths on Windows/exFAT.
+        // The metadata block's `timestamp` keeps the colon-form ISO-8601.
         let ts = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
         PathBuf::from(format!("bench/results/{ts}"))
     });

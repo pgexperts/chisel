@@ -184,6 +184,9 @@ pub fn discover_cells(
             }
         };
 
+        // `remove` (not `get`): consuming the entry here is what makes Step 3
+        // below correct — whatever stays in aux_map after this loop is exactly
+        // the set of aux entries that had no matching Criterion cell.
         let aux = aux_map.remove(&(row.clone(), mode.clone(), size.clone()));
 
         // Only emit the cell if at least one side has data.

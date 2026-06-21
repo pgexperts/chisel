@@ -174,6 +174,13 @@ fn test_recovery_uncommitted_data_lost() {
 
 #[test]
 fn test_recovery_corrupt_superblock_b() {
+    // Besides proving slot-A fallback, this test pins a layout fact that
+    // sibling tests depend on: a single first user commit lands in slot 0
+    // (page 0), leaving slot 1 (page 1) as the still-empty fallback. That
+    // "first commit -> page 0" invariant is what lets the tagged-index and
+    // torn-second-superblock tests below corrupt page 1 to target the NEWER
+    // commit. If commit-slot rotation ever changes parity, this test breaks
+    // first and flags the assumption for the others.
     let file = NamedTempFile::new().unwrap();
     let path = file.path().to_owned();
     let handle;
@@ -884,7 +891,10 @@ fn test_named_roots_table_full() {
     let mut db = Chisel::open(&path, Default::default()).unwrap();
     db.begin().unwrap();
 
-    // Fill all 8 slots.
+    // Fill all 8 slots. The literal 8 is coupled to superblock::NAMED_ROOT_COUNT
+    // (the on-disk named-root array is fixed-size, [NamedRoot; 8]); if that
+    // constant ever changes this bound must move with it, or the "table full"
+    // assertion below stops testing the boundary.
     for i in 0..8 {
         let name = format!("r{i}");
         db.set_root_name(&name, i as u64).unwrap();

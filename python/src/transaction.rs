@@ -82,6 +82,13 @@ impl PyTransaction {
     // example because the engine is now poisoned), the caller gets the
     // rollback error instead of the original — matching standard
     // context-manager semantics for secondary errors on cleanup.
+    //
+    // Ordering invariant: `finished` is set BEFORE the engine call, not
+    // after. A commit/rollback that fails (e.g. a poisoning fsync error)
+    // therefore leaves the transaction marked finished and non-retryable
+    // — intentional, since the engine is now poisoned and re-driving it
+    // would only resurface PoisonedError. The single in-flight engine
+    // transaction is already torn down regardless of the error.
     fn __exit__(
         &self,
         py: Python<'_>,

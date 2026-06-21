@@ -212,6 +212,11 @@ impl PageIo {
                 file.read_exact(&mut buf)?;
                 Ok(buf)
             }
+            // Unchecked index is sound: the `page_id >= page_count` guard
+            // above already rejected out-of-range ids, and for Memory the
+            // cached page count is kept identical to `pages.len()` (seeded 0,
+            // grown by write_page, resized by set_page_count). So a passing
+            // bounds check guarantees `page_id < pages.len()` here.
             Backing::Memory { pages } => Ok(pages[page_id as usize]),
         }
     }

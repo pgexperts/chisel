@@ -139,6 +139,11 @@ impl FreeMap {
     // LSB-first within a byte: page_id 0 = bit 0 of byte 0, page_id 7 = bit 7
     // of byte 0, page_id 8 = bit 0 of byte 1. `allocate_first` depends on
     // this ordering via `trailing_zeros`.
+    //
+    // The returned byte index is relative to the bitmap body; every accessor
+    // re-adds BITMAP_OFFSET. That offset is what keeps even page_id 0 from
+    // aliasing the type tag / version header (bytes 0..16), so no in-range id
+    // can corrupt the header by setting or clearing a bit.
     fn bit_position(page_id: u64) -> (usize, usize) {
         let page_id = page_id as usize;
         (page_id / 8, page_id % 8)

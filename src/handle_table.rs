@@ -748,6 +748,11 @@ impl HandleTable {
             for i in 0..ENTRIES_PER_LEAF {
                 let entry = Self::read_entry(buf, i);
                 if entry.flags != HandleFlags::Deleted {
+                    // saturating_add for the same reason the rest of this module
+                    // saturates on a corrupt over-deep spine: a valid tree keeps
+                    // every reconstructed handle < u64::MAX, but a corrupt-but-
+                    // checksummed depth can drive `base_handle` near u64::MAX, and
+                    // `base + slot_index` must not overflow-panic mid-enumeration.
                     result.push((base_handle.saturating_add(i as u64), entry));
                 }
             }
