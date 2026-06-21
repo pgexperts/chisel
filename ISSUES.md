@@ -151,6 +151,8 @@ This directly violated the shadow-paging invariant spelled out in `allocate_data
 
 **Regression test:** `format_version_gate_is_major_only` in `src/transaction.rs`. Creates a fresh database, closes, patches both superblock slots to (a) the current major with a bumped minor — asserts open succeeds (pre-fix this rejected with `UnsupportedFormatVersion`); then patches to a bumped major — asserts open fails with `UnsupportedFormatVersion`. Exercises both halves of the MAJOR-only check.
 
+**Phase 2 (landed 2026-06-21):** the file-MINOR write-gate is live. If the file's MINOR exceeds the binary's MINOR, `PageIo::open_existing` forces the store read-only (`PageIo::force_read_only`) — no writes are permitted. See `docs/specs/2026-06-21-per-page-format-versioning-design.md`.
+
 ### I31. Per-page format version byte + reserved common-header space [infrastructure 2026-04-22] — **P1** (pre-1.0 foundation) ✅ PHASE 1 LANDED 2026-04-22
 **Where:** `page.rs` `page_format_version` / `PAGE_FORMAT_VERSION_CURRENT` / `COMMON_RESERVED_*`; every non-superblock page-type module's `init_page` (data_page, overflow, freemap, handle_table)
 
@@ -170,6 +172,8 @@ This directly violated the shadow-paging invariant spelled out in `allocate_data
 **Phase 2 (deferred — the "eager upgrader"):** when a realistic format change requires it, the read path in the affected page-type module grows a version switch (`match page_format_version(buf) { 0 => read_v0(buf), 1 => read_v1(buf), _ => Err(Unsupported) }`), writes always produce the latest version, and an opt-in `db.upgrade(on_progress)` method rewrites every cold page. `on_progress: FnMut(UpgradeProgress)` lets the caller surface progress to logs / TUI / IPC. A later phase 3 would wrap this in an async worker thread for fully-unattended upgrade — but per the design discussion, that's polish on top of the synchronous scanner, not a separate architecture.
 
 **Regression tests:** `page_format_version_dispatches_by_page_type` (pure unit test pinning the per-type offset) and `fresh_pages_report_current_version` (asserts Data/FreeMap `init_page` output reports `PAGE_FORMAT_VERSION_CURRENT` through the `page_format_version` reader; Overflow and HandleTable init through their cache-aware paths and are covered end-to-end by existing integration tests). Both in `src/page.rs`'s test module.
+
+**Phase 1a (landed 2026-06-21):** the read-side dispatch helpers `page::page_format_version()` and `page::current_version()` are now active — every `init_page` site stamps `current_version(type)` explicitly. The per-module version switch (Phase 2 / "eager upgrader") remains deferred pending a real format change that needs it. See `docs/specs/2026-06-21-per-page-format-versioning-design.md`.
 
 ---
 
