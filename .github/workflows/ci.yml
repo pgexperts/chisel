@@ -109,6 +109,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
+      # I110 (ISSUES.md, 2026-06-21): lib-only ON PURPOSE. `--tests` was tried
+      # and reverted — it pulls proptest's transitive `getrandom` (which now
+      # requires `edition2024`, i.e. Rust 1.85+), so chisel's TEST tree floats
+      # above the 1.82 library floor for the same reason bench/python do (I61).
+      # The MSRV promise is about the published library, which this verifies.
       - name: Build chisel library with MSRV toolchain
         run: cargo build --verbose -p chisel
 

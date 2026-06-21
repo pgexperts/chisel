@@ -1383,19 +1383,23 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 **Fixed (2026-06-21):** took the `--workspace` option — the clippy job now runs `cargo clippy --workspace -- -D warnings`, which lints all three members (chisel, chisel-bench, chisel-py). Verified locally that the run checks `chisel-py v0.1.0` and passes clean. pyo3's `extension-module` feature means no libpython link during a check, so it runs on the bare clippy runner with no Python/maturin setup. Chose `--workspace` over a dedicated python-job step to avoid running clippy 4× across the OS×version matrix and to future-proof any new workspace member.
 
-#### I109. The release/tag wheel path has no `cargo audit` gate [deepdive 2026-06-21] — **P2**
+#### I109. The release/tag wheel path has no `cargo audit` gate [deepdive 2026-06-21] — **P2** ✅ FIXED 2026-06-21
 **Where:** `.github/workflows/wheels.yml:11-17`
 
 **Problem:** the `audit` job lives in `ci.yml` (push/PR to main) but is not a dependency of the tag-triggered wheel build, which runs only `cargo test --release`. A vulnerable dependency introduced and tagged without merging through a PR would publish wheels unaudited.
 
 **Direction of fix:** add a `cargo audit` step (or reuse the `rustsec/audit-check` action from I54) as a gate on the wheel job.
 
-#### I110. The MSRV job builds but never `--tests` and skips bench/python [deepdive 2026-06-21] — **P3**
+**Fixed (2026-06-21):** added `cargo install cargo-audit` + `cargo audit` to `wheels.yml`'s `cargo-test-gate` job (which both `wheels` and `sdist` already `needs:`), so a tag build now fails fast on a vulnerable dependency instead of publishing wheels unaudited.
+
+#### I110. The MSRV job builds but never `--tests` and skips bench/python [deepdive 2026-06-21] — **P3** ✅ RESOLVED 2026-06-21 (not viable as specified — msrv stays lib-only; reason below)
 **Where:** `.github/workflows/ci.yml:98-107`
 
 **Problem:** `cargo build -p chisel` verifies the library compiles at 1.82 but not its test code, so an MSRV-breaking construct in a test module passes. Low risk.
 
 **Direction of fix:** `cargo build --tests -p chisel` in the msrv job (a cheap strengthening; keep bench/python scoped out per I55/I61's deliberate floor-floating decision).
+
+**Resolved (2026-06-21) — NOT VIABLE as specified, reverted:** `--tests` was tried and the msrv CI job went **red**: `cargo build --tests -p chisel` at 1.82 fails to resolve proptest's transitive `getrandom v0.4.2`, which now requires the `edition2024` Cargo feature (Rust 1.85+). So chisel's *test* dependency tree floats above the 1.82 *library* floor — the exact MSRV-floating problem I61 documents for bench/python. Reverted to lib-only `cargo build --verbose -p chisel`; added an inline `ci.yml` comment recording why `--tests` is intentionally NOT used, so it isn't re-attempted. The MSRV promise is about the published library (which has no `getrandom`/proptest in its tree), and that remains verified. Net: the review's "cheap strengthening" was a good idea that the dependency ecosystem makes impractical — a deliberate non-fix, not an oversight.
 
 ### Tests
 
@@ -1613,12 +1617,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 ### Python binding (PyO3)
 
-#### I137. `db.rs` / `transaction.rs` file-header docs still describe the engine as `RefCell<Option<Chisel>>` — it's a `Mutex` since I75 [deepdive 2026-06-21] — **P2**
+#### I137. `db.rs` / `transaction.rs` file-header docs still describe the engine as `RefCell<Option<Chisel>>` — it's a `Mutex` since I75 [deepdive 2026-06-21] — **P2** ✅ FIXED 2026-06-21
 **Where:** `python/src/db.rs:2-29` (header) vs the actual field at `:76`; `python/src/transaction.rs:44` (same stale claim)
 
 **Problem:** the file headers argue "why RefCell (and not Mutex)", but I75 migrated the field to `Mutex<Option<Chisel>>` (the struct comment 30 lines below correctly documents the Mutex and contradicts the header above it). A first-time reader gets the wrong concurrency model and the wrong I21 failure mode (RefCell *panics* on re-entry; the Mutex *deadlocks*).
 
 **Direction of fix:** rewrite both file headers to describe the Mutex model and the deadlock-not-panic re-entry semantics.
+
+**Fixed (2026-06-21):** rewrote the `python/src/db.rs` file header — `Mutex<Option<Chisel>>` (not RefCell), "Why Mutex (and not RefCell) — I75" (PyO3 0.24+ Sync requirement), and the re-entry hazard now correctly says **deadlock** (non-reentrant `std::sync::Mutex`), not panic. Now consistent with the already-correct `inner`-field comment 30 lines below. Also fixed `python/src/transaction.rs:44` (`RefCell` → `Mutex`, and its stale "PoisonedError" → `ClosedError` per I25).
 
 #### I138. `errors.rs` catchall routes any future variant to the abstract base, bypassing the Operational/Fatal split [deepdive 2026-06-21] — **P2** ✅ FIXED 2026-06-21
 **Where:** `python/src/errors.rs:326` (the `_` arm); the "exhaustive, no silent fallback" header claim at `:11-13`

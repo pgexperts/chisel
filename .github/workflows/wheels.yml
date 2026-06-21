@@ -15,6 +15,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release
+      # I109 (ISSUES.md, 2026-06-21): audit the tag/release path too. ci.yml's
+      # audit job only runs on push/PR to main, so a vulnerable dependency
+      # introduced and tagged WITHOUT merging through a PR would otherwise
+      # publish wheels unaudited. Gate the wheel/sdist build (both `needs:`
+      # this job) on a clean cargo audit.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - run: cargo audit
 
   # One runner per native platform, no QEMU and no 32-bit:
   #   * Linux x86_64 and aarch64 each on their own native runner.
