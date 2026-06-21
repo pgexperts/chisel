@@ -36,8 +36,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # I108 (ISSUES.md, 2026-06-21): --workspace so the chisel-py PyO3 binding
+      # is linted too. Plain `cargo clippy` honors default-members = [".", "bench"],
+      # which excludes python/, so ~1,300 lines of binding Rust shipped unlinted
+      # (fmt --check already walked it; only clippy had the hole). pyo3's
+      # `extension-module` feature means no libpython link during a check, so this
+      # runs on the bare clippy runner without a Python/maturin setup.
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --workspace -- -D warnings
 
   fmt:
     runs-on: ubuntu-latest
