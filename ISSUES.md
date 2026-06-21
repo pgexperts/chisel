@@ -1392,14 +1392,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 **Fixed (2026-06-21):** added `cargo install cargo-audit` + `cargo audit` to `wheels.yml`'s `cargo-test-gate` job (which both `wheels` and `sdist` already `needs:`), so a tag build now fails fast on a vulnerable dependency instead of publishing wheels unaudited.
 
-#### I110. The MSRV job builds but never `--tests` and skips bench/python [deepdive 2026-06-21] — **P3** ✅ FIXED 2026-06-21
+#### I110. The MSRV job builds but never `--tests` and skips bench/python [deepdive 2026-06-21] — **P3** ✅ RESOLVED 2026-06-21 (not viable as specified — msrv stays lib-only; reason below)
 **Where:** `.github/workflows/ci.yml:98-107`
 
 **Problem:** `cargo build -p chisel` verifies the library compiles at 1.82 but not its test code, so an MSRV-breaking construct in a test module passes. Low risk.
 
 **Direction of fix:** `cargo build --tests -p chisel` in the msrv job (a cheap strengthening; keep bench/python scoped out per I55/I61's deliberate floor-floating decision).
 
-**Fixed (2026-06-21):** the msrv job now runs `cargo build --verbose --tests -p chisel`, so the 1.82 floor covers chisel's test code (incl. dev-deps proptest/tempfile) too, not just the library. Still `-p chisel` only. CI validates this on every PR.
+**Resolved (2026-06-21) — NOT VIABLE as specified, reverted:** `--tests` was tried and the msrv CI job went **red**: `cargo build --tests -p chisel` at 1.82 fails to resolve proptest's transitive `getrandom v0.4.2`, which now requires the `edition2024` Cargo feature (Rust 1.85+). So chisel's *test* dependency tree floats above the 1.82 *library* floor — the exact MSRV-floating problem I61 documents for bench/python. Reverted to lib-only `cargo build --verbose -p chisel`; added an inline `ci.yml` comment recording why `--tests` is intentionally NOT used, so it isn't re-attempted. The MSRV promise is about the published library (which has no `getrandom`/proptest in its tree), and that remains verified. Net: the review's "cheap strengthening" was a good idea that the dependency ecosystem makes impractical — a deliberate non-fix, not an oversight.
 
 ### Tests
 

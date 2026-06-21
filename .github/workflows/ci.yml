@@ -109,12 +109,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
-      # I110 (ISSUES.md, 2026-06-21): --tests so the MSRV gate also compiles
-      # chisel's test code (not just the library), catching a test that needs a
-      # newer Rust than the floor. Still `-p chisel` only — bench/python stay
-      # excluded per I55/I61 (their heavy deps float their MSRV faster).
-      - name: Build chisel library + tests with MSRV toolchain
-        run: cargo build --verbose --tests -p chisel
+      # I110 (ISSUES.md, 2026-06-21): lib-only ON PURPOSE. `--tests` was tried
+      # and reverted — it pulls proptest's transitive `getrandom` (which now
+      # requires `edition2024`, i.e. Rust 1.85+), so chisel's TEST tree floats
+      # above the 1.82 library floor for the same reason bench/python do (I61).
+      # The MSRV promise is about the published library, which this verifies.
+      - name: Build chisel library with MSRV toolchain
+        run: cargo build --verbose -p chisel
 
   # I58 (ISSUES.md, 2026-05-22): a dedicated `bench-tests` job once
   # ran `cd bench && cargo test --verbose` because bench/ was a
