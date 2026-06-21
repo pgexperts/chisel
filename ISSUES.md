@@ -30,6 +30,8 @@ Priority legend:
 > **Status note (2026-05-22):** the deepdive-rust fresh-eyes review (output at `docs/reviews/review-20260522-073901.md`) adds I35–I71 in a new "Deepdive review findings (2026-05-22)" section below. The cluster is dominated by 1.0-readiness work: public-API surface (`pub mod` exposure of engine internals, missing `#[non_exhaustive]` on `Options` / `ChiselError` / `DrainInsertion` / `SpillwayLocation`), Cargo.toml publication metadata gaps, `License: TBD` in the README, and a small batch of code-quality, performance, and doc-drift items. None are correctness bugs. Highest leverage before the 1.0 freeze: I35 (`pub` → `pub(crate)` reshape), which forces the urgency of I36 (`#[non_exhaustive]` on the types that remain public); then I54–I57 (CI supply-chain check + MSRV pin + publication metadata + license) to unblock crates.io publication. The 2026-04-26 perf-review's deltas (F1/F4/F5 resolved, F2/F3/F6 unchanged) are recorded inline at the top of the new section.
 >
 > **Status note (2026-06-01):** the `chisel-performance` + `rust-performance` full hot-path sweep (output at `docs/reviews/perf-review-2026-06-01.md`) adds I77–I96 in a new "Perf-review findings (2026-06-01)" section below. No correctness bugs and no Don't-Break-List violations were found — the engine's data-handling is confirmed tight (zero-copy reads, in-place slot mutation, dead-on-prod `compact()`, verified I18 / I51 / 3-fsync discipline). The cluster splits into engine hot-path optimizations (I77–I89) and benchmark-harness integrity (I90–I96). The central conclusion is a **sequencing constraint**: the bench harness cannot currently validate an engine change (no `black_box`, no `[profile.release]`, no in-memory-backend row), so the I90/I91/I92 measurement-integrity fixes GATE the two engine P1s (I77 SipHash hasher, I78 per-insert XXH3 re-stamp) — and `black_box` (I90) must precede the LTO profile (I91) because LTO widens the dead-code-elimination window. Prior deferred perf items are unchanged: F2 (`read` → `to_vec`) and F3 (`Cell` counters) still UNCHANGED; I33 (`delete_many` per-leaf) and I34 (mmap cache) still DEFERRED.
+>
+> **Status note (2026-06-21):** the `deepdive-rust` fresh-eyes pass (output at `docs/reviews/review-20260621-185541.md`, run after PRs #34–#50 and the per-page format-versioning feature landed) adds **I104–I140** in a new "Deepdive review findings (2026-06-21)" section below. The *entire* prior executive summary (2026-06-16) is resolved with no regressions, so the new cluster is fresh — concentrated in error-classification defaults, one CI lint hole, the radix test gap, and doc drift introduced by the #46 dead-code sweep. No new P0 / data-loss bugs were found. Highest leverage first: **I108** (the 1,300-line PyO3 binding escapes the gating `cargo clippy` because `default-members` excludes it — a real CI hole that ships clippy regressions silently) and **I111** (the radix key-math — the engine's most off-by-one-prone code — has no property tests, and its one "two-level" test only reaches depth 1). Then the cheap zero-risk cluster: **I104** (`is_fatal` exhaustiveness test, NOT a default flip — see the review's countercase), **I127** (the `live_slots` SipHash maps the I77 FxHashMap pass missed), and the doc-drift fixes **I128 / I130 / I131 / I132 / I133**. Carried-not-regressed: F2 (`read`→`to_vec`) and the `delete_with_tag` partial-progress drop (re-filed as **I107**) remain open by design. The ADR-to-repo question (**I129**) is a maintainer process call. Three 2026-05-22 fixes have narrow follow-ups here (I46→I117, I63→I131, I71→I111) — the original fix was correct but didn't cover the site this re-review found.
 
 Dependencies and batching drove this more than raw priority. Earlier items unblocked later ones.
 
@@ -1327,3 +1329,292 @@ Source: primary Chisel client, 2026-06-02.
 **Where:** `python/Cargo.toml` (`pyo3 = "0.29"`); migration touches `python/src/{db,transaction,savepoint,errors}.rs`.
 
 **What:** two RustSec advisories landed against `pyo3` < 0.29 — RUSTSEC-2026-0176 (out-of-bounds read in `PyList` / `PyTuple` `nth` / `nth_back` iterators) and RUSTSEC-2026-0177 (missing `Sync` bound on `PyCFunction::new_closure`). The chisel binding uses NEITHER vulnerable API, but `cargo audit` flags the crate transitively, turning the gating `audit` CI job red repo-wide. Both are patched only in 0.29.0, so the fix is a 0.24 → 0.29 bump (an alternative `cargo audit --ignore` was rejected in favor of the real upgrade). PyO3 0.29 migration applied: `PyObject` → `Py<PyAny>` (dropped from the prelude); `Python::with_gil` → `Python::attach` and `py.allow_threads` → `py.detach` (the attach/detach GIL model); `Bound::downcast` → `Bound::cast`; and `#[pyclass(from_py_object)]` opt-in on `PyDrainInsertion` (the auto-`FromPyObject` derive for `Clone` pyclasses is now opt-in, and this enum IS extracted from Python args). Public Python API unchanged. `cargo audit` → 0 vulnerabilities; the engine/bench suites and `cargo clippy -p chisel-py --all-targets -- -D warnings` pass; the CI Python matrix (pytest, CPython 3.11/3.13 × Linux/macOS) validates runtime. Independent of the handle-table COW page-reclamation work (PR #34).
+
+---
+
+## Deepdive review findings (2026-06-21)
+
+The `deepdive-rust` fresh-eyes pass at commit `deb0303` (full output at `docs/reviews/review-20260621-185541.md`). `cargo build`/`test`/`clippy --all-targets -- -D warnings`/`fmt --check` were green on that commit. The *entire* 2026-06-16 executive summary is resolved with no regressions (handle-table COW spine leak, tag-map `CacheFull` divergence, corrupt-radix OOB panic, the `Deleted=0x03` doc, the crash-between-fsyncs test — all closed by PRs #34/#40/#44). No new P0 / data-loss bugs. The cluster below (severity tags map to the file's P-legend: BUG/blocking → P1, DESIGN/latent → P2, SMELL/NIT → P3) concentrates in error-classification defaults, a CI lint hole, the radix test gap, and doc drift from the #46 dead-code sweep.
+
+Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix proptest gap) first — both are real gaps with cheap fixes; then the zero-risk cheap batch **I104 / I127 / I128 / I130 / I131 / I132 / I133** (a test, a hasher swap, and doc edits — no runtime behaviour change); then the P2 DESIGN items as they get touched. The P3 idiom/NIT items batch with any PR in their file.
+
+### Error handling and classification
+
+#### I104. `ChiselError::is_fatal()` is fail-open — unlisted future variants classified non-fatal [deepdive 2026-06-21] — **P2**
+**Where:** `src/error.rs:168-181`
+
+**Problem:** the `matches!`-based classifier returns `false` for any variant not in its Fatal list, so a future fatal variant a maintainer forgets to add is silently classified *operational* and will NOT poison the manager. For a durability-first engine this is the one function whose default leans the wrong way; the in-code INVARIANT comment already admits it's "a durability hole, not a compile error." All 24 current variants are classified correctly — the gap is latent, not a present bug.
+
+**Direction of fix (NOT a default flip):** the review argues a `_ => true` flip just moves the latent bug (a future *operational* variant would then over-poison and tank availability). Instead add an exhaustiveness test that constructs every `ChiselError` variant and asserts `is_fatal()` matches the value the enum's documented Fatal/Operational block prescribes. Converts the prose invariant into a compile-time-ish signal the `#[non_exhaustive]` enum can't give, catches *both* misclassification directions, changes zero runtime behaviour (~30 lines). See the review's countercase section for the full argument.
+
+#### I105. Blanket `From<io::Error>` makes every `?` on an I/O call produce a *fatal* `IoError` invisibly [deepdive 2026-06-21] — **P2**
+**Where:** `src/error.rs:282-286` (conversion); `:280-281` (the caveat comment)
+
+**Problem:** the blanket conversion means any `?` on an io call silently produces a fatal `IoError` and poisons, even on a benign `NotFound`. The comment concedes callers "must catch and remap" to classify e.g. `NotFound` as operational, but nothing enforces it — the `FileNotFound` operational variant exists *because* the conversion is too coarse. A future `?` on an io call that should be recoverable will poison.
+
+**Direction of fix:** drop the blanket `From` (force explicit classification at each I/O site), or have the conversion inspect `ErrorKind` and route the known-operational kinds (`NotFound`, `AlreadyExists`, …) to operational variants.
+
+#### I106. `CorruptSuperblock` folds three distinct causes into one nullary fatal variant [deepdive 2026-06-21] — **P3**
+**Where:** `src/error.rs:106`
+
+**Problem:** bad checksum, bad magic, and out-of-range `superblock_count` all surface as the same nullary, fatal, unrecoverable `CorruptSuperblock`; the comment admits operators "should look at the raw slot bytes." Discarding which-slot-and-why on the engine's worst failure is an operability loss. (Related: `InvalidMagic` at `:111` is likely unreachable because a bad magic already surfaces here via `select` — see I115.)
+
+**Direction of fix:** add a cause field (`enum SuperblockDefect { Checksum, Magic, BadCount(u32) }`) and/or the offending slot index.
+
+#### I107. `delete_with_tag` discards its partial-deletion list on a mid-pass error [deepdive 2026-06-21, carried from 2026-05-22] — **P3**
+**Where:** `src/lib.rs:553`; `src/transaction.rs:2041` (`delete_with_tag_inner`)
+
+**Problem:** the `?` inside the per-handle loop drops the already-built `deleted` set; the caller gets `Err` with no `TagDropProgress`. On-disk state stays consistent (the failed transaction rolls back), but a resumable relation-drop cannot reconcile what it had dropped. Unchanged since the 2026-05-22 pass — not a regression, restated to keep it tracked under a number.
+
+**Direction of fix:** attach the partial progress to the error variant, or document that rollback-on-error is mandatory and the caller must restart the drop. (Interacts with I102's batched-drop work.)
+
+### CI and automation
+
+#### I108. The PyO3 binding (1,300+ lines of Rust) is never clippy-linted in CI [deepdive 2026-06-21] — **P1**
+**Where:** `.github/workflows/ci.yml:40` (root clippy step); python job at `:118-160`
+
+**Problem:** the gating `cargo clippy -- -D warnings` (no `--workspace`/`-p`) honors `default-members = [".", "bench"]`, which excludes `chisel-py`; the python job runs only `maturin develop` + `pytest`. Confirmed empirically — clippy only checks `chisel` and `chisel-bench`. So clippy regressions in `python/src/*` ship silently. (`cargo fmt -- --check` *does* cover it — rustfmt walks all members — so only clippy has the hole.)
+
+**Direction of fix:** add `cargo clippy -p chisel-py --all-targets -- -D warnings` (with the maturin linker env) to the python job, or run root clippy with `--workspace`.
+
+#### I109. The release/tag wheel path has no `cargo audit` gate [deepdive 2026-06-21] — **P2**
+**Where:** `.github/workflows/wheels.yml:11-17`
+
+**Problem:** the `audit` job lives in `ci.yml` (push/PR to main) but is not a dependency of the tag-triggered wheel build, which runs only `cargo test --release`. A vulnerable dependency introduced and tagged without merging through a PR would publish wheels unaudited.
+
+**Direction of fix:** add a `cargo audit` step (or reuse the `rustsec/audit-check` action from I54) as a gate on the wheel job.
+
+#### I110. The MSRV job builds but never `--tests` and skips bench/python [deepdive 2026-06-21] — **P3**
+**Where:** `.github/workflows/ci.yml:98-107`
+
+**Problem:** `cargo build -p chisel` verifies the library compiles at 1.82 but not its test code, so an MSRV-breaking construct in a test module passes. Low risk.
+
+**Direction of fix:** `cargo build --tests -p chisel` in the msrv job (a cheap strengthening; keep bench/python scoped out per I55/I61's deliberate floor-floating decision).
+
+### Tests
+
+#### I111. Radix key-math has no property tests, and the one "two-level" test reaches depth 1 [deepdive 2026-06-21, follow-up to I71] — **P1**
+**Where:** `src/handle_table.rs:1313` (`test_handle_table_grows_to_two_levels`); the `find_leaf`/`span_at_level`/`insert`/`grow`/`recover_depth` paths and the identical `src/membership_index.rs` paths
+
+**Problem:** `test_handle_table_grows_to_two_levels` is misnamed — it inserts `ENTRIES_PER_LEAF + 10` (520) handles (forces depth 1) and never asserts `ht.depth()`. No test exercises a depth-≥2 descent, so the multi-digit `span_at_level` / `handle % child_span` decomposition — the engine's most off-by-one-prone code, addressing both the stable-handle table and the tag index — is exercised only at depth 0–1. I71 added proptests for slot packing / freemap bit math / checksum round-trip but not for the radix math.
+
+**Direction of fix:** insert `> ENTRIES_PER_LEAF²` and assert depth ≥2; add a `HashMap`-oracle property (`insert(h,e); lookup(h)==Some(e)` over arbitrary `u64` on a depth-≥2 tree, plus a `grow → recover_depth` round-trip) — ~15 lines that would catch any `span_at_level` off-by-one instantly. `transaction.rs` also lacks a stateful commit/rollback/savepoint proptest despite a ready oracle (`assert_no_reachable_page_is_free`, `:2642`).
+
+#### I112. Fault-injection test layer absent — the poison/flush coupling and the fatal-`IoError` path are reasoned, not tested [deepdive 2026-06-21] — **P2**
+**Where:** `src/page_cache.rs` flush (clears dirty flags before the trailing fsync); `src/transaction.rs:2833` (`fatal_error_outside_commit_also_poisons`); `error.rs:94` (`IoError`)
+
+**Problem:** flush clears per-page dirty flags *before* the trailing fsync — safe *only* under the poison model, and the comment warns it breaks if poisoning is weakened. No test asserts a flush/fsync error actually poisons: `test_poison_recovery_by_reopen` can't inject a fault, and `fatal_error_outside_commit_also_poisons` is tautological (`force_poison_for_test()` then asserts `Poisoned`). The most-traveled fatal path (`IoError`) is constructed-only — no test induces a real I/O fault and observes the engine returning it.
+
+**Direction of fix:** a `Backing::FaultyFile` test variant that fails a chosen syscall closes the poison/flush gap and exercises `IoError` / `CorruptSuperblock` / `InvalidMagic` end-to-end (also addresses open question 4 and several I115 gaps at once).
+
+#### I113. Weak assertions that survive a subtle break [deepdive 2026-06-21] — **P3**
+**Where:** `tests/defrag.rs:63`; `src/page_cache.rs:1294`; `tests/spillway_runtime_mutability.rs:33`; assorted `assert!(x.is_some()/is_err())` sites
+
+**Problem:** `assert!(pages_freed > 0)` passes if defrag freed 1 of ~45 (the sibling `:154` bounds it correctly); `assert_eq!(dh+dm,1)` passes if a hit is recorded as a miss; the spillway-mutability test sets the cap then asserts nothing about its effect; several `is_some`/`is_err` checks never inspect the value/variant.
+
+**Direction of fix:** tighten each to assert the actual expected value/variant/bound.
+
+#### I114. `claim_page_asserts_on_dirty_page` is `#[cfg(debug_assertions)]` and vanishes under `--release` [deepdive 2026-06-21] — **P3**
+**Where:** `src/page_cache.rs:1236`; the release-profile gate at `wheels.yml:17`
+
+**Problem:** the test guarding the I20 dirty-page invariant is debug-only, so it silently disappears under `cargo test --release` — which the wheel gate uses. The invariant is checked only in dev-profile runs.
+
+**Direction of fix:** either keep the `debug_assert!` but assert the *observable* consequence in a release-safe test, or document why debug-only coverage is acceptable here.
+
+#### I115. Error-variant coverage gaps; `InvalidMagic` likely unreachable; `CorruptSuperblock` never pinned [deepdive 2026-06-21] — **P3**
+**Where:** `src/error.rs:111` (`InvalidMagic`); `tests/recovery_tests.rs:533` (the OR-arm); the `Poisoned` end-to-end loop
+
+**Problem:** `InvalidMagic` is probably unreachable (a bad magic surfaces as `CorruptSuperblock` via `select` — see I106); `CorruptSuperblock` is never *pinned* as the expected variant (only matched in an OR-arm); the `Poisoned` end-to-end path is synthetic (`force_poison_for_test`, never a real fatal error driven into a live manager — see I112). **Memory correction:** the project note "ReadOnlyMode never raised" is stale — `tests/options_validation.rs:240` genuinely drives and matches it.
+
+**Direction of fix:** pin `CorruptSuperblock` as the sole expected variant in the recovery tests; decide whether `InvalidMagic` is dead (remove) or reachable (add a test); drive a real fatal error for the `Poisoned` loop (depends on I112).
+
+### Correctness
+
+#### I116. `PageCache::truncate` decrements `dirty_count` unguarded — underflow disables the cache cap [deepdive 2026-06-21] — **P2**
+**Where:** `src/page_cache.rs:625-654` (`truncate`); the guarded siblings `discard`, `maybe_evict` Phase B, `set_cache_max_bytes` (justification comment at `:986-994`)
+
+**Problem:** `self.dirty_count -= 1` per removed dirty entry is the one decrement site not guarded against an `entries`/`dirty_count` desync. On any desync it underflows (debug panic / release wrap to `usize::MAX`), after which `maybe_evict`'s `dirty_count == entries.len()` short-circuit never fires and the cache silently stops enforcing its cap. This `dirty_count`-underflow shape has now appeared in two consecutive reviews at different call sites (2026-06-16 flagged the `maybe_evict` site, since guarded).
+
+**Direction of fix:** recompute `dirty_count` from surviving entries after the loop, or saturate — and consolidate all four decrement sites behind one helper to end the recurrence (ties into I136's eviction-loop extraction).
+
+#### I117. `insert_into_data_page`'s `.expect("value fits in empty page")` is a library-reachable panic if the inline-size constants drift [deepdive 2026-06-21, follow-up to I46] — **P2**
+**Where:** `src/transaction.rs:2576`; the hand-maintained literal `MAX_INLINE_VALUE` at `:66`
+
+**Problem:** correct today (`MAX_INLINE_VALUE = 8162` exactly equals `CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE - SLOT_ENTRY_SIZE`), but `MAX_INLINE_VALUE` is a hand-maintained literal with only a prose "keep in sync" note. If any of the three constants is edited independently, `DataPage::insert` returns `None` on the "fits" path and a plain `allocate()` of the wrong-sized value panics the process. I46 added an `// INVARIANT:` comment here; this asks for a compile-time guard.
+
+**Direction of fix:** `const _: () = assert!(MAX_INLINE_VALUE == CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE - SLOT_ENTRY_SIZE);`, or map the `None` to a typed error.
+
+#### I118. Fresh inner-tree roots bypass the freemap-aware allocator — churn workloads extend the file [deepdive 2026-06-21] — **P3**
+**Where:** `src/membership_index.rs:603` (`create_root` → `init_page` → `cache.new_page()`); the "bounded steady-state page count" header claim at `:41-49`
+
+**Problem:** `MembershipIndex::insert` threads the freemap-aware `alloc` closure into `inner.insert`, but a tag's first-ever `create_root` always extends (never reuses a freed page). Not a correctness bug (the id is past the watermark; rollback's `truncate` and commit's freemap merge both handle it), but a workload that repeatedly empties and re-creates a tag's inner tree extends the file once per re-create, undercutting the module's own bounded-page-count claim.
+
+**Direction of fix:** plumb the `alloc` closure into `create_root`/`init_page`, or narrow the header comment to exclude first-create.
+
+#### I119. `commit_inner`'s `txn_counter += 1` is an unchecked `u64` increment [deepdive 2026-06-21, carried] — **P3**
+**Where:** `src/transaction.rs:889`
+
+**Problem:** practically unreachable, but a wrapped counter corrupts `Superblock::select`'s "highest counter wins", and a debug overflow panics mid-protocol after dirty flags were cleared. Inconsistent with the `saturating_add` discipline used elsewhere.
+
+**Direction of fix:** `checked_add` → fatal error on overflow.
+
+### API design
+
+#### I120. Handles are raw `u64` and tags raw `u32` across the whole public surface [deepdive 2026-06-21] — **P2**
+**Where:** `src/lib.rs` (`allocate -> u64`; `read`/`update`/`delete`/`tag`/`handle_live_page_id` take `u64`; `delete_tagged(handle, tag)` takes two integers)
+
+**Problem:** a crate that is `#[non_exhaustive]`-everything and careful about API stability leaves its most-used values primitive-obsessed; `delete_tagged`'s two integer args can be transposed with no compiler error. (Related: `handles()` / `handles_with_tag()` return eager `Vec<u64>` with a three-paragraph prose contract — the streaming variant is already tracked as I97/I100; the newtype is the orthogonal half.)
+
+**Direction of fix:** opaque `Handle(u64)` / `Tag(u32)` newtypes with `From`/`Into` — makes `delete_tagged` un-transposable and distinguishes `handles()` from `handles_with_tag()` return types.
+
+#### I121. `DefragStats` and `TagDropProgress` are outcome reports but not `#[must_use]` [deepdive 2026-06-21] — **P3**
+**Where:** `src/defrag.rs:111` (`DefragStats`); `src/membership_index.rs:538` (`TagDropProgress`)
+
+**Problem:** `db.defrag(opts)?;` silently discards `pages_freed`; `delete_with_tag(...)?;` discards `complete` — the field the caller must loop on (see I107). The crate already added `#[must_use]` to `close()` (I38), so it values the pattern.
+
+**Direction of fix:** `#[must_use]` on both type definitions.
+
+#### I122. `DefragOptions::max_pages` counts values relocated, not pages [deepdive 2026-06-21] — **P3**
+**Where:** `src/defrag.rs:64-70` (the "DESPITE THE NAME…" comment)
+
+**Problem:** preserving a misleading public field/setter name "for stability" on a pre-1.0, `#[non_exhaustive]`, no-production-users crate is the wrong trade — the C4 doc-sweep and the Python `__init__.py` note both already paper over the mismatch instead of fixing it.
+
+**Direction of fix:** rename to `max_values` now (and the Python `DefragOptions.max_pages` mirror), while there are no users to break.
+
+#### I123. `page_count` / `file_page_count` keep `&mut self` "for API stability" on a pure `Cell` read [deepdive 2026-06-21] — **P3**
+**Where:** `src/page_io.rs:330,594`
+
+**Problem:** these now-pure cache reads keep `&mut self`, forcing a `borrow_mut()` on semantically-read `&self` paths — a latent double-borrow risk if a future `&self` path nests a cache read. The comment already concedes a future patch can drop the `&mut`.
+
+**Direction of fix:** drop the `&mut self` now (the ripple is small).
+
+#### I124. Public fallible methods broadly lack `# Errors` rustdoc; several omit `# Panics` [deepdive 2026-06-21] — **P3**
+**Where:** `savepoint`/`rollback_to`/`release`/`set_root_name`/`get_root_name` and most `TransactionManager` mutators; assert sites at `transaction.rs:307`, `membership_index.rs:167`
+
+**Problem:** for a published crate this is the `missing_errors_doc` / `missing_panics_doc` surface clippy would flag under `--all-targets` pedantic.
+
+**Direction of fix:** a shared "Errors & poisoning" doc convention plus targeted `# Errors`/`# Panics` sections.
+
+### Type system
+
+#### I125. Three different deleted-handle semantics for the same "look up a live handle" [deepdive 2026-06-21] — **P2**
+**Where:** `src/transaction.rs:1563-1602` (`read`, `client_byte`, `tag`); `:2014` (`delete_tagged`)
+
+**Problem:** `read()` and `client_byte()` reject a tombstone with `InvalidHandle`; `tag()` reads through it; `delete_tagged()` reads `.tag` off the looked-up entry with no Deleted guard. The "a handle is live" invariant lives in scattered per-method guards, so a fourth caller can easily get it wrong.
+
+**Direction of fix:** one `lookup_live(handle) -> Result<HandleEntry>` applying the Deleted ⇒ `InvalidHandle` rule once, used by all four sites.
+
+#### I126. Tag/client-byte `0` is overloaded as the "untagged"/"unset" sentinel [deepdive 2026-06-21] — **P3**
+**Where:** `src/lib.rs` tag surface; threaded through the membership layer
+
+**Problem:** `0` doubles as a valid value and the "no tag" sentinel for both tag (`u32`) and client byte (`u8`); `allocate_tagged(value, tag: u32)` can be called with the sentinel by mistake and "membership index not updated for tag 0" is an implicit rule.
+
+**Direction of fix:** `Option<NonZeroU32>` at the tag API boundary — "no tag" becomes expressible in the type (composes with the I120 newtype).
+
+### Performance
+
+#### I127. `current_live_slots` / `committed_live_slots` / `Savepoint.live_slots` use std `HashMap` (SipHash) on the per-op path [deepdive 2026-06-21, follow-up to I77] — **P2**
+**Where:** `src/transaction.rs:144` (field decls ~144/216); probed/updated at `insert_into_data_page:2555/2591`, `release_data_slot:2463`
+
+**Problem:** these slot-accounting maps are probed and updated on every insert/update/delete. Keys are trusted local `u64` page ids — the identical threat model to the page-cache/LRU maps the I77 pass already moved to `FxHashMap` with an explicit "no DoS surface, SipHash is pure cost" rationale. I77 simply missed these.
+
+**Direction of fix:** `rustc_hash::FxHashMap` for all three; zero-risk, same free win. (Verified-clean by the same review: LRU is O(1), eviction short-circuits on `dirty_count`, radix descent is allocation-free, XXH3 re-stamps once per touched page — no other perf gaps on the hot path.)
+
+### Docs vs reality
+
+#### I128. ADR-7 + `ARCHITECTURE.md:580` describe per-page version read-dispatch as live, but no code reads the byte [deepdive 2026-06-21] — **P2**
+**Where:** ADR-7 (`.codebase-memory/adr.md`); `ARCHITECTURE.md:580`; `PageCache::load_page`
+
+**Problem:** both claim "reads dispatch on the per-page version byte" / "the page-cache load path validates the per-page version on every miss." Every page type *writes* `current_version(type)` at init, but `load_page` validates only the XXH3 checksum — there is no version read or dispatch anywhere. The mechanism is reserved-and-stamped, not implemented (consistent with the ADR's own "I31 eager upgrader (deferred)" note; the consequence bullets contradict it). ADR-7 was partially corrected 2026-06-21 — verify the corrected text and `ARCHITECTURE.md:580` both read reserved/future tense.
+
+**Direction of fix:** reword the live-dispatch claims to reserved/future tense in both ADR-7 and ARCHITECTURE.md. See also I31's "Phase 1a" note (the read helpers exist but are dormant — no production caller).
+
+#### I129. The ADR is not git-tracked — a fresh clone has no ADR and `// see ADR-N` comments resolve to nothing [deepdive 2026-06-21] — **P2**
+**Where:** `.codebase-memory/adr.md` (the codebase-memory MCP's local store, untracked); the many `// see ARCHITECTURE.md ADR-N` code comments
+
+**Problem:** the ADR-0..14 record lives only in the untracked MCP store; ARCHITECTURE.md has no ADR sections, so every code comment citing an ADR number is a dangling reference for anyone who clones the repo. This is a process/maintainer decision, not a code fix.
+
+**Direction of fix:** commit the ADR into the repo as `docs/ADR.md` (and either re-point the `// see …` comments at it or keep them once the file exists). Edit the MCP store via `manage_adr mode=update` with the FULL content — the `sections` param wipes the whole store (recorded footgun). **Open question for the maintainer:** is the ADR meant to be a repo artifact? If yes, this is the migration; if it stays MCP-only, the code comments should stop citing ADR numbers.
+
+#### I130. `ARCHITECTURE.md` cites functions deleted in the #46 dead-code sweep [deepdive 2026-06-21] — **P2**
+**Where:** `ARCHITECTURE.md:246` (`page::page_format_version()`); `:108` and `:471` (`allocate_near`, the latter claiming it's "currently used by data-page allocation" — already false before deletion)
+
+**Problem:** the #46 sweep updated code comments but not ARCHITECTURE.md, leaving three references to deleted functions. (Note: `page::page_format_version()` was *re-introduced* as a dormant read helper by the 2026-06-21 versioning work per I31's Phase 1a — confirm whether the `:246` reference is now accurate or still describes the deleted signature.)
+
+**Direction of fix:** reconcile the three references against current code — delete the `allocate_near` ones; correct or keep `page_format_version` depending on its current dormant-but-present status.
+
+#### I131. `README.md:14` says commit is "two-phase" but the protocol does three fsyncs [deepdive 2026-06-21, follow-up to I63] — **P3**
+**Where:** `README.md:14`; the `commit()` rustdoc (numbers only two fsyncs)
+
+**Problem:** I63 fixed the *docstring's* "two fsyncs" claim, but the README's "two-phase durability (fsync data pages, then fsync superblock)" and the rustdoc step-numbering were missed. The protocol does THREE fsyncs (pre-drain I28 flush `transaction.rs:971`, step-1 data flush `:989`, superblock `:1026`); ARCHITECTURE.md gets it right ("3 fsyncs", with a `== 3` regression test).
+
+**Direction of fix:** README → three-fsync; renumber the `commit()` rustdoc to give the pre-drain a step number.
+
+#### I132. `ARCHITECTURE.md` says `bench/` is "not a workspace member" — it is [deepdive 2026-06-21] — **P3**
+**Where:** `ARCHITECTURE.md:588`, `:619`, `:668` (the last draws a now-false build-topology inference)
+
+**Problem:** `Cargo.toml:20` is `members = [".", "python", "bench"]`; bench is merely excluded from `default-members`. README.md:72 is correct; ARCHITECTURE contradicts it three times. (Post-I61 state.)
+
+**Direction of fix:** "a workspace member excluded from `default-members`."
+
+#### I133. `ARCHITECTURE.md` "common 16-byte header" vs `COMMON_HEADER_SIZE = 12` [deepdive 2026-06-21] — **P3**
+**Where:** `ARCHITECTURE.md:232`, `:235`; `src/page.rs:41`
+
+**Problem:** the 16 figure is actually `DATA_PAGE_HEADER_SIZE` (the data-only extended header); the named common-header constant is 12.
+
+**Direction of fix:** reconcile the number against the constant name.
+
+### Idiomaticity
+
+#### I134. The COW page copy bounces through a named 8 KB stack array for the borrow checker [deepdive 2026-06-21] — **P3**
+**Where:** `src/handle_table.rs:330-333`; `src/membership_index.rs:205-208`, `:290-292`
+
+**Problem:** three sites copy a page through a named stack buffer purely to satisfy the borrow checker; the pattern is unnamed and duplicated.
+
+**Direction of fix:** a shared `cow_copy_page(cache, src, dst)` helper using `copy_from_slice`.
+
+#### I135. `u64::from_le_bytes(buf[off..off+8].try_into().unwrap())` repeated ~15× [deepdive 2026-06-21] — **P3**
+**Where:** across `src/handle_table.rs` and `src/superblock.rs::deserialize`
+
+**Problem:** the load-bearing infallibility of each `unwrap()` is undocumented at every site.
+
+**Direction of fix:** a tiny `read_u64_le(buf, off)` helper that names the invariant once.
+
+#### I136. Three hand-copied clean-victim eviction loops with divergent short-circuits [deepdive 2026-06-21, carried] — **P3**
+**Where:** `src/page_cache.rs` — `maybe_evict` Phase A, `set_cache_max_bytes`, `flush` Phase 1b (the last omits the `dirty_count` early-out)
+
+**Problem:** the three loops are subtly divergent; carried from the prior review. Relates to the `dirty_count` underflow trend (I116).
+
+**Direction of fix:** extract `evict_clean_to_cap` and consolidate (do alongside I116's `dirty_count` helper).
+
+### Python binding (PyO3)
+
+#### I137. `db.rs` / `transaction.rs` file-header docs still describe the engine as `RefCell<Option<Chisel>>` — it's a `Mutex` since I75 [deepdive 2026-06-21] — **P2**
+**Where:** `python/src/db.rs:2-29` (header) vs the actual field at `:76`; `python/src/transaction.rs:44` (same stale claim)
+
+**Problem:** the file headers argue "why RefCell (and not Mutex)", but I75 migrated the field to `Mutex<Option<Chisel>>` (the struct comment 30 lines below correctly documents the Mutex and contradicts the header above it). A first-time reader gets the wrong concurrency model and the wrong I21 failure mode (RefCell *panics* on re-entry; the Mutex *deadlocks*).
+
+**Direction of fix:** rewrite both file headers to describe the Mutex model and the deadlock-not-panic re-entry semantics.
+
+#### I138. `errors.rs` catchall routes any future variant to the abstract base, bypassing the Operational/Fatal split [deepdive 2026-06-21] — **P2**
+**Where:** `python/src/errors.rs:326` (the `_` arm); the "exhaustive, no silent fallback" header claim at `:11-13`
+
+**Problem:** the same fail-open class as engine I104, on the binding side. A new *fatal* engine variant would surface in Python as a bare `ChiselError`, so `except chisel.FatalError:` poison-recovery handlers silently miss it — breaking the documented `FatalError` contract (`errors.rs:5-7`). The header still claims the match is exhaustive with "no silent fallback", which `#[non_exhaustive]` (I36) made false.
+
+**Direction of fix:** branch the catchall through the Operational/Fatal base class instead of the abstract `ChiselError`; correct the header claim.
+
+#### I139. The typed-exception contract is largely unverified [deepdive 2026-06-21] — **P3**
+**Where:** `python/tests/` (`test_operational_hierarchy`, `test_threading.py`); `python/src/errors.rs::to_py_err`
+
+**Problem:** routing is correct today, but `SavepointNotFoundError`, `DuplicateSavepointError`, `CacheFullError`, `SpillwayFullError`, `RootNameTableFullError`, `InvalidRootNameError` are never raised in any test, and `test_operational_hierarchy` omits `TagMismatch`/`SpillwayFull`/`TransactionInProgress` — a swapped `to_py_err` arm ships green. `test_threading.py` joins before re-touching, so the Mutex deadlock/poison path (the whole reason for I75's Mutex-over-RefCell decision) is unexercised.
+
+**Direction of fix:** a parametrized "trigger each variant, assert the concrete class" test, plus a two-thread contention test.
+
+### Cargo hygiene
+
+#### I140. `python/Cargo.toml:6` carries a stale "PyO3 0.22" comment — the dep is 0.29 [deepdive 2026-06-21] — **P3**
+**Where:** `python/Cargo.toml:6`
+
+**Problem:** cosmetic — the dependency is `pyo3 = "0.29"` (I103) but the comment still says 0.22. The only cargo-hygiene finding; every declared dependency is otherwise used and MSRV 1.82 holds against every floor.
+
+**Direction of fix:** update or delete the comment.
