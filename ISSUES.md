@@ -1451,12 +1451,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 **Fixed (2026-06-21):** added `PageCache::untrack_dirty(was_dirty)` doing `dirty_count = dirty_count.saturating_sub(1)` and routed the decrement sites through it. **Two corrections to the framing:** (1) `truncate` was NOT the lone unguarded outlier — like `discard` and `maybe_evict` Phase B it already had the `if entry.dirty` guard; the genuine fix is making all of them **saturating** (they used plain `-= 1`, which underflows only under a real `entries`/`dirty_count` desync). (2) There are **three** decrement sites, not four: `set_cache_max_bytes` evicts CLEAN entries only and never touches `dirty_count`. Saturation turns a desync into "cap not strictly enforced until the next flush/rollback resets the count" instead of a debug panic / release wrap. Behavior-preserving under the invariant; full suite green.
 
-#### I117. `insert_into_data_page`'s `.expect("value fits in empty page")` is a library-reachable panic if the inline-size constants drift [deepdive 2026-06-21, follow-up to I46] — **P2**
+#### I117. `insert_into_data_page`'s `.expect("value fits in empty page")` is a library-reachable panic if the inline-size constants drift [deepdive 2026-06-21, follow-up to I46] — **P2** ✅ FIXED 2026-06-21
 **Where:** `src/transaction.rs:2576`; the hand-maintained literal `MAX_INLINE_VALUE` at `:66`
 
 **Problem:** correct today (`MAX_INLINE_VALUE = 8162` exactly equals `CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE - SLOT_ENTRY_SIZE`), but `MAX_INLINE_VALUE` is a hand-maintained literal with only a prose "keep in sync" note. If any of the three constants is edited independently, `DataPage::insert` returns `None` on the "fits" path and a plain `allocate()` of the wrong-sized value panics the process. I46 added an `// INVARIANT:` comment here; this asks for a compile-time guard.
 
 **Direction of fix:** `const _: () = assert!(MAX_INLINE_VALUE == CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE - SLOT_ENTRY_SIZE);`, or map the `None` to a typed error.
+
+**Fixed (2026-06-21):** went one better than a const-assert — made `MAX_INLINE_VALUE` a **derived** const: `page::CHECKSUM_OFFSET - page::DATA_PAGE_HEADER_SIZE - data_page::SLOT_ENTRY_SIZE` (was the `8162` literal). It can no longer drift (it IS the page constants), so the upstream `value.len() > MAX_INLINE_VALUE` check can't diverge from the page's real capacity and the `.expect` is unreachable by construction. Made `data_page::SLOT_ENTRY_SIZE` `pub(crate)` so transaction.rs can reference it. Value unchanged (still 8162); overflow-boundary tests pass.
 
 #### I118. Fresh inner-tree roots bypass the freemap-aware allocator — churn workloads extend the file [deepdive 2026-06-21] — **P3**
 **Where:** `src/membership_index.rs:603` (`create_root` → `init_page` → `cache.new_page()`); the "bounded steady-state page count" header claim at `:41-49`
@@ -1465,12 +1467,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 **Direction of fix:** plumb the `alloc` closure into `create_root`/`init_page`, or narrow the header comment to exclude first-create.
 
-#### I119. `commit_inner`'s `txn_counter += 1` is an unchecked `u64` increment [deepdive 2026-06-21, carried] — **P3**
+#### I119. `commit_inner`'s `txn_counter += 1` is an unchecked `u64` increment [deepdive 2026-06-21, carried] — **P3** ✅ FIXED 2026-06-21
 **Where:** `src/transaction.rs:889`
 
 **Problem:** practically unreachable, but a wrapped counter corrupts `Superblock::select`'s "highest counter wins", and a debug overflow panics mid-protocol after dirty flags were cleared. Inconsistent with the `saturating_add` discipline used elsewhere.
 
 **Direction of fix:** `checked_add` → fatal error on overflow.
+
+**Fixed (2026-06-21):** `self.txn_counter = self.txn_counter.checked_add(1).expect("…unreachable")`. **Chose a controlled panic over the review's "fatal error" suggestion deliberately:** overflow needs 2^64 commits (structurally unreachable), so a dedicated fatal `ChiselError` variant for it would be speculative public surface (a new enum arm + Display + `is_fatal` + the I104 exhaustiveness test + a Python exception class — all for an impossible event). The real defect was the **silent release-side wrap to 0** corrupting `Superblock::select`; `checked_add().expect()` replaces that with a loud, controlled failure on the invariant. If a typed fatal variant is preferred, it's a one-line swap at the `expect`.
 
 ### API design
 

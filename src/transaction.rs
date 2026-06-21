@@ -67,8 +67,16 @@ use crate::superblock::{
 
 // Largest value stored inline in a data-page slot. Larger values are written to an
 // overflow chain and referenced by a single HandleEntry with HandleFlags::Overflow.
-// Derived from PAGE_SIZE minus DataPage header/slot overhead; keep in sync with data_page.rs.
-const MAX_INLINE_VALUE: usize = 8162;
+//
+// I117 (ISSUES.md, 2026-06-21): COMPUTED from the page constants (was a
+// hand-maintained `8162` literal with only a prose "keep in sync" note). A data
+// page's usable body is `CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE`, minus one
+// `SLOT_ENTRY_SIZE` slot-directory entry. Deriving it makes drift impossible —
+// which is what makes the `.expect("value fits in empty page")` in
+// `insert_into_data_page` safe by construction: a value `<= MAX_INLINE_VALUE`
+// always fits an empty page, so that expect is structurally unreachable.
+const MAX_INLINE_VALUE: usize =
+    page::CHECKSUM_OFFSET - page::DATA_PAGE_HEADER_SIZE - crate::data_page::SLOT_ENTRY_SIZE;
 
 /// Freemap-aware page allocator shared by data-page allocation and the
 /// handle-table / membership-index COW paths.
@@ -1019,7 +1027,17 @@ impl TransactionManager {
         // Step 2: Build the new superblock. Bumping txn_counter here both makes
         // it outrank the current superblock on recovery AND (via parity) picks
         // the target slot in step 3.
-        self.txn_counter += 1;
+        //
+        // I119 (ISSUES.md, 2026-06-21): checked, not `+= 1`. A wrapped counter
+        // would corrupt `Superblock::select`'s "highest counter wins" (release
+        // wrap to 0) — far worse than the loud, controlled panic here. Overflow
+        // needs 2^64 commits, so it is structurally unreachable; a dedicated
+        // fatal error variant for an impossible event would be speculative
+        // public surface, so the `expect` on the invariant is proportionate.
+        self.txn_counter = self
+            .txn_counter
+            .checked_add(1)
+            .expect("txn_counter overflowed u64 (2^64 commits) — unreachable");
         let total_pages = cache.file_page_count()?;
         let sb = Superblock {
             magic: page::MAGIC,
