@@ -1370,12 +1370,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 ### CI and automation
 
-#### I108. The PyO3 binding (1,300+ lines of Rust) is never clippy-linted in CI [deepdive 2026-06-21] — **P1**
+#### I108. The PyO3 binding (1,300+ lines of Rust) is never clippy-linted in CI [deepdive 2026-06-21] — **P1** ✅ FIXED 2026-06-21
 **Where:** `.github/workflows/ci.yml:40` (root clippy step); python job at `:118-160`
 
 **Problem:** the gating `cargo clippy -- -D warnings` (no `--workspace`/`-p`) honors `default-members = [".", "bench"]`, which excludes `chisel-py`; the python job runs only `maturin develop` + `pytest`. Confirmed empirically — clippy only checks `chisel` and `chisel-bench`. So clippy regressions in `python/src/*` ship silently. (`cargo fmt -- --check` *does* cover it — rustfmt walks all members — so only clippy has the hole.)
 
 **Direction of fix:** add `cargo clippy -p chisel-py --all-targets -- -D warnings` (with the maturin linker env) to the python job, or run root clippy with `--workspace`.
+
+**Fixed (2026-06-21):** took the `--workspace` option — the clippy job now runs `cargo clippy --workspace -- -D warnings`, which lints all three members (chisel, chisel-bench, chisel-py). Verified locally that the run checks `chisel-py v0.1.0` and passes clean. pyo3's `extension-module` feature means no libpython link during a check, so it runs on the bare clippy runner with no Python/maturin setup. Chose `--workspace` over a dedicated python-job step to avoid running clippy 4× across the OS×version matrix and to future-proof any new workspace member.
 
 #### I109. The release/tag wheel path has no `cargo audit` gate [deepdive 2026-06-21] — **P2**
 **Where:** `.github/workflows/wheels.yml:11-17`
@@ -1393,12 +1395,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 ### Tests
 
-#### I111. Radix key-math has no property tests, and the one "two-level" test reaches depth 1 [deepdive 2026-06-21, follow-up to I71] — **P1**
+#### I111. Radix key-math has no property tests, and the one "two-level" test reaches depth 1 [deepdive 2026-06-21, follow-up to I71] — **P1** ✅ FIXED 2026-06-21
 **Where:** `src/handle_table.rs:1313` (`test_handle_table_grows_to_two_levels`); the `find_leaf`/`span_at_level`/`insert`/`grow`/`recover_depth` paths and the identical `src/membership_index.rs` paths
 
 **Problem:** `test_handle_table_grows_to_two_levels` is misnamed — it inserts `ENTRIES_PER_LEAF + 10` (520) handles (forces depth 1) and never asserts `ht.depth()`. No test exercises a depth-≥2 descent, so the multi-digit `span_at_level` / `handle % child_span` decomposition — the engine's most off-by-one-prone code, addressing both the stable-handle table and the tag index — is exercised only at depth 0–1. I71 added proptests for slot packing / freemap bit math / checksum round-trip but not for the radix math.
 
 **Direction of fix:** insert `> ENTRIES_PER_LEAF²` and assert depth ≥2; add a `HashMap`-oracle property (`insert(h,e); lookup(h)==Some(e)` over arbitrary `u64` on a depth-≥2 tree, plus a `grow → recover_depth` round-trip) — ~15 lines that would catch any `span_at_level` off-by-one instantly. `transaction.rs` also lacks a stateful commit/rollback/savepoint proptest despite a ready oracle (`assert_no_reachable_page_is_free`, `:2642`).
+
+**Fixed (2026-06-21):** **correction to the direction above** — the depth-2 boundary is `capacity(1) = ENTRIES_PER_LEAF * PTRS_PER_INTERIOR = 510 * 1021 = 520_710`, NOT `ENTRIES_PER_LEAF²` (= 260_100, still depth 1). Changes: (1) renamed `test_handle_table_grows_to_two_levels` → `test_handle_table_grows_to_depth_one` and added `assert_eq!(ht.depth(), 1)` so it honestly pins what it exercises; (2) added `test_handle_table_grows_to_depth_two` — inserts a sparse handle set including one ≥ 520_710, asserts `depth() == 2`, reads every entry back, and asserts an uninserted in-capacity handle reads absent (the historical I6/I26 phantom-descent guard); (3) added two `HandleTable` proptests — a `HashMap`-oracle insert/lookup over handles `0..1_100_000` (cases routinely reach depth 2, last-write-wins) and a `grow → recover_depth` round-trip over `0..600M` (depths 0–3); (4) mirrored both proptests onto the membership index's generic `RadixU64` (the second radix implementation — `prop_radix_insert_lookup_matches_oracle` over keys `0..2.5M` crossing its `capacity(1) = 1021² = 1_042_441` boundary, and `prop_radix_recover_depth_matches` over `0..1.1e9`). All six new tests pass; full suite green. The `transaction.rs` stateful-commit proptest noted above is NOT done here — deferred as its own item.
 
 #### I112. Fault-injection test layer absent — the poison/flush coupling and the fatal-`IoError` path are reasoned, not tested [deepdive 2026-06-21] — **P2**
 **Where:** `src/page_cache.rs` flush (clears dirty flags before the trailing fsync); `src/transaction.rs:2833` (`fatal_error_outside_commit_also_poisons`); `error.rs:94` (`IoError`)

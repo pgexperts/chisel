@@ -1290,13 +1290,18 @@ mod tests {
         assert_ne!(root1, root2);
     }
 
-    // The handle table's two-level growth requires COW-copying the path on
-    // every insert, so 520 inserts allocate significantly more than 520
-    // pages. max_pages=2048 gives comfortable room (was 256×8=2048 under
-    // the old 8× HARD_CEILING_MULTIPLIER). With spillway_max_bytes=0 the
-    // cap is now strict, so the helper needs the full 2048 budget.
+    // Inserting ENTRIES_PER_LEAF + 10 (520) handles crosses the depth-0 leaf
+    // capacity (510) exactly once, so the tree grows to depth 1 — one interior
+    // level above the leaves. This pins that boundary and the COW path. Renamed
+    // from `..._grows_to_two_levels` (ISSUES.md I111): "two levels" read as
+    // depth 2, but it only ever reached depth 1 and never asserted depth(). The
+    // depth-≥2 descent (the multi-digit span_at_level decomposition) is covered
+    // by `test_handle_table_grows_to_depth_two` and the proptest below.
+    //
+    // The two-level growth COW-copies the path on every insert, so 520 inserts
+    // allocate significantly more than 520 pages; max_pages=2048 gives room.
     #[test]
-    fn test_handle_table_grows_to_two_levels() {
+    fn test_handle_table_grows_to_depth_one() {
         let mut cache = ht_cache(2048);
         let mut ht = HandleTable::new();
         let mut root = ht.create_root(&mut cache).unwrap();
@@ -1310,9 +1315,129 @@ mod tests {
             };
             root = ht.insert_t(&mut cache, root, i, &entry).unwrap();
         }
+        assert_eq!(ht.depth(), 1, "520 handles must grow the tree to depth 1");
         for i in 0..(ENTRIES_PER_LEAF as u64 + 10) {
             let found = ht.lookup(&mut cache, root, i).unwrap().unwrap();
             assert_eq!(found.page_id, i);
+        }
+    }
+
+    // ISSUES.md I111: depth-≥2 coverage. capacity(1) = ENTRIES_PER_LEAF *
+    // PTRS_PER_INTERIOR = 510 * 1021 = 520_710; a handle at or above that
+    // boundary forces a second grow to depth 2, exercising the multi-level
+    // `handle / span_at_level` decomposition that the depth-0/1 tests never
+    // reach. The radix only materializes the ~3 pages on each inserted handle's
+    // path, not the 531M-handle address space depth 2 can address.
+    #[test]
+    fn test_handle_table_grows_to_depth_two() {
+        const DEPTH2_BOUNDARY: u64 = ENTRIES_PER_LEAF as u64 * PTRS_PER_INTERIOR as u64; // 520_710
+        let mut cache = ht_cache(256);
+        let mut ht = HandleTable::new();
+        let mut root = ht.create_root(&mut cache).unwrap();
+        // A sparse spread landing in different leaves at depth 2, including the
+        // boundary handle that triggers the second grow.
+        let handles = [
+            0u64,
+            5,
+            509,
+            ENTRIES_PER_LEAF as u64,
+            DEPTH2_BOUNDARY,
+            DEPTH2_BOUNDARY + 7,
+            1_000_000,
+        ];
+        for &h in &handles {
+            let entry = HandleEntry {
+                page_id: h.wrapping_add(100),
+                slot_index: (h % 1021) as u16,
+                flags: HandleFlags::Live,
+                tag: 0,
+                client_byte: 0,
+            };
+            root = ht.insert_t(&mut cache, root, h, &entry).unwrap();
+        }
+        assert_eq!(
+            ht.depth(),
+            2,
+            "a handle >= capacity(1) must grow the tree to depth 2"
+        );
+        for &h in &handles {
+            let found = ht
+                .lookup(&mut cache, root, h)
+                .unwrap()
+                .unwrap_or_else(|| panic!("handle {h} missing after depth-2 grow"));
+            assert_eq!(
+                found.page_id,
+                h.wrapping_add(100),
+                "page_id mismatch for {h}"
+            );
+            assert_eq!(
+                found.slot_index,
+                (h % 1021) as u16,
+                "slot_index mismatch for {h}"
+            );
+        }
+        // An uninserted handle within capacity must read back absent — not a
+        // phantom descent into checksum bytes (historical I6 / I26).
+        assert!(ht
+            .lookup(&mut cache, root, DEPTH2_BOUNDARY + 1)
+            .unwrap()
+            .is_none());
+    }
+
+    // ISSUES.md I111: property tests for the radix key math — the engine's most
+    // off-by-one-prone code. A HashMap oracle over a wide handle range (crossing
+    // the depth-1 boundary at 520_710, so cases routinely reach depth 2) catches
+    // any `span_at_level` / decomposition miscalculation: every inserted handle
+    // must read back its exact entry, last-write-wins.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(96))]
+
+        #[test]
+        fn prop_handle_table_insert_lookup_matches_oracle(
+            ops in proptest::collection::vec(
+                (0u64..1_100_000u64, 0u64..=u32::MAX as u64),
+                1..40usize,
+            )
+        ) {
+            let mut cache = ht_cache(4096);
+            let mut ht = HandleTable::new();
+            let mut root = ht.create_root(&mut cache).unwrap();
+            let mut oracle: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+            for (handle, page_id) in &ops {
+                let entry = HandleEntry {
+                    page_id: *page_id,
+                    slot_index: 0,
+                    flags: HandleFlags::Live,
+                    tag: 0,
+                    client_byte: 0,
+                };
+                root = ht.insert_t(&mut cache, root, *handle, &entry).unwrap();
+                oracle.insert(*handle, *page_id); // last write wins, mirroring the radix
+            }
+            for (handle, expected) in &oracle {
+                let found = ht.lookup(&mut cache, root, *handle).unwrap();
+                proptest::prop_assert!(found.is_some(), "handle {} vanished", handle);
+                proptest::prop_assert_eq!(found.unwrap().page_id, *expected);
+            }
+        }
+
+        // grow → recover_depth round-trip: the depth re-derived from the on-page
+        // left spine (the open-time / rollback recovery path, I99) must equal the
+        // in-memory depth that grow() maintained, at any depth 0..=3.
+        #[test]
+        fn prop_handle_table_recover_depth_matches(handle in 0u64..600_000_000u64) {
+            let mut cache = ht_cache(256);
+            let mut ht = HandleTable::new();
+            let mut root = ht.create_root(&mut cache).unwrap();
+            let entry = HandleEntry {
+                page_id: 1,
+                slot_index: 0,
+                flags: HandleFlags::Live,
+                tag: 0,
+                client_byte: 0,
+            };
+            root = ht.insert_t(&mut cache, root, handle, &entry).unwrap();
+            proptest::prop_assert_eq!(HandleTable::recover_depth(&mut cache, root).unwrap(), ht.depth());
         }
     }
 

@@ -1071,6 +1071,55 @@ mod tests {
         assert_eq!(recovered, t.depth);
     }
 
+    // ISSUES.md I111: property tests for the generic RadixU64 key math. The
+    // membership index's outer tag tree and per-tag inner sets are both built
+    // from RadixU64, so this covers the second of the engine's two radix
+    // implementations (the other is HandleTable). capacity(1) = SLOTS_PER_PAGE^2
+    // = 1021^2 = 1_042_441, so a key range that crosses it drives cases to
+    // depth >= 2 — the multi-level descent the single-level tests never reach.
+    // HashMap oracle, with 0 as the absent sentinel.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(96))]
+
+        #[test]
+        fn prop_radix_insert_lookup_matches_oracle(
+            ops in proptest::collection::vec(
+                // value != 0: 0 is the absent sentinel (insert debug-asserts non-zero).
+                (0u64..2_500_000u64, 1u64..=u32::MAX as u64),
+                1..40usize,
+            )
+        ) {
+            let mut c = cache(4096);
+            let mut t = RadixU64::new();
+            let mut root = t.create_root(&mut c).unwrap();
+            let mut oracle: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+            for (key, value) in &ops {
+                root = t.insert_t(&mut c, root, *key, *value).unwrap();
+                oracle.insert(*key, *value); // last write wins
+            }
+            for (key, expected) in &oracle {
+                proptest::prop_assert_eq!(t.lookup(&mut c, root, *key).unwrap(), *expected);
+            }
+            // A key never inserted reads back as the absent sentinel 0.
+            let mut absent = 7u64;
+            while oracle.contains_key(&absent) {
+                absent += 1;
+            }
+            proptest::prop_assert_eq!(t.lookup(&mut c, root, absent).unwrap(), 0);
+        }
+
+        // grow → recover_depth round-trip across depths 0..=3 (capacity(2) =
+        // 1021^3 = 1_064_332_261, so keys past it reach depth 3).
+        #[test]
+        fn prop_radix_recover_depth_matches(key in 0u64..1_100_000_000u64) {
+            let mut c = cache(256);
+            let mut t = RadixU64::new();
+            let mut root = t.create_root(&mut c).unwrap();
+            root = t.insert_t(&mut c, root, key, 1).unwrap();
+            proptest::prop_assert_eq!(RadixU64::recover_depth(&mut c, root).unwrap(), t.depth);
+        }
+    }
+
     #[test]
     fn membership_insert_contains_remove() {
         let mut c = cache(8192);
