@@ -97,6 +97,12 @@ impl LruIndex {
         if self.contains(id) {
             self.unlink(id);
         }
+        // unlink-first is load-bearing: the old-head `get_mut` below borrows
+        // `nodes` and would alias `id`'s own entry if it were still linked in.
+        // After unlink, `id`'s entry (if any) is detached, so patching the
+        // neighbour and the final `insert` touch disjoint slots. The `insert`
+        // must come last — patching `old_head.prev` first keeps the back-edge
+        // consistent before `id` exists as a node.
         // Re-link at head.
         let new_node = Node {
             prev: None,

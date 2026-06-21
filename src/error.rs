@@ -158,6 +158,13 @@ impl ChiselError {
     /// `Poisoned` itself is NOT fatal by this definition: it just means
     /// the manager is already dead, so seeing it again should not trigger
     /// a redundant state change.
+    ///
+    /// INVARIANT: this match must list exactly the variants in the "Fatal"
+    /// block of the enum above. Adding a fatal variant without adding it here
+    /// silently leaves it classified operational, so the manager would keep
+    /// serving requests over questionable on-disk state — a durability hole,
+    /// not a compile error (the `#[non_exhaustive]` enum has no exhaustiveness
+    /// check to catch the omission).
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
@@ -202,6 +209,10 @@ impl fmt::Display for ChiselError {
                 "page cache full: {limit} dirty pages held; commit or roll back to free cache"
             ),
             ChiselError::SpillwayFull { limit_bytes } => {
+                // limit_bytes == 0 is the "spillway disabled" sentinel, not a
+                // zero-capacity overflow: the cache filled and there is no
+                // spillway configured to absorb it. Reworded so operators do
+                // not chase a phantom spill area that was never enabled.
                 if *limit_bytes == 0 {
                     write!(
                         f,

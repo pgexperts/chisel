@@ -74,6 +74,10 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
+// Tuple is (name, prepopulate-workload, measured-workload) in that order —
+// the two `Workload` fields are positional and not otherwise distinguishable,
+// so the prepopulate phase MUST stay in slot 1 and the timed phase in slot 2
+// to match the destructuring in `main`.
 fn build_scenarios() -> Vec<(&'static str, Workload, Workload)> {
     let s1 = seed_for("ycsb-a");
     let s2 = seed_for("ycsb-b");

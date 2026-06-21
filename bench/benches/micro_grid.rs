@@ -225,6 +225,10 @@ fn bench_row_read_warm(c: &mut Criterion, aux: &mut AuxMetricsWriter) {
                 &workload,
                 snap.ids(),
             );
+            // Ordering matters: aux capture reuses the SAME engine the bench just
+            // warmed, so the counter delta it records is a cache-hit-dominated
+            // read — exactly the warm-read regime this row is meant to measure.
+            // Capturing before the bench would instead sample a cold first read.
             aux.append(&capture_aux_metrics_warm_read(
                 CellId {
                     row: "read-warm",

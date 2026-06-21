@@ -221,7 +221,13 @@ impl Superblock {
         }
         // NOTE: format_version is read but not validated here. Callers that
         // need version gating must check it on the returned struct (see
-        // TransactionManager::open_existing and ISSUES.md I15).
+        // TransactionManager::open_existing and ISSUES.md I15). page_size is
+        // likewise read-not-validated for the same reason: a mismatch against
+        // the compiled PAGE_SIZE is a fatal open-time error the caller raises,
+        // not a torn-slot signal that should make select() fall back. Only
+        // superblock_count is range-checked below, because it is fed straight
+        // into the commit-time slot modulus and a bad value there would
+        // misdirect a write into the data region before any caller runs.
         let mut named_roots = [NamedRoot::EMPTY; NAMED_ROOT_COUNT];
         for (i, entry) in named_roots.iter_mut().enumerate() {
             let base = NAMED_ROOTS_OFFSET + i * NAMED_ROOT_ENTRY_SIZE;

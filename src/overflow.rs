@@ -106,6 +106,12 @@ impl Overflow {
             };
 
             let buf = cache.get_mut(page_id)?;
+            // Zero the whole buffer first: new_page() returns uninitialized
+            // bytes, and the trailing payload region on the final page (the
+            // bytes past `chunk`) is never explicitly written below. Zeroing
+            // makes those slack bytes deterministic so the stamped checksum is
+            // reproducible on re-read, and clears the I31 reserved header
+            // regions (bytes 2..8 and 8..16) that nothing else touches here.
             buf.fill(0);
             buf[0] = PageType::Overflow as u8;
             // I31: per-page version at byte 1. Explicit for the same

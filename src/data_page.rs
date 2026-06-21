@@ -249,6 +249,17 @@ impl DataPage {
     // In-place path (fits): preserves the old offset, only the length changes.
     // This keeps data packing stable when values shrink.
     //
+    // Side effect of the in-place shrink: when the new value is strictly
+    // shorter, the tail bytes between the new length and old_length stay
+    // packed inside the page but are no longer referenced by any slot.
+    // free_end is deliberately NOT advanced to reclaim them (the data region
+    // grows backward from free_end, and this slot's offset is below other
+    // live data), so those bytes are unrecoverable orphans until compact()
+    // rebuilds the page. They don't count toward used_space() (which reads the
+    // current slot length), so the page can report less occupancy than its
+    // physical packing — intentional: reclaiming mid-region holes is compact()'s
+    // job, not update()'s.
+    //
     // Relocate path (doesn't fit): the old bytes are abandoned in place and
     // become dead space until compact() runs. The new data is carved from the
     // central hole exactly like insert(), but free_start is NOT advanced —

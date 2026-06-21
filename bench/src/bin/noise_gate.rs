@@ -78,6 +78,13 @@ fn run(cli: &Cli) -> Result<bool, Box<dyn std::error::Error>> {
         // binary works regardless of the caller's cwd. The matching
         // write path is in bench/benches/scenarios.rs (also rooted at
         // CARGO_MANIFEST_DIR).
+        //
+        // The harness opens the file with File::create, which already
+        // truncates on each `cargo bench`, so this remove is not what
+        // prevents cross-run bleed. Its real value is fail-loud: if a
+        // run produces no file at all (harness crashed before writing),
+        // the read_to_string below errors instead of silently reusing
+        // the previous run's rows and averaging in stale samples.
         let metrics_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("results")
             .join("scenarios_metrics.jsonl");
