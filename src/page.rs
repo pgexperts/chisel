@@ -138,7 +138,7 @@ pub enum PageType {
 /// stamps — the single source of truth for the write side (every `init_page`
 /// site calls this). Returns 0 for every type today. When a page type's layout
 /// gains a version-requiring field, ONLY that type's arm changes; others stay
-/// put (ADR-7: per-type evolution). The match is exhaustive on purpose — adding
+/// put (per-type format evolution — see docs/specs/2026-06-21-per-page-format-versioning-design.md). The match is exhaustive on purpose — adding
 /// a `PageType` variant forces a decision here rather than defaulting silently.
 /// See ISSUES.md I31.
 pub const fn current_version(page_type: PageType) -> u8 {

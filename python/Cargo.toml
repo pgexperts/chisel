@@ -3,8 +3,8 @@ name = "chisel-py"
 version = "0.1.0"
 edition = "2021"
 # MSRV mirrors the root crate (1.82, from Option::is_none_or in chisel's
-# page_cache). PyO3 0.22 itself only needs 1.63, but the path-dep on the
-# root crate makes its floor ours too.
+# page_cache). PyO3 has a lower MSRV of its own, but the path-dep on the
+# root crate makes its 1.82 floor ours too.
 rust-version = "1.82"
 authors = ["Christophe Pettus <cpettus@pgexperts.com>"]
 description = "PyO3 binding for the Chisel transactional storage engine"

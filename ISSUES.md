@@ -1521,56 +1521,70 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 ### Performance
 
-#### I127. `current_live_slots` / `committed_live_slots` / `Savepoint.live_slots` use std `HashMap` (SipHash) on the per-op path [deepdive 2026-06-21, follow-up to I77] — **P2**
+#### I127. `current_live_slots` / `committed_live_slots` / `Savepoint.live_slots` use std `HashMap` (SipHash) on the per-op path [deepdive 2026-06-21, follow-up to I77] — **P2** ✅ FIXED 2026-06-21
 **Where:** `src/transaction.rs:144` (field decls ~144/216); probed/updated at `insert_into_data_page:2555/2591`, `release_data_slot:2463`
 
 **Problem:** these slot-accounting maps are probed and updated on every insert/update/delete. Keys are trusted local `u64` page ids — the identical threat model to the page-cache/LRU maps the I77 pass already moved to `FxHashMap` with an explicit "no DoS surface, SipHash is pure cost" rationale. I77 simply missed these.
 
 **Direction of fix:** `rustc_hash::FxHashMap` for all three; zero-risk, same free win. (Verified-clean by the same review: LRU is O(1), eviction short-circuits on `dirty_count`, radix descent is allocation-free, XXH3 re-stamps once per touched page — no other perf gaps on the hot path.)
 
+**Fixed (2026-06-21):** swapped all three maps to `rustc_hash::FxHashMap` in `src/transaction.rs` (field types + `HashMap::new()` → `FxHashMap::default()`; import `std::collections::HashMap` → `rustc_hash::FxHashMap`). `rustc_hash` was already a root dep (I77). Drop-in, no callers changed; full suite green.
+
 ### Docs vs reality
 
-#### I128. ADR-7 + `ARCHITECTURE.md:580` describe per-page version read-dispatch as live, but no code reads the byte [deepdive 2026-06-21] — **P2**
+#### I128. ADR-7 + `ARCHITECTURE.md:580` describe per-page version read-dispatch as live, but no code reads the byte [deepdive 2026-06-21] — **P2** ✅ FIXED 2026-06-21
 **Where:** ADR-7 (`.codebase-memory/adr.md`); `ARCHITECTURE.md:580`; `PageCache::load_page`
 
 **Problem:** both claim "reads dispatch on the per-page version byte" / "the page-cache load path validates the per-page version on every miss." Every page type *writes* `current_version(type)` at init, but `load_page` validates only the XXH3 checksum — there is no version read or dispatch anywhere. The mechanism is reserved-and-stamped, not implemented (consistent with the ADR's own "I31 eager upgrader (deferred)" note; the consequence bullets contradict it). ADR-7 was partially corrected 2026-06-21 — verify the corrected text and `ARCHITECTURE.md:580` both read reserved/future tense.
 
 **Direction of fix:** reword the live-dispatch claims to reserved/future tense in both ADR-7 and ARCHITECTURE.md. See also I31's "Phase 1a" note (the read helpers exist but are dormant — no production caller).
 
-#### I129. The ADR is not git-tracked — a fresh clone has no ADR and `// see ADR-N` comments resolve to nothing [deepdive 2026-06-21] — **P2**
+**Fixed (2026-06-21):** reworded the ARCHITECTURE.md Page-level versioning bullet — "reads dispatch on the version byte" → "reads *will* dispatch … the decode helpers and `page::page_format_version()` exist but are **dormant today** — `load_page` validates only the XXH3 checksum and nothing reads the version byte yet." The page-header diagram footnote was already accurate (decode-only, cites the spec). ADR-7's text was already corrected during the 2026-06-21 versioning work and stays MCP-only per I129.
+
+#### I129. The ADR is not git-tracked — a fresh clone has no ADR and `// see ADR-N` comments resolve to nothing [deepdive 2026-06-21] — **P2** ✅ RESOLVED 2026-06-21 (ADR kept MCP-only; dangling comments reworded)
 **Where:** `.codebase-memory/adr.md` (the codebase-memory MCP's local store, untracked); the many `// see ARCHITECTURE.md ADR-N` code comments
 
 **Problem:** the ADR-0..14 record lives only in the untracked MCP store; ARCHITECTURE.md has no ADR sections, so every code comment citing an ADR number is a dangling reference for anyone who clones the repo. This is a process/maintainer decision, not a code fix.
 
 **Direction of fix:** commit the ADR into the repo as `docs/ADR.md` (and either re-point the `// see …` comments at it or keep them once the file exists). Edit the MCP store via `manage_adr mode=update` with the FULL content — the `sections` param wipes the whole store (recorded footgun). **Open question for the maintainer:** is the ADR meant to be a repo artifact? If yes, this is the migration; if it stays MCP-only, the code comments should stop citing ADR numbers.
 
-#### I130. `ARCHITECTURE.md` cites functions deleted in the #46 dead-code sweep [deepdive 2026-06-21] — **P2**
+**Resolved (2026-06-21, maintainer decision = keep ADR MCP-only):** the ADR stays in the codebase-memory store (NOT committed as `docs/ADR.md`). The dangling `// … ADR-N` code comments were reworded to stop citing numbers that don't resolve in a clone: `src/page.rs` (ADR-7 → "per-type format evolution; see the per-page-versioning spec") and `python/src/db.rs` ×2 (dropped "ADR-5"; point at ARCHITECTURE.md). `grep -rE 'ADR-[0-9]' src/ python/src/` is now clean of dangling repo refs.
+
+#### I130. `ARCHITECTURE.md` cites functions deleted in the #46 dead-code sweep [deepdive 2026-06-21] — **P2** ✅ FIXED 2026-06-21
 **Where:** `ARCHITECTURE.md:246` (`page::page_format_version()`); `:108` and `:471` (`allocate_near`, the latter claiming it's "currently used by data-page allocation" — already false before deletion)
 
 **Problem:** the #46 sweep updated code comments but not ARCHITECTURE.md, leaving three references to deleted functions. (Note: `page::page_format_version()` was *re-introduced* as a dormant read helper by the 2026-06-21 versioning work per I31's Phase 1a — confirm whether the `:246` reference is now accurate or still describes the deleted signature.)
 
 **Direction of fix:** reconcile the three references against current code — delete the `allocate_near` ones; correct or keep `page_format_version` depending on its current dormant-but-present status.
 
-#### I131. `README.md:14` says commit is "two-phase" but the protocol does three fsyncs [deepdive 2026-06-21, follow-up to I63] — **P3**
+**Fixed (2026-06-21):** removed the `allocate_near` references (deleted in PR #46): the freemap responsibility-table row (now `allocate_first` / `mark_free`) and the detail paragraph (now notes the radius-scan variant was removed in #46). The `page::page_format_version()` ref is NOT stale — the function was re-introduced as a dormant read helper by the I31 work, and the surrounding text already describes it as decode-only (the dispatch-overclaim is handled by I128).
+
+#### I131. `README.md:14` says commit is "two-phase" but the protocol does three fsyncs [deepdive 2026-06-21, follow-up to I63] — **P3** ✅ FIXED 2026-06-21
 **Where:** `README.md:14`; the `commit()` rustdoc (numbers only two fsyncs)
 
 **Problem:** I63 fixed the *docstring's* "two fsyncs" claim, but the README's "two-phase durability (fsync data pages, then fsync superblock)" and the rustdoc step-numbering were missed. The protocol does THREE fsyncs (pre-drain I28 flush `transaction.rs:971`, step-1 data flush `:989`, superblock `:1026`); ARCHITECTURE.md gets it right ("3 fsyncs", with a `== 3` regression test).
 
 **Direction of fix:** README → three-fsync; renumber the `commit()` rustdoc to give the pre-drain a step number.
 
-#### I132. `ARCHITECTURE.md` says `bench/` is "not a workspace member" — it is [deepdive 2026-06-21] — **P3**
+**Fixed (2026-06-21):** README.md:14 → "shadow-paging durability (all data pages fsync'd before the superblock fsync; three fsyncs per commit)"; the `commit()` rustdoc gained a "Step 0 — pre-drain (I28)" entry documenting the third fsync, without renumbering the load-bearing steps 1–5.
+
+#### I132. `ARCHITECTURE.md` says `bench/` is "not a workspace member" — it is [deepdive 2026-06-21] — **P3** ✅ FIXED 2026-06-21
 **Where:** `ARCHITECTURE.md:588`, `:619`, `:668` (the last draws a now-false build-topology inference)
 
 **Problem:** `Cargo.toml:20` is `members = [".", "python", "bench"]`; bench is merely excluded from `default-members`. README.md:72 is correct; ARCHITECTURE contradicts it three times. (Post-I61 state.)
 
 **Direction of fix:** "a workspace member excluded from `default-members`."
 
-#### I133. `ARCHITECTURE.md` "common 16-byte header" vs `COMMON_HEADER_SIZE = 12` [deepdive 2026-06-21] — **P3**
+**Fixed (2026-06-21):** corrected all three ARCHITECTURE.md claims (lines had drifted to :591/:622/:671) — the bench-infrastructure intro now says bench IS a workspace member (in `members` + `default-members`, so a root `cargo test` runs it); the PR-2 history note is "a sibling subcrate at this point (I61 later made it a member)"; the lessons-learned item is past-tensed and marked RESOLVED via I58/I61. (Note: bench is in `default-members`; `python` is the member excluded from it.)
+
+#### I133. `ARCHITECTURE.md` "common 16-byte header" vs `COMMON_HEADER_SIZE = 12` [deepdive 2026-06-21] — **P3** ⏸ DEFERRED 2026-06-21 (code-constant inconsistency, not doc drift — needs a maintainer call)
 **Where:** `ARCHITECTURE.md:232`, `:235`; `src/page.rs:41`
 
 **Problem:** the 16 figure is actually `DATA_PAGE_HEADER_SIZE` (the data-only extended header); the named common-header constant is 12.
 
 **Direction of fix:** reconcile the number against the constant name.
+
+**Deferred (2026-06-21) — NOT a doc edit:** investigating this surfaced a genuine *code-constant* inconsistency, so "change ARCHITECTURE's 16 → 12" would create a new error rather than fix one. `COMMON_HEADER_SIZE = 12` (page.rs:41) is the outlier: the I31 reserved region is bytes 8..16 (`COMMON_RESERVED_OFFSET = 8`, `COMMON_RESERVED_LEN = 8`), the page.rs:60 comment calls bytes 8..16 "common-header fields", and ARCHITECTURE.md:232 ("16-byte common header = 0..8 type-specific + 8..16 reserved") is internally consistent with **16** — yet the named constant says 12, and it carries `#[allow(dead_code)]` (no caller, so the contradiction never had to resolve). On a data page (`DATA_PAGE_HEADER_SIZE = 16`) the reserved 8..16 also overlaps the 12..16 slot-metadata region. **Maintainer decision needed:** the canonical common-header size (bump `COMMON_HEADER_SIZE` → 16? shrink `COMMON_RESERVED_LEN` to fit 12?) and whether the reserved region collides with data-page slot metadata. No doc edit is correct until that's decided.
 
 ### Idiomaticity
 
@@ -1622,9 +1636,11 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 ### Cargo hygiene
 
-#### I140. `python/Cargo.toml:6` carries a stale "PyO3 0.22" comment — the dep is 0.29 [deepdive 2026-06-21] — **P3**
+#### I140. `python/Cargo.toml:6` carries a stale "PyO3 0.22" comment — the dep is 0.29 [deepdive 2026-06-21] — **P3** ✅ FIXED 2026-06-21
 **Where:** `python/Cargo.toml:6`
 
 **Problem:** cosmetic — the dependency is `pyo3 = "0.29"` (I103) but the comment still says 0.22. The only cargo-hygiene finding; every declared dependency is otherwise used and MSRV 1.82 holds against every floor.
 
 **Direction of fix:** update or delete the comment.
+
+**Fixed (2026-06-21):** dropped the stale "PyO3 0.22 … only needs 1.63" specifics for "PyO3 has a lower MSRV of its own, but the path-dep on the root crate makes its 1.82 floor ours too" — version-agnostic, so it can't drift again.

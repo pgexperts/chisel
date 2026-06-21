@@ -83,7 +83,7 @@ pub struct PyChisel {
 // on the Rust enum implementing the PyO3 conversion traits.
 //
 // Variant names match the Rust spelling (`LruTail`, `Mru`) rather than
-// PEP-8 `LRU_TAIL` / `MRU` so cross-referencing ARCHITECTURE.md ADR-5
+// PEP-8 `LRU_TAIL` / `MRU` so cross-referencing ARCHITECTURE.md
 // and the Rust source stays mechanical. `eq` / `eq_int` give Python users
 // `chisel.DrainInsertion.LruTail == chisel.DrainInsertion.LruTail` and
 // efficient int-based comparison under the hood.
@@ -437,7 +437,7 @@ impl PyChisel {
     // TransactionInProgressError, because shrinking the cache or
     // spillway mid-transaction would either reject pinned dirty pages
     // or silently spill them — neither is a clean story (see
-    // ARCHITECTURE.md ADR-5 + ISSUES.md for the spillway design).
+    // ARCHITECTURE.md + ISSUES.md for the spillway design).
     //
     // All three flow through with_inner_mut_io, so a closed handle
     // raises ClosedError uniformly with every other mutating method.

@@ -11,7 +11,7 @@ Pre-1.0. Current release: `0.1.0`. The API is stable-by-intent but subject to re
 ## Features
 
 - **Crash durability** — N configurable superblocks (2–16) with round-robin writes ensure committed data survives crashes. Every page carries an XXH3 checksum for torn-write and bit-rot detection.
-- **Transactions** — begin / commit / rollback with two-phase durability (fsync data pages, then fsync superblock).
+- **Transactions** — begin / commit / rollback with shadow-paging durability (all data pages fsync'd before the superblock fsync; three fsyncs per commit).
 - **Savepoints** — PostgreSQL-style named savepoints with `rollback_to` (savepoint preserved for retry) and `release` (merges into the enclosing scope).
 - **Handles** — store a value, get back a `u64` handle. Read, update, or delete by handle. Handles are stable across updates, defrag, and reopens.
 - **Chunk tags** — attach an immutable `u32` tag to a chunk at allocation time; a reverse membership index maps each tag back to its handles. Enumerate a tag's members, delete with a tag-match assertion, or bulk-drop a whole tagged relation in bounded passes. Tag `0` means untagged.
