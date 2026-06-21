@@ -1442,12 +1442,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 ### Correctness
 
-#### I116. `PageCache::truncate` decrements `dirty_count` unguarded — underflow disables the cache cap [deepdive 2026-06-21] — **P2**
+#### I116. `PageCache::truncate` decrements `dirty_count` unguarded — underflow disables the cache cap [deepdive 2026-06-21] — **P2** ✅ FIXED 2026-06-21
 **Where:** `src/page_cache.rs:625-654` (`truncate`); the guarded siblings `discard`, `maybe_evict` Phase B, `set_cache_max_bytes` (justification comment at `:986-994`)
 
 **Problem:** `self.dirty_count -= 1` per removed dirty entry is the one decrement site not guarded against an `entries`/`dirty_count` desync. On any desync it underflows (debug panic / release wrap to `usize::MAX`), after which `maybe_evict`'s `dirty_count == entries.len()` short-circuit never fires and the cache silently stops enforcing its cap. This `dirty_count`-underflow shape has now appeared in two consecutive reviews at different call sites (2026-06-16 flagged the `maybe_evict` site, since guarded).
 
 **Direction of fix:** recompute `dirty_count` from surviving entries after the loop, or saturate — and consolidate all four decrement sites behind one helper to end the recurrence (ties into I136's eviction-loop extraction).
+
+**Fixed (2026-06-21):** added `PageCache::untrack_dirty(was_dirty)` doing `dirty_count = dirty_count.saturating_sub(1)` and routed the decrement sites through it. **Two corrections to the framing:** (1) `truncate` was NOT the lone unguarded outlier — like `discard` and `maybe_evict` Phase B it already had the `if entry.dirty` guard; the genuine fix is making all of them **saturating** (they used plain `-= 1`, which underflows only under a real `entries`/`dirty_count` desync). (2) There are **three** decrement sites, not four: `set_cache_max_bytes` evicts CLEAN entries only and never touches `dirty_count`. Saturation turns a desync into "cap not strictly enforced until the next flush/rollback resets the count" instead of a debug panic / release wrap. Behavior-preserving under the invariant; full suite green.
 
 #### I117. `insert_into_data_page`'s `.expect("value fits in empty page")` is a library-reachable panic if the inline-size constants drift [deepdive 2026-06-21, follow-up to I46] — **P2**
 **Where:** `src/transaction.rs:2576`; the hand-maintained literal `MAX_INLINE_VALUE` at `:66`
@@ -1608,12 +1610,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 **Direction of fix:** a tiny `read_u64_le(buf, off)` helper that names the invariant once.
 
-#### I136. Three hand-copied clean-victim eviction loops with divergent short-circuits [deepdive 2026-06-21, carried] — **P3**
+#### I136. Three hand-copied clean-victim eviction loops with divergent short-circuits [deepdive 2026-06-21, carried] — **P3** ✅ FIXED 2026-06-21
 **Where:** `src/page_cache.rs` — `maybe_evict` Phase A, `set_cache_max_bytes`, `flush` Phase 1b (the last omits the `dirty_count` early-out)
 
 **Problem:** the three loops are subtly divergent; carried from the prior review. Relates to the `dirty_count` underflow trend (I116).
 
 **Direction of fix:** extract `evict_clean_to_cap` and consolidate (do alongside I116's `dirty_count` helper).
+
+**Fixed (2026-06-21):** extracted `PageCache::evict_clean_to_cap()` and routed all three sites through it (the review's "three loops" was accurate this time — confirmed by reading each). `maybe_evict` Phase A and `set_cache_max_bytes` were character-identical; `flush` Phase 1b was the same loop minus the `dirty_count == entries.len()` early-out — now unified, which adds that early-out to Phase 1b harmlessly (Phase 1a has already cleared every dirty flag there, so it never fires). Behavior-preserving; full suite green.
 
 ### Python binding (PyO3)
 

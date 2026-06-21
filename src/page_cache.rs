@@ -477,21 +477,10 @@ impl PageCache {
             }
             // Evict back to max_pages if drain insertions over-filled the
             // cache. Only clean pages are evicted — dirty pages cannot be
-            // removed without writing first, and there should be none left
-            // at this point (Phase 1a cleared them all).
-            while self.entries.len() > self.max_pages {
-                let victim = self
-                    .lru
-                    .iter_lru_to_mru()
-                    .find(|&id| self.entries.get(&id).is_some_and(|e| !e.dirty));
-                match victim {
-                    Some(id) => {
-                        self.entries.remove(&id);
-                        self.lru.remove(id);
-                    }
-                    None => break, // All pages are dirty — shouldn't happen here.
-                }
-            }
+            // removed without writing first, and there should be none left at
+            // this point (Phase 1a cleared them all). I136: shared loop (its
+            // dirty_count early-out is a no-op here — nothing is dirty).
+            self.evict_clean_to_cap();
         }
         // Truncate the spillway file to zero once all batches are drained.
         // The file will be reused for the next transaction's overflow without
@@ -533,9 +522,7 @@ impl PageCache {
     #[allow(dead_code)]
     pub fn discard(&mut self, page_id: u64) {
         if let Some(entry) = self.entries.remove(&page_id) {
-            if entry.dirty {
-                self.dirty_count -= 1;
-            }
+            self.untrack_dirty(entry.dirty);
         }
         self.lru.remove(page_id);
     }
@@ -631,9 +618,7 @@ impl PageCache {
             .collect();
         for id in to_remove {
             if let Some(entry) = self.entries.remove(&id) {
-                if entry.dirty {
-                    self.dirty_count -= 1;
-                }
+                self.untrack_dirty(entry.dirty);
             }
             self.lru.remove(id);
         }
@@ -789,23 +774,8 @@ impl PageCache {
     pub fn set_cache_max_bytes(&mut self, bytes: u64) -> Result<()> {
         let new_max_pages = (bytes / PAGE_SIZE as u64).max(1) as usize;
         self.max_pages = new_max_pages;
-        // Best-effort shrink: evict clean entries from LRU tail.
-        while self.entries.len() > self.max_pages {
-            if self.dirty_count == self.entries.len() {
-                break;
-            }
-            let victim = self
-                .lru
-                .iter_lru_to_mru()
-                .find(|&id| self.entries.get(&id).is_some_and(|e| !e.dirty));
-            match victim {
-                Some(id) => {
-                    self.entries.remove(&id);
-                    self.lru.remove(id);
-                }
-                None => break,
-            }
-        }
+        // Best-effort shrink: evict clean entries from the LRU tail (I136).
+        self.evict_clean_to_cap();
         Ok(())
     }
 
@@ -910,6 +880,54 @@ impl PageCache {
         self.lru.push_front(page_id);
     }
 
+    /// Decrement `dirty_count` for one just-removed entry, saturating.
+    ///
+    /// I116 (ISSUES.md, 2026-06-21): the single decrement site for every
+    /// entry-removal path that can drop a dirty page — `discard`, `truncate`,
+    /// and `maybe_evict` Phase B. Guarding on `was_dirty` keeps the count
+    /// correct; `saturating_sub` makes a (buggy) `entries`/`dirty_count` desync
+    /// degrade to "cap not strictly enforced until the next flush/rollback
+    /// resets the count to 0" rather than an underflow — a debug panic, or a
+    /// release wrap to `usize::MAX` that would defeat the `dirty_count ==
+    /// entries.len()` short-circuit. (`set_cache_max_bytes` and
+    /// `evict_clean_to_cap` evict CLEAN entries only, so they never decrement.)
+    fn untrack_dirty(&mut self, was_dirty: bool) {
+        if was_dirty {
+            self.dirty_count = self.dirty_count.saturating_sub(1);
+        }
+    }
+
+    /// Evict clean LRU-tail entries until the cache is within `max_pages`.
+    ///
+    /// I136 (ISSUES.md, 2026-06-21): the one clean-victim loop shared by
+    /// `maybe_evict` Phase A, `set_cache_max_bytes`, and `flush` Phase 1b
+    /// (previously three near-identical copies — Phase 1b's was missing the
+    /// `dirty_count` early-out). Dirty pages are skipped: they are pinned until
+    /// `flush()` writes them. The `dirty_count == entries.len()` early-out
+    /// avoids an O(n) LRU walk on every allocation in a write-heavy transaction
+    /// (every entry dirty → nothing clean to evict; the caller's Phase B /
+    /// CacheFull path takes over). Adding it to the Phase 1b path is a no-op
+    /// there — Phase 1a already cleared every dirty flag — so one authoritative
+    /// loop is safe. Stops early if no clean victim remains.
+    fn evict_clean_to_cap(&mut self) {
+        while self.entries.len() > self.max_pages {
+            if self.dirty_count == self.entries.len() {
+                break;
+            }
+            let victim = self
+                .lru
+                .iter_lru_to_mru()
+                .find(|&id| self.entries.get(&id).is_some_and(|e| !e.dirty));
+            match victim {
+                Some(id) => {
+                    self.entries.remove(&id);
+                    self.lru.remove(id);
+                }
+                None => break,
+            }
+        }
+    }
+
     /// Enforce the strict `max_pages` cap, evicting or spilling as needed.
     ///
     /// Phase A: evict clean LRU-tail entries until we are within the cap.
@@ -930,24 +948,9 @@ impl PageCache {
     /// (`None`) guards against a stale LRU id; it should never fire
     /// in practice because the LRU and the entries map stay in sync.
     fn maybe_evict(&mut self) -> Result<()> {
-        // Phase A: evict clean LRU-tail entries until we fit, exactly
-        // as before.
-        while self.entries.len() > self.max_pages {
-            if self.dirty_count == self.entries.len() {
-                break; // Phase B handles this — every entry is dirty.
-            }
-            let victim = self
-                .lru
-                .iter_lru_to_mru()
-                .find(|&id| self.entries.get(&id).is_some_and(|e| !e.dirty));
-            match victim {
-                Some(id) => {
-                    self.entries.remove(&id);
-                    self.lru.remove(id);
-                }
-                None => break,
-            }
-        }
+        // Phase A: evict clean LRU-tail entries until we fit (I136: shared
+        // loop, which also carries the dirty_count early-out for Phase B).
+        self.evict_clean_to_cap();
 
         // Phase B: still over the cap and every entry is dirty? Spill
         // the LRU-tail dirty page to the spillway. If the spillway is
@@ -983,15 +986,10 @@ impl PageCache {
                 .ok_or(ChiselError::CorruptPage { page_id: victim_id })?;
             self.lru.remove(victim_id);
             // The victim is dirty here (Phase B runs only when every entry is
-            // dirty), so this decrement always fires today. Guard it on
-            // `entry.dirty` anyway — matching every other decrement site
-            // (`discard`/`truncate`/`set_cache_max_bytes`) — so a future change
-            // that let a clean page sit at the LRU tail during a spill would
-            // no-op here instead of underflowing `dirty_count` (a debug panic /
-            // release wrap that would silently break the cap-eviction logic).
-            if entry.dirty {
-                self.dirty_count -= 1;
-            }
+            // dirty), so this always fires today; `untrack_dirty` (I116) guards
+            // on the flag and saturates anyway, so a future change that let a
+            // clean page sit at the LRU tail during a spill can't underflow.
+            self.untrack_dirty(entry.dirty);
 
             // Spill (may return SpillwayFull, in which case we DO NOT
             // re-insert — the entry is dropped and the caller will
