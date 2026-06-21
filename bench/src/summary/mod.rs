@@ -6,15 +6,13 @@
 //   results.json   — flat composite-key schema for PR 7's CI diff
 //   raw/           — archival copy of estimates.json + sample.json per cell
 //
-// The five submodules split by responsibility, not by output artifact:
+// The six submodules split by responsibility, not by output artifact:
 //
 //   format        — magnitude-adaptive formatters + percentile-interp helper
 //   discover      — Cell/TimingStats/AuxMetrics types + filesystem walk + JSONL parse
 //   metadata      — Metadata/MachineInfo + git/hostname gathering
 //   render_json   — Vec<Cell> + Metadata -> serde_json::Value
 //   render_md     — Vec<Cell> + Metadata -> String
-//
-// A sixth submodule was added after this list was written:
 //   render_cross_engine — Vec<ScenarioMetrics> + Metadata -> String (PR 8
 //                         cross-engine comparison report; scenario tier only)
 
