@@ -275,13 +275,25 @@ impl std::error::Error for ChiselError {
     }
 }
 
-// Blanket conversion so `?` works on std::io calls in page_io.rs and friends.
-// Note: every io::Error becomes a *fatal* IoError — callers that want to
-// classify "file not found at open time" as operational must catch and
-// remap it before the `?` conversion fires.
+// Conversion so `?` works on std::io calls in page_io.rs and friends.
+//
+// I105 (ISSUES.md, 2026-06-21): inspect ErrorKind instead of blanket-classifying
+// every io::Error as a *fatal* IoError. `NotFound` is demoted to the operational
+// `FileNotFound`: it can only arise from resolving a missing PATH (open() of a
+// non-existent file), never from a read/write on the already-open, flock'd fd, so
+// it signals a caller mistake (bad path), not on-disk corruption — the DB is
+// untouched and the caller can retry. (Chisel::open already pre-checks the
+// missing-file case in lib.rs and returns FileNotFound directly; this just makes
+// any stray NotFound that reaches a `?` classify consistently rather than
+// poisoning.) Every other kind stays fatal: under the poison model over-poisoning
+// is the safe direction (reopen recovers), and demoting a kind that might signal
+// real corruption would be the same fail-open hazard as I104's is_fatal default.
 impl From<io::Error> for ChiselError {
     fn from(e: io::Error) -> Self {
-        ChiselError::IoError(e)
+        match e.kind() {
+            io::ErrorKind::NotFound => ChiselError::FileNotFound,
+            _ => ChiselError::IoError(e),
+        }
     }
 }
 
@@ -361,5 +373,103 @@ mod tests {
             msg.contains("42"),
             "Display message {msg:?} should mention page id 42"
         );
+    }
+
+    // I104 (ISSUES.md, 2026-06-21): exhaustiveness guard for is_fatal(). The
+    // `documented_is_fatal` helper classifies every variant via a match with NO
+    // `_` arm; because this is the DEFINING crate, #[non_exhaustive] does not
+    // suppress the exhaustiveness check here, so adding a ChiselError variant
+    // fails to COMPILE until it is placed in the Fatal or Operational block —
+    // the compile-time signal is_fatal()'s `matches!` cannot provide. The test
+    // then asserts is_fatal() agrees with the documented classification for a
+    // constructed instance of every variant, catching a misclassification in
+    // EITHER direction (a fatal variant left out of is_fatal(), or an operational
+    // one wrongly listed). The two encodings are independent on purpose:
+    // documented_is_fatal does NOT call is_fatal().
+    #[test]
+    fn is_fatal_matches_documented_classification_for_every_variant() {
+        fn documented_is_fatal(e: &ChiselError) -> bool {
+            match e {
+                // Operational — database file is intact; caller can recover.
+                ChiselError::InvalidHandle(_)
+                | ChiselError::NoActiveTransaction
+                | ChiselError::TransactionAlreadyActive
+                | ChiselError::SavepointNotFound(_)
+                | ChiselError::DuplicateSavepoint(_)
+                | ChiselError::ReadOnlyMode
+                | ChiselError::FileNotFound
+                | ChiselError::InvalidRootName
+                | ChiselError::RootNameTableFull
+                | ChiselError::InvalidSuperblockCount { .. }
+                | ChiselError::CacheFull { .. }
+                | ChiselError::SpillwayFull { .. }
+                | ChiselError::TransactionInProgress
+                | ChiselError::TagMismatch { .. }
+                // Poisoned is operational by is_fatal()'s definition: the manager
+                // is already dead, so re-seeing it must not re-poison.
+                | ChiselError::Poisoned => false,
+                // Fatal — integrity in question; close and reopen.
+                ChiselError::IoError(_)
+                | ChiselError::ChecksumMismatch { .. }
+                | ChiselError::CorruptSuperblock
+                | ChiselError::FileSizeMismatch { .. }
+                | ChiselError::InvalidMagic
+                | ChiselError::LockFailed
+                | ChiselError::UnsupportedFormatVersion { .. }
+                | ChiselError::CorruptPage { .. }
+                | ChiselError::InvalidPageId { .. } => true,
+            }
+        }
+
+        // One instance of every variant. If a variant is added to the enum,
+        // documented_is_fatal stops compiling first; this list then needs the
+        // new variant too so is_fatal() is actually exercised against it.
+        let all = [
+            ChiselError::InvalidHandle(0),
+            ChiselError::NoActiveTransaction,
+            ChiselError::TransactionAlreadyActive,
+            ChiselError::SavepointNotFound("s".to_string()),
+            ChiselError::DuplicateSavepoint("s".to_string()),
+            ChiselError::ReadOnlyMode,
+            ChiselError::FileNotFound,
+            ChiselError::InvalidRootName,
+            ChiselError::RootNameTableFull,
+            ChiselError::InvalidSuperblockCount { value: 0 },
+            ChiselError::CacheFull { limit: 0 },
+            ChiselError::SpillwayFull { limit_bytes: 0 },
+            ChiselError::TransactionInProgress,
+            ChiselError::TagMismatch {
+                handle: 0,
+                expected: 0,
+                actual: 0,
+            },
+            ChiselError::Poisoned,
+            ChiselError::IoError(io::Error::other("io")),
+            ChiselError::ChecksumMismatch { page_id: 0 },
+            ChiselError::CorruptSuperblock,
+            ChiselError::FileSizeMismatch {
+                expected: 0,
+                actual: 0,
+            },
+            ChiselError::InvalidMagic,
+            ChiselError::LockFailed,
+            ChiselError::UnsupportedFormatVersion {
+                found: 0,
+                expected: 0,
+            },
+            ChiselError::CorruptPage { page_id: 0 },
+            ChiselError::InvalidPageId { page_id: 0 },
+        ];
+        for e in &all {
+            assert_eq!(
+                e.is_fatal(),
+                documented_is_fatal(e),
+                "is_fatal() disagrees with the documented Fatal/Operational block for {e:?}"
+            );
+        }
+        // Tripwire: exactly 9 variants are fatal today. If this count moves, the
+        // Fatal/Operational split changed — confirm that was intentional (it is a
+        // breaking change for callers doing error-class matching, per the header).
+        assert_eq!(all.iter().filter(|e| e.is_fatal()).count(), 9);
     }
 }
