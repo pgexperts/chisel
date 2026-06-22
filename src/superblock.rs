@@ -32,6 +32,7 @@
 // discover it from the first valid slot.
 
 use crate::page::{self, MAGIC, PAGE_SIZE};
+use std::fmt;
 
 // Superblock count bounds (ISSUES.md R4). Hardcoded limits keep the
 // probe-at-open-time cost bounded and prevent obviously-broken configs.
@@ -107,6 +108,42 @@ impl NamedRoot {
     }
 }
 
+/// Why a superblock slot failed validation (I106). These are exactly the three
+/// torn-slot causes `deserialize` checks. `Copy` and small so the failure-path
+/// `Vec<SlotDefect>` is cheap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+// Variant names intentionally share the `Bad` prefix — they describe the
+// three distinct bad-slot causes and the prefix reads naturally at call
+// sites (SuperblockDefect::BadChecksum, etc.). Suppressed until Task 2
+// wires the hot path through these types and callers appear in non-test code.
+#[allow(clippy::enum_variant_names)]
+pub enum SuperblockDefect {
+    BadChecksum,
+    BadMagic,
+    BadCount(u32), // the out-of-range superblock_count value
+}
+
+impl fmt::Display for SuperblockDefect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SuperblockDefect::BadChecksum => write!(f, "bad checksum"),
+            SuperblockDefect::BadMagic => write!(f, "bad magic"),
+            SuperblockDefect::BadCount(n) => write!(f, "bad superblock_count {n}"),
+        }
+    }
+}
+
+/// A defect tagged with the candidate-slot index it was found at (I106).
+// Suppressed until Task 2 wires diagnose() into the CorruptSuperblock error
+// path — SlotDefect will be carried in the error variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct SlotDefect {
+    pub slot: u32,
+    pub defect: SuperblockDefect,
+}
+
 /// In-memory superblock. The on-disk encoding is a fixed little-endian layout:
 /// bytes 0..52 hold the scalar fields, bytes 52..308 hold the named-root
 /// table (8 × 32-byte entries), bytes 308..312 hold `superblock_count`,
@@ -166,6 +203,29 @@ pub struct Superblock {
     pub root_membership_index_page: u64,
 }
 
+/// The three torn-slot rules, shared by the hot path (`deserialize`) and the
+/// cold path (`diagnose`). Order is load-bearing: checksum first — a bad
+/// checksum means the rest of the buffer (including magic) is untrusted, so it
+/// is reported as `BadChecksum` even if the magic bytes also differ.
+fn validate(buf: &[u8; PAGE_SIZE]) -> Result<(), SuperblockDefect> {
+    if !page::verify_checksum(buf) {
+        return Err(SuperblockDefect::BadChecksum);
+    }
+    let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    if magic != MAGIC {
+        return Err(SuperblockDefect::BadMagic);
+    }
+    let count = u32::from_le_bytes(
+        buf[SUPERBLOCK_COUNT_OFFSET..SUPERBLOCK_COUNT_OFFSET + 4]
+            .try_into()
+            .unwrap(),
+    );
+    if !(MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS).contains(&count) {
+        return Err(SuperblockDefect::BadCount(count));
+    }
+    Ok(())
+}
+
 impl Superblock {
     /// Serialize the superblock into a full page buffer with a trailing checksum.
     /// The offsets below are part of the on-disk format contract — do not
@@ -210,24 +270,15 @@ impl Superblock {
     /// discard a torn slot and fall back to its sibling. Promotion to a
     /// fatal `CorruptSuperblock` happens only if *both* slots fail.
     pub fn deserialize(buf: &[u8; PAGE_SIZE]) -> Option<Superblock> {
-        // Checksum first: if it fails, the rest of the buffer is untrusted
-        // and we must not interpret any field (including magic).
-        if !page::verify_checksum(buf) {
-            return None;
-        }
-        let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        if magic != MAGIC {
-            return None;
-        }
-        // NOTE: format_version is read but not validated here. Callers that
-        // need version gating must check it on the returned struct (see
+        // Delegates to validate() for the three torn-slot checks (checksum,
+        // magic, superblock_count range). See validate()'s doc for why order
+        // matters. NOTE: format_version is read but not validated here. Callers
+        // that need version gating must check it on the returned struct (see
         // TransactionManager::open_existing and ISSUES.md I15). page_size is
         // likewise read-not-validated for the same reason: a mismatch against
         // the compiled PAGE_SIZE is a fatal open-time error the caller raises,
-        // not a torn-slot signal that should make select() fall back. Only
-        // superblock_count is range-checked below, because it is fed straight
-        // into the commit-time slot modulus and a bad value there would
-        // misdirect a write into the data region before any caller runs.
+        // not a torn-slot signal that should make select() fall back.
+        validate(buf).ok()?;
         let mut named_roots = [NamedRoot::EMPTY; NAMED_ROOT_COUNT];
         for (i, entry) in named_roots.iter_mut().enumerate() {
             let base = NAMED_ROOTS_OFFSET + i * NAMED_ROOT_ENTRY_SIZE;
@@ -240,23 +291,13 @@ impl Superblock {
                     .unwrap(),
             );
         }
-        // Superblock count (R4). Must be within MIN..=MAX; any other
-        // value is treated as a corrupt slot. This is load-bearing:
-        // commit uses `txn_counter % superblock_count` to pick the
-        // next write slot, so an out-of-range count would direct a
-        // superblock write into the data region. Validating here (not
-        // later) means `select()` automatically falls back to the
-        // sibling slot if only one slot has a bad count.
         let superblock_count = u32::from_le_bytes(
             buf[SUPERBLOCK_COUNT_OFFSET..SUPERBLOCK_COUNT_OFFSET + 4]
                 .try_into()
                 .unwrap(),
         );
-        if !(MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS).contains(&superblock_count) {
-            return None;
-        }
         Some(Superblock {
-            magic,
+            magic: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
             format_version: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
             txn_counter: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
             root_handle_table_page: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
@@ -306,6 +347,25 @@ impl Superblock {
             .iter()
             .filter_map(Superblock::deserialize)
             .max_by_key(|sb| sb.txn_counter)
+    }
+
+    /// Explain why every candidate slot failed. Called only on the cold path,
+    /// when `select` returned `None` — which means EVERY candidate failed
+    /// `validate` (none deserialized), so this returns one `SlotDefect` per
+    /// candidate. Bounded by `buffers.len()`.
+    // Suppressed until Task 2 wires this into the CorruptSuperblock error path.
+    #[allow(dead_code)]
+    pub(crate) fn diagnose(buffers: &[[u8; PAGE_SIZE]]) -> Vec<SlotDefect> {
+        buffers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                validate(b).err().map(|defect| SlotDefect {
+                    slot: i as u32,
+                    defect,
+                })
+            })
+            .collect()
     }
 
     /// Create the initial superblock for a new, empty database.
@@ -406,6 +466,50 @@ mod tests {
 
         let picked = Superblock::select(&[bad_buf, good_buf]).expect("no slot picked");
         assert_eq!(picked.superblock_count, DEFAULT_SUPERBLOCK_COUNT);
+    }
+
+    #[test]
+    fn validate_classifies_each_defect() {
+        let good = Superblock::new_empty(2).serialize();
+        assert_eq!(validate(&good), Ok(()));
+
+        let mut bad_checksum = good;
+        bad_checksum[16] ^= 0xFF;
+        assert_eq!(validate(&bad_checksum), Err(SuperblockDefect::BadChecksum));
+
+        let mut bad_magic = good;
+        bad_magic[0] ^= 0xFF;
+        page::stamp_checksum(&mut bad_magic);
+        assert_eq!(validate(&bad_magic), Err(SuperblockDefect::BadMagic));
+
+        let mut bad_count = good;
+        bad_count[SUPERBLOCK_COUNT_OFFSET..SUPERBLOCK_COUNT_OFFSET + 4]
+            .copy_from_slice(&99u32.to_le_bytes());
+        page::stamp_checksum(&mut bad_count);
+        assert_eq!(validate(&bad_count), Err(SuperblockDefect::BadCount(99)));
+    }
+
+    #[test]
+    fn diagnose_reports_each_slots_defect() {
+        let good = Superblock::new_empty(2).serialize();
+        let mut slot0 = good;
+        slot0[16] ^= 0xFF;
+        let mut slot1 = good;
+        slot1[0] ^= 0xFF;
+        page::stamp_checksum(&mut slot1);
+        assert_eq!(
+            Superblock::diagnose(&[slot0, slot1]),
+            vec![
+                SlotDefect {
+                    slot: 0,
+                    defect: SuperblockDefect::BadChecksum
+                },
+                SlotDefect {
+                    slot: 1,
+                    defect: SuperblockDefect::BadMagic
+                },
+            ]
+        );
     }
 
     // ── Migrated 2026-05-22 from tests/basic_ops.rs (I35 reshape) ──
