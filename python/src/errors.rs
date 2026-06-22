@@ -308,7 +308,7 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
             })
         }
         RustChiselError::ChecksumMismatch { .. } => ChecksumMismatchError::new_err(msg),
-        RustChiselError::CorruptSuperblock => CorruptSuperblockError::new_err(msg),
+        RustChiselError::CorruptSuperblock { .. } => CorruptSuperblockError::new_err(msg),
         RustChiselError::FileSizeMismatch { .. } => FileSizeMismatchError::new_err(msg),
         RustChiselError::LockFailed => LockFailedError::new_err(msg),
         RustChiselError::UnsupportedFormatVersion { .. } => {

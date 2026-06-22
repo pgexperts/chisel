@@ -541,7 +541,7 @@ fn test_recovery_truncated_file_is_rejected() {
         matches!(
             err,
             ChiselError::InvalidPageId { .. }
-                | ChiselError::CorruptSuperblock
+                | ChiselError::CorruptSuperblock { .. }
                 | ChiselError::FileSizeMismatch { .. }
         ),
         "expected a typed integrity error, got {err:?}"
@@ -1467,8 +1467,18 @@ fn corrupt_magic_surfaces_as_corrupt_superblock_not_invalid_magic() {
         });
     }
     match Chisel::open(&path, Default::default()) {
-        Err(ChiselError::CorruptSuperblock) => {}
-        Err(e) => panic!("bad magic must surface as CorruptSuperblock (sole variant), got {e:?}"),
+        Err(ChiselError::CorruptSuperblock { defects }) => {
+            // I106: the real superblock slots (0 and 1) must be reported as
+            // BadMagic — we corrupted the magic while keeping the checksum valid.
+            for slot in 0..crate::superblock::DEFAULT_SUPERBLOCK_COUNT {
+                assert!(
+                    defects.iter().any(|d| d.slot == slot
+                        && d.defect == crate::superblock::SuperblockDefect::BadMagic),
+                    "slot {slot} should be reported BadMagic, got {defects:?}"
+                );
+            }
+        }
+        Err(e) => panic!("bad magic must surface as CorruptSuperblock, got {e:?}"),
         Ok(_) => panic!("Chisel::open accepted a fully-corrupted-magic file"),
     };
 }

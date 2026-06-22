@@ -135,10 +135,7 @@ impl fmt::Display for SuperblockDefect {
 }
 
 /// A defect tagged with the candidate-slot index it was found at (I106).
-// Suppressed until Task 2 wires diagnose() into the CorruptSuperblock error
-// path — SlotDefect will be carried in the error variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct SlotDefect {
     pub slot: u32,
     pub defect: SuperblockDefect,
@@ -353,8 +350,6 @@ impl Superblock {
     /// when `select` returned `None` — which means EVERY candidate failed
     /// `validate` (none deserialized), so this returns one `SlotDefect` per
     /// candidate. Bounded by `buffers.len()`.
-    // Suppressed until Task 2 wires this into the CorruptSuperblock error path.
-    #[allow(dead_code)]
     pub(crate) fn diagnose(buffers: &[[u8; PAGE_SIZE]]) -> Vec<SlotDefect> {
         buffers
             .iter()

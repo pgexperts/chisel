@@ -451,7 +451,9 @@ impl TransactionManager {
         // Step 2 + 3: pick the winner via select(). select() uses
         // deserialize, which validates checksum and magic — data
         // pages in the candidate list (if any) are filtered out.
-        let sb = Superblock::select(&candidates).ok_or(ChiselError::CorruptSuperblock)?;
+        let sb = Superblock::select(&candidates).ok_or_else(|| ChiselError::CorruptSuperblock {
+            defects: Superblock::diagnose(&candidates),
+        })?;
 
         // Format-version gate (see ISSUES.md I15 for the original check,
         // I29 for the major/minor split). Compare MAJOR only: the packed

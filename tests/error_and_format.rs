@@ -53,7 +53,7 @@ fn test_is_fatal_storage_integrity_variants_are_fatal() {
     let cases: Vec<ChiselError> = vec![
         ChiselError::IoError(std::io::Error::other("x")),
         ChiselError::ChecksumMismatch { page_id: 0 },
-        ChiselError::CorruptSuperblock,
+        ChiselError::CorruptSuperblock { defects: vec![] },
         ChiselError::FileSizeMismatch {
             expected: 0,
             actual: 0,
@@ -99,7 +99,7 @@ fn test_error_display_is_non_empty_for_every_variant() {
         ChiselError::InvalidSuperblockCount { value: 17 },
         ChiselError::IoError(std::io::Error::other("x")),
         ChiselError::ChecksumMismatch { page_id: 0 },
-        ChiselError::CorruptSuperblock,
+        ChiselError::CorruptSuperblock { defects: vec![] },
         ChiselError::FileSizeMismatch {
             expected: 1,
             actual: 2,
