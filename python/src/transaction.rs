@@ -196,6 +196,23 @@ impl PyTransaction {
         self.db.bind(py).borrow().clear_root_name(name)
     }
 
+    fn handles(&self, py: Python<'_>) -> PyResult<Vec<u64>> {
+        self.db.bind(py).borrow().handles()
+    }
+
+    fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.db.bind(py).borrow().stats(py)
+    }
+
+    fn counters(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.db.bind(py).borrow().counters(py)
+    }
+
+    #[pyo3(signature = (options=None))]
+    fn defrag(&self, py: Python<'_>, options: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
+        self.db.bind(py).borrow().defrag(py, options)
+    }
+
     // PySavepoint takes its OWN Py<PyChisel> (via clone_ref, which
     // bumps the Python refcount), so the savepoint object outlives
     // this PyTransaction reference-wise. That is harmless: both

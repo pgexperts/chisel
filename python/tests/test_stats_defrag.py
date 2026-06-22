@@ -79,3 +79,42 @@ def test_defrag_options_accepted(mem_db):
     with mem_db.transaction():
         result = mem_db.defrag(chisel.DefragOptions(sparse_threshold=0.5, max_values=10))
     assert isinstance(result, chisel.DefragStats)
+
+
+# Transaction.handles / .stats / .counters / .defrag — the four read-side
+# methods that were missing from PyTransaction (mirrored from PyChisel).
+def test_transaction_handles_visible_mid_tx(mem_db):
+    with mem_db.transaction() as tx:
+        h1 = tx.allocate(b"a")
+        h2 = tx.allocate(b"b")
+        # handles() must be reachable on the transaction object itself.
+        live = tx.handles()
+        assert h1 in live
+        assert h2 in live
+
+
+def test_transaction_stats_mid_tx(mem_db):
+    with mem_db.transaction() as tx:
+        tx.allocate(b"payload")
+        s = tx.stats()
+    assert isinstance(s, chisel.Stats)
+    assert s.handle_count >= 1
+
+
+def test_transaction_counters_mid_tx(mem_db):
+    with mem_db.transaction() as tx:
+        tx.allocate(b"x")
+        c = tx.counters()
+    assert isinstance(c, chisel.Counters)
+    assert c.pages_allocated >= 1
+
+
+def test_transaction_defrag_mid_tx(mem_db):
+    # defrag() is documented as running inside the active transaction;
+    # verify it is accessible on the Transaction object.
+    with mem_db.transaction() as tx:
+        for i in range(10):
+            tx.allocate(bytes([i]) * 50)
+    with mem_db.transaction() as tx:
+        result = tx.defrag()
+    assert isinstance(result, chisel.DefragStats)
