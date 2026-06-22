@@ -30,7 +30,8 @@
 //   bytes 8184..8192: XXH3 checksum (stamped by caller after mutation)
 //
 // One freemap page therefore tracks up to PAGE_BODY_SIZE * 8 pages
-// (~512 MB of data at 8 KB pages). A multi-page freemap is not yet implemented.
+// (~512 MB of data at 8 KB pages). The multi-page freemap (freemap_tree.rs)
+// composes many of these leaf pages into a COW radix tree.
 //
 // COW discipline: this module is pure bitmap manipulation on a buffer the caller
 // owns. Callers are responsible for obtaining a writable COW copy (via
