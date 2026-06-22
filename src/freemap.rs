@@ -135,44 +135,17 @@ impl FreeMap {
         None
     }
 
-    /// Return the lowest free page id without claiming it.
-    ///
-    /// Non-mutating companion to `allocate_first`: the freemap tree (the next
-    /// unit) uses this to read a leaf's minimum free page id when deciding
-    /// whether an interior node's subtree has any free pages at all, without
-    /// needing a COW copy of the leaf just to probe. Callers that need to
-    /// actually allocate must follow up with `allocate_first` (or a COW-aware
-    /// wrapper) — this function only peeks.
-    ///
-    /// The scan here deliberately duplicates `allocate_first`'s loop rather
-    /// than calling it; `allocate_first` was intentionally left unchanged (it
-    /// takes `&mut` and clears the bit) so no refactor was missed.
-    // `#[allow(dead_code)]`: the freemap tree (next implementation unit) is
-    // the production caller; no non-test caller exists yet in this unit.
-    #[allow(dead_code)]
-    pub fn first_free_bit(buf: &[u8; PAGE_SIZE]) -> Option<u64> {
-        for byte_idx in 0..PAGE_BODY_SIZE {
-            let byte = buf[BITMAP_OFFSET + byte_idx];
-            if byte != 0 {
-                return Some((byte_idx * 8 + byte.trailing_zeros() as usize) as u64);
-            }
-        }
-        None
-    }
-
     /// Return the lowest free page id that is `>= lo`, or `None` if every free
     /// bit in this leaf is below `lo`.
     ///
-    /// This is the resumable variant of `first_free_bit`: the freemap tree's
-    /// `allocate_first` carries an in-memory "lowest id that might be free" hint
-    /// and must skip any free bit it already handed out (an id below the hint
-    /// belongs to an earlier descent and is being re-walked only because the
-    /// hint is conservative). Scanning from `lo` lets the leaf scan resume mid-
-    /// page without rescanning the exhausted prefix.
+    /// The non-mutating leaf finder the freemap tree's scan composes with COW:
+    /// `scan_node` calls this with a leaf-local lower bound derived from the
+    /// caller's hint, so the scan resumes mid-page without rescanning an already-
+    /// exhausted prefix. Pass `lo = 0` to find the absolute lowest free bit.
     ///
     /// The starting byte is masked so that bits below `lo` within that byte are
-    /// ignored; subsequent bytes scan whole. Mirrors `first_free_bit`'s loop
-    /// (and its `trailing_zeros` LSB-first convention) rather than calling it.
+    /// ignored; subsequent bytes scan whole. Uses the same `trailing_zeros`
+    /// LSB-first convention as `allocate_first`.
     // `#[allow(dead_code)]`: the freemap tree is the production caller; no
     // non-test caller exists yet in this unit.
     #[allow(dead_code)]
@@ -253,18 +226,6 @@ mod tests {
     #[test]
     fn test_freemap_capacity() {
         assert_eq!(FreeMap::capacity(), PAGE_BODY_SIZE * 8);
-    }
-
-    #[test]
-    fn first_free_bit_finds_lowest_without_clearing() {
-        let mut buf = [0u8; PAGE_SIZE];
-        FreeMap::init_page(&mut buf);
-        assert_eq!(FreeMap::first_free_bit(&buf), None);
-        FreeMap::mark_free(&mut buf, 300);
-        FreeMap::mark_free(&mut buf, 12);
-        assert_eq!(FreeMap::first_free_bit(&buf), Some(12));
-        assert_eq!(FreeMap::first_free_bit(&buf), Some(12));
-        assert!(FreeMap::is_free(&buf, 12));
     }
 
     #[test]

@@ -305,6 +305,13 @@ impl FreeMapTree {
 
         // `current` is now the COW'd (or freshly materialized) leaf. Apply the
         // bit op and re-stamp.
+        //
+        // Defense-in-depth: this check_type can never fire under correct code —
+        // a COW'd leaf was already position-validated in cow_node before copying,
+        // and copy_page preserves buf[0]; a freshly materialized leaf has buf[0]
+        // set explicitly by FreeMap::init_page. The primary leaf-type guard is in
+        // cow_node; this one exists so a future caller that bypasses the COW path
+        // cannot silently corrupt the wrong page type.
         let buf = cache.get_mut(current)?;
         check_type(buf, PageType::FreeMap, current)?;
         leaf_op(buf, remaining % LEAF_CAPACITY);
@@ -355,9 +362,15 @@ impl FreeMapTree {
     }
 
     /// Clear `id`'s bit (mark it in-use again), COWing the spine. Used by
-    /// `allocate_first` to claim the id it found. The leaf is assumed present
-    /// (the scan that chose `id` already proved it), but materialization is
-    /// harmless if not.
+    /// `allocate_first` to claim the id it found.
+    ///
+    /// Precondition: the leaf covering `id` is present. The only caller,
+    /// `allocate_first`, satisfies this: it clears an id that `scan_from` just
+    /// proved free, so the leaf exists. A future caller clearing an id in an
+    /// ABSENT subtree would cause `cow_descend` to materialize a fresh leaf and
+    /// queue a superseded-page entry — correct for the bitmap, but wasteful (a
+    /// new page is allocated for a leaf that was never written, and
+    /// `pending_superseded` grows). Avoid clearing ids in absent subtrees.
     fn clear_bit(
         &mut self,
         cache: &mut PageCache,
@@ -466,28 +479,15 @@ mod tests {
     use super::*;
     use crate::page_cache::PageCache;
 
-    fn make_cache() -> PageCache {
+    // Reserve pages 0/1 so new_page() never returns the zero-child sentinel.
+    // Pass a larger max_pages for tests that materialize many pages (deep trees,
+    // large proptest sequences) so COW spines do not thrash against a small cap.
+    fn make_cache(max_pages: usize) -> PageCache {
         let file = tempfile::NamedTempFile::new().unwrap();
         let io = crate::page_io::PageIo::open(file.path(), false).unwrap();
         let mut cache = PageCache::new(
             io,
-            256 * crate::page::PAGE_SIZE as u64,
-            0,
-            crate::DrainInsertion::LruTail,
-            crate::SpillwayLocation::InMemory,
-        );
-        cache.set_next_page_id(2);
-        cache
-    }
-
-    // A bigger cache for tests that materialize many pages (deep trees, large
-    // proptest sequences) so COW spines do not thrash against the 256-page cap.
-    fn make_big_cache() -> PageCache {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let io = crate::page_io::PageIo::open(file.path(), false).unwrap();
-        let mut cache = PageCache::new(
-            io,
-            1_000_000 * crate::page::PAGE_SIZE as u64,
+            max_pages as u64 * crate::page::PAGE_SIZE as u64,
             0,
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
@@ -502,7 +502,7 @@ mod tests {
 
     #[test]
     fn depth0_is_free_round_trip() {
-        let mut c = make_cache();
+        let mut c = make_cache(256);
         let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
         assert_eq!(t.depth, 0);
         t.mark_free(&mut c, 5, &mut extend).unwrap();
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn mark_free_materializes_absent_subtree_at_depth1() {
-        let mut c = make_cache();
+        let mut c = make_cache(256);
         let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
         t.grow(&mut c, &mut extend).unwrap();
         assert_eq!(t.depth, 1);
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn mark_free_structural_alloc_is_extend_only() {
-        let mut c = make_cache();
+        let mut c = make_cache(256);
         // Spy: count how many times `extend` is invoked. Materializing a leaf in
         // an absent subtree must call it >= 1 (proves structural COW draws from
         // extend, never from the freemap itself). A Cell lets the closure share
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn grow_increases_depth_and_preserves_existing_frees() {
-        let mut c = make_cache();
+        let mut c = make_cache(256);
         let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
         t.mark_free(&mut c, 7, &mut extend).unwrap();
         t.grow(&mut c, &mut extend).unwrap();
@@ -565,7 +565,7 @@ mod tests {
 
     #[test]
     fn mark_free_growing_grows_to_reach_high_id() {
-        let mut c = make_cache();
+        let mut c = make_cache(256);
         let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
         let id = LEAF_CAPACITY * 3 + 17;
         t.mark_free_growing(&mut c, id, &mut extend).unwrap();
@@ -575,7 +575,7 @@ mod tests {
 
     #[test]
     fn allocate_first_returns_lowest_free_and_clears_it() {
-        let mut c = make_cache();
+        let mut c = make_cache(256);
         let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
         t.mark_free_growing(&mut c, 500, &mut extend).unwrap();
         t.mark_free_growing(&mut c, 9, &mut extend).unwrap();
@@ -612,7 +612,7 @@ mod tests {
     // hardening: the cache verifies only the XXH3 checksum, not the type tag.
     #[test]
     fn descent_rejects_wrong_type_child_as_corrupt_page() {
-        let mut c = make_cache();
+        let mut c = make_cache(256);
         let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
         t.grow(&mut c, &mut extend).unwrap(); // depth 1: root is an interior
                                               // Materialize child 0's leaf by freeing an id in its range.
@@ -644,7 +644,7 @@ mod tests {
     // this is the exposed path that needed the hardening.
     #[test]
     fn mark_free_rejects_wrong_position_page_on_cow_spine() {
-        let mut c = make_cache();
+        let mut c = make_cache(256);
         let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
         // Depth 2: root (level 2) -> interior children (level 1's parents) -> leaves.
         t.grow(&mut c, &mut extend).unwrap();
@@ -694,7 +694,7 @@ mod tests {
                 1..120usize,
             )
         ) {
-            let mut c = make_big_cache();
+            let mut c = make_cache(1_000_000);
             let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
             let mut oracle: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
             let mut hint = 0u64;
