@@ -180,8 +180,9 @@ pub struct Superblock {
     // reserved as the "no handle" sentinel and is never minted — a fresh store
     // seeds this at 1 (see new_empty), so the first handle handed out is 1.
     pub next_handle: u64,
-    // Stored so a future page-size change can be detected at open time
-    // rather than silently misreading.
+    // Validated against the compiled `PAGE_SIZE` at open time
+    // (`TransactionManager::open_existing`). A mismatch surfaces as
+    // `UnsupportedPageSize` before any data is read.
     pub page_size: u32,
     // Named-root table (F2). Fixed size; unused slots have name[0] == 0.
     // Serialized at byte offset 52 for 256 bytes total. These are part of
@@ -371,9 +372,35 @@ impl Superblock {
     /// Explain why every candidate slot failed. Called only on the cold path,
     /// when `select` returned `None` — which means EVERY candidate failed
     /// `validate` (none deserialized), so this returns one `SlotDefect` per
-    /// candidate. Bounded by `buffers.len()`.
+    /// genuine superblock slot.
+    ///
+    /// The `buffers` slice may contain up to `MAX_SUPERBLOCKS` pages because
+    /// the open path reads blindly up to that limit without first knowing N.
+    /// Pages at indices >= the actual superblock_count are ordinary data
+    /// pages, not superblock slots — including them in the defect list would
+    /// falsely label intact data pages as corrupt superblocks.
+    ///
+    /// To recover the true count without a valid superblock, we scan each
+    /// buffer's raw superblock_count field (byte offset 308). The first value
+    /// in `MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS` is used as the upper bound.
+    /// If no buffer yields a plausible count (every slot is so badly mangled
+    /// that even the count field is garbage), we fall back to `MIN_SUPERBLOCKS`:
+    /// any real database has at least that many slots, so slots 0..MIN are
+    /// always legitimate candidates to report and we never under-report.
     pub(crate) fn diagnose(buffers: &[[u8; PAGE_SIZE]]) -> Vec<SlotDefect> {
-        buffers
+        let bound = buffers
+            .iter()
+            .map(|b| {
+                u32::from_le_bytes(
+                    b[SUPERBLOCK_COUNT_OFFSET..SUPERBLOCK_COUNT_OFFSET + 4]
+                        .try_into()
+                        .unwrap(),
+                )
+            })
+            .find(|&n| (MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS).contains(&n))
+            .unwrap_or(MIN_SUPERBLOCKS) as usize;
+
+        buffers[..bound.min(buffers.len())]
             .iter()
             .enumerate()
             .filter_map(|(i, b)| {

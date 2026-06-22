@@ -591,6 +591,20 @@ impl TransactionManager {
             });
         }
 
+        // Reject files written with a different page geometry before reading any
+        // data pages — every page boundary calculation would be wrong if the page
+        // size differed. The superblock.rs deserialize() reads the field but does
+        // not validate it (a size mismatch is not a torn-slot signal; it must not
+        // cause select() to fall back to a sibling slot). This is the right place
+        // to raise it: after select() has picked the winning slot but before any
+        // data is touched.
+        if sb.page_size != PAGE_SIZE as u32 {
+            return Err(ChiselError::UnsupportedPageSize {
+                stored: sb.page_size,
+                compiled: PAGE_SIZE as u32,
+            });
+        }
+
         // I29 write-gate: a file whose MINOR exceeds this binary's may contain
         // version-requiring page layouts we cannot safely write — we would
         // stamp pages at our older minor and drop the newer fields. Reads ARE
@@ -2313,7 +2327,7 @@ impl TransactionManager {
             HandleFlags::Overflow => {
                 let walked = {
                     let mut cache = self.cache.borrow_mut();
-                    Overflow::delete(&mut cache, entry.page_id)
+                    Overflow::collect_chain_pages(&mut cache, entry.page_id)
                 };
                 match walked {
                     Ok(freed) => OldRelease::Overflow(freed),
@@ -2407,8 +2421,7 @@ impl TransactionManager {
 
         // Stage the value-storage release. The only FALLIBLE part — walking an
         // overflow chain to collect its page ids — runs here in prepare;
-        // `Overflow::delete` is a read-only walk that mutates no freemap state,
-        // so discarding its result on a later failure is safe (the still-current
+        // discarding the result on a later failure is safe (the still-current
         // old entry keeps referencing the chain). The actual free-queueing /
         // slot release is deferred to the install phase below. Order vs. the
         // tombstone write does not matter for correctness — both become durable
@@ -2422,7 +2435,7 @@ impl TransactionManager {
             HandleFlags::Overflow => {
                 let freed = {
                     let mut cache = self.cache.borrow_mut();
-                    Overflow::delete(&mut cache, entry.page_id)?
+                    Overflow::collect_chain_pages(&mut cache, entry.page_id)?
                 };
                 PendingRelease::Overflow(freed)
             }
@@ -3154,10 +3167,8 @@ mod tests {
                     match entry.flags {
                         HandleFlags::Live => reachable.push(entry.page_id),
                         HandleFlags::Overflow => {
-                            // `Overflow::delete` is a read-only chain walk that
-                            // returns the chain's page ids (it frees nothing
-                            // itself); reuse it to enumerate the whole chain.
-                            let chain = Overflow::delete(&mut cache, entry.page_id).unwrap();
+                            let chain =
+                                Overflow::collect_chain_pages(&mut cache, entry.page_id).unwrap();
                             reachable.extend(chain);
                         }
                         HandleFlags::Deleted => {}
@@ -3507,7 +3518,7 @@ mod tests {
         // to guarantee whole-page frees is to use overflow-sized
         // values (> MAX_INLINE_VALUE): each gets its own overflow
         // chain, and delete releases every page in the chain into
-        // txn_freed_pages via Overflow::delete.
+        // txn_freed_pages via Overflow::collect_chain_pages.
         let big: Vec<u8> = vec![0xAB; MAX_INLINE_VALUE + 32];
         tm.begin().unwrap();
         let h_throwaway = tm.allocate(&big).unwrap();

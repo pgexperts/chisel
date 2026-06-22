@@ -1546,8 +1546,17 @@ fn corrupt_magic_surfaces_as_corrupt_superblock_not_invalid_magic() {
     }
     match Chisel::open(&path, Default::default()) {
         Err(ChiselError::CorruptSuperblock { defects }) => {
-            // I106: the real superblock slots (0 and 1) must be reported as
-            // BadMagic — we corrupted the magic while keeping the checksum valid.
+            // I106: exactly the real superblock slots (0 and 1) must appear,
+            // each reported as BadMagic. The length check pins the requirement
+            // that no spurious entries appear for data pages at slot indices >=
+            // DEFAULT_SUPERBLOCK_COUNT — those pages are not superblock slots
+            // and must never be labelled as corrupt superblocks.
+            let expected = crate::superblock::DEFAULT_SUPERBLOCK_COUNT as usize;
+            assert_eq!(
+                defects.len(),
+                expected,
+                "expected exactly {expected} defects (one per real superblock slot), got {defects:?}"
+            );
             for slot in 0..crate::superblock::DEFAULT_SUPERBLOCK_COUNT {
                 assert!(
                     defects.iter().any(|d| d.slot == slot
@@ -1559,4 +1568,56 @@ fn corrupt_magic_surfaces_as_corrupt_superblock_not_invalid_magic() {
         Err(e) => panic!("bad magic must surface as CorruptSuperblock, got {e:?}"),
         Ok(_) => panic!("Chisel::open accepted a fully-corrupted-magic file"),
     };
+}
+
+// Regression test: a file whose superblock records a different page_size than
+// the one compiled into this binary must be refused with UnsupportedPageSize.
+// Pre-fix, open_existing read the page_size field but never checked it, so a
+// file written with (say) 4096-byte pages would silently open and misread every
+// page boundary.
+//
+// Counterfactual: removing the `sb.page_size != PAGE_SIZE as u32` check in
+// open_existing would cause this test to panic at the `Err(...)` arm — the
+// open would return Ok and we would never see UnsupportedPageSize.
+//
+// `page_size` sits at superblock bytes 48..52 (see superblock.rs serialize()).
+// We use rewrite_page_with_valid_checksum so the checksum passes and the engine
+// reaches the page_size gate (a bad checksum would stop at CorruptSuperblock
+// first, which would not exercise this path at all).
+#[test]
+fn test_open_rejects_page_size_mismatch() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.chisel");
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        db.allocate(b"x").unwrap();
+        db.commit().unwrap();
+        db.close().unwrap();
+    }
+
+    // Overwrite the page_size field in every superblock slot with a
+    // clearly-wrong value (4096). The field lives at bytes 48..52 in the
+    // serialized superblock page.
+    const WRONG_PAGE_SIZE: u32 = 4096;
+    for slot in 0..crate::superblock::DEFAULT_SUPERBLOCK_COUNT as u64 {
+        rewrite_page_with_valid_checksum(&path, slot, |buf| {
+            buf[48..52].copy_from_slice(&WRONG_PAGE_SIZE.to_le_bytes());
+        });
+    }
+
+    match Chisel::open(&path, Default::default()) {
+        Err(ChiselError::UnsupportedPageSize { stored, compiled }) => {
+            assert_eq!(
+                stored, WRONG_PAGE_SIZE,
+                "stored page size should be the forged value"
+            );
+            assert_eq!(
+                compiled, PAGE_SIZE as u32,
+                "compiled page size must be PAGE_SIZE"
+            );
+        }
+        Err(e) => panic!("expected UnsupportedPageSize, got {e:?}"),
+        Ok(_) => panic!("Chisel::open accepted a file with a mismatched page_size"),
+    }
 }

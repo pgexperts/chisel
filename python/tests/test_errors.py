@@ -36,6 +36,7 @@ def test_fatal_hierarchy():
         "FileSizeMismatchError",
         "LockFailedError",
         "UnsupportedFormatVersionError",
+        "UnsupportedPageSizeError",
         "CorruptPageError",
         "InvalidPageIdError",
         "PoisonedError",

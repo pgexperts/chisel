@@ -44,6 +44,7 @@
 //         FileSizeMismatchError
 //         LockFailedError
 //         UnsupportedFormatVersionError
+//         UnsupportedPageSizeError
 //         CorruptPageError
 //         InvalidPageIdError
 //         PoisonedError
@@ -137,6 +138,7 @@ create_exception!(_chisel, CorruptSuperblockError, FatalError);
 create_exception!(_chisel, FileSizeMismatchError, FatalError);
 create_exception!(_chisel, LockFailedError, FatalError);
 create_exception!(_chisel, UnsupportedFormatVersionError, FatalError);
+create_exception!(_chisel, UnsupportedPageSizeError, FatalError);
 create_exception!(_chisel, CorruptPageError, FatalError);
 create_exception!(_chisel, InvalidPageIdError, FatalError);
 create_exception!(_chisel, PoisonedError, FatalError);
@@ -220,6 +222,10 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "UnsupportedFormatVersionError",
         py.get_type::<UnsupportedFormatVersionError>(),
+    )?;
+    m.add(
+        "UnsupportedPageSizeError",
+        py.get_type::<UnsupportedPageSizeError>(),
     )?;
     m.add("CorruptPageError", py.get_type::<CorruptPageError>())?;
     m.add("InvalidPageIdError", py.get_type::<InvalidPageIdError>())?;
@@ -314,6 +320,7 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
         RustChiselError::UnsupportedFormatVersion { .. } => {
             UnsupportedFormatVersionError::new_err(msg)
         }
+        RustChiselError::UnsupportedPageSize { .. } => UnsupportedPageSizeError::new_err(msg),
         RustChiselError::CorruptPage { .. } => CorruptPageError::new_err(msg),
         RustChiselError::InvalidPageId { .. } => InvalidPageIdError::new_err(msg),
         RustChiselError::Poisoned => PoisonedError::new_err(msg),

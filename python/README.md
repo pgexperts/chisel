@@ -8,11 +8,14 @@ Pre-1.0. Current release: `0.1.0`. The API is stable-by-intent but subject to re
 
 ## Install
 
+Not yet published to PyPI; build locally with [maturin](https://www.maturin.rs/):
+
 ```bash
-pip install chisel
+pip install maturin
+cd python && maturin develop
 ```
 
-Wheels are provided for CPython 3.11–3.13 on Linux (x86_64, aarch64) and macOS (x86_64, arm64). Windows is not supported — the engine uses `flock`.
+Wheels for CPython 3.11–3.13 on Linux (x86_64, aarch64) and macOS (x86_64, arm64) will be provided on PyPI when published. Windows is not supported — the engine uses `flock`.
 
 ## Quick start
 

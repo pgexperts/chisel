@@ -324,7 +324,7 @@ impl PyChisel {
         self.with_inner_mut_io(|c| c.delete_many(&hs))
     }
 
-    fn handles(&self) -> PyResult<Vec<u64>> {
+    pub(crate) fn handles(&self) -> PyResult<Vec<u64>> {
         self.with_inner_io(|c| {
             c.handles()
                 .map(|v| v.into_iter().map(|h| h.get()).collect())
@@ -392,7 +392,7 @@ impl PyChisel {
     // immutable borrow path is sufficient. We materialize a
     // `chisel.Stats` dataclass rather than a pyclass so users get the
     // standard dataclass ergonomics (repr, eq, frozen).
-    fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    pub(crate) fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let s = self.with_inner_io(|c| c.stats())?;
         let module = py.import("chisel")?;
         let cls = module.getattr("Stats")?;
@@ -412,7 +412,7 @@ impl PyChisel {
     // counters() is read-only on the engine side (`&self`), so the usual
     // immutable borrow path is sufficient. We materialize a
     // `chisel.Counters` dataclass — same shape as stats().
-    fn counters(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    pub(crate) fn counters(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let c = self.with_inner_io(|c| c.counters())?;
         let module = py.import("chisel")?;
         let cls = module.getattr("Counters")?;
@@ -434,7 +434,7 @@ impl PyChisel {
     // class, so a user-defined options-shaped object will also work
     // — the dataclass is just the nice ergonomic default.
     #[pyo3(signature = (options=None))]
-    fn defrag(&self, py: Python<'_>, options: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
+    pub(crate) fn defrag(&self, py: Python<'_>, options: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let rust_opts = match options {
             None => chisel::DefragOptions::default(),
             Some(obj) => {

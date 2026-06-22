@@ -30,9 +30,9 @@ walkdir = "2"
 # I61 (ISSUES.md, 2026-05-22): tilde-range `~4.5` (= >=4.5.0, <4.6.0)
 # is required because clap_derive 4.6.0+ pulls in the cargo
 # `edition2024` feature, which isn't stable until Rust 1.85. Our MSRV
-# is 1.82 (pinned by Option::is_none_or; see root Cargo.toml). Lift the
-# pin when MSRV moves past 1.85 OR when clap_derive backs out the
-# edition2024 requirement on 4.6.x.
+# is 1.82 (conservative pin; see root Cargo.toml). Lift the pin when
+# MSRV moves past 1.85 OR when clap_derive backs out the edition2024
+# requirement on 4.6.x.
 clap = { version = "~4.5", features = ["derive"] }
 hostname = "0.4"
 
