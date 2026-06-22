@@ -55,6 +55,10 @@ harness = false
 name = "scenarios"
 harness = false
 
+[[bench]]
+name = "freemap_churn"
+harness = false
+
 [[bin]]
 name = "summarize"
 path = "src/bin/summarize.rs"
