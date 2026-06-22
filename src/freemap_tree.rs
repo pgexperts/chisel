@@ -97,23 +97,48 @@ fn check_type(buf: &[u8; PAGE_SIZE], expected: PageType, page_id: u64) -> Result
 /// threading them through the superblock; `pending_superseded` accumulates the
 /// old page ids this tree's mutations have COW-superseded, for the caller to
 /// drain into the freed list at commit.
-#[allow(dead_code)] // standalone unit: the integration unit is the production consumer.
+///
+/// COW-ONCE-PER-SESSION: a `FreeMapTree` handle represents one transaction's
+/// working view. The FIRST mutation that touches a committed page COWs it (fresh
+/// `extend` copy, old id queued on `pending_superseded`); SUBSEQUENT mutations
+/// that re-touch a page THIS handle already created mutate it IN PLACE — no new
+/// `extend`, no new supersede. Without this, `persist_freemap`'s loop over many
+/// frees (all landing in the same depth-0 leaf) would re-COW the leaf once per
+/// id, extending and superseding a fresh page each time and turning the
+/// committed-free reclamation into unbounded file growth. The `session_owned`
+/// set records every page this handle materialized or COW'd this transaction;
+/// it is the in-memory "already dirty this txn" marker the spec's cost model
+/// ("first touch this txn ... subsequent frees in the same leaf are in-place")
+/// assumes. It is transient working state, never serialized.
 pub(crate) struct FreeMapTree {
     pub root: u64,
     pub depth: u32,
     pub pending_superseded: Vec<u64>,
+    // Pages this transaction has extended/COW'd (so a re-touch is in-place, not
+    // a re-COW). FxHashSet: trusted local page ids, no DoS surface.
+    //
+    // The integration layer rebuilds a fresh `FreeMapTree` handle from
+    // `{root, depth}` at EVERY allocation site within one transaction (data-page
+    // alloc, each handle-table / membership COW, persist_freemap). Each of those
+    // re-touches the same freemap leaf, so the dedup set must SURVIVE across
+    // those handles or every site would re-COW the leaf. The manager therefore
+    // owns the set for the whole transaction and swaps it into each transient
+    // handle via `from_roots`, reading it back out after. `pub(crate)` so the
+    // manager can move it in and out; `from_roots`/`create` seed it.
+    pub(crate) session_owned: rustc_hash::FxHashSet<u64>,
 }
 
-#[allow(dead_code)] // standalone unit: the integration unit is the production consumer.
 impl FreeMapTree {
     /// Reconstruct a tree handle from a committed `(root, depth)` (open path).
     /// Starts with an empty `pending_superseded` — nothing has been superseded
-    /// in the new transaction yet.
+    /// in the new transaction yet — and an empty `session_owned` set (no page is
+    /// this-txn-dirty until the first mutation COWs one).
     pub fn from_roots(root: u64, depth: u32) -> FreeMapTree {
         FreeMapTree {
             root,
             depth,
             pending_superseded: Vec::new(),
+            session_owned: rustc_hash::FxHashSet::default(),
         }
     }
 
@@ -128,10 +153,15 @@ impl FreeMapTree {
         let buf = cache.get_mut(root)?;
         FreeMap::init_page(buf);
         page::stamp_checksum(buf);
+        // The leaf was just extended by THIS handle, so it is in-place-mutable
+        // for the rest of the transaction.
+        let mut session_owned = rustc_hash::FxHashSet::default();
+        session_owned.insert(root);
         Ok(FreeMapTree {
             root,
             depth: 0,
             pending_superseded: Vec::new(),
+            session_owned,
         })
     }
 
@@ -200,6 +230,14 @@ impl FreeMapTree {
     }
 
     /// Is `id` currently free? Absent subtree (or past reach) reads as in-use.
+    ///
+    /// Read-only query: production allocation/free goes through `allocate_first`
+    /// / `mark_free_growing`, so the only consumers are the in-crate tests and
+    /// the transaction layer's C1-invariant assertions (both `#[cfg(test)]`).
+    /// Kept on the non-test build as a legitimate diagnostic accessor; the
+    /// targeted allow (covering its sole helper `find_leaf`) documents that it
+    /// is intentionally retained rather than dead.
+    #[allow(dead_code)]
     pub fn is_free(&self, cache: &mut PageCache, id: u64) -> Result<bool> {
         let Some(leaf) = self.find_leaf(cache, id)? else {
             return Ok(false);
@@ -226,6 +264,8 @@ impl FreeMapTree {
         init_interior(buf);
         write_child(buf, 0, self.root); // old root becomes child 0
         page::stamp_checksum(buf);
+        // Freshly extended by this handle => in-place-mutable hereafter.
+        self.session_owned.insert(new_root);
         self.root = new_root;
         self.depth += 1;
         Ok(())
@@ -256,13 +296,12 @@ impl FreeMapTree {
             PageType::FreeMap
         };
         let new_root = self.cow_node(cache, self.root, root_expected, extend)?;
-        let old_root = self.root;
         self.root = new_root;
-        self.pending_superseded.push(old_root);
 
         // Walk interiors, COWing each child (materializing absent ones) and
         // rewriting the parent's pointer to the new child. `current` is the
-        // already-COW'd page we are editing in place this frame.
+        // already-COW'd (or session-owned) page we are editing in place this
+        // frame.
         let mut current = new_root;
         let mut remaining = id;
         for level in (1..=self.depth).rev() {
@@ -287,15 +326,20 @@ impl FreeMapTree {
                 } else {
                     init_interior(buf);
                 }
+                self.session_owned.insert(id_new);
                 id_new
             } else {
-                // Present subtree: COW it (validating its position type); the old
-                // child is superseded.
-                let copied = self.cow_node(cache, child, child_expected, extend)?;
-                self.pending_superseded.push(child);
-                copied
+                // Present subtree: COW it (validating its position type), unless
+                // it is already session-owned (cow_node returns it unchanged and
+                // queues nothing).
+                self.cow_node(cache, child, child_expected, extend)?
             };
-            // Rewrite the parent's pointer to the new child and re-stamp.
+            // Rewrite the parent's pointer to the new child and re-stamp. When
+            // the child was session-owned and unchanged this write is a no-op on
+            // the pointer value but harmless (and the re-stamp is required only
+            // if `current` itself changed, which it did at least once on the
+            // first touch). `current` is always session-owned here, so this is
+            // an in-place edit.
             let buf = cache.get_mut(current)?;
             write_child(buf, child_idx, new_child);
             page::stamp_checksum(buf);
@@ -319,10 +363,16 @@ impl FreeMapTree {
         Ok(())
     }
 
-    /// COW-copy one existing tree page into a fresh `extend`-allocated page,
-    /// validating it is the `expected` POSITION type first. Returns the new page
-    /// id. The caller queues the old page on `pending_superseded` (cow_descend
-    /// does so per frame).
+    /// Return the page to edit in place for `page_id`'s position, COWing it if
+    /// (and only if) it is not already owned by this transaction's handle.
+    ///
+    /// - If `page_id` is `session_owned` (this handle already extended or COW'd
+    ///   it this transaction), return it UNCHANGED — no `extend`, no supersede.
+    ///   This is what makes a second mutation to the same leaf/spine an in-place
+    ///   edit, the property `persist_freemap`'s multi-free loop relies on.
+    /// - Otherwise it is a committed page: validate its POSITION type, `extend`
+    ///   a fresh copy, record the new id as session-owned, queue the old id on
+    ///   `pending_superseded`, and return the new id.
     ///
     /// `expected` is the type the descent level says must live here (interior vs
     /// leaf). Validating against it — rather than self-classifying from buf[0] —
@@ -333,17 +383,24 @@ impl FreeMapTree {
     /// mark_free/mark_free_growing — which reach the spine without a prior
     /// position-validating read — fail closed identically.
     fn cow_node(
-        &self,
+        &mut self,
         cache: &mut PageCache,
         page_id: u64,
         expected: PageType,
         extend: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
     ) -> Result<u64> {
+        // Already this-txn-dirty: edit in place. (No type re-validation needed —
+        // it was validated when first COW'd/materialized this session.)
+        if self.session_owned.contains(&page_id) {
+            return Ok(page_id);
+        }
         // Validate before copying so a corrupt wrong-type page on the spine
         // fails closed rather than propagating into a fresh COW page.
         check_type(cache.get(page_id)?, expected, page_id)?;
         let new_id = extend(cache)?;
         cache.copy_page(page_id, new_id)?;
+        self.session_owned.insert(new_id);
+        self.pending_superseded.push(page_id);
         Ok(new_id)
     }
 
@@ -663,9 +720,18 @@ mod tests {
             FreeMap::init_page(buf);
             page::stamp_checksum(buf);
         }
-        // Mark a fresh id whose spine traverses the corrupted child (anything under
-        // root child 0). The COW descent must reject it on the positional check.
-        let err = match t.mark_free(&mut c, 5, &mut extend) {
+        // Reach the corrupted interior through a FRESH handle (empty
+        // session-owned set) — the production scenario, where a new transaction
+        // descends into a COMMITTED, now-corrupt page via from_roots. The COW
+        // short-circuit only skips re-validation for pages THIS handle already
+        // COW'd this transaction (freshly written, single-writer, so they cannot
+        // rot between two touches); a committed page reached fresh is always
+        // re-validated. Re-reading on the original `t` (which COW'd
+        // `interior_child` itself this session) would correctly treat it as
+        // in-place and NOT re-validate, so the from_roots handle is what models
+        // the corruption-detection path.
+        let mut t2 = FreeMapTree::from_roots(t.root, t.depth);
+        let err = match t2.mark_free(&mut c, 5, &mut extend) {
             Ok(()) => panic!("mark_free accepted a position-wrong interior child"),
             Err(e) => e,
         };
