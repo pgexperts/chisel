@@ -642,9 +642,22 @@ impl MembershipIndex {
             )?
         } else {
             // The tag's last member is gone: drop the outer entry and reclaim
-            // the now-empty inner-tree root page. The root is always a leaf
-            // (delete shrinks depth on emptying but the emptied leaf produced
-            // by the final COW delete is still live until freed here).
+            // the now-empty inner tree's ROOT page (`new_inner_root`), so a later
+            // `create_root` for this tag reuses it via the freemap (I118) instead
+            // of extending the file. Safe: the root was never installed in the
+            // outer tree and the old entry is removed by the `outer.delete` below,
+            // so it is fully orphaned and freed exactly once (verified: no
+            // double-free, no use-after-free, correct across reopen).
+            //
+            // RESIDUAL (I118 follow-up): `delete` does NOT shrink depth, so if
+            // this tag's inner tree had grown to depth >= 1 (i.e. carried more
+            // than SLOTS_PER_PAGE handles at once), the emptied tree is a chain
+            // of interior pages and only its root is reclaimed here — the empty
+            // interior pages below it leak (a bounded, non-corrupting residual,
+            // strictly better than the prior "free nothing" behavior). The common
+            // single-leaf case — the scenario I118 targets — is fully reclaimed.
+            // Completing this needs either a depth-shrinking `delete` or a walk
+            // that frees the whole emptied subtree; tracked separately.
             freed.push(new_inner_root);
             let (r, _) = outer.delete(cache, outer_root, tag as u64, alloc, freed)?;
             r
