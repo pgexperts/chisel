@@ -8,9 +8,8 @@
 // shape. Dual-backed where it makes sense via dual_backing_test!.
 
 mod common;
+use chisel::{Chisel, ChiselError};
 use common::{open_chisel, Backing};
-
-use chisel::Chisel;
 use tempfile::NamedTempFile;
 
 // --- Chisel public API tests ---
@@ -28,7 +27,10 @@ fn test_chisel_public_api_roundtrip_body(b: &Backing) {
     db.delete(h2).unwrap();
     db.commit().unwrap();
     assert_eq!(db.read(h1).unwrap(), b"updated");
-    assert!(db.read(h2).is_err());
+    assert!(
+        matches!(db.read(h2), Err(ChiselError::InvalidHandle(_))),
+        "deleted handle must be InvalidHandle"
+    );
     db.close().unwrap();
 }
 

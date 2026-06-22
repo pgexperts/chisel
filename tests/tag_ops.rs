@@ -98,7 +98,10 @@ fn delete_tagged_verifies_tag_then_self_maintains_index() {
     db.begin().unwrap();
     db.delete_tagged(a, Tag::new(42).unwrap()).unwrap();
     db.commit().unwrap();
-    assert!(db.read(a).is_err(), "chunk gone after delete_tagged");
+    assert!(
+        matches!(db.read(a), Err(ChiselError::InvalidHandle(_))),
+        "chunk gone after delete_tagged: expected InvalidHandle"
+    );
     assert_eq!(
         db.handles_with_tag(Tag::new(42).unwrap()).unwrap(),
         vec![b],
@@ -160,7 +163,10 @@ fn dropping_a_relation_removes_all_handles_no_orphans() {
         "no orphan index entries remain for the dropped tag"
     );
     for h in &hs {
-        assert!(db.read(*h).is_err(), "dropped chunk {h} must be unreadable");
+        assert!(
+            matches!(db.read(*h), Err(ChiselError::InvalidHandle(_))),
+            "dropped chunk {h} must be InvalidHandle after delete_with_tag"
+        );
     }
     // The untouched relation is fully intact.
     assert_eq!(db.tag(keep).unwrap().unwrap(), 2);

@@ -6,7 +6,7 @@
 
 mod common;
 
-use chisel::{Chisel, Options};
+use chisel::{Chisel, ChiselError, Options};
 
 #[test]
 fn open_in_memory_round_trip_commit() {
@@ -25,7 +25,10 @@ fn open_in_memory_round_trip_rollback() {
     db.rollback().unwrap();
     // A fresh transaction must not see rolled-back handles.
     db.begin().unwrap();
-    assert!(db.read(h).is_err());
+    assert!(
+        matches!(db.read(h), Err(ChiselError::InvalidHandle(_))),
+        "rolled-back handle must be InvalidHandle"
+    );
 }
 
 #[test]
@@ -35,7 +38,13 @@ fn open_in_memory_with_options_respects_superblock_count() {
     // but an invalid value must still be rejected by the same validation
     // path used for file-backed open.
     let bad = Options::default().superblock_count(1); // below MIN_SUPERBLOCKS (2)
-    assert!(Chisel::open_in_memory_with_options(bad).is_err());
+    assert!(
+        matches!(
+            Chisel::open_in_memory_with_options(bad),
+            Err(ChiselError::InvalidSuperblockCount { value: 1 })
+        ),
+        "superblock_count=1 must produce InvalidSuperblockCount {{ value: 1 }}"
+    );
 
     let good = Options::default().superblock_count(4);
     let mut db = Chisel::open_in_memory_with_options(good).unwrap();
@@ -51,7 +60,13 @@ fn open_in_memory_rejects_read_only_option() {
     // We surface this early as an explicit InvalidArgument-style error
     // rather than letting the bootstrap fail obliquely.
     let opts = Options::default().read_only(true);
-    assert!(Chisel::open_in_memory_with_options(opts).is_err());
+    assert!(
+        matches!(
+            Chisel::open_in_memory_with_options(opts),
+            Err(ChiselError::ReadOnlyMode)
+        ),
+        "read_only in-memory open must fail with ReadOnlyMode"
+    );
 }
 
 #[test]

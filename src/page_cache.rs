@@ -1331,15 +1331,21 @@ mod tests {
             }
             cache.flush().unwrap();
         }
-        // Re-fetch the original page; it has been evicted.
+        // Re-fetch the original page; it has been evicted (33 pages total > 16-page
+        // capacity). The re-fetch must be a cache MISS, not a hit.
         let h1 = cache.cache_hit_count();
         let m1 = cache.cache_miss_count();
         let _ = cache.get(id).unwrap();
-        // Either it was still cached (hit) or it was evicted (miss). The
-        // weaker assertion: exactly ONE counter advanced.
-        let dh = cache.cache_hit_count() - h1;
-        let dm = cache.cache_miss_count() - m1;
-        assert_eq!(dh + dm, 1, "exactly one of hits/misses must increment");
+        assert_eq!(
+            cache.cache_hit_count(),
+            h1,
+            "evicted page re-fetch must not be a cache hit"
+        );
+        assert_eq!(
+            cache.cache_miss_count(),
+            m1 + 1,
+            "evicted page re-fetch must record a cache miss"
+        );
     }
 
     #[test]

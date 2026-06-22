@@ -251,7 +251,10 @@ fn test_recovery_tagged_index_recovers_from_prior_superblock() {
     );
     assert_eq!(db.tag(h1).unwrap().unwrap(), 9);
     // h2 existed only in the corrupted newer state -> gone after recovery.
-    assert!(db.read(h2).is_err());
+    assert!(
+        matches!(db.read(h2), Err(ChiselError::InvalidHandle(_))),
+        "h2 must be InvalidHandle after recovery to pre-h2 state"
+    );
 }
 
 #[test]
@@ -405,7 +408,10 @@ fn test_recovery_both_superblocks_corrupt() {
         f.sync_all().unwrap();
     }
     let result = Chisel::open(&path, Default::default());
-    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(ChiselError::CorruptSuperblock)),
+        "both-superblocks-corrupt must surface CorruptSuperblock"
+    );
 }
 
 #[test]
@@ -1440,7 +1446,10 @@ fn test_file_not_found_without_create() {
     let path = std::path::PathBuf::from("/tmp/chisel_nonexistent_test.db");
     let _ = fs::remove_file(&path);
     let result = Chisel::open(&path, Options::default().create_if_missing(false));
-    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(ChiselError::FileNotFound)),
+        "open of nonexistent file with create_if_missing=false must be FileNotFound"
+    );
 }
 
 // I115: corrupt the 4-byte magic (superblock offset 0..4) in EVERY superblock

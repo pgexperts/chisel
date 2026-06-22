@@ -60,7 +60,18 @@ fn test_defrag_reclaims_space_after_deletes_body(b: &Backing) {
             "handle {h} (index {i}) lost or corrupted its value across defrag"
         );
     }
-    assert!(result.pages_freed > 0);
+    // 50 values of 200 bytes spread across 2 data pages (~39 per page).
+    // After deleting 45, only 5 survive on the first page; defrag compacts
+    // them, examines 1 sparse page, frees 1 page, and moves 5 values.
+    assert_eq!(
+        result.pages_examined, 1,
+        "expected exactly 1 sparse page examined"
+    );
+    assert_eq!(
+        result.values_moved, 5,
+        "expected exactly 5 values relocated"
+    );
+    assert_eq!(result.pages_freed, 1, "expected exactly 1 page freed");
 }
 
 dual_backing_test!(
