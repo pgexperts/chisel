@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn tag_try_from_zero_errors() {
-        assert!(Tag::try_from(0).is_err());
+        assert_eq!(Tag::try_from(0), Err(ZeroTagError));
         assert_eq!(Tag::try_from(9).unwrap().get(), 9);
     }
 

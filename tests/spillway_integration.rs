@@ -116,7 +116,10 @@ fn rollback_with_spill_leaves_main_file_unchanged() {
 
     // Handles allocated in the aborted transaction are gone.
     for h in spilled_handles {
-        assert!(db.read(h).is_err(), "handle {h} survived rollback");
+        assert!(
+            matches!(db.read(h), Err(ChiselError::InvalidHandle(_))),
+            "handle {h} survived rollback: expected InvalidHandle"
+        );
     }
 
     // Subsequent commits work normally — the engine is not wedged.
