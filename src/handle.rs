@@ -26,6 +26,22 @@ use std::num::NonZeroU32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Handle(u64);
 
+// Pin the layout the bench adapter's `&[u64]` -> `&[Handle]` transmute depends
+// on (bench/src/chisel_engine.rs). With this, dropping `#[repr(transparent)]` or
+// adding a field fails THIS crate's build with a clear message, instead of
+// turning the cross-crate transmute into silent UB the bench can't detect
+// (review 2026-06-22). const assertions are evaluated at compile time.
+const _: () = {
+    assert!(
+        core::mem::size_of::<Handle>() == core::mem::size_of::<u64>(),
+        "Handle must stay layout-identical to u64 (bench transmute relies on repr(transparent))"
+    );
+    assert!(
+        core::mem::align_of::<Handle>() == core::mem::align_of::<u64>(),
+        "Handle must stay layout-identical to u64 (bench transmute relies on repr(transparent))"
+    );
+};
+
 impl Handle {
     /// The underlying raw id. Handles are minted from `1` (the engine reserves
     /// `0` as the "no handle" sentinel); this carrier type does not itself

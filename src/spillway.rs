@@ -84,12 +84,22 @@ impl Spillway {
         // path, reconstruct from db_path.
         let mut path = db_path.as_os_str().to_owned();
         path.push(".spillway");
+        // Force any open error to the FATAL IoError variant rather than letting
+        // it flow through `From<io::Error>`, which demotes ErrorKind::NotFound to
+        // the operational FileNotFound (error.rs I105). That demotion is correct
+        // only for the initial DB open (a caller-supplied bad path). The spillway
+        // is a SECOND file opened lazily MID-TRANSACTION under cache pressure; a
+        // NotFound here (e.g. the parent directory vanished) is a degraded
+        // in-flight cache state, not a "fix your path and retry" condition, so it
+        // must poison rather than mislead the caller into continuing (review
+        // 2026-06-22).
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&path)?;
+            .open(&path)
+            .map_err(ChiselError::IoError)?;
         Ok(Spillway {
             backing: Backing::File { file },
             slots: HashMap::new(),

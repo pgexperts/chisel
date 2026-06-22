@@ -40,6 +40,23 @@ def test_open_in_memory_rejects_read_only():
         chisel.open(None, read_only=True)
 
 
+def test_open_file_read_only_allows_reads_rejects_writes(tmp_db):
+    # The in-memory read_only test above is produced engine-side independent of
+    # correct plumbing; this exercises the FILE-backed path end-to-end, so a
+    # dropped/inverted read_only kwarg (db.rs .read_only(...)) would be caught
+    # (review 2026-06-22).
+    with chisel.open(str(tmp_db)) as db:
+        with db.transaction() as tx:
+            h = tx.allocate(b"seed")
+    with chisel.open(str(tmp_db), read_only=True) as db:
+        # Reads still work...
+        assert db.read(h) == b"seed"
+        # ...but opening a transaction (which would permit writes) is rejected.
+        with pytest.raises(chisel.ReadOnlyModeError):
+            with db.transaction():
+                pass
+
+
 def test_open_accepts_pathlib(tmp_db):
     with chisel.open(tmp_db) as db:
         assert db is not None

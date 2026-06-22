@@ -447,6 +447,18 @@ impl PageCache {
                 // match and here can drop the spillway — there is no mutating
                 // call to self that could call `self.spillway = None`, and
                 // drain_spillway holds &mut self exclusively.
+                // DURABILITY WINDOW (analogous to Phase 1a above): `forget`
+                // drops the spillway's resident copy BEFORE `write_page` makes
+                // the main-file copy durable. If `write_page` then fails, the
+                // only surviving copy of this dirty page is the local `buf`,
+                // which is dropped on the `?` early-return — the page is lost.
+                // This is safe ONLY because the I1 poison model treats any
+                // commit-protocol failure as fatal: on a drain error the
+                // TransactionManager poisons and the caller must drop+reopen, so
+                // the half-drained cache is never trusted and the transaction is
+                // effectively rolled back. If commit is ever made retryable,
+                // reorder to write_page-then-forget so a failed drain leaves the
+                // page recoverable from the spillway (review 2026-06-22).
                 let buf = {
                     let spw = self.spillway.as_mut().unwrap();
                     let b = spw.rehydrate(page_id)?;

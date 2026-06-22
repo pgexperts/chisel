@@ -152,6 +152,18 @@ impl Overflow {
     pub fn read(cache: &mut PageCache, first_page: u64) -> Result<Vec<u8>> {
         let total_length = {
             let buf = cache.get(first_page)?;
+            // Reject a wrong-type page before trusting its header. The cache
+            // verifies only the XXH3 checksum, which catches bit-flips but NOT
+            // a checksum-valid page of the WRONG type reached via a stale/buggy
+            // handle entry. Without this, a Data/FreeMap/HandleTable page would
+            // be parsed as overflow metadata (bytes 16..24 as total_length,
+            // 24..32 as next_page). data_page::validate_header defends exactly
+            // this for data pages; overflow must too (review 2026-06-22).
+            if buf[0] != PageType::Overflow as u8 {
+                return Err(ChiselError::CorruptPage {
+                    page_id: first_page,
+                });
+            }
             u64::from_le_bytes(buf[16..24].try_into().unwrap()) as usize
         };
         // An empty value should never be stored as an overflow chain
@@ -178,6 +190,14 @@ impl Overflow {
             pages_visited += 1;
 
             let buf = cache.get(current_page)?;
+            // Validate every page in the walk, not just the first: a mid-chain
+            // next_page pointer could (under corruption) reference a non-overflow
+            // page. See the first-page check above for the full rationale.
+            if buf[0] != PageType::Overflow as u8 {
+                return Err(ChiselError::CorruptPage {
+                    page_id: current_page,
+                });
+            }
             let next_page = u64::from_le_bytes(buf[24..32].try_into().unwrap());
             let remaining = total_length.saturating_sub(result.len());
             if remaining == 0 {
@@ -221,6 +241,15 @@ impl Overflow {
     pub fn delete(cache: &mut PageCache, first_page: u64) -> Result<Vec<u64>> {
         let total_length = {
             let buf = cache.get(first_page)?;
+            // Same wrong-type guard as `read` (review 2026-06-22): the checksum
+            // does not certify the page TYPE, so a stale handle pointing at a
+            // checksum-valid non-overflow page must surface as CorruptPage, not
+            // enumerate a bogus chain.
+            if buf[0] != PageType::Overflow as u8 {
+                return Err(ChiselError::CorruptPage {
+                    page_id: first_page,
+                });
+            }
             u64::from_le_bytes(buf[16..24].try_into().unwrap()) as usize
         };
         if total_length == 0 {
@@ -239,6 +268,11 @@ impl Overflow {
                 });
             }
             let buf = cache.get(current_page)?;
+            if buf[0] != PageType::Overflow as u8 {
+                return Err(ChiselError::CorruptPage {
+                    page_id: current_page,
+                });
+            }
             let next_page = u64::from_le_bytes(buf[24..32].try_into().unwrap());
             freed.push(current_page);
             if next_page == 0 {
@@ -422,5 +456,56 @@ mod tests {
         let first_page = Overflow::write(&mut cache, &value).unwrap();
         let freed = Overflow::delete(&mut cache, first_page).unwrap();
         assert!(freed.len() >= 3);
+    }
+
+    // Review 2026-06-22: read/delete must reject a checksum-valid page of the
+    // WRONG type (reached via a stale/buggy handle entry) instead of parsing its
+    // bytes as overflow metadata. Mirrors data_page::corruption_tests, which
+    // defends the same failure mode for data pages.
+    #[test]
+    fn read_and_delete_reject_wrong_page_type_at_first_page() {
+        let mut cache = make_cache();
+        // A checksum-valid non-overflow page carrying a HUGE total_length in
+        // bytes 16..24. The first-page guard must reject it BEFORE the code
+        // trusts that length — read() would otherwise reach
+        // `Vec::with_capacity(total_length)` (a speculative huge allocation)
+        // before the per-page loop guard fires. Using u64::MAX makes the test a
+        // true discriminator: without the first-page guard, read aborts on the
+        // allocation rather than returning a clean CorruptPage (review 2026-06-22).
+        let id = cache.new_page().unwrap();
+        {
+            let buf = cache.get_mut(id).unwrap();
+            buf.fill(0);
+            buf[0] = PageType::Data as u8;
+            buf[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+            page::stamp_checksum(buf);
+        }
+        assert!(
+            matches!(Overflow::read(&mut cache, id), Err(ChiselError::CorruptPage { page_id }) if page_id == id),
+            "read must reject a wrong-type first page before trusting its total_length"
+        );
+        assert!(
+            matches!(Overflow::delete(&mut cache, id), Err(ChiselError::CorruptPage { page_id }) if page_id == id),
+            "delete must reject a wrong-type first page"
+        );
+    }
+
+    #[test]
+    fn read_rejects_wrong_page_type_mid_chain() {
+        let mut cache = make_cache();
+        let (first, _value) = write_three_page_chain(&mut cache);
+        // Re-type the SECOND page to a non-overflow page, keeping the checksum
+        // valid so only the type guard (not the checksum) can catch it.
+        let second = read_next_page(&mut cache, first);
+        assert_ne!(second, 0, "a three-page chain must have a second page");
+        {
+            let buf = cache.get_mut(second).unwrap();
+            buf[0] = PageType::Data as u8;
+            page::stamp_checksum(buf);
+        }
+        assert!(
+            matches!(Overflow::read(&mut cache, first), Err(ChiselError::CorruptPage { page_id }) if page_id == second),
+            "read must reject a wrong-type page mid-walk"
+        );
     }
 }

@@ -313,3 +313,30 @@ def test_operational_hierarchy_missing_classes():
             f"{cls_name} must be a subclass of ChiselError"
         assert not issubclass(cls, chisel.FatalError), \
             f"{cls_name} must NOT be a subclass of FatalError"
+
+
+# ---------------------------------------------------------------------------
+# 11. Fatal-arm routing: a real fatal error reaches its concrete class
+# ---------------------------------------------------------------------------
+# The operational arms of to_py_err have contract tests above; the fatal arms
+# did not — a swapped/mis-routed fatal arm would pass the whole green suite
+# (review 2026-06-22). Drive the highest-value fatal variant end-to-end through
+# the binding: corrupt every superblock so open() surfaces CorruptSuperblock.
+# (Per-variant coverage of all fatal arms would want a Rust-side unit test of
+# to_py_err; that needs binding-crate test infrastructure tracked separately.)
+
+
+def test_corrupt_superblock_routes_to_fatal_class(tmp_db):
+    # superblock_count=2 puts the only superblock slots at pages 0 and 1.
+    with chisel.open(str(tmp_db), superblock_count=2) as db:
+        with db.transaction() as tx:
+            tx.allocate(b"x")
+    # Zero both superblock slots (PAGE_SIZE = 8192) WITHOUT resizing the file
+    # (r+b does not truncate), so the failure is bad magic, not a size mismatch.
+    with open(tmp_db, "r+b") as f:
+        f.write(b"\x00" * (2 * 8192))
+    with pytest.raises(chisel.CorruptSuperblockError) as exc_info:
+        chisel.open(str(tmp_db))
+    # It must ALSO be a FatalError: `except chisel.FatalError` must catch every
+    # drop-and-reopen condition (the two-tier poison contract).
+    assert isinstance(exc_info.value, chisel.FatalError)
