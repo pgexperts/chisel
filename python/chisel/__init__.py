@@ -42,6 +42,7 @@ from chisel._chisel import (
     FileSizeMismatchError,
     LockFailedError,
     UnsupportedFormatVersionError,
+    UnsupportedPageSizeError,
     CorruptPageError,
     InvalidPageIdError,
     PoisonedError,
@@ -135,6 +136,6 @@ __all__ = [
     "ClosedError", "AlreadyFinishedError", "TagMismatchError",
     "IoError", "ChecksumMismatchError", "CorruptSuperblockError",
     "FileSizeMismatchError", "LockFailedError",
-    "UnsupportedFormatVersionError", "CorruptPageError", "InvalidPageIdError",
+    "UnsupportedFormatVersionError", "UnsupportedPageSizeError", "CorruptPageError", "InvalidPageIdError",
     "PoisonedError",
 ]
