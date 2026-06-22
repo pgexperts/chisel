@@ -1516,12 +1516,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 **Fixed (2026-06-21):** `PageIo::page_count` and `PageCache::file_page_count` now take `&self` (both are pure `Cell`/field reads). Callers holding `&mut` still compile (coercion); the ripple the review predicted was indeed small — three now-unnecessary `mut` bindings (`PageCache::new`'s `io` param + two page_io tests), de-`mut`'d.
 
-#### I124. Public fallible methods broadly lack `# Errors` rustdoc; several omit `# Panics` [deepdive 2026-06-21] — **P3**
+#### I124. Public fallible methods broadly lack `# Errors` rustdoc; several omit `# Panics` [deepdive 2026-06-21] — **P3** ✅ FIXED 2026-06-21
 **Where:** `savepoint`/`rollback_to`/`release`/`set_root_name`/`get_root_name` and most `TransactionManager` mutators; assert sites at `transaction.rs:307`, `membership_index.rs:167`
 
 **Problem:** for a published crate this is the `missing_errors_doc` / `missing_panics_doc` surface clippy would flag under `--all-targets` pedantic.
 
 **Direction of fix:** a shared "Errors & poisoning" doc convention plus targeted `# Errors`/`# Panics` sections.
+
+**Fixed (2026-06-21):** the public API is entirely the `Chisel` impl in `src/lib.rs` (the storage internals are `pub(crate)` per I35), so the pedantic lint flags **only** that surface — `cargo clippy -p chisel --lib -W clippy::missing_errors_doc` enumerated exactly **33** `# Errors` gaps there and **0** `# Panics` (the public methods delegate to `pub(crate)` internals, so the assert sites the deepdive cites are not on the published surface). Added the shared convention as a `# Errors and poisoning` section on the `Chisel` type doc — every method's `# Errors` lists only its *operational* errors; `Poisoned` and fatal I/O/corruption are universal and documented once — then a concise `# Errors` to all 33 methods (the three savepoint methods, previously undocumented, also got summaries). Made it self-enforcing: `#![warn(clippy::missing_errors_doc)]` at the crate root, which CI's `-D warnings` promotes to a hard error, so a future public `-> Result` method without `# Errors` fails the build. Verified with `cargo doc -p chisel -D warnings` (anchors/intra-doc links resolve) + the full green gate. `# Panics` left untouched (none needed on the public surface; the brittle `missing_panics_doc` lint was deliberately NOT enabled). Done AFTER the I120 reshape so the documented signatures are final, and AFTER I125 so the `lookup_live`/`InvalidHandle` contract the docs reference is in place.
 
 ### Type system
 

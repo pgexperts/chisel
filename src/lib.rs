@@ -19,6 +19,13 @@
 // Durability model: see `transaction.rs`. Commits are shadow-paged and
 // finalized by a superblock swap; there is no WAL and no background writer.
 
+// I124: enforce `# Errors` rustdoc on every public fallible method. The lint
+// only fires on truly-public items, and the entire public API lives in this
+// file, so internal `pub(crate)` modules are unaffected. CI runs clippy with
+// `-D warnings`, which promotes this to a hard error — a new public `-> Result`
+// method without an `# Errors` section fails the build.
+#![warn(clippy::missing_errors_doc)]
+
 // I35 (ISSUES.md, 2026-05-22): every storage-internals module is
 // pub(crate). The supported public surface is the curated re-export
 // list further down (Chisel, Options, DrainInsertion, ChiselError,
@@ -249,6 +256,18 @@ impl Options {
 /// necessary because Linux `fsync` semantics (fsyncgate, 2018) do not
 /// permit safely retrying a failed fsync — the kernel may have discarded
 /// the dirty pages before reporting the error.
+///
+/// # Errors and poisoning
+///
+/// One rule is shared by every fallible method below: once the handle is
+/// poisoned (above), the method returns [`ChiselError::Poisoned`] — reads
+/// included. Each method's own `# Errors` section therefore lists only the
+/// *operational* (recoverable, non-poisoning) errors specific to that call;
+/// it does not re-list `Poisoned` or the fatal I/O and corruption errors,
+/// which are universal and all funnel into the poison model. Operational
+/// errors leave the handle usable: fix the condition (or `rollback`) and
+/// continue. The constructors (`open`, `open_in_memory*`) have no handle to
+/// poison, so their errors are fully enumerated in place.
 // I68 (ISSUES.md, 2026-05-22): `Chisel` has no explicit `Drop` impl
 // because shadow paging guarantees the on-disk state is always the
 // last successfully committed state — whether the value goes out of
@@ -274,6 +293,14 @@ impl Chisel {
     /// Acquires an exclusive `flock` on the file before any parsing, so a
     /// second concurrent `open()` on the same path fails fast with
     /// `LockFailed` rather than racing on the superblock.
+    ///
+    /// # Errors
+    /// `InvalidSuperblockCount` (the `superblock_count` option is out of
+    /// range), `FileNotFound` (no file at `path` and `create_if_missing` is
+    /// false), or `LockFailed` (another handle holds the exclusive flock). When
+    /// reopening an existing file, parsing the superblock can also yield
+    /// `InvalidMagic`, `UnsupportedFormatVersion`, `CorruptSuperblock`,
+    /// `ChecksumMismatch`, `FileSizeMismatch`, or `IoError`.
     pub fn open(path: &Path, options: Options) -> Result<Chisel> {
         // R4: validate superblock_count before touching the file.
         // Only meaningful on the create path, but we check it always
@@ -323,6 +350,11 @@ impl Chisel {
     ///
     /// Uses default `Options`. For a tuned cache size or superblock count,
     /// use `open_in_memory_with_options`.
+    ///
+    /// # Errors
+    /// Only a bootstrap `IoError` from the initial superblock write — the
+    /// memory backing makes this practically infallible. See
+    /// [`open_in_memory_with_options`](Self::open_in_memory_with_options).
     pub fn open_in_memory() -> Result<Chisel> {
         Self::open_in_memory_with_options(Options::default())
     }
@@ -335,6 +367,11 @@ impl Chisel {
     /// ignored — memory mode always creates a fresh database. All other
     /// options (cache_max_bytes, spillway_max_bytes, drain_insertion,
     /// superblock_count) flow through normally.
+    ///
+    /// # Errors
+    /// `ReadOnlyMode` if `options.read_only` is set (a fresh memory database
+    /// must be writable to bootstrap), `InvalidSuperblockCount` if
+    /// `options.superblock_count` is out of range, or a bootstrap `IoError`.
     pub fn open_in_memory_with_options(options: Options) -> Result<Chisel> {
         if options.read_only {
             // Fail fast rather than bootstrapping and then blocking the
@@ -373,6 +410,10 @@ impl Chisel {
     /// so callers who drop the result without explicit `let _ = …` get
     /// a lint warning. `Result` is already `#[must_use]` by default;
     /// the custom message adds the human-readable rationale.
+    ///
+    /// # Errors
+    /// Currently never — `close` always returns `Ok`. The `Result` is reserved
+    /// so a future release can surface fsync/close errors without an API break.
     #[must_use = "Chisel::close may surface fsync/close errors in a future release; \
                   ignore explicitly with `let _ = db.close();` if intentional"]
     pub fn close(self) -> Result<()> {
@@ -384,6 +425,9 @@ impl Chisel {
     /// active transaction; `allocate`/`update`/`delete` will return
     /// `NoActiveTransaction` otherwise. Only one transaction is active at a
     /// time — there is no nesting beyond savepoints.
+    ///
+    /// # Errors
+    /// `TransactionAlreadyActive` if a transaction is already open.
     pub fn begin(&mut self) -> Result<()> {
         self.txm.begin()
     }
@@ -410,6 +454,12 @@ impl Chisel {
     /// `tests/spillway_integration.rs::no_spill_workload_preserves_two_fsync_commit`
     /// pins the count to `== 3`; the test name retains the older
     /// "two_fsync" label from the original spec.
+    ///
+    /// # Errors
+    /// `NoActiveTransaction` if none is open. Operationally, `CacheFull` or
+    /// `SpillwayFull` if the transaction's working set exceeds the cache /
+    /// spillway caps. A failure inside the fsync/superblock protocol is fatal
+    /// and poisons the handle — the previous committed state stays intact.
     pub fn commit(&mut self) -> Result<()> {
         self.txm.commit()
     }
@@ -417,6 +467,9 @@ impl Chisel {
     /// Abort the active transaction. Pages written during the transaction
     /// become unreachable garbage (they are never linked from a superblock),
     /// so rollback is effectively free — no undo log to replay.
+    ///
+    /// # Errors
+    /// `NoActiveTransaction` if no transaction is open.
     pub fn rollback(&mut self) -> Result<()> {
         self.txm.rollback()
     }
@@ -426,14 +479,31 @@ impl Chisel {
     // written since the savepoint are simply abandoned on `rollback_to`, the
     // same way a full rollback abandons the whole transaction.
 
+    /// Create a named savepoint within the active transaction.
+    ///
+    /// # Errors
+    /// `NoActiveTransaction` if no transaction is open; `DuplicateSavepoint` if
+    /// `name` is already a live savepoint in this transaction.
     pub fn savepoint(&mut self, name: &str) -> Result<()> {
         self.txm.savepoint(name)
     }
 
+    /// Roll the active transaction back to a named savepoint, discarding work
+    /// done since (pages written meanwhile are abandoned, as in a full rollback).
+    ///
+    /// # Errors
+    /// `NoActiveTransaction` if no transaction is open; `SavepointNotFound` if
+    /// `name` is not a live savepoint.
     pub fn rollback_to(&mut self, name: &str) -> Result<()> {
         self.txm.rollback_to(name)
     }
 
+    /// Discard a named savepoint without rolling back, folding its scope into
+    /// the surrounding transaction.
+    ///
+    /// # Errors
+    /// `NoActiveTransaction` if no transaction is open; `SavepointNotFound` if
+    /// `name` is not a live savepoint.
     pub fn release(&mut self, name: &str) -> Result<()> {
         self.txm.release(name)
     }
@@ -449,6 +519,11 @@ impl Chisel {
     /// values are written to an overflow chain in `overflow.rs`. The
     /// caller cannot tell which path was taken except by consulting
     /// stats; all reads go through the same `read()` entry point.
+    ///
+    /// # Errors
+    /// `NoActiveTransaction` if no transaction is open; `CacheFull` or
+    /// `SpillwayFull` if the value's pages do not fit within the cache /
+    /// spillway caps.
     pub fn allocate(&mut self, value: &[u8]) -> Result<Handle> {
         self.txm.allocate(value).map(Handle::from)
     }
@@ -458,12 +533,20 @@ impl Chisel {
     /// membership index (tag→handles) so `handles_with_tag(tag)` can enumerate it.
     /// Tag 0 is the "untagged" sentinel — prefer plain `allocate` for untagged
     /// values; the membership index is not updated for tag 0.
+    ///
+    /// # Errors
+    /// As [`allocate`](Self::allocate) (`NoActiveTransaction`, `CacheFull`,
+    /// `SpillwayFull`); the reverse membership-index insert is subject to the
+    /// same cap errors.
     pub fn allocate_tagged(&mut self, value: &[u8], tag: Tag) -> Result<Handle> {
         self.txm.allocate_tagged(value, tag.get()).map(Handle::from)
     }
 
     /// Return the tag stored in the handle-table entry for `handle`.
     /// Returns 0 for untagged handles. Takes `&self` (F3).
+    ///
+    /// # Errors
+    /// `InvalidHandle` if `handle` is unknown or deleted.
     pub fn tag(&self, handle: Handle) -> Result<Option<Tag>> {
         self.txm.tag(handle.get()).map(Tag::new) // stored 0 -> None
     }
@@ -472,12 +555,19 @@ impl Chisel {
     /// `handle`. Returns 0 for chunks whose byte was never set (including all
     /// chunks created before this feature). Chisel never interprets it. Takes
     /// `&self` (F3).
+    ///
+    /// # Errors
+    /// `InvalidHandle` if `handle` is unknown or deleted.
     pub fn client_byte(&self, handle: Handle) -> Result<u8> {
         self.txm.client_byte(handle.get())
     }
 
     /// Set the opaque client byte for `handle`. Requires an active
     /// transaction; durable on commit, reverted on rollback.
+    ///
+    /// # Errors
+    /// `NoActiveTransaction` if no transaction is open; `InvalidHandle` if
+    /// `handle` is unknown or deleted.
     pub fn set_client_byte(&mut self, handle: Handle, byte: u8) -> Result<()> {
         self.txm.set_client_byte(handle.get(), byte)
     }
@@ -490,6 +580,10 @@ impl Chisel {
     /// repeated calls return an identical `Vec` while the set of live handles
     /// carrying `tag` is unchanged and no `defrag` has run. The order is
     /// unspecified and may differ after a reopen or `defrag`.
+    ///
+    /// # Errors
+    /// Only on poisoning — an empty or absent index is not an error and returns
+    /// an empty `Vec`.
     pub fn handles_with_tag(&self, tag: Tag) -> Result<Vec<Handle>> {
         Ok(self
             .txm
@@ -506,6 +600,11 @@ impl Chisel {
     /// threaded by design, so this `&self` only enables `&self`-taking
     /// read APIs in downstream wrappers (e.g. the client's `StorageEngine`
     /// trait), not cross-thread sharing.
+    ///
+    /// # Errors
+    /// `InvalidHandle` if `handle` is unknown or deleted. A structural
+    /// disagreement between the handle table and the data page surfaces as the
+    /// fatal `CorruptPage`, which poisons the handle.
     pub fn read(&self, handle: Handle) -> Result<Vec<u8>> {
         self.txm.read(handle.get())
     }
@@ -514,12 +613,21 @@ impl Chisel {
     /// is written to a new slot (and, if it crosses the inline threshold,
     /// to a new overflow chain). The handle-table entry is rewritten via
     /// COW, so the update is invisible until commit.
+    ///
+    /// # Errors
+    /// `NoActiveTransaction` if no transaction is open; `InvalidHandle` if
+    /// `handle` is unknown or deleted; `CacheFull` or `SpillwayFull` if the new
+    /// value's pages do not fit the caps.
     pub fn update(&mut self, handle: Handle, value: &[u8]) -> Result<()> {
         self.txm.update(handle.get(), value)
     }
 
     /// Remove a handle. The handle itself is retired (not reused); any
     /// overflow pages it owned are queued for release on commit.
+    ///
+    /// # Errors
+    /// `NoActiveTransaction` if no transaction is open; `InvalidHandle` if
+    /// `handle` is unknown or already deleted.
     pub fn delete(&mut self, handle: Handle) -> Result<()> {
         self.txm.delete(handle.get())
     }
@@ -533,6 +641,11 @@ impl Chisel {
     /// mis-directed handle should not silently delete the wrong chunk).
     /// `delete` remains the unchecked fast path for callers that trust
     /// their handle provenance.
+    ///
+    /// # Errors
+    /// `NoActiveTransaction` if no transaction is open; `InvalidHandle` if
+    /// `handle` is unknown or deleted; `TagMismatch` if the stored tag differs
+    /// from `tag` (nothing is deleted in that case).
     pub fn delete_tagged(&mut self, handle: Handle, tag: Tag) -> Result<()> {
         self.txm.delete_tagged(handle.get(), tag.get())
     }
@@ -542,7 +655,9 @@ impl Chisel {
     /// `begin -> delete_with_tag -> commit` until `complete` for an incremental,
     /// bounded-time relation drop. `max == 0` is a no-op (`complete == false`).
     ///
-    /// Error semantics: a mid-pass error returns only `Err` — the
+    /// # Errors
+    /// `NoActiveTransaction` if no transaction is open. A mid-pass error returns
+    /// only `Err` — the
     /// [`TagDropProgress`] is NOT produced, so the set of handles already
     /// dropped this pass is not reported and is unrecoverable from the return
     /// value. Each individual delete is atomic (a non-fatal `CacheFull`/
@@ -576,6 +691,11 @@ impl Chisel {
     /// On error, partial progress remains visible in the current
     /// transaction: rollback or commit to decide whether the half-done
     /// batch should be kept.
+    ///
+    /// # Errors
+    /// `NoActiveTransaction` if no transaction is open; `InvalidHandle` if any
+    /// handle in `handles` is unknown or already deleted (handles before the
+    /// failure remain deleted in the current transaction).
     pub fn delete_many(&mut self, handles: &[Handle]) -> Result<()> {
         // Copy to a raw Vec; bulk delete is far below the fsync floor, so the
         // allocation is immaterial. (The bench adapter does the zero-copy
@@ -590,6 +710,11 @@ impl Chisel {
     /// active transaction; becomes durable on commit, reverts on
     /// rollback/rollback_to. See `TransactionManager::set_root_name` for
     /// validation rules and the fixed table-size limit.
+    ///
+    /// # Errors
+    /// `NoActiveTransaction` if no transaction is open; `InvalidRootName` if
+    /// `name` violates the validation rules; `RootNameTableFull` if the
+    /// fixed-size table has no free slot.
     pub fn set_root_name(&mut self, name: &str, handle: Handle) -> Result<()> {
         self.txm.set_root_name(name, handle.get())
     }
@@ -597,12 +722,18 @@ impl Chisel {
     /// Look up a named root. Returns `Ok(None)` if the name is not bound.
     /// Reads see the transactional view (pending sets/clears are visible
     /// inside an active transaction). Takes `&self` (F3).
+    ///
+    /// # Errors
+    /// Only on poisoning — an unbound `name` returns `Ok(None)`.
     pub fn get_root_name(&self, name: &str) -> Result<Option<Handle>> {
         Ok(self.txm.get_root_name(name)?.map(Handle::from))
     }
 
     /// Remove a named root. No-op if the name is not bound. Requires an
     /// active transaction; becomes durable on commit.
+    ///
+    /// # Errors
+    /// `NoActiveTransaction` if no transaction is open.
     pub fn clear_root_name(&mut self, name: &str) -> Result<()> {
         self.txm.clear_root_name(name)
     }
@@ -618,6 +749,9 @@ impl Chisel {
     /// The order itself is unspecified: it is not sorted, not insertion order,
     /// and may differ after a reopen or `defrag`, or across Chisel versions.
     /// Rely on within-session repeatability; do not rely on the order.
+    ///
+    /// # Errors
+    /// Only on poisoning (e.g. a fatal `IoError` while walking the handle table).
     pub fn handles(&self) -> Result<Vec<Handle>> {
         Ok(self.txm.handles()?.into_iter().map(Handle::from).collect())
     }
@@ -627,6 +761,10 @@ impl Chisel {
     /// from `page_count * PAGE_SIZE` rather than `stat(2)` so it reflects
     /// the page-aligned view the engine has, not any trailing partial page
     /// that might exist mid-extend.
+    ///
+    /// # Errors
+    /// Only on poisoning — a fatal `IoError` while scanning the handle table or
+    /// reading the file length poisons the handle.
     pub fn stats(&self) -> Result<Stats> {
         // Both calls below route through the poison-aware wrappers on
         // TransactionManager, so a fatal I/O error in either one will
@@ -661,8 +799,10 @@ impl Chisel {
     /// `open()`; the bench harness reads-subtract-reads to compute
     /// deltas for individual operations or workloads.
     ///
-    /// Same `&self` semantic-read shape as `stats()`. Returns
-    /// `ChiselError::Poisoned` if the engine is poisoned.
+    /// Same `&self` semantic-read shape as `stats()`.
+    ///
+    /// # Errors
+    /// Only on poisoning.
     pub fn counters(&self) -> Result<ChiselCounters> {
         self.txm.counters()
     }
@@ -679,6 +819,9 @@ impl Chisel {
     /// `file_size_bytes` shouldn't pay that cost. `stats()` keeps its
     /// current shape because the typical caller wants all three
     /// fields together; this is the dedicated single-field accessor.
+    ///
+    /// # Errors
+    /// Only on poisoning (a fatal `IoError` reading the file length).
     pub fn file_size_bytes(&self) -> Result<u64> {
         let page_count = self.txm.file_page_count()?;
         Ok(page_count.saturating_mul(PAGE_SIZE as u64))
@@ -697,15 +840,20 @@ impl Chisel {
     /// transaction (see `defrag.rs` for why). This method does NOT begin or
     /// commit one on the caller's behalf — defrag is composable with other
     /// work in the same transaction and atomic with it on commit.
+    ///
+    /// # Errors
+    /// `NoActiveTransaction` if no transaction is open; `CacheFull` if the
+    /// relocation working set exceeds the cache cap.
     pub fn defrag(&mut self, options: DefragOptions) -> Result<DefragStats> {
         defrag::defrag(&mut self.txm, &options)
     }
 
-    /// Resize the in-memory cache cap. Returns
-    /// `ChiselError::TransactionInProgress` if a transaction is
-    /// active. Shrinking evicts clean LRU-tail entries to fit;
-    /// growing takes effect on the next allocation. See spec
+    /// Resize the in-memory cache cap. Shrinking evicts clean LRU-tail entries
+    /// to fit; growing takes effect on the next allocation. See spec
     /// §"Runtime mutability".
+    ///
+    /// # Errors
+    /// `TransactionInProgress` if a transaction is active.
     pub fn set_cache_max_bytes(&mut self, bytes: u64) -> Result<()> {
         self.txm.set_cache_max_bytes(bytes)
     }
@@ -715,6 +863,9 @@ impl Chisel {
     /// Returns `ChiselError::TransactionInProgress` if a transaction
     /// is active. The spillway is empty between transactions, so
     /// resize is state-free.
+    ///
+    /// # Errors
+    /// `TransactionInProgress` if a transaction is active.
     pub fn set_spillway_max_bytes(&mut self, bytes: u64) -> Result<()> {
         self.txm.set_spillway_max_bytes(bytes)
     }
@@ -722,6 +873,9 @@ impl Chisel {
     /// Update the drain insertion policy used at the next commit.
     /// Returns `ChiselError::TransactionInProgress` if a transaction
     /// is active.
+    ///
+    /// # Errors
+    /// `TransactionInProgress` if a transaction is active.
     pub fn set_drain_insertion(&mut self, policy: DrainInsertion) -> Result<()> {
         self.txm.set_drain_insertion(policy)
     }
