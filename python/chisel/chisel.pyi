@@ -96,7 +96,7 @@ class Counters:
 @dataclass(frozen=True)
 class DefragOptions:
     sparse_threshold: float = 0.25
-    max_pages: int = 0
+    max_values: int = 0
 
 
 @dataclass(frozen=True)

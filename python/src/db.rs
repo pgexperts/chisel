@@ -410,12 +410,12 @@ impl PyChisel {
             None => chisel::DefragOptions::default(),
             Some(obj) => {
                 let sparse_threshold: f64 = obj.getattr("sparse_threshold")?.extract()?;
-                let max_pages: usize = obj.getattr("max_pages")?.extract()?;
+                let max_values: usize = obj.getattr("max_values")?.extract()?;
                 // I36: DefragOptions is #[non_exhaustive]; build via the
                 // chained-setter builder.
                 chisel::DefragOptions::default()
                     .sparse_threshold(sparse_threshold)
-                    .max_pages(max_pages)
+                    .max_values(max_values)
             }
         };
 
