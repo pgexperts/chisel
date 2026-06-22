@@ -72,9 +72,9 @@ pub struct Stats {
 ///   freemap-aware path, so a counter that ignored it would read ~0 for a
 ///   steady-state mutating workload. The actual disk write happens on the
 ///   next `flush()`.
-/// - `fsync_calls` — `PageIo::fsync` invocations that SUCCEEDED. Two per
-///   Chisel commit (data pages, then superblock); zero between commits in
-///   a normal txn. A failed fsync poisons the engine (I1 / fsyncgate) and
+/// - `fsync_calls` — `PageIo::fsync` invocations that SUCCEEDED. Three per
+///   Chisel commit (pre-drain flush, data-page flush, then superblock fsync);
+///   zero between commits in a normal txn. A failed fsync poisons the engine (I1 / fsyncgate) and
 ///   is not counted; `cache_misses` by contrast counts attempted misses
 ///   even when the subsequent load fails. The asymmetry is intentional —
 ///   see `PageIo::fsync` and I1 in ISSUES.md for the rationale.
