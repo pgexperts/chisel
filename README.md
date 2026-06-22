@@ -344,13 +344,9 @@ Rust stable, edition 2021. Minimum supported Rust version (MSRV): 1.82 — a con
 
 ## Python binding
 
-A PyO3 wrapper lives in the `python/` subdirectory and is published to PyPI as `chisel`:
+A PyO3 wrapper lives in the `python/` subdirectory and will be published to PyPI as `chisel`; until then, build locally with `maturin develop` (see [`python/README.md`](python/README.md)).
 
-```bash
-pip install chisel
-```
-
-The Python API mirrors the Rust one but adds context managers for transactions and savepoints. See [`python/README.md`](python/README.md).
+The Python API mirrors the Rust one but adds context managers for transactions and savepoints.
 
 ## Design documents
 
