@@ -36,7 +36,8 @@ name = "chisel"
 version = "0.1.0"
 edition = "2021"
 # MSRV: bump only with a release-notes call-out; CI pins this same version.
-# Floor today comes from Option::is_none_or in src/page_cache.rs (stabilized 1.82).
+# 1.82 is a conservative pin; the true stdlib floor is ~1.74 (io::Error::other,
+# stabilized 1.74, used in src/page_io.rs).
 rust-version = "1.82"
 authors = ["Christophe Pettus <cpettus@pgexperts.com>"]
 description = "Transactional slot-based storage engine with shadow paging"

@@ -340,7 +340,7 @@ Chisel runs on macOS and Linux. File locking uses `flock(2)` via `libc`. Windows
 
 `flock` is **advisory**, not mandatory. Cooperating processes (any other Chisel instance, or any tool that honours advisory locks) will respect the exclusive lock and block. A tool that bypasses advisory locking — `cp` while a transaction is in flight, some sync utilities, naive backup scripts that read the raw file — can still scribble on or read a torn view of the database. The shadow-paging invariants assume an exclusive owner; respect the lock from outside Chisel as well as inside it.
 
-Rust stable, edition 2021. Minimum supported Rust version (MSRV): 1.82 — the version that stabilized `Option::is_none_or`, used in `src/page_cache.rs`. A future MSRV bump will appear in `Cargo.toml`'s `rust-version` field and be called out in release notes.
+Rust stable, edition 2021. Minimum supported Rust version (MSRV): 1.82 — a conservative pin above the ~1.74 stdlib floor (the true floor comes from `io::Error::other`, stabilized in 1.74, used in `src/page_io.rs`). A future MSRV bump will appear in `Cargo.toml`'s `rust-version` field and be called out in release notes.
 
 ## Python binding
 
