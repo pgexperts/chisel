@@ -142,7 +142,7 @@ fn open_with_txn_body(b: &Backing) -> Chisel {
 
 fn test_named_root_empty_name_rejected_body(b: &Backing) {
     let mut db = open_with_txn_body(b);
-    let err = db.set_root_name("", 0).unwrap_err();
+    let err = db.set_root_name("", chisel::Handle::from(0)).unwrap_err();
     assert!(matches!(err, ChiselError::InvalidRootName));
 }
 
@@ -154,7 +154,9 @@ dual_backing_test!(
 fn test_named_root_too_long_rejected_body(b: &Backing) {
     let mut db = open_with_txn_body(b);
     let long = "x".repeat(NAMED_ROOT_NAME_LEN + 1);
-    let err = db.set_root_name(&long, 0).unwrap_err();
+    let err = db
+        .set_root_name(&long, chisel::Handle::from(0))
+        .unwrap_err();
     assert!(matches!(err, ChiselError::InvalidRootName));
 }
 
@@ -167,8 +169,11 @@ fn test_named_root_max_length_accepted_body(b: &Backing) {
     // Exactly NAMED_ROOT_NAME_LEN bytes is the inclusive upper bound.
     let mut db = open_with_txn_body(b);
     let name = "x".repeat(NAMED_ROOT_NAME_LEN);
-    db.set_root_name(&name, 7).unwrap();
-    assert_eq!(db.get_root_name(&name).unwrap(), Some(7));
+    db.set_root_name(&name, chisel::Handle::from(7)).unwrap();
+    assert_eq!(
+        db.get_root_name(&name).unwrap(),
+        Some(chisel::Handle::from(7))
+    );
 }
 
 dual_backing_test!(
@@ -178,7 +183,9 @@ dual_backing_test!(
 
 fn test_named_root_embedded_nul_rejected_body(b: &Backing) {
     let mut db = open_with_txn_body(b);
-    let err = db.set_root_name("bad\0name", 0).unwrap_err();
+    let err = db
+        .set_root_name("bad\0name", chisel::Handle::from(0))
+        .unwrap_err();
     assert!(matches!(err, ChiselError::InvalidRootName));
 }
 
@@ -189,9 +196,12 @@ dual_backing_test!(
 
 fn test_named_root_overwrite_reuses_slot_body(b: &Backing) {
     let mut db = open_with_txn_body(b);
-    db.set_root_name("meta", 1).unwrap();
-    db.set_root_name("meta", 42).unwrap();
-    assert_eq!(db.get_root_name("meta").unwrap(), Some(42));
+    db.set_root_name("meta", chisel::Handle::from(1)).unwrap();
+    db.set_root_name("meta", chisel::Handle::from(42)).unwrap();
+    assert_eq!(
+        db.get_root_name("meta").unwrap(),
+        Some(chisel::Handle::from(42))
+    );
 }
 
 dual_backing_test!(
@@ -204,9 +214,12 @@ fn test_named_root_table_full_body(b: &Backing) {
     // RootNameTableFull.
     let mut db = open_with_txn_body(b);
     for i in 0..NAMED_ROOT_COUNT {
-        db.set_root_name(&format!("n{i}"), i as u64).unwrap();
+        db.set_root_name(&format!("n{i}"), chisel::Handle::from(i as u64))
+            .unwrap();
     }
-    let err = db.set_root_name("one_too_many", 999).unwrap_err();
+    let err = db
+        .set_root_name("one_too_many", chisel::Handle::from(999))
+        .unwrap_err();
     assert!(matches!(err, ChiselError::RootNameTableFull));
 }
 
@@ -215,12 +228,17 @@ dual_backing_test!(test_named_root_table_full, test_named_root_table_full_body);
 fn test_named_root_clear_then_reuse_slot_body(b: &Backing) {
     let mut db = open_with_txn_body(b);
     for i in 0..NAMED_ROOT_COUNT {
-        db.set_root_name(&format!("n{i}"), i as u64).unwrap();
+        db.set_root_name(&format!("n{i}"), chisel::Handle::from(i as u64))
+            .unwrap();
     }
     db.clear_root_name("n0").unwrap();
     // Slot freed — new name should now fit.
-    db.set_root_name("replacement", 123).unwrap();
-    assert_eq!(db.get_root_name("replacement").unwrap(), Some(123));
+    db.set_root_name("replacement", chisel::Handle::from(123))
+        .unwrap();
+    assert_eq!(
+        db.get_root_name("replacement").unwrap(),
+        Some(chisel::Handle::from(123))
+    );
     assert_eq!(db.get_root_name("n0").unwrap(), None);
 }
 
@@ -243,7 +261,7 @@ dual_backing_test!(
 fn test_named_root_rollback_reverts_set_body(b: &Backing) {
     let mut db = open_chisel(b);
     db.begin().unwrap();
-    db.set_root_name("meta", 5).unwrap();
+    db.set_root_name("meta", chisel::Handle::from(5)).unwrap();
     db.rollback().unwrap();
     // Not visible outside the rolled-back txn.
     assert_eq!(db.get_root_name("meta").unwrap(), None);
@@ -263,11 +281,14 @@ fn test_named_root_survives_commit_and_reopen() {
     {
         let mut db = Chisel::open(&path, Options::default()).unwrap();
         db.begin().unwrap();
-        db.set_root_name("meta", 9).unwrap();
+        db.set_root_name("meta", chisel::Handle::from(9)).unwrap();
         db.commit().unwrap();
     }
     {
         let db = Chisel::open(&path, Options::default()).unwrap();
-        assert_eq!(db.get_root_name("meta").unwrap(), Some(9));
+        assert_eq!(
+            db.get_root_name("meta").unwrap(),
+            Some(chisel::Handle::from(9))
+        );
     }
 }

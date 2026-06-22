@@ -62,12 +62,11 @@ use crate::transaction::TransactionManager;
 /// re-packing a mostly-full page exceeds the benefit. Values <= 0
 /// disable the sweep entirely (the sparse set comes back empty).
 ///
-/// `max_pages`: soft cap on work per call, so a very large database can
+/// `max_values`: soft cap on work per call, so a very large database can
 /// be defragged incrementally across several transactions. `0` means no
-/// limit. DESPITE THE NAME, the cap counts values relocated, not pages
-/// touched — the field name is a carry-over from pre-R3 defrag and is
-/// preserved for API stability. Breaking the loop early leaves the
-/// transaction in a valid state; the caller chooses commit vs rollback.
+/// limit. The cap counts values relocated, not pages touched. Breaking
+/// the loop early leaves the transaction in a valid state; the caller
+/// chooses commit vs rollback.
 ///
 /// I36 (ISSUES.md, 2026-05-22): `#[non_exhaustive]` so a future
 /// tuning knob (e.g. a per-page time cap, a pages-vs-values-priority
@@ -78,28 +77,28 @@ use crate::transaction::TransactionManager;
 #[derive(Debug, Clone)]
 pub struct DefragOptions {
     pub sparse_threshold: f64,
-    pub max_pages: usize,
+    pub max_values: usize,
 }
 
 impl Default for DefragOptions {
     fn default() -> DefragOptions {
         DefragOptions {
             sparse_threshold: 0.25,
-            max_pages: 0,
+            max_values: 0,
         }
     }
 }
 
 // I36: chained setters paired with #[non_exhaustive]. Same shape as
 // `Options`'s builder; method names match field names. External callers
-// build via `DefragOptions::default().sparse_threshold(0.1).max_pages(100)`.
+// build via `DefragOptions::default().sparse_threshold(0.1).max_values(100)`.
 impl DefragOptions {
     pub fn sparse_threshold(mut self, threshold: f64) -> Self {
         self.sparse_threshold = threshold;
         self
     }
-    pub fn max_pages(mut self, cap: usize) -> Self {
-        self.max_pages = cap;
+    pub fn max_values(mut self, cap: usize) -> Self {
+        self.max_values = cap;
         self
     }
 }
@@ -206,7 +205,7 @@ pub fn defrag(txm: &mut TransactionManager, options: &DefragOptions) -> Result<D
     // Step 5: relocate handles living on sparse pages.
     let mut examined_pages: HashSet<u64> = HashSet::new();
     for &handle in &handles {
-        if options.max_pages > 0 && stats.values_moved >= options.max_pages as u64 {
+        if options.max_values > 0 && stats.values_moved >= options.max_values as u64 {
             break;
         }
         let page_id = match txm.handle_live_page_id(handle)? {

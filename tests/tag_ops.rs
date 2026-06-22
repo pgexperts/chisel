@@ -12,19 +12,21 @@
 //! concern these tests guard is orphan-handle integrity, which is deterministic.
 mod common;
 
-use chisel::{Chisel, ChiselError};
+use chisel::{Chisel, ChiselError, Handle, Tag};
 use common::{open_chisel, Backing};
 use tempfile::NamedTempFile;
 
 fn tag_survives_in_session_body(b: &Backing) {
     let mut db = open_chisel(b);
     db.begin().unwrap();
-    let h = db.allocate_tagged(b"relation row", 77).unwrap();
+    let h = db
+        .allocate_tagged(b"relation row", Tag::new(77).unwrap())
+        .unwrap();
     db.commit().unwrap();
-    assert_eq!(db.tag(h).unwrap(), 77);
+    assert_eq!(db.tag(h).unwrap().unwrap(), 77);
     // Also exercise the membership-index read path on BOTH backings (the
     // in-memory backing's index read is otherwise only covered transitively).
-    assert_eq!(db.handles_with_tag(77).unwrap(), vec![h]);
+    assert_eq!(db.handles_with_tag(Tag::new(77).unwrap()).unwrap(), vec![h]);
     db.close().unwrap();
 }
 dual_backing_test!(tag_survives_in_session, tag_survives_in_session_body);
@@ -37,15 +39,18 @@ fn tag_and_index_survive_reopen() {
     {
         let mut db = Chisel::open(&path, Default::default()).unwrap();
         db.begin().unwrap();
-        h = db.allocate_tagged(b"survive", 9).unwrap();
-        db.allocate_tagged(b"survive2", 9).unwrap();
+        h = db
+            .allocate_tagged(b"survive", Tag::new(9).unwrap())
+            .unwrap();
+        db.allocate_tagged(b"survive2", Tag::new(9).unwrap())
+            .unwrap();
         db.commit().unwrap();
         db.close().unwrap();
     }
     {
         let db = Chisel::open(&path, Default::default()).unwrap();
-        assert_eq!(db.tag(h).unwrap(), 9);
-        assert_eq!(db.handles_with_tag(9).unwrap().len(), 2);
+        assert_eq!(db.tag(h).unwrap().unwrap(), 9);
+        assert_eq!(db.handles_with_tag(Tag::new(9).unwrap()).unwrap().len(), 2);
         db.close().unwrap();
     }
 }
@@ -58,13 +63,13 @@ fn tag_and_index_survive_reopen() {
 fn delete_tagged_verifies_tag_then_self_maintains_index() {
     let mut db = Chisel::open_in_memory().unwrap();
     db.begin().unwrap();
-    let a = db.allocate_tagged(b"a", 42).unwrap();
-    let b = db.allocate_tagged(b"b", 42).unwrap();
+    let a = db.allocate_tagged(b"a", Tag::new(42).unwrap()).unwrap();
+    let b = db.allocate_tagged(b"b", Tag::new(42).unwrap()).unwrap();
     db.commit().unwrap();
 
     // Wrong tag: TagMismatch, and the chunk + reverse index are left untouched.
     db.begin().unwrap();
-    let err = match db.delete_tagged(a, 99) {
+    let err = match db.delete_tagged(a, Tag::new(99).unwrap()) {
         Ok(()) => panic!("delete_tagged with a non-matching tag must fail"),
         Err(e) => e,
     };
@@ -83,18 +88,18 @@ fn delete_tagged_verifies_tag_then_self_maintains_index() {
         "chunk untouched after TagMismatch"
     );
     assert_eq!(
-        db.handles_with_tag(42).unwrap().len(),
+        db.handles_with_tag(Tag::new(42).unwrap()).unwrap().len(),
         2,
         "reverse index untouched after TagMismatch"
     );
 
     // Correct tag: the chunk is deleted AND drops out of the reverse index.
     db.begin().unwrap();
-    db.delete_tagged(a, 42).unwrap();
+    db.delete_tagged(a, Tag::new(42).unwrap()).unwrap();
     db.commit().unwrap();
     assert!(db.read(a).is_err(), "chunk gone after delete_tagged");
     assert_eq!(
-        db.handles_with_tag(42).unwrap(),
+        db.handles_with_tag(Tag::new(42).unwrap()).unwrap(),
         vec![b],
         "a removed from the reverse index; b remains"
     );
@@ -114,21 +119,26 @@ fn dropping_a_relation_removes_all_handles_no_orphans() {
     let mut hs = Vec::new();
     for i in 0..200u64 {
         hs.push(
-            db.allocate_tagged(format!("row {i}").as_bytes(), 1)
+            db.allocate_tagged(format!("row {i}").as_bytes(), Tag::new(1).unwrap())
                 .unwrap(),
         );
     }
     // A second relation under a different tag must survive the tag-1 drop intact.
-    let keep = db.allocate_tagged(b"other relation", 2).unwrap();
+    let keep = db
+        .allocate_tagged(b"other relation", Tag::new(2).unwrap())
+        .unwrap();
     db.commit().unwrap();
-    assert_eq!(db.handles_with_tag(1).unwrap().len(), 200);
+    assert_eq!(
+        db.handles_with_tag(Tag::new(1).unwrap()).unwrap().len(),
+        200
+    );
 
     // Drop the whole tag-1 relation in bounded batches; accumulate the reported
     // handles to confirm every member is accounted for exactly once.
     db.begin().unwrap();
     let mut dropped = Vec::new();
     loop {
-        let p = db.delete_with_tag(1, 64).unwrap();
+        let p = db.delete_with_tag(Tag::new(1).unwrap(), 64).unwrap();
         dropped.extend(p.deleted);
         if p.complete {
             break;
@@ -144,16 +154,19 @@ fn dropping_a_relation_removes_all_handles_no_orphans() {
         "every tagged handle reported dropped, once"
     );
     assert_eq!(
-        db.handles_with_tag(1).unwrap(),
-        Vec::<u64>::new(),
+        db.handles_with_tag(Tag::new(1).unwrap()).unwrap(),
+        Vec::<Handle>::new(),
         "no orphan index entries remain for the dropped tag"
     );
     for h in &hs {
         assert!(db.read(*h).is_err(), "dropped chunk {h} must be unreadable");
     }
     // The untouched relation is fully intact.
-    assert_eq!(db.tag(keep).unwrap(), 2);
-    assert_eq!(db.handles_with_tag(2).unwrap(), vec![keep]);
+    assert_eq!(db.tag(keep).unwrap().unwrap(), 2);
+    assert_eq!(
+        db.handles_with_tag(Tag::new(2).unwrap()).unwrap(),
+        vec![keep]
+    );
     db.close().unwrap();
 
     // Durability: the drop mutated the membership-index root via COW. Reopen
@@ -164,8 +177,8 @@ fn dropping_a_relation_removes_all_handles_no_orphans() {
     // drop path).
     let db = Chisel::open(&path, Default::default()).unwrap();
     assert_eq!(
-        db.handles_with_tag(1).unwrap(),
-        Vec::<u64>::new(),
+        db.handles_with_tag(Tag::new(1).unwrap()).unwrap(),
+        Vec::<Handle>::new(),
         "dropped tag-1 relation must stay empty across reopen (no resurrection)"
     );
     for h in &hs {
@@ -175,8 +188,11 @@ fn dropping_a_relation_removes_all_handles_no_orphans() {
         );
     }
     // The other relation survives the reopen with its value intact.
-    assert_eq!(db.tag(keep).unwrap(), 2);
-    assert_eq!(db.handles_with_tag(2).unwrap(), vec![keep]);
+    assert_eq!(db.tag(keep).unwrap().unwrap(), 2);
+    assert_eq!(
+        db.handles_with_tag(Tag::new(2).unwrap()).unwrap(),
+        vec![keep]
+    );
     assert_eq!(db.read(keep).unwrap(), b"other relation");
     db.close().unwrap();
 }
@@ -200,8 +216,39 @@ fn old_database_opens_with_all_untagged() {
     }
     {
         let db = Chisel::open(&path, Default::default()).unwrap();
-        assert_eq!(db.tag(h).unwrap(), 0);
-        assert_eq!(db.handles_with_tag(0).unwrap(), Vec::<u64>::new());
+        // I126: an untagged handle now reports `None`, not the old sentinel 0.
+        // Tag 0 is no longer expressible (`Tag(0)` is unconstructable), so the
+        // old `handles_with_tag(0)` empty-index check can't be written verbatim;
+        // the "empty membership index" coverage is preserved by querying an
+        // arbitrary real tag, which must have no members in a legacy database.
+        assert_eq!(db.tag(h).unwrap(), None);
+        assert_eq!(
+            db.handles_with_tag(Tag::new(1).unwrap()).unwrap(),
+            Vec::<Handle>::new()
+        );
         db.close().unwrap();
     }
+}
+
+// I126: the Option<Tag> contract at the public boundary. An untagged handle
+// reports None; a tagged one reports Some(Tag). The transposition guarantee for
+// delete_tagged(Handle, Tag) is enforced by the type system at compile time and
+// needs no runtime test.
+#[test]
+fn tag_of_untagged_handle_is_none() {
+    let mut db = Chisel::open_in_memory().unwrap();
+    db.begin().unwrap();
+    let h = db.allocate(b"plain").unwrap();
+    db.commit().unwrap();
+    assert_eq!(db.tag(h).unwrap(), None);
+}
+
+#[test]
+fn tag_of_tagged_handle_is_some() {
+    let mut db = Chisel::open_in_memory().unwrap();
+    db.begin().unwrap();
+    let h = db.allocate_tagged(b"row", Tag::new(42).unwrap()).unwrap();
+    db.commit().unwrap();
+    assert_eq!(db.tag(h).unwrap(), Some(Tag::new(42).unwrap()));
+    assert_eq!(db.tag(h).unwrap().unwrap(), 42);
 }

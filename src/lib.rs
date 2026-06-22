@@ -33,6 +33,7 @@ pub(crate) mod data_page;
 pub(crate) mod defrag;
 pub(crate) mod error;
 pub(crate) mod freemap;
+pub(crate) mod handle;
 pub(crate) mod handle_table;
 mod lru;
 pub(crate) mod membership_index;
@@ -60,7 +61,7 @@ pub use error::{ChiselError, Result};
 // re-exports define the supported access paths and keep the documented
 // API at the crate root.
 pub use defrag::{DefragOptions, DefragStats};
-pub use membership_index::TagDropProgress;
+pub use handle::{Handle, Tag, TagDropProgress};
 pub use page::PAGE_SIZE;
 pub use stats::{ChiselCounters, Stats};
 pub use superblock::{
@@ -448,8 +449,8 @@ impl Chisel {
     /// values are written to an overflow chain in `overflow.rs`. The
     /// caller cannot tell which path was taken except by consulting
     /// stats; all reads go through the same `read()` entry point.
-    pub fn allocate(&mut self, value: &[u8]) -> Result<u64> {
-        self.txm.allocate(value)
+    pub fn allocate(&mut self, value: &[u8]) -> Result<Handle> {
+        self.txm.allocate(value).map(Handle::from)
     }
 
     /// Store `value` tagged with `tag` and return a freshly minted stable handle.
@@ -457,28 +458,28 @@ impl Chisel {
     /// membership index (tag→handles) so `handles_with_tag(tag)` can enumerate it.
     /// Tag 0 is the "untagged" sentinel — prefer plain `allocate` for untagged
     /// values; the membership index is not updated for tag 0.
-    pub fn allocate_tagged(&mut self, value: &[u8], tag: u32) -> Result<u64> {
-        self.txm.allocate_tagged(value, tag)
+    pub fn allocate_tagged(&mut self, value: &[u8], tag: Tag) -> Result<Handle> {
+        self.txm.allocate_tagged(value, tag.get()).map(Handle::from)
     }
 
     /// Return the tag stored in the handle-table entry for `handle`.
     /// Returns 0 for untagged handles. Takes `&self` (F3).
-    pub fn tag(&self, handle: u64) -> Result<u32> {
-        self.txm.tag(handle)
+    pub fn tag(&self, handle: Handle) -> Result<Option<Tag>> {
+        self.txm.tag(handle.get()).map(Tag::new) // stored 0 -> None
     }
 
     /// Return the opaque client byte stored in the handle-table entry for
     /// `handle`. Returns 0 for chunks whose byte was never set (including all
     /// chunks created before this feature). Chisel never interprets it. Takes
     /// `&self` (F3).
-    pub fn client_byte(&self, handle: u64) -> Result<u8> {
-        self.txm.client_byte(handle)
+    pub fn client_byte(&self, handle: Handle) -> Result<u8> {
+        self.txm.client_byte(handle.get())
     }
 
     /// Set the opaque client byte for `handle`. Requires an active
     /// transaction; durable on commit, reverted on rollback.
-    pub fn set_client_byte(&mut self, handle: u64, byte: u8) -> Result<()> {
-        self.txm.set_client_byte(handle, byte)
+    pub fn set_client_byte(&mut self, handle: Handle, byte: u8) -> Result<()> {
+        self.txm.set_client_byte(handle.get(), byte)
     }
 
     /// Enumerate all live handles that carry `tag`. Returns an empty Vec if
@@ -489,8 +490,13 @@ impl Chisel {
     /// repeated calls return an identical `Vec` while the set of live handles
     /// carrying `tag` is unchanged and no `defrag` has run. The order is
     /// unspecified and may differ after a reopen or `defrag`.
-    pub fn handles_with_tag(&self, tag: u32) -> Result<Vec<u64>> {
-        self.txm.handles_with_tag(tag)
+    pub fn handles_with_tag(&self, tag: Tag) -> Result<Vec<Handle>> {
+        Ok(self
+            .txm
+            .handles_with_tag(tag.get())?
+            .into_iter()
+            .map(Handle::from)
+            .collect())
     }
 
     /// Read the current value for `handle`. Takes `&self` — the page cache
@@ -500,22 +506,22 @@ impl Chisel {
     /// threaded by design, so this `&self` only enables `&self`-taking
     /// read APIs in downstream wrappers (e.g. the client's `StorageEngine`
     /// trait), not cross-thread sharing.
-    pub fn read(&self, handle: u64) -> Result<Vec<u8>> {
-        self.txm.read(handle)
+    pub fn read(&self, handle: Handle) -> Result<Vec<u8>> {
+        self.txm.read(handle.get())
     }
 
     /// Replace the value for `handle`. The handle is preserved; the value
     /// is written to a new slot (and, if it crosses the inline threshold,
     /// to a new overflow chain). The handle-table entry is rewritten via
     /// COW, so the update is invisible until commit.
-    pub fn update(&mut self, handle: u64, value: &[u8]) -> Result<()> {
-        self.txm.update(handle, value)
+    pub fn update(&mut self, handle: Handle, value: &[u8]) -> Result<()> {
+        self.txm.update(handle.get(), value)
     }
 
     /// Remove a handle. The handle itself is retired (not reused); any
     /// overflow pages it owned are queued for release on commit.
-    pub fn delete(&mut self, handle: u64) -> Result<()> {
-        self.txm.delete(handle)
+    pub fn delete(&mut self, handle: Handle) -> Result<()> {
+        self.txm.delete(handle.get())
     }
 
     /// Remove a handle only if its tag equals `tag`. Returns
@@ -527,8 +533,8 @@ impl Chisel {
     /// mis-directed handle should not silently delete the wrong chunk).
     /// `delete` remains the unchecked fast path for callers that trust
     /// their handle provenance.
-    pub fn delete_tagged(&mut self, handle: u64, tag: u32) -> Result<()> {
-        self.txm.delete_tagged(handle, tag)
+    pub fn delete_tagged(&mut self, handle: Handle, tag: Tag) -> Result<()> {
+        self.txm.delete_tagged(handle.get(), tag.get())
     }
 
     /// Delete up to `max` chunks carrying `tag`, returning the handles dropped
@@ -550,8 +556,12 @@ impl Chisel {
     /// bounded loop to finish. A fatal error additionally poisons the manager
     /// (drop and reopen). To learn exactly which handles were dropped, commit
     /// in single-element passes (`max == 1`) and read each success's progress.
-    pub fn delete_with_tag(&mut self, tag: u32, max: usize) -> Result<TagDropProgress> {
-        self.txm.delete_with_tag(tag, max)
+    pub fn delete_with_tag(&mut self, tag: Tag, max: usize) -> Result<TagDropProgress> {
+        let (ids, complete) = self.txm.delete_with_tag(tag.get(), max)?;
+        Ok(TagDropProgress {
+            deleted: ids.into_iter().map(Handle::from).collect(),
+            complete,
+        })
     }
 
     /// Delete many handles in one transaction (ISSUES.md F1 / I12).
@@ -566,8 +576,12 @@ impl Chisel {
     /// On error, partial progress remains visible in the current
     /// transaction: rollback or commit to decide whether the half-done
     /// batch should be kept.
-    pub fn delete_many(&mut self, handles: &[u64]) -> Result<()> {
-        self.txm.delete_many(handles)
+    pub fn delete_many(&mut self, handles: &[Handle]) -> Result<()> {
+        // Copy to a raw Vec; bulk delete is far below the fsync floor, so the
+        // allocation is immaterial. (The bench adapter does the zero-copy
+        // reinterpret where it matters; the engine API stays simple here.)
+        let raw: Vec<u64> = handles.iter().map(|h| h.get()).collect();
+        self.txm.delete_many(&raw)
     }
 
     /// Bind `name` to `handle` in the named-root table (ISSUES.md F2).
@@ -576,15 +590,15 @@ impl Chisel {
     /// active transaction; becomes durable on commit, reverts on
     /// rollback/rollback_to. See `TransactionManager::set_root_name` for
     /// validation rules and the fixed table-size limit.
-    pub fn set_root_name(&mut self, name: &str, handle: u64) -> Result<()> {
-        self.txm.set_root_name(name, handle)
+    pub fn set_root_name(&mut self, name: &str, handle: Handle) -> Result<()> {
+        self.txm.set_root_name(name, handle.get())
     }
 
     /// Look up a named root. Returns `Ok(None)` if the name is not bound.
     /// Reads see the transactional view (pending sets/clears are visible
     /// inside an active transaction). Takes `&self` (F3).
-    pub fn get_root_name(&self, name: &str) -> Result<Option<u64>> {
-        self.txm.get_root_name(name)
+    pub fn get_root_name(&self, name: &str) -> Result<Option<Handle>> {
+        Ok(self.txm.get_root_name(name)?.map(Handle::from))
     }
 
     /// Remove a named root. No-op if the name is not bound. Requires an
@@ -604,8 +618,8 @@ impl Chisel {
     /// The order itself is unspecified: it is not sorted, not insertion order,
     /// and may differ after a reopen or `defrag`, or across Chisel versions.
     /// Rely on within-session repeatability; do not rely on the order.
-    pub fn handles(&self) -> Result<Vec<u64>> {
-        self.txm.handles()
+    pub fn handles(&self) -> Result<Vec<Handle>> {
+        Ok(self.txm.handles()?.into_iter().map(Handle::from).collect())
     }
 
     /// Summary statistics derived by scanning the current handle table and

@@ -100,7 +100,9 @@ fn tagged_allocate_delete_churn_reaches_bounded_page_count() {
     // Establish one long-lived tagged member so the tag's inner tree never
     // fully drains (draining abandons the inner tree, a separate concern).
     db.begin().unwrap();
-    let keeper = db.allocate_tagged(b"keeper", 7).unwrap();
+    let keeper = db
+        .allocate_tagged(b"keeper", chisel::Tag::new(7).unwrap())
+        .unwrap();
     db.commit().unwrap();
 
     let pages_before = db.stats().unwrap().total_pages;
@@ -108,7 +110,9 @@ fn tagged_allocate_delete_churn_reaches_bounded_page_count() {
     const N: u64 = 1000;
     for _ in 0..N {
         db.begin().unwrap();
-        let h = db.allocate_tagged(b"ephemeral", 7).unwrap();
+        let h = db
+            .allocate_tagged(b"ephemeral", chisel::Tag::new(7).unwrap())
+            .unwrap();
         db.commit().unwrap();
 
         db.begin().unwrap();
@@ -131,8 +135,11 @@ fn tagged_allocate_delete_churn_reaches_bounded_page_count() {
     );
 
     // The long-lived member must still be tagged and enumerable.
-    assert_eq!(db.tag(keeper).unwrap(), 7);
-    assert_eq!(db.handles_with_tag(7).unwrap(), vec![keeper]);
+    assert_eq!(db.tag(keeper).unwrap().unwrap(), 7);
+    assert_eq!(
+        db.handles_with_tag(chisel::Tag::new(7).unwrap()).unwrap(),
+        vec![keeper]
+    );
 }
 
 // Reclamation reuses pages freed by *prior committed* transactions. This test
@@ -147,7 +154,7 @@ fn heavy_churn_with_reclamation_survives_reopen_file_backed() {
     let path = dir.path().join("churn.db");
 
     // model: handle -> (value, tag, client_byte)
-    let mut model: HashMap<u64, (Vec<u8>, u32, u8)> = HashMap::new();
+    let mut model: HashMap<chisel::Handle, (Vec<u8>, u32, u8)> = HashMap::new();
 
     {
         let mut db = Chisel::open(&path, Options::default()).unwrap();
@@ -160,7 +167,8 @@ fn heavy_churn_with_reclamation_survives_reopen_file_backed() {
             let h = if tag == 0 {
                 db.allocate(&val).unwrap()
             } else {
-                db.allocate_tagged(&val, tag).unwrap()
+                db.allocate_tagged(&val, chisel::Tag::new(tag).unwrap())
+                    .unwrap()
             };
             model.insert(h, (val, tag, 0));
         }
@@ -172,12 +180,12 @@ fn heavy_churn_with_reclamation_survives_reopen_file_backed() {
         // round R+1 — exactly the reuse path under test.
         for round in 0u64..60 {
             db.begin().unwrap();
-            let handles: Vec<u64> = model.keys().copied().collect();
+            let handles: Vec<chisel::Handle> = model.keys().copied().collect();
             for (idx, h) in handles.iter().enumerate() {
                 match (round as usize + idx) % 4 {
                     0 => {
                         // same-size update
-                        let new = vec![(round ^ *h) as u8; model[h].0.len()];
+                        let new = vec![(round ^ h.get()) as u8; model[h].0.len()];
                         db.update(*h, &new).unwrap();
                         model.get_mut(h).unwrap().0 = new;
                     }
@@ -198,13 +206,15 @@ fn heavy_churn_with_reclamation_survives_reopen_file_backed() {
                         if tag == 0 {
                             db.delete(*h).unwrap();
                         } else {
-                            db.delete_tagged(*h, tag).unwrap();
+                            db.delete_tagged(*h, chisel::Tag::new(tag).unwrap())
+                                .unwrap();
                         }
                         let val = vec![round as u8; 120];
                         let nh = if tag == 0 {
                             db.allocate(&val).unwrap()
                         } else {
-                            db.allocate_tagged(&val, tag).unwrap()
+                            db.allocate_tagged(&val, chisel::Tag::new(tag).unwrap())
+                                .unwrap()
                         };
                         model.insert(nh, (val, tag, 0));
                     }
@@ -218,8 +228,9 @@ fn heavy_churn_with_reclamation_survives_reopen_file_backed() {
 
     // Reopen from disk and verify the durable state matches the model exactly.
     let db = Chisel::open(&path, Options::default()).unwrap();
-    let live: std::collections::HashSet<u64> = db.handles().unwrap().into_iter().collect();
-    let expected: std::collections::HashSet<u64> = model.keys().copied().collect();
+    let live: std::collections::HashSet<chisel::Handle> =
+        db.handles().unwrap().into_iter().collect();
+    let expected: std::collections::HashSet<chisel::Handle> = model.keys().copied().collect();
     assert_eq!(live, expected, "live handle set must survive reopen");
 
     for (h, (val, tag, cb)) in &model {
@@ -228,7 +239,11 @@ fn heavy_churn_with_reclamation_survives_reopen_file_backed() {
             val,
             "value for handle {h} after reopen"
         );
-        assert_eq!(db.tag(*h).unwrap(), *tag, "tag for handle {h} after reopen");
+        assert_eq!(
+            db.tag(*h).unwrap().map_or(0, |t| t.get()),
+            *tag,
+            "tag for handle {h} after reopen"
+        );
         assert_eq!(
             db.client_byte(*h).unwrap(),
             *cb,
@@ -237,14 +252,14 @@ fn heavy_churn_with_reclamation_survives_reopen_file_backed() {
     }
 
     // Reverse index must agree with the forward tags after all the churn.
-    let mut expected_by_tag: HashMap<u32, Vec<u64>> = HashMap::new();
+    let mut expected_by_tag: HashMap<u32, Vec<chisel::Handle>> = HashMap::new();
     for (h, (_, tag, _)) in &model {
         if *tag != 0 {
             expected_by_tag.entry(*tag).or_default().push(*h);
         }
     }
     for (tag, mut handles) in expected_by_tag {
-        let mut got = db.handles_with_tag(tag).unwrap();
+        let mut got = db.handles_with_tag(chisel::Tag::new(tag).unwrap()).unwrap();
         got.sort_unstable();
         handles.sort_unstable();
         assert_eq!(got, handles, "handles_with_tag({tag}) after reopen");

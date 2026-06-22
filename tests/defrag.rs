@@ -133,7 +133,7 @@ fn test_defrag_stats_are_page_accurate_body(b: &Backing) {
     // 200-byte values pack ~39 per 8 KB page, so 100 values land
     // on ~3 data pages.
     db.begin().unwrap();
-    let handles: Vec<u64> = (0..100)
+    let handles: Vec<chisel::Handle> = (0..100)
         .map(|i| db.allocate(&[i as u8; 200]).unwrap())
         .collect();
     db.commit().unwrap();
@@ -175,15 +175,15 @@ dual_backing_test!(
     test_defrag_stats_are_page_accurate_body
 );
 
-fn test_defrag_respects_max_pages_body(b: &Backing) {
-    // `max_pages` caps how much work defrag does in one call so
+fn test_defrag_respects_max_values_body(b: &Backing) {
+    // `max_values` caps how much work defrag does in one call so
     // large databases can be incrementally compacted. With a cap of
     // 2, defrag should relocate at most 2 values.
     use chisel::DefragOptions;
     let mut db = open_chisel(b);
 
     db.begin().unwrap();
-    let handles: Vec<u64> = (0..50)
+    let handles: Vec<chisel::Handle> = (0..50)
         .map(|i| db.allocate(&[i as u8; 200]).unwrap())
         .collect();
     db.commit().unwrap();
@@ -196,13 +196,17 @@ fn test_defrag_respects_max_pages_body(b: &Backing) {
 
     db.begin().unwrap();
     let result = db
-        .defrag(DefragOptions::default().sparse_threshold(0.25).max_pages(2))
+        .defrag(
+            DefragOptions::default()
+                .sparse_threshold(0.25)
+                .max_values(2),
+        )
         .unwrap();
     db.commit().unwrap();
 
     assert!(
         result.values_moved <= 2,
-        "max_pages=2 should cap values_moved to 2, got {}",
+        "max_values=2 should cap values_moved to 2, got {}",
         result.values_moved
     );
     // Surviving data is still readable.
@@ -212,6 +216,6 @@ fn test_defrag_respects_max_pages_body(b: &Backing) {
 }
 
 dual_backing_test!(
-    test_defrag_respects_max_pages,
-    test_defrag_respects_max_pages_body
+    test_defrag_respects_max_values,
+    test_defrag_respects_max_values_body
 );

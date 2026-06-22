@@ -77,5 +77,5 @@ def test_defrag_inside_transaction_returns_stats(mem_db):
 
 def test_defrag_options_accepted(mem_db):
     with mem_db.transaction():
-        result = mem_db.defrag(chisel.DefragOptions(sparse_threshold=0.5, max_pages=10))
+        result = mem_db.defrag(chisel.DefragOptions(sparse_threshold=0.5, max_values=10))
     assert isinstance(result, chisel.DefragStats)

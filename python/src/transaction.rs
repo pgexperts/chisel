@@ -160,7 +160,7 @@ impl PyTransaction {
         self.db.bind(py).borrow().allocate_tagged(value, tag)
     }
 
-    fn tag(&self, py: Python<'_>, handle: u64) -> PyResult<u32> {
+    fn tag(&self, py: Python<'_>, handle: u64) -> PyResult<Option<u32>> {
         self.db.bind(py).borrow().tag(handle)
     }
 

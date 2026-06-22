@@ -56,7 +56,7 @@ use crate::data_page::DataPage;
 use crate::error::{ChiselError, Result};
 use crate::freemap::FreeMap;
 use crate::handle_table::{HandleEntry, HandleFlags, HandleTable};
-use crate::membership_index::{MembershipIndex, RadixU64, TagDropProgress};
+use crate::membership_index::{MembershipIndex, RadixU64};
 use crate::overflow::Overflow;
 use crate::page::{self, PAGE_ID_NONE, PAGE_SIZE};
 use crate::page_cache::PageCache;
@@ -2084,21 +2084,18 @@ impl TransactionManager {
     /// pass set is not reported. Each `delete_inner` is atomic (BUG#2 staging),
     /// so the surviving in-transaction state is consistent (rollback or commit
     /// are both safe); only the progress *reporting* is lost on error.
-    pub fn delete_with_tag(&mut self, tag: u32, max: usize) -> Result<TagDropProgress> {
+    pub fn delete_with_tag(&mut self, tag: u32, max: usize) -> Result<(Vec<u64>, bool)> {
         self.check_alive()?;
         let result = self.delete_with_tag_inner(tag, max);
         self.poison_on_fatal(result)
     }
 
-    fn delete_with_tag_inner(&mut self, tag: u32, max: usize) -> Result<TagDropProgress> {
+    fn delete_with_tag_inner(&mut self, tag: u32, max: usize) -> Result<(Vec<u64>, bool)> {
         if !self.active_txn {
             return Err(ChiselError::NoActiveTransaction);
         }
         if max == 0 {
-            return Ok(TagDropProgress {
-                deleted: Vec::new(),
-                complete: false,
-            });
+            return Ok((Vec::new(), false));
         }
         // Bounded enumeration: ask for max+1 so the count tells us whether more
         // remain (len > max => not complete). saturating_add keeps the absurd
@@ -2128,10 +2125,7 @@ impl TransactionManager {
         for &h in &take {
             self.delete_inner(h)?;
         }
-        Ok(TagDropProgress {
-            deleted: take,
-            complete,
-        })
+        Ok((take, complete))
     }
 
     /// Delete many handles in a single transaction.
@@ -3532,8 +3526,8 @@ mod tests {
 
         // ...and the bounded loop finishes cleanly on a disarmed retry.
         tm.begin().unwrap();
-        let progress = tm.delete_with_tag(5, 3).unwrap();
-        assert!(progress.complete, "retry must drain the tag");
+        let (_, complete) = tm.delete_with_tag(5, 3).unwrap();
+        assert!(complete, "retry must drain the tag");
         tm.commit().unwrap();
         assert!(tm.handles_with_tag(5).unwrap().is_empty());
         assert_no_reachable_page_is_free(&tm);
@@ -4061,12 +4055,12 @@ mod tests {
         }
         tm.commit().unwrap();
         tm.begin().unwrap();
-        let p1 = tm.delete_with_tag(3, 4).unwrap();
-        assert_eq!(p1.deleted.len(), 4);
-        assert!(!p1.complete);
-        let p2 = tm.delete_with_tag(3, 100).unwrap();
-        assert_eq!(p2.deleted.len(), 6);
-        assert!(p2.complete);
+        let (d1, c1) = tm.delete_with_tag(3, 4).unwrap();
+        assert_eq!(d1.len(), 4);
+        assert!(!c1);
+        let (d2, c2) = tm.delete_with_tag(3, 100).unwrap();
+        assert_eq!(d2.len(), 6);
+        assert!(c2);
         tm.commit().unwrap();
         assert_eq!(tm.handles_with_tag(3).unwrap(), Vec::<u64>::new());
         // The chunks themselves are gone too.
@@ -4089,10 +4083,10 @@ mod tests {
         }
         tm.commit().unwrap();
         tm.begin().unwrap();
-        let p = tm.delete_with_tag(8, 5).unwrap();
-        assert_eq!(p.deleted.len(), 5);
+        let (deleted, complete) = tm.delete_with_tag(8, 5).unwrap();
+        assert_eq!(deleted.len(), 5);
         assert!(
-            p.complete,
+            complete,
             "deleting exactly all members in one max-sized pass must report complete"
         );
         tm.commit().unwrap();

@@ -49,6 +49,16 @@ use chisel::Chisel;
 
 use crate::errors::to_py_err;
 
+/// Convert a Python-supplied `u32` tag into a non-zero `chisel::Tag`, raising
+/// Python `ValueError` on `0`. Tag `0` is no longer a valid value — "untagged"
+/// is expressed by calling `allocate` (not `allocate_tagged`), and `tag()`
+/// returns `None` for an untagged handle (ISSUES.md I126). Handles cross the
+/// boundary as plain `u64` (Python `int`); only tags carry this validation.
+fn require_tag(tag: u32) -> PyResult<chisel::Tag> {
+    chisel::Tag::new(tag)
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("tag must be non-zero"))
+}
+
 #[pyclass(name = "Chisel", module = "chisel._chisel")]
 pub struct PyChisel {
     // Option<> so close() can take the inner engine and drop it
@@ -288,7 +298,7 @@ impl PyChisel {
 
     pub(crate) fn allocate(&self, value: &Bound<'_, PyAny>) -> PyResult<u64> {
         let bytes = crate::convert::coerce_value(value)?;
-        self.with_inner_mut_io(|c| c.allocate(&bytes))
+        self.with_inner_mut_io(|c| c.allocate(&bytes).map(|h| h.get()))
     }
 
     pub(crate) fn read<'py>(
@@ -296,63 +306,82 @@ impl PyChisel {
         py: Python<'py>,
         handle: u64,
     ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        let data = self.with_inner_io(|c| c.read(handle))?;
+        let data = self.with_inner_io(|c| c.read(chisel::Handle::from(handle)))?;
         Ok(pyo3::types::PyBytes::new(py, &data))
     }
 
     pub(crate) fn update(&self, handle: u64, value: &Bound<'_, PyAny>) -> PyResult<()> {
         let bytes = crate::convert::coerce_value(value)?;
-        self.with_inner_mut_io(|c| c.update(handle, &bytes))
+        self.with_inner_mut_io(|c| c.update(chisel::Handle::from(handle), &bytes))
     }
 
     pub(crate) fn delete(&self, handle: u64) -> PyResult<()> {
-        self.with_inner_mut_io(|c| c.delete(handle))
+        self.with_inner_mut_io(|c| c.delete(chisel::Handle::from(handle)))
     }
 
     pub(crate) fn delete_many(&self, handles: Vec<u64>) -> PyResult<()> {
-        self.with_inner_mut_io(|c| c.delete_many(&handles))
+        let hs: Vec<chisel::Handle> = handles.into_iter().map(chisel::Handle::from).collect();
+        self.with_inner_mut_io(|c| c.delete_many(&hs))
     }
 
     fn handles(&self) -> PyResult<Vec<u64>> {
-        self.with_inner_io(|c| c.handles())
+        self.with_inner_io(|c| {
+            c.handles()
+                .map(|v| v.into_iter().map(|h| h.get()).collect())
+        })
     }
 
     pub(crate) fn allocate_tagged(&self, value: &Bound<'_, PyAny>, tag: u32) -> PyResult<u64> {
+        let tag = require_tag(tag)?;
         let bytes = crate::convert::coerce_value(value)?;
-        self.with_inner_mut_io(|c| c.allocate_tagged(&bytes, tag))
+        self.with_inner_mut_io(|c| c.allocate_tagged(&bytes, tag).map(|h| h.get()))
     }
 
-    pub(crate) fn tag(&self, handle: u64) -> PyResult<u32> {
-        self.with_inner_io(|c| c.tag(handle))
+    /// Returns the tag as a Python `int`, or `None` for an untagged handle
+    /// (I126: the old sentinel `0` is gone).
+    pub(crate) fn tag(&self, handle: u64) -> PyResult<Option<u32>> {
+        self.with_inner_io(|c| {
+            c.tag(chisel::Handle::from(handle))
+                .map(|o| o.map(|t| t.get()))
+        })
     }
 
     pub(crate) fn handles_with_tag(&self, tag: u32) -> PyResult<Vec<u64>> {
-        self.with_inner_io(|c| c.handles_with_tag(tag))
+        let tag = require_tag(tag)?;
+        self.with_inner_io(|c| {
+            c.handles_with_tag(tag)
+                .map(|v| v.into_iter().map(|h| h.get()).collect())
+        })
     }
 
     pub(crate) fn client_byte(&self, handle: u64) -> PyResult<u8> {
-        self.with_inner_io(|c| c.client_byte(handle))
+        self.with_inner_io(|c| c.client_byte(chisel::Handle::from(handle)))
     }
 
     pub(crate) fn set_client_byte(&self, handle: u64, byte: u8) -> PyResult<()> {
-        self.with_inner_mut_io(|c| c.set_client_byte(handle, byte))
+        self.with_inner_mut_io(|c| c.set_client_byte(chisel::Handle::from(handle), byte))
     }
 
     pub(crate) fn delete_tagged(&self, handle: u64, tag: u32) -> PyResult<()> {
-        self.with_inner_mut_io(|c| c.delete_tagged(handle, tag))
+        let tag = require_tag(tag)?;
+        self.with_inner_mut_io(|c| c.delete_tagged(chisel::Handle::from(handle), tag))
     }
 
     /// Returns (deleted: list[int], complete: bool).
     pub(crate) fn delete_with_tag(&self, tag: u32, max: usize) -> PyResult<(Vec<u64>, bool)> {
-        self.with_inner_mut_io(|c| c.delete_with_tag(tag, max).map(|p| (p.deleted, p.complete)))
+        let tag = require_tag(tag)?;
+        self.with_inner_mut_io(|c| {
+            c.delete_with_tag(tag, max)
+                .map(|p| (p.deleted.into_iter().map(|h| h.get()).collect(), p.complete))
+        })
     }
 
     pub(crate) fn set_root_name(&self, name: &str, handle: u64) -> PyResult<()> {
-        self.with_inner_mut_io(|c| c.set_root_name(name, handle))
+        self.with_inner_mut_io(|c| c.set_root_name(name, chisel::Handle::from(handle)))
     }
 
     pub(crate) fn get_root_name(&self, name: &str) -> PyResult<Option<u64>> {
-        self.with_inner_io(|c| c.get_root_name(name))
+        self.with_inner_io(|c| c.get_root_name(name).map(|o| o.map(|h| h.get())))
     }
 
     pub(crate) fn clear_root_name(&self, name: &str) -> PyResult<()> {
@@ -410,12 +439,12 @@ impl PyChisel {
             None => chisel::DefragOptions::default(),
             Some(obj) => {
                 let sparse_threshold: f64 = obj.getattr("sparse_threshold")?.extract()?;
-                let max_pages: usize = obj.getattr("max_pages")?.extract()?;
+                let max_values: usize = obj.getattr("max_values")?.extract()?;
                 // I36: DefragOptions is #[non_exhaustive]; build via the
                 // chained-setter builder.
                 chisel::DefragOptions::default()
                     .sparse_threshold(sparse_threshold)
-                    .max_pages(max_pages)
+                    .max_values(max_values)
             }
         };
 

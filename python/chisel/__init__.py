@@ -1,3 +1,12 @@
+"""Python bindings for the Chisel transactional storage engine.
+
+Handles and tags are plain integers. Tags are integers >= 1: ``0`` is not a
+valid tag — create an untagged value with ``allocate`` (not ``allocate_tagged``),
+and ``tag()`` returns ``None`` for an untagged handle. Passing ``tag=0`` to a
+tagged operation (``allocate_tagged``, ``delete_tagged``, ``handles_with_tag``,
+``delete_with_tag``) raises ``ValueError``.
+"""
+
 from dataclasses import dataclass
 from typing import Optional
 
@@ -97,13 +106,12 @@ class DefragOptions:
 
     sparse_threshold: fraction in [0, 1]. A data page is considered sparse
         when live-slot-count <= threshold * max_observed. Default 0.25.
-    max_pages: cap on VALUES relocated in one pass; 0 means no limit.
-        The name is a legacy carry-over from an earlier defrag design
-        that counted pages; the current implementation caps value moves,
-        which is the useful knob for bounding pass cost. Default 0.
+    max_values: cap on VALUES relocated in one pass; 0 means no limit.
+        The current implementation caps value moves, which is the useful
+        knob for bounding pass cost. Default 0.
     """
     sparse_threshold: float = 0.25
-    max_pages: int = 0
+    max_values: int = 0
 
 
 @dataclass(frozen=True)

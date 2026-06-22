@@ -521,24 +521,6 @@ fn unpack_inner(packed: u64) -> (u64, u32) {
     (packed & INNER_ROOT_MASK, (packed >> INNER_ROOT_BITS) as u32)
 }
 
-/// Progress report from a bounded `delete_with_tag` pass. Produced ONLY on the
-/// success path: a mid-pass error returns `Err` and no `TagDropProgress`, so
-/// the handles dropped before the failure are not reported (the per-delete
-/// state stays consistent — see `Chisel::delete_with_tag` — only the reporting
-/// is lost).
-// I121 (ISSUES.md, 2026-06-21): #[must_use] so a caller cannot drop the
-// progress report — `complete` is the field a resumable drop must loop on.
-#[must_use = "TagDropProgress.complete tells you whether the tag drop finished; loop on it or bind with `let _`"]
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct TagDropProgress {
-    /// Handles removed from the index in this pass (the engine deletes their
-    /// chunks). May be fewer than `max` if the tag emptied first.
-    pub deleted: Vec<u64>,
-    /// `true` if the tag has no remaining members after this pass.
-    pub complete: bool,
-}
-
 /// Two-level membership index: tag -> {handles}. Owns the outer tree's depth;
 /// inner depths ride the outer values via `pack_inner`. The caller (transaction
 /// layer) owns the outer root and threads it through `Roots`/superblock.

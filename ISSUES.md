@@ -33,7 +33,7 @@ Priority legend:
 >
 > **Status note (2026-06-21):** the `deepdive-rust` fresh-eyes pass (output at `docs/reviews/review-20260621-185541.md`, run after PRs #34–#50 and the per-page format-versioning feature landed) adds **I104–I140** in a new "Deepdive review findings (2026-06-21)" section below. The *entire* prior executive summary (2026-06-16) is resolved with no regressions, so the new cluster is fresh — concentrated in error-classification defaults, one CI lint hole, the radix test gap, and doc drift introduced by the #46 dead-code sweep. No new P0 / data-loss bugs were found. Highest leverage first: **I108** (the 1,300-line PyO3 binding escapes the gating `cargo clippy` because `default-members` excludes it — a real CI hole that ships clippy regressions silently) and **I111** (the radix key-math — the engine's most off-by-one-prone code — has no property tests, and its one "two-level" test only reaches depth 1). Then the cheap zero-risk cluster: **I104** (`is_fatal` exhaustiveness test, NOT a default flip — see the review's countercase), **I127** (the `live_slots` SipHash maps the I77 FxHashMap pass missed), and the doc-drift fixes **I128 / I130 / I131 / I132 / I133**. Carried-not-regressed: F2 (`read`→`to_vec`) and the `delete_with_tag` partial-progress drop (re-filed as **I107**) remain open by design. The ADR-to-repo question (**I129**) is a maintainer process call. Three 2026-05-22 fixes have narrow follow-ups here (I46→I117, I63→I131, I71→I111) — the original fix was correct but didn't cover the site this re-review found.
 >
-> **Status note (2026-06-21 — lower-priority backlog progress + handoff):** after the higher-leverage cluster shipped (PRs #51–#55), the remaining lower-priority items were worked in themed PRs. **DONE (PRs #56–#59):** I109, I110 (*resolved-not-viable* — `--tests` pulls `getrandom`/edition2024 above MSRV; msrv stays lib-only), I116, I117, I119, I121, I123, I134, I136, I137. Several review premises were **corrected** while fixing: I116 "four unguarded sites" → three already-guarded (the real fix is *saturation*; `set_cache_max_bytes` doesn't decrement); I134 "three copies" → five. **STILL OPEN (paused here by maintainer decision — resume in a fresh focused session):** the two large features come FIRST on resume — **I120 + I126 + I122** (the full Handle/Tag newtype reshape across the Rust + Python surface; maintainer chose the full reshape) and **I112** (the `FaultyFile` fault-injection layer, which *subsumes* I114 + I115 — drive a real I/O fault into poison + the IoError/CorruptSuperblock paths). Then the moderate/cosmetic P3s: **I106** (`CorruptSuperblock` cause field — design ready: `deserialize -> Result<_, SuperblockDefect>` + a `diagnose` helper + `CorruptSuperblock { defects }`, ~6 files incl. the I104 exhaustiveness test), **I107** (`delete_with_tag` runs in the caller's txn, so document "roll back on error" — no partial-progress to attach), **I113** (tighten weak assertions), **I124** (`# Errors`/`# Panics` rustdoc — do AFTER the I120 reshape so it documents final signatures), **I125** (`lookup_live` unification — note it CHANGES `tag()`/`delete_tagged()` to reject tombstones, a behaviour change to confirm), **I139** (Python typed-exception contract tests), **I118** (plumb the freemap-aware `alloc` into membership `create_root`).
+> **Status note (2026-06-21 — lower-priority backlog progress + handoff):** after the higher-leverage cluster shipped (PRs #51–#55), the remaining lower-priority items were worked in themed PRs. **DONE (PRs #56–#59):** I109, I110 (*resolved-not-viable* — `--tests` pulls `getrandom`/edition2024 above MSRV; msrv stays lib-only), I116, I117, I119, I121, I123, I134, I136, I137. Several review premises were **corrected** while fixing: I116 "four unguarded sites" → three already-guarded (the real fix is *saturation*; `set_cache_max_bytes` doesn't decrement); I134 "three copies" → five. **STILL OPEN (paused here by maintainer decision — resume in a fresh focused session):** **I120 + I126 + I122** (the full Handle/Tag newtype reshape across the Rust + Python surface) ✅ LANDED 2026-06-21 — see each entry below for the resolution. Next on resume: **I112** (the `FaultyFile` fault-injection layer, which *subsumes* I114 + I115 — drive a real I/O fault into poison + the IoError/CorruptSuperblock paths). Then the moderate/cosmetic P3s: **I106** (`CorruptSuperblock` cause field — design ready: `deserialize -> Result<_, SuperblockDefect>` + a `diagnose` helper + `CorruptSuperblock { defects }`, ~6 files incl. the I104 exhaustiveness test), **I107** (`delete_with_tag` runs in the caller's txn, so document "roll back on error" — no partial-progress to attach), **I113** (tighten weak assertions), **I124** (`# Errors`/`# Panics` rustdoc — do AFTER the I120 reshape so it documents final signatures), **I125** (`lookup_live` unification — note it CHANGES `tag()`/`delete_tagged()` to reject tombstones, a behaviour change to confirm), **I139** (Python typed-exception contract tests), **I118** (plumb the freemap-aware `alloc` into membership `create_root`).
 
 Dependencies and batching drove this more than raw priority. Earlier items unblocked later ones.
 
@@ -1480,12 +1480,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 ### API design
 
-#### I120. Handles are raw `u64` and tags raw `u32` across the whole public surface [deepdive 2026-06-21] — **P2**
+#### I120. Handles are raw `u64` and tags raw `u32` across the whole public surface [deepdive 2026-06-21] — **P2** ✅ FIXED 2026-06-21
 **Where:** `src/lib.rs` (`allocate -> u64`; `read`/`update`/`delete`/`tag`/`handle_live_page_id` take `u64`; `delete_tagged(handle, tag)` takes two integers)
 
 **Problem:** a crate that is `#[non_exhaustive]`-everything and careful about API stability leaves its most-used values primitive-obsessed; `delete_tagged`'s two integer args can be transposed with no compiler error. (Related: `handles()` / `handles_with_tag()` return eager `Vec<u64>` with a three-paragraph prose contract — the streaming variant is already tracked as I97/I100; the newtype is the orthogonal half.)
 
 **Direction of fix:** opaque `Handle(u64)` / `Tag(u32)` newtypes with `From`/`Into` — makes `delete_tagged` un-transposable and distinguishes `handles()` from `handles_with_tag()` return types.
+
+**Fixed (2026-06-21):** `Handle(u64)` (`#[repr(transparent)]`) and `Tag(NonZeroU32)` newtypes in a new `src/handle.rs`, re-exported from the crate root. The full reshape (maintainer's choice) flips every `Chisel` method in `lib.rs` to take/return `Handle`/`Tag`; the engine (`transaction.rs`, `handle_table.rs`, `membership_index.rs`) stays raw `u64`/`u32` (radix math + on-disk layout are structural). `delete_tagged(Handle, Tag)` is now un-transposable. Per the I120 decision, the newtypes carry `PartialEq` against their raw primitive + `Display` for ergonomics (most call sites compile untouched). PyO3 binding converts at the edge; Python handles/tags stay plain `int`. Design: `docs/specs/2026-06-21-handle-tag-newtype-reshape-design.md`; plan: `docs/plans/2026-06-21-handle-tag-newtype-reshape.md`.
 
 #### I121. `DefragStats` and `TagDropProgress` are outcome reports but not `#[must_use]` [deepdive 2026-06-21] — **P3** ✅ FIXED 2026-06-21
 **Where:** `src/defrag.rs:111` (`DefragStats`); `src/membership_index.rs:538` (`TagDropProgress`)
@@ -1496,12 +1498,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 **Fixed (2026-06-21):** `#[must_use = "…"]` on both struct defs. It immediately earned its keep — clippy `--all-targets` flagged one genuine discard (`tests/defrag.rs:81` `db.defrag(..).unwrap();`), now `let _ = …` since that test only checks post-defrag readback.
 
-#### I122. `DefragOptions::max_pages` counts values relocated, not pages [deepdive 2026-06-21] — **P3**
+#### I122. `DefragOptions::max_pages` counts values relocated, not pages [deepdive 2026-06-21] — **P3** ✅ FIXED 2026-06-21
 **Where:** `src/defrag.rs:64-70` (the "DESPITE THE NAME…" comment)
 
 **Problem:** preserving a misleading public field/setter name "for stability" on a pre-1.0, `#[non_exhaustive]`, no-production-users crate is the wrong trade — the C4 doc-sweep and the Python `__init__.py` note both already paper over the mismatch instead of fixing it.
 
 **Direction of fix:** rename to `max_values` now (and the Python `DefragOptions.max_pages` mirror), while there are no users to break.
+
+**Fixed (2026-06-21):** renamed the field, builder method, `Default`, the single consumer in `defrag.rs`, and the Python mirror (`__init__.py` dataclass + docstring, `.pyi`, the duck-typed `getattr` in `python/src/db.rs`). The "DESPITE THE NAME" comment is gone — the name is now honest. Clean break (pre-1.0, `#[non_exhaustive]`, no production users). Landed first as its own commit, independent of the newtype reshape.
 
 #### I123. `page_count` / `file_page_count` keep `&mut self` "for API stability" on a pure `Cell` read [deepdive 2026-06-21] — **P3** ✅ FIXED 2026-06-21
 **Where:** `src/page_io.rs:330,594`
@@ -1528,12 +1532,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 **Direction of fix:** one `lookup_live(handle) -> Result<HandleEntry>` applying the Deleted ⇒ `InvalidHandle` rule once, used by all four sites.
 
-#### I126. Tag/client-byte `0` is overloaded as the "untagged"/"unset" sentinel [deepdive 2026-06-21] — **P3**
+#### I126. Tag/client-byte `0` is overloaded as the "untagged"/"unset" sentinel [deepdive 2026-06-21] — **P3** ✅ FIXED 2026-06-21 (tag half)
 **Where:** `src/lib.rs` tag surface; threaded through the membership layer
 
 **Problem:** `0` doubles as a valid value and the "no tag" sentinel for both tag (`u32`) and client byte (`u8`); `allocate_tagged(value, tag: u32)` can be called with the sentinel by mistake and "membership index not updated for tag 0" is an implicit rule.
 
 **Direction of fix:** `Option<NonZeroU32>` at the tag API boundary — "no tag" becomes expressible in the type (composes with the I120 newtype).
+
+**Fixed (2026-06-21):** `Tag(NonZeroU32)` — `Tag(0)` is unconstructable, so "untagged" can only be expressed by calling `allocate` (not `allocate_tagged`). `tag()` returns `Option<Tag>` (stored `0 → None`). Python: `tag()` returns `int | None`; passing `tag=0` to a tagged op raises `ValueError` at the binding edge (`require_tag` helper). The on-disk/engine representation is unchanged (`u32` with `0`=untagged; the two `if tag != 0` membership guards stay). **Client-byte half NOT changed** — `0` there is a genuine default, not a functional sentinel (no membership coupling), so it stays a plain `u8`; this entry's resolution covers only the tag half, which was the stated direction of fix.
 
 ### Performance
 
