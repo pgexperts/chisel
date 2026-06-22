@@ -1525,12 +1525,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 ### Type system
 
-#### I125. Three different deleted-handle semantics for the same "look up a live handle" [deepdive 2026-06-21] — **P2**
+#### I125. Three different deleted-handle semantics for the same "look up a live handle" [deepdive 2026-06-21] — **P2** ✅ FIXED 2026-06-21
 **Where:** `src/transaction.rs:1563-1602` (`read`, `client_byte`, `tag`); `:2014` (`delete_tagged`)
 
 **Problem:** `read()` and `client_byte()` reject a tombstone with `InvalidHandle`; `tag()` reads through it; `delete_tagged()` reads `.tag` off the looked-up entry with no Deleted guard. The "a handle is live" invariant lives in scattered per-method guards, so a fourth caller can easily get it wrong.
 
 **Direction of fix:** one `lookup_live(handle) -> Result<HandleEntry>` applying the Deleted ⇒ `InvalidHandle` rule once, used by all four sites.
+
+**Fixed (2026-06-21):** the deepdive premise was already **stale** — every site (`read`, `tag`, `client_byte`, `set_client_byte`, `update`, `delete_tagged`) funnels through `handle_table::lookup`, which collapses `Deleted → None`, then does `.ok_or(InvalidHandle)`, so the *behavior* was already uniform (no semantic change). What remained was the duplication the issue warns about: the `lookup(...)?.ok_or(InvalidHandle(handle))?` incantation was copy-pasted six times, plus two now-**dead** post-lookup guards (`client_byte_inner`'s `match Deleted` arm and `set_client_byte_inner`'s `if matches!(Deleted)` could never fire). Introduced `TransactionManager::lookup_live(&self, handle) -> Result<HandleEntry>` (read-view root selection + the single `ok_or(InvalidHandle)`), routed all six sites through it, and deleted both dead guards. `read_inner` keeps a Live/Overflow dispatch `match` whose `Deleted` arm is now a documented non-panicking backstop (exhaustiveness only). `handle_live_page_id` deliberately stays on its own Option-returning lookup (absent ≠ error). Pinned by a new `tests/tag_ops.rs::deleted_handle_is_invalid_across_all_entry_points` characterization test (green before and after — confirms the refactor preserved behavior); full Rust + Python suites + clippy `--workspace --all-targets` green.
 
 #### I126. Tag/client-byte `0` is overloaded as the "untagged"/"unset" sentinel [deepdive 2026-06-21] — **P3** ✅ FIXED 2026-06-21 (tag half)
 **Where:** `src/lib.rs` tag surface; threaded through the membership layer
