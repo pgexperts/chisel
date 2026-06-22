@@ -148,6 +148,17 @@ pub enum ChiselError {
     InvalidPageId {
         page_id: u64,
     },
+    // Raised at open time when the superblock's `page_size` field does not
+    // match the `PAGE_SIZE` compiled into this binary. A mismatch means
+    // the file was written with a different page geometry and every page
+    // boundary calculation would be wrong; the open is refused before any
+    // data is read. Distinct from `UnsupportedFormatVersion` (which guards
+    // the format-version field) so operators can distinguish a compile-
+    // configuration mismatch from an actual version incompatibility.
+    UnsupportedPageSize {
+        stored: u32,
+        compiled: u32,
+    },
 }
 
 impl ChiselError {
@@ -178,6 +189,7 @@ impl ChiselError {
                 | ChiselError::UnsupportedFormatVersion { .. }
                 | ChiselError::CorruptPage { .. }
                 | ChiselError::InvalidPageId { .. }
+                | ChiselError::UnsupportedPageSize { .. }
         )
     }
 }
@@ -263,6 +275,10 @@ impl fmt::Display for ChiselError {
             ChiselError::InvalidPageId { page_id } => {
                 write!(f, "invalid page id {page_id} (out of range for file)")
             }
+            ChiselError::UnsupportedPageSize { stored, compiled } => write!(
+                f,
+                "page size mismatch: file was written with {stored}-byte pages, this build uses {compiled}-byte pages"
+            ),
         }
     }
 }
@@ -475,7 +491,8 @@ mod tests {
                 | ChiselError::LockFailed
                 | ChiselError::UnsupportedFormatVersion { .. }
                 | ChiselError::CorruptPage { .. }
-                | ChiselError::InvalidPageId { .. } => true,
+                | ChiselError::InvalidPageId { .. }
+                | ChiselError::UnsupportedPageSize { .. } => true,
             }
         }
 
@@ -516,6 +533,10 @@ mod tests {
             },
             ChiselError::CorruptPage { page_id: 0 },
             ChiselError::InvalidPageId { page_id: 0 },
+            ChiselError::UnsupportedPageSize {
+                stored: 0,
+                compiled: 0,
+            },
         ];
         for e in &all {
             assert_eq!(
@@ -524,9 +545,9 @@ mod tests {
                 "is_fatal() disagrees with the documented Fatal/Operational block for {e:?}"
             );
         }
-        // Tripwire: exactly 8 variants are fatal today. If this count moves, the
+        // Tripwire: exactly 9 variants are fatal today. If this count moves, the
         // Fatal/Operational split changed — confirm that was intentional (it is a
         // breaking change for callers doing error-class matching, per the header).
-        assert_eq!(all.iter().filter(|e| e.is_fatal()).count(), 8);
+        assert_eq!(all.iter().filter(|e| e.is_fatal()).count(), 9);
     }
 }
