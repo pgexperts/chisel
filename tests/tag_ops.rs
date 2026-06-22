@@ -218,9 +218,14 @@ fn old_database_opens_with_all_untagged() {
         let db = Chisel::open(&path, Default::default()).unwrap();
         // I126: an untagged handle now reports `None`, not the old sentinel 0.
         // Tag 0 is no longer expressible (`Tag(0)` is unconstructable), so the
-        // old `handles_with_tag(0)` empty-index check is removed — "untagged"
-        // is fully captured by `tag(h) == None`.
+        // old `handles_with_tag(0)` empty-index check can't be written verbatim;
+        // the "empty membership index" coverage is preserved by querying an
+        // arbitrary real tag, which must have no members in a legacy database.
         assert_eq!(db.tag(h).unwrap(), None);
+        assert_eq!(
+            db.handles_with_tag(Tag::new(1).unwrap()).unwrap(),
+            Vec::<Handle>::new()
+        );
         db.close().unwrap();
     }
 }
