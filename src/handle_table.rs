@@ -663,15 +663,26 @@ impl HandleTable {
         // an out-of-bounds slice for very large handles. `insert`
         // pre-grows via `while handle >= capacity { grow() }` so it
         // cannot hit this path — only the lookup side (read / update /
-        // delete) needs the guard. At depth 0 `handle % ENTRIES_PER_LEAF`
-        // is already total, so the check is only needed when we actually
-        // descend.
+        // delete) needs the guard.
+        //
+        // The guard MUST run at depth 0 too: there `capacity() ==
+        // ENTRIES_PER_LEAF`, and the depth-0 early return below maps the
+        // handle with `handle % ENTRIES_PER_LEAF`. Without the guard an
+        // out-of-range handle (>= ENTRIES_PER_LEAF) would WRAP onto an
+        // occupied slot and `find_leaf` would return another handle's entry
+        // — a confidentiality/correctness break, not merely "absent". Fixed
+        // 2026-06-22: the prior `self.depth > 0` qualifier skipped the guard
+        // at depth 0, so e.g. `read(Handle::from(516))` returned handle 6's
+        // value on a 100-handle (depth-0) tree. `delete`/`RadixU64::delete`
+        // already guarded depth 0; only the read/find_leaf path was missing it.
+        //
         // When capacity() SATURATED to u64::MAX (depth 6, real capacity exceeds
-        // u64::MAX), every u64 handle is in reach, so skip the guard — otherwise
-        // the single handle u64::MAX would be wrongly reported absent. The
-        // child_idx bound during descent still protects against a corrupt depth.
+        // u64::MAX), every u64 handle is in reach, so the `cap != u64::MAX`
+        // clause skips the guard — otherwise the single handle u64::MAX would be
+        // wrongly reported absent. The child_idx bound during descent still
+        // protects against a corrupt depth.
         let cap = self.capacity();
-        if self.depth > 0 && cap != u64::MAX && handle >= cap {
+        if cap != u64::MAX && handle >= cap {
             return Ok(None);
         }
 
@@ -1199,6 +1210,47 @@ mod tests {
             ht.lookup(&mut cache, root2, u64::MAX).unwrap(),
             None,
             "u64::MAX handle must not panic nor read past the page"
+        );
+    }
+
+    // Regression (review 2026-06-22): the capacity guard in `find_leaf` was
+    // gated on `self.depth > 0`, so at depth 0 an out-of-range handle WRAPPED
+    // via `handle % ENTRIES_PER_LEAF` onto an occupied slot and `find_leaf`
+    // returned another handle's entry — a confidentiality/correctness break.
+    // `lookup_handle_beyond_capacity_returns_none` above only covers depth >= 1
+    // (it grows the tree first), so it never exercised the depth-0 leaf. Here
+    // the tree stays at depth 0.
+    #[test]
+    fn lookup_out_of_range_handle_at_depth_0_returns_none() {
+        let mut cache = make_cache();
+        let mut ht = HandleTable::new();
+        let root = ht.create_root(&mut cache).unwrap();
+
+        let entry = HandleEntry {
+            page_id: 42,
+            slot_index: 7,
+            flags: HandleFlags::Live,
+            tag: 0,
+            client_byte: 0,
+        };
+        // A single insert at handle 6 keeps the tree at depth 0.
+        let root = ht.insert_t(&mut cache, root, 6, &entry).unwrap();
+        assert_eq!(ht.depth(), 0, "single insert must not grow the tree");
+
+        // The in-range handle resolves to its entry...
+        assert_eq!(
+            ht.lookup(&mut cache, root, 6).unwrap(),
+            Some(entry),
+            "in-range handle must resolve to its entry"
+        );
+        // ...but `6 + ENTRIES_PER_LEAF` aliases slot 6 via the depth-0 modulo.
+        // It is out of range (capacity at depth 0 is ENTRIES_PER_LEAF) and MUST
+        // read as absent, NOT alias handle 6's entry.
+        let aliasing = 6 + ENTRIES_PER_LEAF as u64;
+        assert_eq!(
+            ht.lookup(&mut cache, root, aliasing).unwrap(),
+            None,
+            "out-of-range handle at depth 0 must be absent, not alias an occupied slot"
         );
     }
 

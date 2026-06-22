@@ -185,6 +185,41 @@ dual_backing_test!(
     test_read_invalid_handle_on_empty_db_errors_body
 );
 
+// Regression (review 2026-06-22): an out-of-range handle aliased onto a live
+// slot at handle-table depth 0, so `read` returned another handle's value
+// instead of InvalidHandle. With < ENTRIES_PER_LEAF (510) live handles the tree
+// stays at depth 0, where `handle % 510` mapped any handle onto a slot. Because
+// `(h + 510) % 510 == h % 510`, fabricating `h + 510` aliased h's own slot.
+// `Handle::from` is public, so a caller can construct the out-of-range handle.
+fn test_read_out_of_range_handle_does_not_alias_body(b: &Backing) {
+    let mut db = open_chisel(b);
+    db.begin().unwrap();
+    let mut handles = Vec::new();
+    for i in 0..100u64 {
+        handles.push(db.allocate(format!("value-{i}").as_bytes()).unwrap());
+    }
+    db.commit().unwrap();
+
+    // Fabricate a handle 510 (ENTRIES_PER_LEAF) past a live one — out of range
+    // for a depth-0 tree, and aliasing the live handle's own slot via the modulo.
+    let live = handles[5];
+    let aliasing = chisel::Handle::from(u64::from(live) + 510);
+    let err = db.read(aliasing).unwrap_err();
+    assert!(
+        matches!(err, ChiselError::InvalidHandle(_)),
+        "out-of-range handle must be InvalidHandle, got {err:?}"
+    );
+    // The live handle still resolves to its own value (the fix did not break
+    // in-range lookups).
+    assert_eq!(db.read(live).unwrap(), b"value-5");
+    assert!(!db.is_poisoned());
+}
+
+dual_backing_test!(
+    test_read_out_of_range_handle_does_not_alias,
+    test_read_out_of_range_handle_does_not_alias_body
+);
+
 // --- Empty value roundtrip ---
 
 fn test_allocate_empty_value_roundtrip_body(b: &Backing) {

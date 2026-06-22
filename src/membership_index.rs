@@ -143,13 +143,20 @@ impl RadixU64 {
         root: u64,
         key: u64,
     ) -> Result<Option<(u64, usize)>> {
-        // Reject keys past the tree's reach (I26). When capacity() SATURATED to
-        // u64::MAX (depth 6, where the real capacity exceeds u64::MAX), every u64
-        // key is in reach, so the guard is skipped — otherwise the single key
-        // u64::MAX would be wrongly reported absent. The child_idx bound below
-        // still protects the descent.
+        // Reject keys past the tree's reach (I26). The guard MUST run at depth 0
+        // too: there `capacity() == SLOTS_PER_PAGE` and the depth-0 early return
+        // below maps the key with `key % SLOTS_PER_PAGE`, so without the guard an
+        // out-of-range key would WRAP onto an occupied slot and find_leaf would
+        // report a false hit (e.g. `contains(tag, 2000)` true when 2000 % 1021 is
+        // a member). Fixed 2026-06-22: the prior `self.depth > 0` qualifier
+        // skipped the guard at depth 0, the twin of the handle-table bug.
+        // When capacity() SATURATED to u64::MAX (depth 6, where the real capacity
+        // exceeds u64::MAX), every u64 key is in reach, so the `cap != u64::MAX`
+        // clause skips the guard — otherwise the single key u64::MAX would be
+        // wrongly reported absent. The child_idx bound below still protects the
+        // descent.
         let cap = self.capacity();
-        if self.depth > 0 && cap != u64::MAX && key >= cap {
+        if cap != u64::MAX && key >= cap {
             return Ok(None);
         }
         if self.depth == 0 {
@@ -1219,6 +1226,36 @@ mod tests {
         assert!(idx.contains(&mut c, root2, 7, 200).unwrap());
         let (_root3, removed_again) = idx.remove_t(&mut c, root2, 7, 100).unwrap();
         assert!(!removed_again, "removing an absent member reports false");
+    }
+
+    // Regression (review 2026-06-22): RadixU64::find_leaf gated its capacity
+    // guard on `self.depth > 0`, so at depth 0 an out-of-range key wrapped via
+    // `key % SLOTS_PER_PAGE` onto an occupied slot and `lookup` returned the
+    // aliased value (a false membership hit). The twin of the handle-table bug;
+    // the tree stays at depth 0 here.
+    #[test]
+    fn radix_lookup_out_of_range_key_at_depth_0_is_absent() {
+        let mut c = cache(8192);
+        let mut t = RadixU64::new();
+        let root = t
+            .create_root(&mut c, &mut |c: &mut PageCache| c.new_page())
+            .unwrap();
+        let root = t.insert_t(&mut c, root, 5, 99).unwrap();
+        assert_eq!(t.depth, 0, "single insert must not grow the tree");
+
+        assert_eq!(
+            t.lookup(&mut c, root, 5).unwrap(),
+            99,
+            "in-range key resolves"
+        );
+        // `5 + SLOTS_PER_PAGE` aliases slot 5 at depth 0; it is out of range and
+        // must read as the absent sentinel 0, not the aliased value.
+        let aliasing = 5 + SLOTS_PER_PAGE as u64;
+        assert_eq!(
+            t.lookup(&mut c, root, aliasing).unwrap(),
+            0,
+            "out-of-range key at depth 0 must be absent, not alias an occupied slot"
+        );
     }
 
     #[test]
