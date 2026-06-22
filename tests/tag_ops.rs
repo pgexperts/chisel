@@ -294,6 +294,65 @@ fn recreating_a_dropped_tag_reuses_freed_pages() {
     );
 }
 
+#[test]
+fn dropping_a_deep_tag_reopens_empty() {
+    // I118 deep-tree completion, durability: a tag with > SLOTS_PER_PAGE (1021)
+    // handles has a multi-LEVEL inner tree, so dropping it makes `remove` free the
+    // whole tree via `free_subtree` — including COMMITTED pages referenced by the
+    // on-disk superblock until the drop commits. This file-backed test confirms
+    // that whole-tree free PERSISTS: after a multi-batch drop + reopen, the tag is
+    // empty with no resurrection of any of the multi-level tree's handles. (The
+    // unit test pins free_subtree's page-freeing in-memory; this covers the
+    // committed/reopen path the in-memory reuse test cannot.)
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    let n = 1100u64; // > 1021 forces inner-tree depth >= 1
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        // Allocate in committed chunks so the cache stays bounded (no CacheFull).
+        let mut i = 0u64;
+        while i < n {
+            db.begin().unwrap();
+            let end = (i + 256).min(n);
+            while i < end {
+                db.allocate_tagged(format!("row {i}").as_bytes(), Tag::new(1).unwrap())
+                    .unwrap();
+                i += 1;
+            }
+            db.commit().unwrap();
+        }
+        assert_eq!(
+            db.handles_with_tag(Tag::new(1).unwrap()).unwrap().len(),
+            n as usize
+        );
+
+        // Drop the whole tag in bounded batches, each its own commit — this is the
+        // multi-batch path where the final tree mixes this-txn and prior-committed
+        // pages, all freed by free_subtree.
+        loop {
+            db.begin().unwrap();
+            let p = db.delete_with_tag(Tag::new(1).unwrap(), 256).unwrap();
+            db.commit().unwrap();
+            if p.complete {
+                break;
+            }
+        }
+        assert_eq!(
+            db.handles_with_tag(Tag::new(1).unwrap()).unwrap(),
+            Vec::<Handle>::new()
+        );
+        db.close().unwrap();
+    }
+    // Reopen from the persisted superblock: the dropped deep tag must stay empty.
+    let db = Chisel::open(&path, Default::default()).unwrap();
+    assert_eq!(
+        db.handles_with_tag(Tag::new(1).unwrap()).unwrap(),
+        Vec::<Handle>::new(),
+        "a fully-dropped deep (multi-level) tag must stay empty across reopen"
+    );
+    db.close().unwrap();
+}
+
 // I125: a tombstoned handle is rejected as InvalidHandle by EVERY read/delete
 // entry point, uniformly — the "is this handle live?" rule lives in one place
 // (`lookup_live`), not in scattered per-method guards. client_byte /
