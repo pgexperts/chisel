@@ -457,7 +457,7 @@ The `0`-means-absent sentinel relies, like the handle table, on page 0 always be
 
 ### Freemap pages
 
-A freemap page (leaf) is a bitmap: each bit represents one page in the file (`1` = free, `0` = in use). One freemap leaf (`PageType::FreeMap = 0x04`) tracks `PAGE_BODY_SIZE × 8 = 65,344` pages (~512 MB at 8 KB pages). Interior nodes (`PageType::FreeMapInterior = 0x07`) hold up to 1021 child page-id pointers (u64 LE, from `DATA_PAGE_HEADER_SIZE`; 0 = absent child = that subtree is all in use). Together they form a COW radix tree with coverage `65,344 × 1021^depth` pages — depth 2 covers ≤ 533 GB, depth 3 ≤ 545 TB. `freemap_depth` in the superblock records the current depth; depth 0 is a single bitmap leaf, which is exactly the historical single-page format (existing databases open unchanged).
+A freemap page (leaf) is a bitmap: each bit represents one page in the file (`1` = free, `0` = in use). One freemap leaf (`PageType::FreeMap = 0x04`) tracks `PAGE_BODY_SIZE × 8 = 65,344` pages (~512 MB at 8 KB pages). Interior nodes (`PageType::FreeMapInterior = 0x07`) hold up to 1021 child page-id pointers (u64 LE, from `DATA_PAGE_HEADER_SIZE`; 0 = absent child = that subtree is all in use). Together they form a COW radix tree with coverage `65,344 × 1021^depth` pages — depth 1 covers ≤ 533 GB, depth 2 ≤ 545 TB. `freemap_depth` in the superblock records the current depth; depth 0 is a single bitmap leaf, which is exactly the historical single-page format (existing databases open unchanged).
 
 ```text
 FreeMap page (PageType = 0x04)
