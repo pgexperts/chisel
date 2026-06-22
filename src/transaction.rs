@@ -491,8 +491,19 @@ impl TransactionManager {
         let page_count = cache.io_mut().page_count()?;
         if page_count < sb.total_pages {
             return Err(ChiselError::FileSizeMismatch {
-                expected: sb.total_pages * PAGE_SIZE as u64,
-                actual: page_count * PAGE_SIZE as u64,
+                // saturating_mul: `sb.total_pages` comes from a checksum-valid but
+                // otherwise untrusted superblock — `Superblock::deserialize` bounds
+                // only the checksum, MAGIC, and superblock_count, NOT total_pages.
+                // A crafted/edited file with total_pages near u64::MAX would
+                // overflow `* PAGE_SIZE` here: a panic in debug builds (how CI
+                // runs) and a silent wrap in release. Saturating keeps the public
+                // `Chisel::open` a typed-error path; "as many bytes as a u64 can
+                // represent" is the right report for an absurd page count (mirrors
+                // the I47 saturation in `Chisel::stats`/`file_size_bytes`).
+                // `page_count` is file-length-bounded and cannot realistically
+                // overflow, but it is saturated too for symmetry.
+                expected: sb.total_pages.saturating_mul(PAGE_SIZE as u64),
+                actual: page_count.saturating_mul(PAGE_SIZE as u64),
             });
         }
         // Reset next_page_id from the authoritative superblock, NOT from
