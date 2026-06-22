@@ -33,6 +33,7 @@ pub(crate) mod data_page;
 pub(crate) mod defrag;
 pub(crate) mod error;
 pub(crate) mod freemap;
+pub(crate) mod handle;
 pub(crate) mod handle_table;
 mod lru;
 pub(crate) mod membership_index;
@@ -60,6 +61,7 @@ pub use error::{ChiselError, Result};
 // re-exports define the supported access paths and keep the documented
 // API at the crate root.
 pub use defrag::{DefragOptions, DefragStats};
+pub use handle::{Handle, Tag};
 pub use membership_index::TagDropProgress;
 pub use page::PAGE_SIZE;
 pub use stats::{ChiselCounters, Stats};
