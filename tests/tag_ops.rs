@@ -252,3 +252,32 @@ fn tag_of_tagged_handle_is_some() {
     assert_eq!(db.tag(h).unwrap(), Some(Tag::new(42).unwrap()));
     assert_eq!(db.tag(h).unwrap().unwrap(), 42);
 }
+
+// I125: a tombstoned handle is rejected as InvalidHandle by EVERY read/delete
+// entry point, uniformly — the "is this handle live?" rule lives in one place
+// (`lookup_live`), not in scattered per-method guards. client_byte /
+// set_client_byte are pinned in tests/client_byte.rs; this pins the tag-aware
+// pair the deepdive flagged as the likely-to-diverge "fourth caller": a naive
+// `.tag` read off the looked-up entry would let tag() read a stale tag through a
+// tombstone, and delete_tagged() would surface TagMismatch instead of
+// InvalidHandle. Both must reject the dead handle before inspecting its tag.
+#[test]
+fn deleted_handle_is_invalid_across_all_entry_points() {
+    let mut db = Chisel::open_in_memory().unwrap();
+    db.begin().unwrap();
+    let h = db.allocate_tagged(b"row", Tag::new(7).unwrap()).unwrap();
+    // Tombstone it within the same transaction (read-your-own-writes makes the
+    // tombstone visible to every subsequent lookup below).
+    db.delete(h).unwrap();
+
+    // read() and tag() must reject the tombstone, not surface stale state.
+    assert!(matches!(db.read(h), Err(ChiselError::InvalidHandle(_))));
+    assert!(matches!(db.tag(h), Err(ChiselError::InvalidHandle(_))));
+    // delete_tagged() must reject the dead handle with InvalidHandle, NOT
+    // TagMismatch — it cannot have read a tag off a deleted entry.
+    assert!(matches!(
+        db.delete_tagged(h, Tag::new(7).unwrap()),
+        Err(ChiselError::InvalidHandle(_))
+    ));
+    db.rollback().unwrap();
+}

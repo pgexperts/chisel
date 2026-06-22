@@ -1606,25 +1606,35 @@ impl TransactionManager {
         }
     }
 
-    fn tag_inner(&self, handle: u64) -> Result<u32> {
+    /// Look up a handle that must be live, applying the "deleted ⇒
+    /// `InvalidHandle`" rule in ONE place (I125). Every read/mutation entry
+    /// point that needs a live `HandleEntry` — `read`, `tag`, `client_byte`,
+    /// `set_client_byte`, `update`, `delete_tagged` — goes through here, so the
+    /// liveness invariant cannot drift between callers.
+    ///
+    /// `handle_table::lookup` already collapses a tombstone (and an empty/absent
+    /// tree, via `live_handle_table_root` returning `PAGE_ID_NONE`) to `None`,
+    /// so the `ok_or` below is the single site that raises the operational
+    /// `InvalidHandle`. Callers that want "absent is not an error" (e.g.
+    /// `handle_live_page_id`, which returns `Ok(None)`) deliberately do NOT use
+    /// this and keep their own Option-returning lookup.
+    fn lookup_live(&self, handle: u64) -> Result<HandleEntry> {
         let root = self.live_handle_table_root();
-        if root == PAGE_ID_NONE {
-            return Err(ChiselError::InvalidHandle(handle));
-        }
         let mut cache = self.cache.borrow_mut();
-        let entry = self
-            .handle_table
+        self.handle_table
             .lookup(&mut cache, root, handle)?
-            .ok_or(ChiselError::InvalidHandle(handle))?;
-        Ok(entry.tag)
+            .ok_or(ChiselError::InvalidHandle(handle))
+    }
+
+    fn tag_inner(&self, handle: u64) -> Result<u32> {
+        Ok(self.lookup_live(handle)?.tag)
     }
 
     /// Return the opaque client byte stored in `handle`'s entry. Returns 0 if
-    /// never set (including every chunk created before this feature). Mirrors
-    /// the read-path root selection. Rejects deleted handles with
-    /// `InvalidHandle` (following `read()`; this is stricter than `tag()`'s
-    /// unguarded read of a tombstone — a pre-existing `tag()` quirk tracked
-    /// separately). Takes `&self`.
+    /// never set (including every chunk created before this feature). Rejects
+    /// deleted handles with `InvalidHandle` via the shared `lookup_live` guard
+    /// (I125 — `read`, `tag`, and `delete_tagged` apply the identical rule).
+    /// Takes `&self`.
     pub fn client_byte(&self, handle: u64) -> Result<u8> {
         self.check_alive()?;
         let result = self.client_byte_inner(handle);
@@ -1632,19 +1642,7 @@ impl TransactionManager {
     }
 
     fn client_byte_inner(&self, handle: u64) -> Result<u8> {
-        let root = self.live_handle_table_root();
-        if root == PAGE_ID_NONE {
-            return Err(ChiselError::InvalidHandle(handle));
-        }
-        let mut cache = self.cache.borrow_mut();
-        let entry = self
-            .handle_table
-            .lookup(&mut cache, root, handle)?
-            .ok_or(ChiselError::InvalidHandle(handle))?;
-        match entry.flags {
-            HandleFlags::Deleted => Err(ChiselError::InvalidHandle(handle)),
-            _ => Ok(entry.client_byte),
-        }
+        Ok(self.lookup_live(handle)?.client_byte)
     }
 
     /// Set the opaque client byte for `handle`. Requires an active
@@ -1661,15 +1659,7 @@ impl TransactionManager {
         if !self.active_txn {
             return Err(ChiselError::NoActiveTransaction);
         }
-        let mut entry = {
-            let mut cache = self.cache.borrow_mut();
-            self.handle_table
-                .lookup(&mut cache, self.current_roots.handle_table_page, handle)?
-                .ok_or(ChiselError::InvalidHandle(handle))?
-        };
-        if matches!(entry.flags, HandleFlags::Deleted) {
-            return Err(ChiselError::InvalidHandle(handle));
-        }
+        let mut entry = self.lookup_live(handle)?;
         entry.client_byte = byte;
         self.ht_insert(handle, &entry)?;
         Ok(())
@@ -1715,18 +1705,9 @@ impl TransactionManager {
     }
 
     fn read_inner(&self, handle: u64) -> Result<Vec<u8>> {
-        let root = self.live_handle_table_root();
-
-        if root == PAGE_ID_NONE {
-            return Err(ChiselError::InvalidHandle(handle));
-        }
+        let entry = self.lookup_live(handle)?;
 
         let mut cache = self.cache.borrow_mut();
-        let entry = self
-            .handle_table
-            .lookup(&mut cache, root, handle)?
-            .ok_or(ChiselError::InvalidHandle(handle))?;
-
         match entry.flags {
             HandleFlags::Live => {
                 let buf = cache.get(entry.page_id)?;
@@ -1744,6 +1725,10 @@ impl TransactionManager {
                 }
             }
             HandleFlags::Overflow => Overflow::read(&mut cache, entry.page_id),
+            // Unreachable in practice: `lookup_live` already excludes tombstones
+            // (I125). Kept as an exhaustive, non-panicking backstop — if the
+            // liveness invariant were ever violated, read still returns the
+            // operational `InvalidHandle` rather than aborting the writer.
             HandleFlags::Deleted => Err(ChiselError::InvalidHandle(handle)),
         }
     }
@@ -1776,12 +1761,9 @@ impl TransactionManager {
             return Err(ChiselError::NoActiveTransaction);
         }
 
-        let entry = {
-            let mut cache = self.cache.borrow_mut();
-            self.handle_table
-                .lookup(&mut cache, self.current_roots.handle_table_page, handle)?
-                .ok_or(ChiselError::InvalidHandle(handle))?
-        };
+        // `update` requires an active txn (checked above), so `lookup_live`'s
+        // read-view root is `current_roots` — read-your-own-writes.
+        let entry = self.lookup_live(handle)?;
 
         // Atomic staging (same discipline as delete_inner): do NOT retire the
         // OLD value's storage until the NEW entry is durably installed. The
@@ -2057,17 +2039,10 @@ impl TransactionManager {
         // Lookup-then-delete: verify the tag before mutating anything, so a wrong
         // tag leaves both the chunk and the membership index untouched. The extra
         // lookup walk (delete_inner walks again) is the price of verify-before-mutate.
-        let actual = {
-            let root = self.current_roots.handle_table_page;
-            if root == PAGE_ID_NONE {
-                return Err(ChiselError::InvalidHandle(handle));
-            }
-            let mut cache = self.cache.borrow_mut();
-            self.handle_table
-                .lookup(&mut cache, root, handle)?
-                .ok_or(ChiselError::InvalidHandle(handle))?
-                .tag
-        };
+        // `lookup_live` rejects an absent/tombstoned handle with `InvalidHandle`
+        // (I125) BEFORE the tag comparison — a dead handle never surfaces as
+        // TagMismatch.
+        let actual = self.lookup_live(handle)?.tag;
         if actual != tag {
             return Err(ChiselError::TagMismatch {
                 handle,
