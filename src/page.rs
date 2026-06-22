@@ -371,6 +371,7 @@ mod tests {
             PageType::Data,
             PageType::Overflow,
             PageType::FreeMap,
+            PageType::FreeMapInterior,
             PageType::MembershipInterior,
             PageType::MembershipLeaf,
         ] {
@@ -389,6 +390,7 @@ mod tests {
             PageType::Data,
             PageType::Overflow,
             PageType::FreeMap,
+            PageType::FreeMapInterior,
             PageType::MembershipInterior,
             PageType::MembershipLeaf,
         ] {

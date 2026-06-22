@@ -143,6 +143,10 @@ impl FreeMap {
     /// needing a COW copy of the leaf just to probe. Callers that need to
     /// actually allocate must follow up with `allocate_first` (or a COW-aware
     /// wrapper) — this function only peeks.
+    ///
+    /// The scan here deliberately duplicates `allocate_first`'s loop rather
+    /// than calling it; `allocate_first` was intentionally left unchanged (it
+    /// takes `&mut` and clears the bit) so no refactor was missed.
     // `#[allow(dead_code)]`: the freemap tree (next implementation unit) is
     // the production caller; no non-test caller exists yet in this unit.
     #[allow(dead_code)]
