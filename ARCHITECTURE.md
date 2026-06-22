@@ -57,7 +57,8 @@ flowchart BT
     superblock["superblock.rs<br/>superblock layout, select()"]
     page_io["page_io.rs<br/>raw file I/O, flock<br/>(only module touching FS)"]
     page_cache["page_cache.rs<br/>LRU cache, dirty tracking,<br/>checksum validation on load"]
-    freemap["freemap.rs<br/>bitmap free-page tracking"]
+    freemap["freemap.rs<br/>bitmap free-page tracking<br/>(single-page leaf primitive)"]
+    freemap_tree["freemap_tree.rs<br/>COW radix tree of bitmap leaves"]
     data_page["data_page.rs<br/>slotted page (R1 packing)"]
     overflow["overflow.rs<br/>large-value chains"]
     handle_table["handle_table.rs<br/>radix tree, per-module COW"]
@@ -78,12 +79,14 @@ flowchart BT
     page --> handle_table
     page --> membership_index
     page_cache --> freemap
+    page_cache --> freemap_tree
     page_cache --> data_page
     page_cache --> overflow
     page_cache --> handle_table
     page_cache --> membership_index
     superblock --> transaction
-    freemap --> transaction
+    freemap --> freemap_tree
+    freemap_tree --> transaction
     data_page --> transaction
     overflow --> transaction
     handle_table --> transaction
@@ -105,7 +108,8 @@ Why bottom-up matters: it means you can read the codebase in dependency order an
 | 1 | `superblock.rs` | In-memory `Superblock` struct, `serialize`/`deserialize`, `select()` across N candidate slots. | Magic + checksum + `superblock_count ∈ 2..=16` filter slots before tie-breaking by `txn_counter`. |
 | 2 | `page_io.rs` | Raw `pread`/`pwrite` of fixed-size pages, exclusive `flock`, `fsync`, in-memory `Vec<u8>` backing. Tracks cumulative successful `fsync_calls` count via a `Cell<u64>`. | The **only** module that touches the filesystem; everything else uses it through `PageCache`. |
 | 3 | `page_cache.rs` | LRU cache over `PageIo`, dirty tracking, checksum validation on load, spillway overflow, and `CacheFull`/`SpillwayFull` errors. Owns three `Cell<u64>` engine-activity counters (cache hits/misses, pages allocated) and exposes `counters()` aggregating them with `PageIo::fsync_count`. | Soft eviction at `max_pages`; dirty overflow spills to a sidecar Spillway file (cap = `spillway_max_bytes`); `CacheFull` at strict `max_pages` when spillway is disabled (`spillway_max_bytes=0`); checksums verified on disk LOAD only. |
-| 4 | `freemap.rs` | Bitmap of free pages, `allocate_first` / `mark_free`. | Pure buffer manipulation; no cache or I/O. |
+| 4 | `freemap.rs` | Single-page bitmap primitive: `allocate_first` / `mark_free` on one `[u8; PAGE_SIZE]` buffer. | Pure buffer manipulation; no cache or I/O. Composed into the multi-page tree by `freemap_tree.rs`. |
+| 4 | `freemap_tree.rs` | COW radix tree of FreeMap leaves; the full multi-page freemap. | All structural COW pages sourced out-of-band (never from the bitmap); session-COW dedup (one COW per node per commit). |
 | 4 | `data_page.rs` | Slotted page layout (R1): slot directory grows forward, packed value data grows backward, dead-slot tombstones reclaimed only by `compact()`. | Slot indices are stable until compact; compact returns an old→new mapping for callers to rewrite. |
 | 4 | `overflow.rs` | Singly-linked overflow chains for values > inline threshold. | `total_length` repeated on every chain page; `next_page == 0` terminates; cycle detection bounded by `total_length / OVERFLOW_PAYLOAD` (I14). |
 | 5 | `handle_table.rs` | Radix tree mapping `u64` handle → `(page_id, slot_index)`. Implements its own copy-on-write atop `PageCache::new_page`. | Capacity = `510 × 1021^depth`; `find_leaf` short-circuits on `handle ≥ capacity` to `Ok(None)` (I26). |
@@ -134,7 +138,7 @@ sequenceDiagram
     TM->>TM: merge savepoint freed_pages<br/>into txn_freed_pages (I27)
     TM->>C: cache.flush() — drain dirty before<br/>persist_freemap can hit ceiling (I28)
     C->>IO: write_page() × N + fsync #1
-    TM->>FM: persist_freemap:<br/>1) allocate new freemap page id<br/>2) merge freed pages into bitmap (I18)<br/>3) write freemap bytes via cache
+    TM->>FM: persist_freemap:<br/>1) allocate structural COW page ids<br/>   (from out-of-band recycle, never bitmap)<br/>2) merge txn_freed_pages into tree (I18)<br/>3) COW-rewrite touched leaves + spine
     TM->>C: cache.flush() — write the<br/>new freemap page + fsync #2
     C->>IO: write_page() (freemap) + fsync
     TM->>TM: build new Superblock<br/>(txn_counter += 1)
@@ -147,7 +151,7 @@ sequenceDiagram
 ### Why each step is in this order
 
 1. **Pre-drain flush.** `persist_freemap` calls `allocate_data_page`, which can trip `maybe_evict`'s spill-or-error decision if every cached page is dirty (nothing evictable, spillway disabled or full). `CacheFull` is operational-by-design (caller recovers via commit/rollback) but the commit wrapper poisons on any error — so a `CacheFull` raised mid-commit would silently demote operational to fatal. Pre-draining clears every dirty pin so the strict cap is reachable via normal eviction. Cost: one extra `fsync`. (See I28.)
-2. **`persist_freemap` allocates BEFORE merging.** The freed pages list and the old freemap page id are both still referenced by the *currently-committed* superblock. If `persist_freemap` merged them into `current_freemap` first, `allocate_first` could return one of those ids, `claim_page` would mark it dirty, and the subsequent flush would overwrite a page the on-disk superblock still depends on. Allocating first guarantees the new page id is either already-free in the committed state or freshly extended. (See I18.)
+2. **`persist_freemap` allocates structural COW pages BEFORE merging.** The freed pages and the old freemap tree pages are both still referenced by the *currently-committed* superblock. Structural COW targets are sourced from an out-of-band recycle pool (dead freemap pages deferred one commit) or file extension, NEVER from the freemap's own bitmap — sourcing from the bitmap would clear a bit, COW a leaf, recurse, and never terminate. Allocating structural pages first guarantees the new page ids are either already-free in the committed state or freshly extended. Per-leaf, the allocate-before-merge (I18) ordering is preserved. (See I18.)
 3. **Two separate fsyncs (data + superblock).** Linux's `fsync` does not order writes within itself — the OS may write the superblock to disk before the data pages it references. Splitting into two fsyncs enforces "all data durable BEFORE superblock durable." A crash between them leaves the previous (intact) superblock active.
 4. **Round-robin write to `txn_counter % N`.** The "active" superblock is whichever slot has the highest valid counter. Writing to `txn_counter % N` always targets the stalest slot; the previously-active slot stays untouched. A torn write can damage the new superblock but cannot damage any of the N-1 last-known-good ones. Higher N (configurable 2..=16) trades disk space for survival of consecutive torn-write retries. (See R4.)
 5. **Promote in-memory state LAST.** Until the superblock fsync returns, the transaction is not durable. Updating `committed_roots` before that point would make in-memory state lie about durability — a subsequent reader could see uncommitted handles.
@@ -274,7 +278,8 @@ bytes        | field                              | type
              |   each: 24-byte name + 8-byte handle |
 308..312     | superblock_count                   | u32 LE (= N, in 2..=16)
 312..320     | root_membership_index_page         | u64 LE (PAGE_ID_NONE if no index)
-320..8184    | reserved (zeroed for forward compat)| [u8; ~7864]
+320..324     | freemap_depth                      | u32 LE (0 = single-page/depth-0)
+324..8184    | reserved (zeroed for forward compat)| [u8; ~7860]
 8184..8192   | XXH3 checksum                      | u64 LE
 ```
 
@@ -452,7 +457,7 @@ The `0`-means-absent sentinel relies, like the handle table, on page 0 always be
 
 ### Freemap pages
 
-A freemap page is a bitmap: each bit represents one page in the file (`1` = free, `0` = in use). One freemap page tracks `PAGE_BODY_SIZE × 8 = 65,344` pages (~512 MB at 8 KB pages); a multi-page freemap is not yet implemented but the layout is forward-compatible (a future extension would chain freemap pages or store an index page).
+A freemap page (leaf) is a bitmap: each bit represents one page in the file (`1` = free, `0` = in use). One freemap leaf (`PageType::FreeMap = 0x04`) tracks `PAGE_BODY_SIZE × 8 = 65,344` pages (~512 MB at 8 KB pages). Interior nodes (`PageType::FreeMapInterior = 0x07`) hold up to 1021 child page-id pointers (u64 LE, from `DATA_PAGE_HEADER_SIZE`; 0 = absent child = that subtree is all in use). Together they form a COW radix tree with coverage `65,344 × 1021^depth` pages — depth 1 covers ≤ 533 GB, depth 2 ≤ 545 TB. `freemap_depth` in the superblock records the current depth; depth 0 is a single bitmap leaf, which is exactly the historical single-page format (existing databases open unchanged).
 
 ```text
 FreeMap page (PageType = 0x04)
@@ -473,7 +478,25 @@ bytes              | field                         | type
 
 `allocate_first` returns the lowest free page id by scanning bytes for non-zero values and using `trailing_zeros` to find the bit. (An `allocate_near(target)` radius-scan variant existed but was removed in the PR #46 dead-code sweep — no caller used it.)
 
-The freemap is consumed during commit's `persist_freemap`: pages freed during the transaction are merged into the bitmap **after** the new freemap page has been allocated (I18 — see commit-protocol section).
+```text
+FreeMapInterior page (PageType = 0x07)
+
+bytes              | field                         | type
+-------------------|-------------------------------|----------
+0                  | PageType (= 0x07)             | u8
+1                  | page_format_version (I31)     | u8
+2..8               | reserved (type-specific)      | [u8; 6]
+8..16              | reserved (I31 common region)  | [u8; 8]
+16..8184           | child page-id pointers        | 1021 × u64 LE
+                   |   0 = absent child subtree    |
+8184..8192         | XXH3 checksum                 | u64 LE
+```
+
+### Multi-page freemap
+
+The freemap is a COW radix tree rooted at the superblock's `root_freemap_page`. At depth 0 the root is itself a single FreeMap leaf — the historical format, unchanged. At depth ≥ 1 the root is a FreeMapInterior whose children are either FreeMapInterior nodes (at depth ≥ 2) or FreeMap leaves (at depth 1). Absent children (0 pointer) implicitly represent fully-in-use subtrees; the tree grows deeper only when the current leaf count is exhausted.
+
+The tree is consumed during commit's `persist_freemap`: pages freed during the transaction are marked free in the COW radix tree, touching (and COW-rewriting) only the leaves and spine nodes that cover the freed ids — after structural pages have been allocated (I18 — see commit-protocol section).
 
 ---
 
@@ -489,9 +512,9 @@ Within-session iteration stability follows from that same handle identity. `hand
 
 ### Per-module copy-on-write
 
-Chisel does not have a centralized COW abstraction. Each layer-4 / layer-5 module that mutates pages (handle_table, freemap during persist) implements COW by allocating fresh pages via `PageCache::new_page`, writing the new state into the new pages, and returning the new root id to the caller. The previously-committed page is left untouched on disk; it remains valid and reachable through the previously-committed superblock for the entire duration of the new transaction.
+Chisel does not have a centralized COW abstraction. Each layer-4 / layer-5 module that mutates pages (handle_table, freemap_tree during persist) implements COW by allocating fresh pages, writing the new state into them, and returning the new root id to the caller. The previously-committed page is left untouched on disk; it remains valid and reachable through the previously-committed superblock for the entire duration of the new transaction.
 
-This per-module pattern is deliberate. A monolithic COW abstraction was considered and rejected — it would have forced every page-type module to express its mutations through a uniform interface, and the modules' actual COW shapes are different enough (handle table walks a tree; freemap rewrites one page; data pages reuse the same page across multiple commits via `claim_page`) that a generic interface would have leaked detail.
+This per-module pattern is deliberate. A monolithic COW abstraction was considered and rejected — it would have forced every page-type module to express its mutations through a uniform interface, and the modules' actual COW shapes are different enough (handle table walks a tree; freemap_tree COWs the touched leaf+spine of a radix tree; data pages reuse the same page across multiple commits via `claim_page`) that a generic interface would have leaked detail.
 
 ### In-memory radix depth is re-derived from the root, never stored
 
@@ -539,9 +562,15 @@ Slot packing (R1) means a single data page can hold many small values; freed slo
 
 ### Freemap reclamation
 
-Free pages enter the freemap during commit's `persist_freemap`: the transaction's `txn_freed_pages` (collected from `delete()` calls) and the previous freemap's own page id are merged into the new freemap snapshot. Subsequent transactions then prefer freemap-reuse over file extension when allocating new data pages — `allocate_data_page` tries `FreeMap::allocate_first` first, falls back to `cache.new_page` if the freemap is empty.
+Free pages enter the freemap during commit's `persist_freemap`: the transaction's `txn_freed_pages` (collected from `delete()` calls) are marked free in the COW radix tree, touching (and COW-rewriting) only the leaves and spine nodes that cover the freed ids. Subsequent transactions then prefer freemap-reuse over file extension when allocating new data pages — `allocate_data_page` tries `FreeMapTree::allocate_first` first, falls back to `cache.new_page` if the freemap is empty or exhausted.
 
-There is one carve-out: freemap-reuse is disabled while any savepoint is active (`allocate_data_page` checks `savepoints.is_empty()`). The reason is that a `rollback_to` would need a per-savepoint freemap snapshot to correctly restore reuse decisions; the v1 simplification is "no reuse during savepoint scopes," which keeps the rollback path simple. Workloads that want reuse don't typically use savepoints.
+**Structural COW pages.** The freemap's own interior/leaf COW copies and newly-materialized nodes are allocated out-of-band — from an in-memory one-commit-deferred recycle pool of dead freemap pages, falling back to file extension — NEVER from the freemap's own bitmap. Sourcing from the bitmap would recurse: clearing a bit COWs a leaf, which needs a structural page, which clears another bit, and so on without bound. The recycle pool has a one-commit defer: a page superseded in transaction T is not reusable until T commits (it is still referenced by the pre-T superblock). In steady state each commit supersedes and consumes a similar small number of structural pages, so the file's high-water stays flat under sustained churn.
+
+**Crash orphan sweep.** Because the recycle pool is in-memory, a crash orphans its entries: freemap-typed pages unreachable from the committed tree and not marked free in the bitmap. `defrag()` reclaims them via `reclaim_freemap_orphans`: it walks the live freemap tree, finds `FreeMap`/`FreeMapInterior` pages neither reachable nor already free, and marks them free in the bitmap. This sweep is skipped while any savepoint is active (a savepoint's rollback must see a stable freemap). Reclaimed orphans enter the BITMAP (data-reusable), disjoint from the in-memory pool (freemap-COW-reusable), so no page is ever handed out twice.
+
+**Session-COW dedup.** Within one transaction, each freemap node is COW'd at most once. A second mutation to an already-COW'd node edits it in place (no new `extend`, no new supersede). Without this, K frees into one leaf would extend and supersede K intermediate leaf copies. The `session_owned` set in the transient `FreeMapTree` handle records every page this transaction has COW'd or materialized; re-encounters are in-place edits. It is transient working state, never serialized.
+
+There is one carve-out for data allocation: freemap-reuse is disabled while any savepoint is active (`allocate_data_page` checks `savepoints.is_empty()`). A `rollback_to` would need a per-savepoint freemap snapshot to restore data-reuse decisions; the v1 simplification is "no reuse during savepoint scopes," which keeps the rollback path simple.
 
 Overflow pages and handle-table COW pages do *not* go through `allocate_data_page` (they call `cache.new_page` directly and always extend), but their *frees* still feed the freemap on commit, so delete-heavy workloads still reach equilibrium via data-page reuse.
 
@@ -582,7 +611,7 @@ Chisel versions its on-disk format at two levels.
 - **File level** (I29): the superblock carries a packed `format_version` u32 — upper 16 bits MAJOR, lower 16 bits MINOR. Open-time gate compares MAJOR only. Any same-major file opens regardless of minor; a different-major file is rejected with `UnsupportedFormatVersion`. This is what makes the README's "sacred within a major version" promise enforceable.
 - **Page level** (I31): each non-superblock page carries a one-byte `page_format_version` in its header (byte 1 for Data/Overflow/FreeMap; byte 2 for HandleTable, where byte 1 holds the FLAG byte). This lets individual page layouts evolve within a major without a file-wide bump. The current value is `0` everywhere. The post-1.0 upgrade plan is lazy migration: reads *will* dispatch on the version byte (the per-module decode helpers and `page::page_format_version()` exist but are **dormant today** — `PageCache::load_page` validates only the XXH3 checksum and nothing reads the version byte yet), writes always stamp the current version, and an opt-in eager upgrader (deferred) sweeps remaining old pages.
 
-Both schemes leave reserved space for forward compatibility — the superblock has bytes 320..8184 reserved (after the `root_membership_index_page` field at 312..320), and every non-superblock page has bytes 8..16 reserved (8 bytes / 64 bits) for future common-header fields.
+Both schemes leave reserved space for forward compatibility — the superblock has bytes 324..8184 reserved (after the `freemap_depth` field at 320..324), and every non-superblock page has bytes 8..16 reserved (8 bytes / 64 bits) for future common-header fields.
 
 ---
 

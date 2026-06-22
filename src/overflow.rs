@@ -43,9 +43,9 @@
 //
 // COW / durability: write() allocates fresh pages via PageCache::new_page(),
 // so under shadow paging the entire chain is new and never modifies existing
-// on-disk pages. delete() just returns the list of page ids to free; it does
-// not touch the freemap (that's the caller's responsibility, and see ARCHITECTURE.md
-// for the v1 note that the freemap is not yet wired into the allocator).
+// on-disk pages. delete() returns the list of page ids to free; the caller
+// (transaction.rs) folds those into txn_freed_pages, which persist_freemap
+// marks free in the COW radix freemap tree at commit.
 
 use crate::error::{ChiselError, Result};
 use crate::page::{self, PageType, CHECKSUM_OFFSET};
