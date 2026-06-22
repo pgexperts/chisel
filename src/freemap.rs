@@ -135,6 +135,27 @@ impl FreeMap {
         None
     }
 
+    /// Return the lowest free page id without claiming it.
+    ///
+    /// Non-mutating companion to `allocate_first`: the freemap tree (the next
+    /// unit) uses this to read a leaf's minimum free page id when deciding
+    /// whether an interior node's subtree has any free pages at all, without
+    /// needing a COW copy of the leaf just to probe. Callers that need to
+    /// actually allocate must follow up with `allocate_first` (or a COW-aware
+    /// wrapper) — this function only peeks.
+    // `#[allow(dead_code)]`: the freemap tree (next implementation unit) is
+    // the production caller; no non-test caller exists yet in this unit.
+    #[allow(dead_code)]
+    pub fn first_free_bit(buf: &[u8; PAGE_SIZE]) -> Option<u64> {
+        for byte_idx in 0..PAGE_BODY_SIZE {
+            let byte = buf[BITMAP_OFFSET + byte_idx];
+            if byte != 0 {
+                return Some((byte_idx * 8 + byte.trailing_zeros() as usize) as u64);
+            }
+        }
+        None
+    }
+
     // Maps a page_id to (byte_index_within_bitmap, bit_index_within_byte).
     // LSB-first within a byte: page_id 0 = bit 0 of byte 0, page_id 7 = bit 7
     // of byte 0, page_id 8 = bit 0 of byte 1. `allocate_first` depends on
@@ -175,6 +196,18 @@ mod tests {
     #[test]
     fn test_freemap_capacity() {
         assert_eq!(FreeMap::capacity(), PAGE_BODY_SIZE * 8);
+    }
+
+    #[test]
+    fn first_free_bit_finds_lowest_without_clearing() {
+        let mut buf = [0u8; PAGE_SIZE];
+        FreeMap::init_page(&mut buf);
+        assert_eq!(FreeMap::first_free_bit(&buf), None);
+        FreeMap::mark_free(&mut buf, 300);
+        FreeMap::mark_free(&mut buf, 12);
+        assert_eq!(FreeMap::first_free_bit(&buf), Some(12));
+        assert_eq!(FreeMap::first_free_bit(&buf), Some(12));
+        assert!(FreeMap::is_free(&buf, 12));
     }
 
     // I71 (ISSUES.md, 2026-05-22): property test — for any page_id
