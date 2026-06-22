@@ -142,40 +142,57 @@ fn steady_state_file_is_flat_under_churn() {
 
 // 3. Crash → reopen → defrag reclaims orphaned freemap pages.
 //
-// Build and churn a file-backed DB so the freemap has multi-page structural
-// state and a non-empty in-memory recycle pool.  Drop the handle without a
-// final commit — this simulates a crash: the pool is lost, orphaning the
-// last commit's structural supersedes.
+// This test DETERMINISTICALLY orphans at least one freemap page through the
+// public API (integration tests cannot reach the cfg(test) forge helper), so
+// a regression that misses ALL orphans fails here rather than passing vacuously.
 //
-// Reopen, run defrag (in an active transaction, as required), commit.  Check
-// `freemap_orphans_reclaimed` — if the crash orphaned pages the count is > 0;
-// if the steady state happened to leave none it is 0.  Either way the second
-// defrag call MUST find zero orphans: idempotence proves the first sweep
-// actually reclaimed whatever the crash left behind.
+// Mechanism: overflow-sized values (> MAX_INLINE_VALUE ≈ 8 KB; we use 9 000
+// bytes) occupy WHOLE overflow pages, so a delete frees entire pages. We first
+// populate and commit a batch of such values so the freemap grows multi-page.
+// Then the FINAL pre-drop step is a commit that DELETEs many of them: that
+// commit's `persist_freemap` marks the freed pages free, which COWs the freemap
+// leaf/spine and supersedes the old freemap pages into the in-memory recycle
+// pool (`pending_structural_frees`). Dropping the handle WITHOUT a further
+// commit == crash: the in-memory pool is lost, orphaning those superseded
+// freemap pages on disk (freemap-typed, unreachable from the committed tree, not
+// marked free).
+//
+// Reopen, run defrag (in an active transaction). The first sweep MUST reclaim
+// >= 1 orphan (the deterministic guarantee); the second MUST find 0 (idempotence
+// proves the first sweep was complete).
 #[test]
 fn crash_orphans_are_reclaimed_by_defrag() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.chisel");
 
+    // 9 000 bytes > MAX_INLINE_VALUE (~8 160), so every value lands in an
+    // overflow chain of whole pages — deletes free whole pages, the precondition
+    // for the freemap-COW churn this test depends on.
+    let big = vec![0xCDu8; 9000];
+
     {
         let mut db = Chisel::open(&path, Options::default()).unwrap();
 
+        // Populate enough overflow-backed values that the freed-page bitmap spans
+        // a real (multi-page) freemap and a later delete-all COWs several nodes.
         db.begin().unwrap();
         let mut hs = Vec::new();
-        for i in 0..2000u64 {
-            hs.push(db.allocate(format!("v{i}").as_bytes()).unwrap());
+        for _ in 0..400u64 {
+            hs.push(db.allocate(&big).unwrap());
         }
         db.commit().unwrap();
 
+        // FINAL pre-drop step: a commit that deletes many overflow-sized values.
+        // Freeing their whole pages drives `persist_freemap` to COW the freemap
+        // and supersede the old pages into the in-memory recycle pool.
         db.begin().unwrap();
-        for h in hs.iter().step_by(2) {
+        for h in &hs {
             db.delete(*h).unwrap();
         }
-        // This commit leaves dead freemap pages in the in-memory recycle pool.
         db.commit().unwrap();
 
-        // Drop without a further commit == crash: the in-memory pool is lost,
-        // orphaning the structural supersedes from the commit above.
+        // Drop without a further commit == crash: the in-memory recycle pool is
+        // lost, orphaning the freemap pages the delete-commit superseded.
     }
 
     let mut db = Chisel::open(&path, Options::default()).unwrap();
@@ -186,10 +203,18 @@ fn crash_orphans_are_reclaimed_by_defrag() {
     let first = db.defrag(DefragOptions::default()).unwrap();
     db.commit().unwrap();
 
-    // The count may be 0 if no structural churn happened to produce orphans;
-    // it is > 0 if the crash did orphan pages.  We do not assert a specific
-    // value here — the idempotence assertion below is the real verification.
-    let _ = first.freemap_orphans_reclaimed;
+    // Deterministic: the delete-commit above superseded at least one freemap page
+    // into the recycle pool, which the crash then orphaned. The sweep MUST find
+    // it. (If a future change makes this non-deterministic, do NOT relax to >= 0
+    // without first restoring determinism — see the unit-test coverage in
+    // transaction.rs for the forge-based deterministic path.)
+    assert!(
+        first.freemap_orphans_reclaimed >= 1,
+        "first defrag must reclaim >= 1 crash-orphaned freemap page \
+         (got {}); the final delete-commit should have superseded freemap pages \
+         into the in-memory pool that the crash then orphaned",
+        first.freemap_orphans_reclaimed
+    );
 
     // Second defrag: must find zero orphans.  If the first sweep reclaimed
     // everything correctly, there is nothing left for the second to find.

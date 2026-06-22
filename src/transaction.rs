@@ -806,6 +806,28 @@ impl TransactionManager {
         Ok(id)
     }
 
+    /// Test-only: forge a CORRUPT, non-reachable page on disk. Extend a fresh
+    /// page, fill it with garbage, deliberately do NOT stamp a valid checksum,
+    /// flush it to the backing file, then drop it from the cache so a later
+    /// `get(id)` re-reads it from disk and fails with `ChecksumMismatch`. The
+    /// page is never referenced from any tree, so it is a corrupt DEAD page —
+    /// exactly what the orphan sweep must SKIP rather than poison on. Returns the
+    /// forged page id.
+    #[cfg(test)]
+    pub(crate) fn test_forge_corrupt_dead_page(&mut self) -> Result<u64> {
+        let mut cache = self.cache.borrow_mut();
+        let id = cache.new_page()?;
+        let buf = cache.get_mut(id)?;
+        // Garbage bytes with a freemap-ish type byte but a checksum that will not
+        // verify (we never call stamp_checksum). The type byte is irrelevant —
+        // the read fails the checksum gate before the type is ever inspected.
+        buf.fill(0xAB);
+        buf[0] = crate::page::PageType::FreeMap as u8;
+        cache.flush()?; // write the garbage bytes to the main file
+        cache.test_drop_from_cache(id); // force a disk re-read (and checksum check) next get
+        Ok(id)
+    }
+
     /// True if this manager has been poisoned by a previous fatal error.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.get()
@@ -1094,11 +1116,33 @@ impl TransactionManager {
     /// crash-orphaned pages are correctly flagged; in a normal (no-crash) defrag
     /// the live pool is excluded so the two reclamation channels never overlap.
     ///
-    /// Reading each page through the cache checksum-verifies it; a corrupt page
-    /// surfaces as a fatal error, consistent with the engine's fail-closed stance
-    /// for a maintenance pass. The scan is O(total_pages) I/O — off the hot path
-    /// (defrag), bounded, and acceptable.
+    /// Reading each non-reachable page through the cache checksum-verifies it.
+    /// A page that fails because it is GARBAGE/corrupt (`CorruptPage` /
+    /// `ChecksumMismatch`) is SKIPPED, not propagated (2026-06-22 review:
+    /// "skip unreadable dead pages") — a non-reachable page we cannot read
+    /// cannot be confirmed as a freemap orphan, and a dead page's corruption is
+    /// irrelevant to correctness. Any OTHER read error (e.g. `IoError`, a real
+    /// device fault) is propagated and poisons, preserving fail-closed for true
+    /// hardware faults. The LIVE-tree walk (`reachable_pages`) still propagates
+    /// fatal on a corrupt LIVE node — only the dead-page scan is softened. The
+    /// scan is O(total_pages) I/O — off the hot path (defrag), bounded, and
+    /// acceptable.
     pub(crate) fn reclaim_freemap_orphans(&mut self) -> Result<u64> {
+        // Skip the sweep entirely while a savepoint is active. The sweep is the
+        // ONLY path that COWs the freemap (draining committed-LIVE pages into the
+        // structural recycle streams) while a savepoint is open — ordinary
+        // allocation already disables structural reuse under a savepoint
+        // (`reuse = self.savepoints.is_empty()`). But `rollback_to` rewinds only
+        // the roots + cache watermark, NOT the structural streams: a page the
+        // sweep drained into `structural_superseded` would survive the rollback,
+        // get promoted at commit, and be reused as a COW target in the next
+        // transaction while the last-durable superblock still references it —
+        // silent durable freemap corruption. Deferring orphan reclamation to a
+        // defrag run with no active savepoint avoids the whole interaction, so
+        // `rollback_to_inner` correctly needs no structural-stream reset.
+        if !self.savepoints.is_empty() {
+            return Ok(0);
+        }
         let root = self.current_roots.freemap_page;
         let depth = self.current_roots.freemap_depth;
         if root == PAGE_ID_NONE {
@@ -1136,7 +1180,25 @@ impl TransactionManager {
                 if reachable.contains(&id) || excluded.contains(&id) {
                     continue;
                 }
-                let ty = cache.get(id)?[0];
+                // Skip a non-reachable page that is GARBAGE/corrupt rather than
+                // letting it poison the whole maintenance pass (2026-06-22 review
+                // decision: "skip unreadable dead pages"). A page that is not in
+                // the live tree cannot be confirmed as a freemap orphan if we
+                // cannot read its type, and a DEAD page's corruption does not
+                // affect correctness — so on `CorruptPage`/`ChecksumMismatch` we
+                // `continue`. We deliberately PROPAGATE every other read error
+                // (e.g. `IoError`): a real device fault should still surface and
+                // poison, not be silently swallowed. NOTE: the live-tree walk
+                // (`reachable_pages` above) still propagates fatal on a corrupt
+                // LIVE page — only the dead-page scan is softened.
+                let buf = match cache.get(id) {
+                    Ok(buf) => buf,
+                    Err(ChiselError::CorruptPage { .. } | ChiselError::ChecksumMismatch { .. }) => {
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                let ty = buf[0];
                 if (ty == crate::page::PageType::FreeMap as u8
                     || ty == crate::page::PageType::FreeMapInterior as u8)
                     && !tree.is_free(&mut cache, id)?
@@ -3690,6 +3752,11 @@ mod tests {
             "precondition: T+1 must actually reuse at least one deferred page \
              (else the defer is untested)"
         );
+        // NOTE: this block is a weak guard on its own. Under session-COW dedup a
+        // leaf is COW'd at most once per commit, so a same-transaction supersede
+        // and its only in-txn reuse pop are the SAME event — they cannot both be
+        // observed here. The load-bearing defer check is the cross-commit
+        // REACHABILITY assertion below; this block is kept as a cheap sanity rail.
         for id in &reused_in_t1 {
             assert!(
                 promoted.contains(id),
@@ -3824,6 +3891,221 @@ mod tests {
             tm.begin().unwrap();
             tm.delete(h).unwrap();
             tm.commit().unwrap();
+        }
+    }
+
+    // PROPERTY 2b — the orphan sweep must NOT run under a savepoint.
+    //
+    // `rollback_to(savepoint)` rewinds the roots + cache watermark but does NOT
+    // reset the structural recycle streams. The only path that COWs the freemap
+    // (mutating those streams) while a savepoint is open is the defrag orphan
+    // sweep. If the sweep ran under a savepoint, it could drain a committed-LIVE
+    // freemap page into `structural_superseded`; after `rollback_to` (which
+    // leaves the stream intact) + commit (which promotes it), the NEXT
+    // transaction would reuse that still-durably-referenced page as a COW target
+    // and overwrite it — silent durable freemap corruption.
+    //
+    // The fix guards `reclaim_freemap_orphans` with `savepoints.is_empty()`.
+    // This test reproduces the trigger end-to-end and asserts the committed
+    // freemap tree survives intact. Counterfactual: removing the guard makes the
+    // committed-tree-intact assertion (or the no-reuse-of-committed-page check)
+    // fail.
+    #[test]
+    fn orphan_sweep_skipped_under_savepoint_preserves_committed_freemap() {
+        let mut tm = fresh_manager();
+        let big: Vec<u8> = vec![0xAB; MAX_INLINE_VALUE + 32];
+
+        // Build a real multi-page freemap with committed structural state so the
+        // committed tree has actual nodes to corrupt. After this the committed
+        // freemap root/depth describe a non-trivial tree.
+        let survivors = structural_churn(&mut tm, &big, 8, 4);
+
+        // Snapshot the committed freemap's free-set and reachable node set BEFORE
+        // the savepoint episode. These are the ground truth the episode must not
+        // disturb.
+        let committed_root = tm.committed_roots.freemap_page;
+        let committed_depth = tm.committed_roots.freemap_depth;
+        assert_ne!(
+            committed_root, PAGE_ID_NONE,
+            "precondition: a committed freemap tree must exist"
+        );
+        let (free_before, reachable_before): (
+            std::collections::BTreeSet<u64>,
+            std::collections::HashSet<u64>,
+        ) = {
+            let mut cache = tm.cache.borrow_mut();
+            let tree = FreeMapTree::from_roots(committed_root, committed_depth);
+            let reachable: std::collections::HashSet<u64> = tree
+                .reachable_pages(&mut cache)
+                .unwrap()
+                .into_iter()
+                .collect();
+            // The set of currently-free ids, scanned over the allocation range.
+            let total = cache.next_page_id();
+            let mut free = std::collections::BTreeSet::new();
+            for id in 0..total {
+                if tree.is_free(&mut cache, id).unwrap() {
+                    free.insert(id);
+                }
+            }
+            (free, reachable)
+        };
+
+        // Episode: open a transaction, take a savepoint, forge a freemap orphan,
+        // and invoke the sweep. With the guard the sweep is a no-op (returns 0)
+        // and touches NO structural stream; without the guard it would reclaim the
+        // forged orphan, COWing the committed freemap and draining the superseded
+        // live page into `structural_superseded`.
+        tm.begin().unwrap();
+        tm.savepoint("sp").unwrap();
+        let _orphan = tm.test_forge_freemap_orphan().unwrap();
+        let reclaimed = tm.reclaim_freemap_orphans().unwrap();
+        assert_eq!(
+            reclaimed, 0,
+            "the orphan sweep must be a no-op under an active savepoint (got {reclaimed})"
+        );
+        // The streams the rollback_to does NOT reset must be untouched by the
+        // sweep, or the rollback leaves dangerous residue.
+        assert!(
+            tm.structural_superseded.is_empty(),
+            "sweep under savepoint leaked into structural_superseded: {:?}",
+            tm.structural_superseded
+        );
+
+        // Roll back to the savepoint (discards the forged page) and commit the
+        // now-empty transaction. With the guard this commit promotes nothing
+        // dangerous; without it, the committed-live page the sweep superseded is
+        // promoted into the reusable pool.
+        tm.rollback_to("sp").unwrap();
+        tm.commit().unwrap();
+
+        // Next transaction does a freemap-COWing operation (delete a survivor,
+        // which marks its page free and COWs the freemap). If a committed-live
+        // freemap page had been promoted into the reuse pool, this is where it
+        // would be drawn as a COW target and OVERWRITTEN.
+        tm.begin().unwrap();
+        tm.delete(survivors[0]).unwrap();
+        tm.commit().unwrap();
+
+        // The committed freemap tree the ORIGINAL (pre-episode) commit described
+        // must still be readable and self-consistent: no node it referenced was
+        // overwritten. We re-open the ORIGINAL committed root/depth and confirm
+        // its reachable set and free-set are unchanged by everything above.
+        // (Deleting survivors[0] in the final txn only ADDS a free bit; it never
+        // removes one and never makes a previously-reachable node unreadable.)
+        let (free_after, reachable_after): (
+            std::collections::BTreeSet<u64>,
+            std::collections::HashSet<u64>,
+        ) = {
+            let mut cache = tm.cache.borrow_mut();
+            let tree = FreeMapTree::from_roots(committed_root, committed_depth);
+            let reachable: std::collections::HashSet<u64> = tree
+                .reachable_pages(&mut cache)
+                .unwrap()
+                .into_iter()
+                .collect();
+            let total = cache.next_page_id();
+            let mut free = std::collections::BTreeSet::new();
+            for id in 0..total {
+                if tree.is_free(&mut cache, id).unwrap() {
+                    free.insert(id);
+                }
+            }
+            (free, reachable)
+        };
+        assert_eq!(
+            reachable_after, reachable_before,
+            "the original committed freemap tree's node set changed — a committed \
+             freemap page was reused-and-overwritten (savepoint guard regression)"
+        );
+        assert_eq!(
+            free_after, free_before,
+            "the original committed freemap tree's free-set changed — its on-disk \
+             bitmap pages were overwritten by a COW into a reused committed page"
+        );
+    }
+
+    // A corrupt DEAD (non-reachable) page must NOT poison the orphan sweep.
+    //
+    // 2026-06-22 review decision ("skip unreadable dead pages"): the sweep scans
+    // every non-reachable page id to classify it as a freemap orphan. A page that
+    // is not in the live tree but fails to read because it is GARBAGE cannot be
+    // confirmed as an orphan, and its corruption is irrelevant (it is dead), so
+    // the sweep SKIPS it instead of propagating fatal. Contrast: a corrupt page
+    // REACHABLE from the live tree must still surface fatal via `reachable_pages`
+    // — that path is deliberately NOT weakened (asserted below).
+    #[test]
+    fn corrupt_dead_page_does_not_poison_orphan_sweep() {
+        let mut tm = fresh_manager();
+        let big: Vec<u8> = vec![0xAB; MAX_INLINE_VALUE + 32];
+
+        // Build a committed multi-page freemap and a real orphan to reclaim, so
+        // the sweep has live work to do AND a corrupt dead page to step over.
+        let _survivors = structural_churn(&mut tm, &big, 8, 4);
+
+        tm.begin().unwrap();
+        let real_orphan = tm.test_forge_freemap_orphan().unwrap();
+        let corrupt = tm.test_forge_corrupt_dead_page().unwrap();
+        assert_ne!(real_orphan, corrupt);
+
+        // The sweep must succeed (NOT poison) despite the corrupt dead page, and
+        // must still reclaim the legitimate orphan it can read.
+        let reclaimed = tm.reclaim_freemap_orphans().unwrap();
+        assert!(
+            reclaimed >= 1,
+            "sweep must skip the corrupt dead page yet still reclaim the readable \
+             orphan (reclaimed={reclaimed})"
+        );
+        assert!(
+            !tm.is_poisoned(),
+            "a corrupt DEAD page must not poison the orphan sweep"
+        );
+        tm.commit().unwrap();
+
+        // Contrast: the live-tree walk MUST still propagate fatal on a corrupt
+        // node reachable from the committed tree — `reachable_pages` is NOT
+        // weakened by the dead-page softening above. Corrupt a REAL live node on
+        // disk (flip its type byte to the wrong PageType but keep the checksum
+        // valid — a type-corruption reached via a live pointer) and confirm the
+        // walk surfaces `CorruptPage` for exactly that node.
+        let live_root = tm.committed_roots.freemap_page;
+        let live_depth = tm.committed_roots.freemap_depth;
+        {
+            let mut cache = tm.cache.borrow_mut();
+            // Pick a non-root reachable node so the root's own type check passes
+            // and the failure happens during descent (the path the softening must
+            // NOT touch). If the tree is a single root (depth 0), the root IS the
+            // only node; corrupt it directly.
+            let tree = FreeMapTree::from_roots(live_root, live_depth);
+            let reachable: Vec<u64> = tree
+                .reachable_pages(&mut cache)
+                .unwrap()
+                .into_iter()
+                .collect();
+            let victim = reachable
+                .iter()
+                .copied()
+                .find(|&id| id != live_root)
+                .unwrap_or(live_root);
+            // Wrong type byte, valid checksum: not a bit-flip, a position-type
+            // corruption that `check_type` rejects. Flip FreeMap<->FreeMapInterior.
+            {
+                let buf = cache.get_mut(victim).unwrap();
+                let wrong = if buf[0] == crate::page::PageType::FreeMap as u8 {
+                    crate::page::PageType::FreeMapInterior as u8
+                } else {
+                    crate::page::PageType::FreeMap as u8
+                };
+                buf[0] = wrong;
+                page::stamp_checksum(buf);
+            }
+            let err = tree.reachable_pages(&mut cache).unwrap_err();
+            assert!(
+                matches!(err, ChiselError::CorruptPage { .. }),
+                "reachable_pages must surface fatal CorruptPage on a corrupt LIVE \
+                 node — the dead-page softening must not weaken the live walk \
+                 (got {err:?})"
+            );
         }
     }
 

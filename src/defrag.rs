@@ -156,7 +156,11 @@ pub struct DefragStats {
 ///      `txm.reclaim_freemap_orphans` (reported as
 ///      `freemap_orphans_reclaimed`). Runs unconditionally — even when
 ///      steps 2-6 found no sparse data pages — since freemap orphans are
-///      an independent reclamation channel.
+///      an independent reclamation channel. EXCEPTION: the orphan sweep is
+///      skipped while a savepoint is active (it returns 0), because the sweep
+///      COWs the freemap and `rollback_to` does not rewind the structural
+///      recycle streams; see `reclaim_freemap_orphans`. Run defrag outside a
+///      savepoint scope to reclaim crash orphans.
 ///
 /// What this does NOT do (v1):
 /// - No fancy ordering of handle visits (e.g., group by page). A

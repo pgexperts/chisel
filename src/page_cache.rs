@@ -273,6 +273,17 @@ impl PageCache {
         self.pages_allocated.get()
     }
 
+    /// Test-only: drop a single page from the in-memory cache (and its LRU
+    /// slot) without touching the backing file, forcing the next `get` to
+    /// re-read it from disk and re-run the checksum verification. Used by the
+    /// corrupt-dead-page sweep test to make a checksum-invalid on-disk page
+    /// actually surface as `ChecksumMismatch` on read.
+    #[cfg(test)]
+    pub(crate) fn test_drop_from_cache(&mut self, page_id: u64) {
+        self.entries.remove(&page_id);
+        self.lru.remove(page_id);
+    }
+
     /// Snapshot all four engine-activity counters into a `ChiselCounters`.
     ///
     /// Three of the four counters live here in `PageCache`; `fsync_calls`

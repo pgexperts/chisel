@@ -842,6 +842,11 @@ impl Chisel {
     /// commit one on the caller's behalf — defrag is composable with other
     /// work in the same transaction and atomic with it on commit.
     ///
+    /// The freemap crash-orphan sweep (step 7) is SKIPPED while a savepoint is
+    /// active, since the sweep COWs the freemap and `rollback_to` does not
+    /// rewind the structural recycle streams. Run defrag outside any savepoint
+    /// scope to reclaim crash-orphaned freemap pages.
+    ///
     /// # Errors
     /// `NoActiveTransaction` if no transaction is open; `CacheFull` if the
     /// relocation working set exceeds the cache cap.
