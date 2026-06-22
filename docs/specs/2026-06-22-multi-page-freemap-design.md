@@ -69,12 +69,17 @@ transaction cost is independent of database size.
    in `committed_roots` / `current_roots`. Bitmap pages are read through, and
    COW-mutated in, the page cache like every other structure.
 
-6. **Structural pages are extend-only.** Freemap interior/leaf COW copies and
-   newly-materialized nodes are *always* allocated by extending the file
-   (`PageCache::new_page`), never drawn from the freemap. This breaks the
-   "the free-list needs a free page to record free pages" recursion and
-   guarantees termination. It generalizes today's `persist_freemap`, which
-   already special-allocates the new freemap page.
+6. **Structural pages recycle out-of-band, never from the bitmap.** Freemap
+   interior/leaf COW copies and newly-materialized nodes are allocated by the
+   freemap's structural allocator, which draws from an in-memory recycle of dead
+   freemap pages and falls back to extending the file (`PageCache::new_page`) —
+   but is NEVER sourced from the freemap's own bitmap. Sourcing a structural page
+   from a free bit would clear that bit, which COWs a leaf, which recurses; the
+   out-of-band recycle is what breaks the "the free-list needs a free page to
+   record free pages" recursion *and* bounds the file (pure extend would march
+   the high-water up one structural page per commit forever — see "Structural-
+   page reclamation"). It generalizes today's `persist_freemap`, which already
+   special-allocates the new freemap page outside the bitmap.
 
 7. **Depth stored in the superblock** (vs. spine-walk recovery). A previously-
    zero reserved region in the superblock (byte 320) holds `freemap_depth`.
@@ -151,10 +156,12 @@ impl FreeMapTree {
 }
 ```
 
-`extend` is always `PageCache::new_page` in production (decision 6). Passing it
-as a closure (rather than calling `new_page` directly) keeps `freemap_tree.rs`
-free of any allocation *policy* and mirrors the `alloc` closure the membership
-tree already takes.
+`extend` is the freemap's structural allocator (decision 6): in production it
+pops a dead freemap page from the in-memory recycle pool and falls back to
+`PageCache::new_page`, but is never sourced from the bitmap. Passing it as a
+closure (rather than baking `new_page` in) keeps `freemap_tree.rs` free of any
+allocation *policy* — the recycle pool lives in the transaction layer — and
+mirrors the `alloc` closure the membership tree already takes.
 
 The persisted identity is `{ root_page, depth }` only — these mirror the
 superblock and live in `committed_roots` / `current_roots`. The
@@ -211,11 +218,12 @@ commit (the superblock swap) as the data it describes, and it can only ever be
   because until the new superblock commits the *old* superblock still references
   the to-be-freed pages. A page is not reusable until the commit that frees it
   has fully landed. This per-leaf ordering is preserved.
-- **Extend-only structural pages (decision 6):** because freemap-structural COW
-  always extends the file, the freemap never overwrites a page the live
-  superblock still points at, and it never recurses into itself for space.
-  Superseded structural pages are queued on the freed list and reclaimed by a
-  later transaction.
+- **Structural-page reuse (decision 6):** the freemap never overwrites a page
+  the live superblock still points at, and it never recurses into itself for
+  space — its COW targets come from an out-of-band in-memory recycle (one-commit
+  deferred) or a file extension, never the bitmap. The full mechanism, and how
+  crash-orphaned recycle entries are reclaimed, is in **Structural-page
+  reclamation** below.
 - **Rollback:** dirty freemap pages above the pre-transaction watermark are
   dropped (the existing I3 mechanism); `{root, depth, hint}` snap back to the
   committed values. No special freemap rollback path remains.
@@ -223,6 +231,57 @@ commit (the superblock swap) as the data it describes, and it can only ever be
   poisons the `TransactionManager` (I1); recovery is drop-and-reopen, which
   re-reads the last durable superblock and reconstructs the committed tree
   handle. The freemap is built to never need its own recovery path.
+
+## Structural-page reclamation
+
+The freemap's own COW churn — every commit that frees a page COWs the affected
+leaf and its spine — produces a stream of dead freemap pages that must be
+reclaimed or the file grows without bound. These pages **cannot** be reclaimed
+through the freemap's own bitmap: marking one free and later reusing it requires
+clearing its bit, which COWs a leaf, which recurses (the termination hazard).
+And they land at high (just-extended) ids, so lowest-first `allocate_first`
+never reaches them even if marked free (data churn keeps reusing the low frees
+while the freemap keeps extending → the high-water marches up forever).
+Reclamation is therefore **out-of-band**. (This gap was found during the Phase 2
+integration; an earlier draft of this spec wrongly assumed "reclaimed by a later
+transaction" through the bitmap, which does not work.)
+
+**Session-COW dedup (bounds the churn).** Within one commit, each freemap node is
+COW'd at most once; a second `mark_free` into an already-COW'd node edits it in
+place. Without this, K frees landing in one leaf would COW-extend the leaf K
+times. A per-transaction `session_owned` set records the pages this transaction
+has already COW'd or materialized; `cow_node` returns a session-owned page
+unchanged (no extend, no supersede). The set is threaded through the transient
+tree handles the integration rebuilds at each allocation site, and is transient
+working state, never serialized. A session-owned page is edited in place WITHOUT
+type re-validation — sound because the single writer just wrote it and it cannot
+rot between two touches in one transaction; a *committed* page reached through a
+fresh handle is **always** position-validated, so the COW-path corruption guard
+(2026-06-22 review hardening) is preserved.
+
+**In-memory recycle with a one-commit defer.** The structural allocator draws a
+dead freemap page from an in-memory pool before extending. The one-commit defer
+is mandatory for crash-safety: a page `P` superseded in transaction `T` is still
+referenced by the pre-`T` superblock until `T` commits, so reusing `P` *within*
+`T` and then crashing pre-commit would corrupt the page the recovered (pre-`T`)
+superblock points at. So supersedes accumulate during `T`, become reusable only
+after `T`'s superblock fsync lands, and are drawn from by `T+1`. The pool has two
+logical states — *pending* (superseded this commit, not yet safe) and *reusable*
+(safe now), promoted at commit. In steady state each commit supersedes and
+consumes a similar small number of pages, so the file reaches a **flat**
+high-water under sustained churn — the property the whole mechanism exists for.
+
+**Crash recovery via defrag orphan-sweep.** Because the recycle pool is
+in-memory, a crash orphans its entries: freemap-typed pages unreachable from the
+committed tree and not marked free in the bitmap (a bounded handful — the last
+commit's structural supersedes). They are not leaked permanently. `defrag`
+reclaims them: walk the live freemap tree to build the reachable-freemap-page
+set, scan for `FreeMap`/`FreeMapInterior`-typed pages that are neither reachable
+nor already free, and mark those free. This is off the hot path and explicit
+(scheduled with the rest of defrag), so durability-first holds without
+per-commit persisted bookkeeping. A reclaimed orphan enters the BITMAP
+(data-reusable), cleanly disjoint from the in-memory pool (freemap-COW-reusable)
+— so no page is ever handed out twice.
 
 ## Architecture-fit assessment
 
@@ -237,8 +296,11 @@ commit (the superblock swap) as the data it describes, and it can only ever be
 
 ## Edge cases and soundness
 
-- **Recursion termination:** structural COW is extend-only (decision 6); the
-  descent is depth-bounded by the freemap's own `MAX_DEPTH` (its leaf fans out to
+- **Recursion termination:** structural COW is sourced out-of-band (the in-memory
+  recycle or a file extension), never from the bitmap (decision 6 / Structural-
+  page reclamation), so marking a page free never triggers another structural
+  allocation that could clear another bit; the descent is depth-bounded by the
+  freemap's own `MAX_DEPTH` (its leaf fans out to
   65,344 ≈ 2¹⁶ and each level multiplies by 1021 ≈ 2¹⁰, so depth 5 already covers
   2⁶⁶ > u64 page ids — the bound is ~5, distinct from the membership tree's 6,
   computed for this leaf fan-out); a corrupt out-of-range depth saturates
@@ -267,15 +329,30 @@ commit (the superblock swap) as the data it describes, and it can only ever be
     oracle of free ids, with proptests crossing depth-0→1→2 boundaries (model
     the membership proptests);
   - growth: freeing an id beyond capacity grows depth and remains consistent;
-  - **termination invariant:** a test asserting freemap-structural COW only ever
-    calls the `extend` closure (never reuses), e.g. an `extend` spy that records
-    its allocations;
+  - **termination invariant:** a test asserting the freemap's structural
+    allocator is never sourced from the bitmap — it draws only from the recycle
+    pool or the `extend` closure (a spy confirming no `allocate_first`/bitmap
+    call re-enters during a structural COW);
+  - **session-COW dedup:** marking N ids into one already-COW'd leaf in a commit
+    supersedes exactly one structural page, not N (an `extend` spy counting
+    materializations);
   - lowest-free hint correctness: after frees and reuses, `allocate_first`
     returns the true lowest free id.
 - **Integration (the scenario the ceiling broke):** allocate > 65,344 pages,
   free a page in a high (depth-1) range, reopen, and confirm the freed page is
   reclaimed by a subsequent allocation. One file-backed reopen test for
   durability; an in-memory proptest for breadth.
+- **Steady-state flat file (the reclamation property):** under sustained
+  allocate/free/commit churn at constant live-data size, `total_pages` reaches a
+  flat high-water (no per-commit growth) — the test that would have caught the
+  original leak.
+- **Crash → defrag reclaim:** simulate a crash with a non-empty recycle pool
+  (drop the manager mid-flight after a committed structural churn), reopen,
+  confirm orphaned freemap-typed pages exist (unreachable + not free), run
+  `defrag`, and confirm they are reclaimed (marked free / file reusable).
+- **Corruption on the COW path:** a fresh handle descending into a committed,
+  position-wrong freemap page surfaces `CorruptPage` (the session-owned in-place
+  skip does not weaken detection).
 - **Recovery:** a committed multi-page freemap, reopened, yields the same
   free-set (root+depth round-trip through the superblock).
 - **Backward compatibility:** a database written by the single-page format (a
@@ -301,7 +378,13 @@ commit (the superblock swap) as the data it describes, and it can only ever be
 - **Depth storage:** superblock field (not spine-walk recovery).
 - **find-first-free:** in-memory lowest-free hint (not interior summary bits) in
   v1.
-- **Structural allocation:** extend-only.
+- **Structural allocation & reclamation** (revised 2026-06-22 after the Phase 2
+  integration exposed the bitmap-reclamation gap): out-of-band, never from the
+  bitmap. An in-memory one-commit-deferred recycle of dead freemap pages, plus a
+  session-COW dedup (one COW per node per commit). Crash-orphaned recycle entries
+  are reclaimed by a `defrag` orphan-sweep — **in-memory pool, no persisted
+  bookkeeping** (chosen over a persisted recycle list and over accepting a
+  permanent per-crash leak). See "Structural-page reclamation".
 - **Module split:** new `freemap_tree.rs` over a retained `freemap.rs` leaf
   primitive.
 
@@ -313,7 +396,11 @@ commit (the superblock swap) as the data it describes, and it can only ever be
   empty interior levels; harmless, reclaimable, and rare for an append-mostly
   engine — mirrors the handle-table/membership "delete does not shrink depth"
   stance).
-- A background freemap compaction/verification pass.
+- A *general* mark-and-sweep reclaiming any leaked page (the defrag orphan-sweep
+  in scope here is narrowly scoped to freemap-typed pages; a full reachability
+  GC over all page types is a larger, separate effort).
+- File truncation to return reclaimed high pages to the OS (reclaimed pages
+  become reusable in the freemap; shrinking the file itself is separate).
 
 ## Relationship to existing tracked work
 
