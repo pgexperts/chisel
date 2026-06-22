@@ -1281,6 +1281,16 @@ mod tests {
             before + 1,
             "claim of a clean page must add exactly one dirty entry (I20 accounting)"
         );
+        // The real I20 invariant is counter/flag CONSISTENCY: dirty_count must
+        // equal the actual number of dirty entries. A mis-accounting claim (the
+        // bug the debug_assert guards) would desync the counter from the flags
+        // even on this legitimate clean-page path — the delta assertion above
+        // alone could not catch a desync that predated the claim.
+        let actual_dirty = cache.entries.values().filter(|e| e.dirty).count();
+        assert_eq!(
+            cache.dirty_count, actual_dirty,
+            "dirty_count must equal the live dirty-entry count (I20 accounting)"
+        );
     }
 
     #[test]
@@ -1616,10 +1626,19 @@ mod tests {
         );
         // The dirty flags were already cleared (phase 1a) before the failed
         // fsync. This is the durability window; poison (asserted in
-        // transaction.rs) is what makes it safe.
+        // transaction.rs) is what makes it safe. Cross-check the counter against
+        // the ACTUAL entry flags: both the `dirty_count` counter and every
+        // entry's `dirty` bit are cleared even though the fsync — and thus
+        // durability — failed. (The `Err(IoError)` assertion above is what
+        // proves the fault actually fired; this pair documents the hazard.)
         assert_eq!(
             cache.dirty_count, 0,
             "phase-1a cleared dirty flags before the (failed) fsync"
+        );
+        assert_eq!(
+            cache.entries.values().filter(|e| e.dirty).count(),
+            0,
+            "phase-1a cleared the real dirty flags, not just the counter"
         );
     }
 }
