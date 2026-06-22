@@ -295,6 +295,14 @@ impl std::error::Error for ChiselError {
 // poisoning.) Every other kind stays fatal: under the poison model over-poisoning
 // is the safe direction (reopen recovers), and demoting a kind that might signal
 // real corruption would be the same fail-open hazard as I104's is_fatal default.
+//
+// One other site CAN surface a NotFound after the DB is open: the spillway is a
+// second file opened lazily mid-transaction (Spillway::open_file). A NotFound
+// there is a degraded in-flight cache state, NOT a recoverable bad-path mistake,
+// so that call site maps its open error to the fatal IoError directly and never
+// routes through this demotion (review 2026-06-22). The invariant this blanket
+// NotFound→operational rule relies on — "NotFound only means the initial open
+// path" — therefore still holds for every `?` that reaches here.
 impl From<io::Error> for ChiselError {
     fn from(e: io::Error) -> Self {
         match e.kind() {
