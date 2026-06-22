@@ -530,43 +530,56 @@ impl FreeMapTree {
         Ok(None)
     }
 
-    /// Test-only: collect every page id physically reachable from the tree root
-    /// (root + every present interior + every materialized leaf). Mirrors
-    /// `HandleTable::collect_page_ids`. Used by the structural-recycle pin-tests
-    /// to assert disjointness between the LIVE tree and the dead-page reuse pool
-    /// (a reuse-pool page must never still be reachable). Returns an empty set
-    /// when the tree is unmaterialized (`root == PAGE_ID_NONE`).
-    #[cfg(test)]
-    pub(crate) fn reachable_pages(&self, cache: &mut PageCache) -> Result<Vec<u64>> {
-        let mut out = Vec::new();
+    /// Collect every page id the live tree physically occupies (root + every
+    /// present interior + every materialized leaf). Mirrors
+    /// `HandleTable::collect_page_ids`. Returns an empty set when the tree is
+    /// unmaterialized (`root == PAGE_ID_NONE`).
+    ///
+    /// Two consumers: the structural-recycle pin-tests (assert the LIVE tree and
+    /// the dead-page reuse pool stay disjoint) and the defrag orphan-sweep
+    /// (`reclaim_freemap_orphans`), which subtracts this set from the
+    /// freemap-typed pages on disk to find pages a crash orphaned. Because the
+    /// sweep acts on the result (marks the complement free), the walk
+    /// type-validates every page — a leaf must be `FreeMap`, an interior
+    /// `FreeMapInterior` — so a checksum-valid wrong-type page reached via a
+    /// corrupt child pointer surfaces as `CorruptPage` rather than silently
+    /// shrinking the reachable set (which would then reclaim a still-live page).
+    pub(crate) fn reachable_pages(
+        &self,
+        cache: &mut PageCache,
+    ) -> Result<rustc_hash::FxHashSet<u64>> {
+        let mut set = rustc_hash::FxHashSet::default();
         if self.root != crate::page::PAGE_ID_NONE {
-            self.collect_reachable(cache, self.root, self.depth, &mut out)?;
+            self.collect_reachable(cache, self.root, self.depth, &mut set)?;
         }
-        Ok(out)
+        Ok(set)
     }
 
-    #[cfg(test)]
     fn collect_reachable(
         &self,
         cache: &mut PageCache,
         page: u64,
         level: u32,
-        out: &mut Vec<u64>,
+        set: &mut rustc_hash::FxHashSet<u64>,
     ) -> Result<()> {
-        out.push(page);
-        if level > 0 {
-            // Materialize child pointers before recursing (the recursive call
-            // needs &mut PageCache, invalidating the borrow on `page`).
-            let children: Vec<u64> = {
-                let buf = cache.get(page)?;
-                (0..PTRS_PER_INTERIOR)
-                    .map(|i| read_child(buf, i))
-                    .filter(|c| *c != 0)
-                    .collect()
-            };
-            for child in children {
-                self.collect_reachable(cache, child, level - 1, out)?;
-            }
+        set.insert(page);
+        if level == 0 {
+            // Leaf: validate the position type, no children to recurse into.
+            check_type(cache.get(page)?, PageType::FreeMap, page)?;
+            return Ok(());
+        }
+        check_type(cache.get(page)?, PageType::FreeMapInterior, page)?;
+        // Materialize child pointers before recursing (the recursive call needs
+        // &mut PageCache, invalidating the borrow on `page`).
+        let children: Vec<u64> = {
+            let buf = cache.get(page)?;
+            (0..PTRS_PER_INTERIOR)
+                .map(|i| read_child(buf, i))
+                .filter(|c| *c != 0)
+                .collect()
+        };
+        for child in children {
+            self.collect_reachable(cache, child, level - 1, set)?;
         }
         Ok(())
     }
@@ -780,6 +793,33 @@ mod tests {
             matches!(err, ChiselError::CorruptPage { page_id } if page_id == interior_child),
             "expected CorruptPage {{ page_id: {interior_child} }}, got {err:?}"
         );
+    }
+
+    // reachable_pages must return exactly the live tree's pages: the root
+    // interior plus every materialized leaf. Forcing depth 1 and freeing ids in
+    // two different child ranges materializes two leaves, so the set is
+    // {root, leaf_a, leaf_b} — count 3.
+    #[test]
+    fn reachable_pages_collects_every_node() {
+        let mut c = make_cache(256);
+        let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
+        t.grow(&mut c, &mut extend).unwrap(); // depth 1: root is an interior
+        assert_eq!(t.depth, 1);
+        // id 5 lives in child 0's leaf; LEAF_CAPACITY + 7 in child 1's leaf —
+        // two distinct materialized leaves under the one root interior.
+        t.mark_free(&mut c, 5, &mut extend).unwrap();
+        t.mark_free(&mut c, LEAF_CAPACITY + 7, &mut extend).unwrap();
+        let reachable = t.reachable_pages(&mut c).unwrap();
+        assert!(reachable.contains(&t.root), "root must be reachable");
+        assert_eq!(
+            reachable.len(),
+            3,
+            "1 root-interior + 2 materialized leaves (depth 1)"
+        );
+        // The superblock page (0) is never part of the tree.
+        for id in reachable.iter() {
+            assert!(*id != 0, "the superblock page must never be a tree page");
+        }
     }
 
     // Oracle proptest — the correctness backbone. Random (is_free_op, id)

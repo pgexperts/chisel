@@ -116,6 +116,12 @@ pub struct DefragStats {
     pub pages_examined: u64,
     pub pages_freed: u64,
     pub values_moved: u64,
+    /// Freemap-typed pages reclaimed by the orphan-sweep — pages a prior crash
+    /// stranded when it lost the in-memory structural recycle pool (see
+    /// `TransactionManager::reclaim_freemap_orphans`). 0 on a clean database.
+    /// Reported, not gating: a non-zero value means a past crash leaked freemap
+    /// pages that this pass returned to the bitmap as reusable space.
+    pub freemap_orphans_reclaimed: u64,
 }
 
 /// Run defragmentation.
@@ -145,6 +151,12 @@ pub struct DefragStats {
 ///   6. Track UNIQUE sparse pages touched via a HashSet (for accurate
 ///      `pages_examined`) and compute `pages_freed` as the net drop
 ///      in data-page count after the sweep.
+///   7. Reclaim freemap pages orphaned by a prior crash that lost the
+///      in-memory structural recycle pool, via
+///      `txm.reclaim_freemap_orphans` (reported as
+///      `freemap_orphans_reclaimed`). Runs unconditionally — even when
+///      steps 2-6 found no sparse data pages — since freemap orphans are
+///      an independent reclamation channel.
 ///
 /// What this does NOT do (v1):
 /// - No fancy ordering of handle visits (e.g., group by page). A
@@ -152,8 +164,9 @@ pub struct DefragStats {
 /// - No merging of adjacent sparse pages into one target. Relocated
 ///   values just go into whatever the insert cursor currently points at.
 /// - Handle-table and overflow-chain COW garbage is not reclaimed by
-///   this pass — only data pages are compacted. Handle-table spine
-///   cleanup would require a separate mechanism.
+///   this pass — only data pages are compacted, and (step 7) freemap
+///   pages orphaned by a crash are swept back into the bitmap. Handle-
+///   table and overflow spine cleanup still requires a separate mechanism.
 pub fn defrag(txm: &mut TransactionManager, options: &DefragOptions) -> Result<DefragStats> {
     // Defrag mutates through `txm.update`, which requires an active
     // transaction. Without this check, a caller who forgot to `begin()`
@@ -169,6 +182,7 @@ pub fn defrag(txm: &mut TransactionManager, options: &DefragOptions) -> Result<D
         pages_examined: 0,
         pages_freed: 0,
         values_moved: 0,
+        freemap_orphans_reclaimed: 0,
     };
 
     // Step 1: empty-database fast path.
@@ -179,59 +193,135 @@ pub fn defrag(txm: &mut TransactionManager, options: &DefragOptions) -> Result<D
         return Ok(stats);
     }
 
-    // Step 2: identify sparse pages. If none qualify, there's nothing
-    // to do and we skip the (potentially expensive) handle scan. This
-    // step loads each candidate data page once to read its stored-slot
-    // count from the header, so it can fail with a fatal I/O or
-    // checksum error (which will poison the manager via the normal
-    // path).
+    // Step 2: identify sparse pages. If none qualify, there is no data-page
+    // compaction to do and we skip the (potentially expensive) handle scan —
+    // but we still fall through to the freemap orphan-sweep below, which is
+    // independent of data-page density (a crash can leave freemap orphans even
+    // in a database with no sparse pages). This step loads each candidate data
+    // page once to read its stored-slot count from the header, so it can fail
+    // with a fatal I/O or checksum error (which will poison the manager via the
+    // normal path).
     let sparse_pages: HashSet<u64> = txm.sparse_data_pages(options.sparse_threshold)?;
-    if sparse_pages.is_empty() {
-        return Ok(stats);
+    if !sparse_pages.is_empty() {
+        // Step 3: snapshot the set of data page ids at the start so we can
+        // report `pages_freed` accurately. Net change in page count is the
+        // wrong metric: a relocation simultaneously drains a sparse page
+        // and creates a dense destination, so net change is ~0 even when
+        // a page genuinely got reclaimed. The right metric is "pages that
+        // existed at the start and are gone at the end", which we compute
+        // via set difference below.
+        let initial_page_ids = txm.data_page_ids_snapshot();
+
+        // Step 4: snapshot the handle set.
+        let handles = txm.handles()?;
+
+        // Step 5: relocate handles living on sparse pages.
+        let mut examined_pages: HashSet<u64> = HashSet::new();
+        for &handle in &handles {
+            if options.max_values > 0 && stats.values_moved >= options.max_values as u64 {
+                break;
+            }
+            let page_id = match txm.handle_live_page_id(handle)? {
+                Some(id) => id,
+                None => continue, // Overflow or Deleted — nothing to compact.
+            };
+            if !sparse_pages.contains(&page_id) {
+                continue; // Dense page — leave it alone.
+            }
+            examined_pages.insert(page_id);
+
+            // Read-then-write under the same handle. The stable-handle
+            // invariant guarantees `handle` still refers to this value
+            // after update; R1's insert cursor packs the re-insertion
+            // into a dense destination.
+            let value = txm.read(handle)?;
+            txm.update(handle, &value)?;
+            stats.values_moved += 1;
+        }
+
+        // Step 6: accurate stats (I17). `pages_freed` counts pages that
+        // were tracked at the start and are gone now — i.e., pages the
+        // sweep fully drained and returned to the freemap.
+        let final_page_ids = txm.data_page_ids_snapshot();
+        stats.pages_examined = examined_pages.len() as u64;
+        stats.pages_freed = initial_page_ids.difference(&final_page_ids).count() as u64;
     }
 
-    // Step 3: snapshot the set of data page ids at the start so we can
-    // report `pages_freed` accurately. Net change in page count is the
-    // wrong metric: a relocation simultaneously drains a sparse page
-    // and creates a dense destination, so net change is ~0 even when
-    // a page genuinely got reclaimed. The right metric is "pages that
-    // existed at the start and are gone at the end", which we compute
-    // via set difference below.
-    let initial_page_ids = txm.data_page_ids_snapshot();
-
-    // Step 4: snapshot the handle set.
-    let handles = txm.handles()?;
-
-    // Step 5: relocate handles living on sparse pages.
-    let mut examined_pages: HashSet<u64> = HashSet::new();
-    for &handle in &handles {
-        if options.max_values > 0 && stats.values_moved >= options.max_values as u64 {
-            break;
-        }
-        let page_id = match txm.handle_live_page_id(handle)? {
-            Some(id) => id,
-            None => continue, // Overflow or Deleted — nothing to compact.
-        };
-        if !sparse_pages.contains(&page_id) {
-            continue; // Dense page — leave it alone.
-        }
-        examined_pages.insert(page_id);
-
-        // Read-then-write under the same handle. The stable-handle
-        // invariant guarantees `handle` still refers to this value
-        // after update; R1's insert cursor packs the re-insertion
-        // into a dense destination.
-        let value = txm.read(handle)?;
-        txm.update(handle, &value)?;
-        stats.values_moved += 1;
-    }
-
-    // Step 6: accurate stats (I17). `pages_freed` counts pages that
-    // were tracked at the start and are gone now — i.e., pages the
-    // sweep fully drained and returned to the freemap.
-    let final_page_ids = txm.data_page_ids_snapshot();
-    stats.pages_examined = examined_pages.len() as u64;
-    stats.pages_freed = initial_page_ids.difference(&final_page_ids).count() as u64;
+    // Step 7: reclaim freemap pages orphaned by a prior crash that lost the
+    // in-memory recycle pool. Off the hot path (defrag is scheduled
+    // maintenance), so this is exactly the place for the O(total_pages) scan.
+    // Runs even when there was no data-page compaction above — the two are
+    // independent reclamation channels.
+    stats.freemap_orphans_reclaimed = txm.reclaim_freemap_orphans()?;
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::page::PAGE_SIZE;
+    use crate::page_cache::PageCache;
+    use crate::page_io::PageIo;
+
+    // Build a committed-once manager, mirroring transaction.rs's `fresh_manager`
+    // (private to that module, hence duplicated here).
+    fn fresh_manager() -> TransactionManager {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let io = PageIo::open(file.path(), false).unwrap();
+        let cache = PageCache::new(
+            io,
+            1024 * PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
+        let mut tm = TransactionManager::create_new(cache, 2).unwrap();
+        tm.begin().unwrap();
+        tm.commit().unwrap();
+        tm
+    }
+
+    // A defrag pass reports any freemap orphan it reclaimed. Forge an orphan (a
+    // crash-stranded freemap page), run defrag inside a transaction, and assert
+    // the new `freemap_orphans_reclaimed` stat counts it. This is the public,
+    // stat-level contract of the crash-recovery sweep wired into step 7.
+    #[test]
+    fn defrag_reports_freemap_orphans_reclaimed() {
+        let mut tm = fresh_manager();
+
+        // Establish a real freemap tree (a value + its delete frees a whole page,
+        // materializing a freemap leaf), so defrag's empty-DB fast path is not
+        // taken and the sweep has a live root to walk.
+        let big: Vec<u8> = vec![0xCD; 1 << 14];
+        tm.begin().unwrap();
+        let h = tm.allocate(&big).unwrap();
+        tm.commit().unwrap();
+        tm.begin().unwrap();
+        tm.delete(h).unwrap();
+        tm.commit().unwrap();
+
+        // Forge the orphan, then run defrag in a fresh transaction.
+        let orphan = tm.test_forge_freemap_orphan().unwrap();
+        tm.begin().unwrap();
+        let stats = defrag(&mut tm, &DefragOptions::default()).unwrap();
+        tm.commit().unwrap();
+
+        assert!(
+            stats.freemap_orphans_reclaimed >= 1,
+            "defrag must report the forged orphan as reclaimed, got {}",
+            stats.freemap_orphans_reclaimed
+        );
+
+        // Idempotent: a second defrag finds nothing (the orphan was already
+        // reclaimed into the bitmap on the first pass).
+        tm.begin().unwrap();
+        let again = defrag(&mut tm, &DefragOptions::default()).unwrap();
+        tm.commit().unwrap();
+        assert_eq!(
+            again.freemap_orphans_reclaimed, 0,
+            "second sweep must find no orphans (idempotent)"
+        );
+        let _ = orphan;
+    }
 }
