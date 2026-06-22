@@ -16,8 +16,7 @@
 //                   today). A future common field added here bumps the
 //                   affected page type's per-page version, not the
 //                   superblock's MAJOR. No live code reads or writes these
-//                   bytes; init_page zeroes them and compact() preserves
-//                   whatever's there across a rebuild.
+//                   bytes; init_page zeroes them.
 //   bytes 16..free_start : slot directory (6 bytes per entry)
 //   bytes free_start..free_end : free hole (shrinks as slots and data are added)
 //   bytes free_end..CHECKSUM_OFFSET : packed value data (grows backward)
@@ -26,15 +25,13 @@
 // Slot directory entry (6 bytes, LE):
 //   bytes 0..2: data offset within the page
 //   bytes 2..4: data length
-//   bytes 4..6: flags (SLOT_FLAG_LIVE = 0x0001, SLOT_FLAG_DEAD = 0x0000)
+//   bytes 4..6: flags (SLOT_FLAG_LIVE = 0x0001)
 //
 // Invariants:
-//   * Slot indices are stable while the page is not compacted — the handle
+//   * Slot indices are stable for the lifetime of the page — the handle
 //     table stores (page_id, slot_index) and relies on this.
-//   * compact() invalidates slot indices and returns an (old→new) mapping so
-//     callers can rewrite handle-table entries.
-//   * Dead slots are NOT reused by insert(); space reclamation only happens
-//     during compact().
+//   * Dead slots are NOT reused by insert(); the transaction layer frees
+//     whole pages rather than compacting individual pages.
 //   * free_start <= free_end at all times; insert() fails rather than violating.
 //   * All multi-byte integers are little-endian.
 //
@@ -44,10 +41,7 @@
 // Mutation discipline: every public mutator operates in place on the buffer
 // argument. None of them stamp the checksum — callers (transaction layer) are
 // responsible for calling page::stamp_checksum before the page is flushed.
-// init_page() does not preserve prior contents; compact() rebuilds the page
-// but preserves bytes 8..16 (the I31 reserved common-header region — currently
-// universally zero, but saved/restored so a future common-header field placed
-// there survives a compaction).
+// init_page() does not preserve prior contents.
 
 use crate::page::{self, PageType, CHECKSUM_OFFSET, DATA_PAGE_HEADER_SIZE, PAGE_SIZE};
 
@@ -57,30 +51,11 @@ use crate::page::{self, PageType, CHECKSUM_OFFSET, DATA_PAGE_HEADER_SIZE, PAGE_S
 // making that constant impossible to drift out of sync with the slot layout.
 pub(crate) const SLOT_ENTRY_SIZE: usize = 6; // offset(2) + length(2) + flags(2)
 const SLOT_FLAG_LIVE: u16 = 0x0001;
-// `SLOT_FLAG_DEAD` documents the symbolic value for a cleared slot
-// entry. It's mathematically equivalent to "absence of SLOT_FLAG_LIVE",
-// so the production tombstone path can just write 0; the named
-// constant exists for the in-cfg(test) `DataPage::delete` path and as
-// the canonical name for forensic readers. `#[allow(dead_code)]`
-// because the I35 pub→pub(crate) reshape surfaced that the only
-// non-test caller (DataPage::delete) is itself only reached from
-// tests.
-#[allow(dead_code)]
-const SLOT_FLAG_DEAD: u16 = 0x0000;
 
 pub struct DataPage;
 
-// I35 reshape note: several DataPage methods (update, delete, compact,
-// free_space, used_space, iter_live, plus the write_slot_* helpers) are
-// reached only from src-tests after the integration tests migrated in
-// from tests/basic_ops.rs. The transaction layer's data-page lifecycle
-// uses insert → slot tombstone via the in-memory live-slot map → whole-
-// page free via txn_freed_pages; it never calls DataPage::delete/update/
-// compact directly. The methods are kept (rather than deleted) because
-// they're useful for any future direct-mutation API (a hypothetical
-// "shrink in place" or eager-defrag worker) and the test coverage they
-// already have is a real asset; #[allow(dead_code)] suppresses the
-// lib-build warning until a real caller materializes.
+// `free_space`, `used_space`, and `iter_live` are called only from
+// cfg(test) today; `#[allow(dead_code)]` suppresses the lib-build warning.
 #[allow(dead_code)]
 impl DataPage {
     /// Initialize a page buffer as an empty data page.
@@ -90,8 +65,7 @@ impl DataPage {
     // offset, where data packing begins growing backward). slot_count is left
     // implicitly at 0 via the fill.
     //
-    // Does NOT preserve any existing bytes — compact() must save/restore the
-    // reserved common-header bytes (8..16) itself if it wants to keep them.
+    // Does NOT preserve any existing bytes.
     pub fn init_page(buf: &mut [u8; PAGE_SIZE]) {
         buf.fill(0);
         buf[0] = PageType::Data as u8;
@@ -121,12 +95,13 @@ impl DataPage {
     /// Available contiguous free space in the page.
     //
     // Reflects only the central hole between slot dir and data region. Does
-    // NOT account for holes left by dead slots — those are reclaimed only by
-    // compact(). Returns 0 if the header is structurally invalid (a corrupt
-    // page with free_start > free_end, or free_end past the checksum region,
-    // etc.) so downstream mutators refuse to operate on it. The more precise
-    // validity check is `validate_header` — callers that care about the
-    // distinction between "full" and "corrupt" should use that.
+    // NOT account for holes left by dead slots (the transaction layer frees
+    // whole pages rather than compacting individual pages). Returns 0 if the
+    // header is structurally invalid (a corrupt page with free_start > free_end,
+    // or free_end past the checksum region, etc.) so downstream mutators refuse
+    // to operate on it. The more precise validity check is `validate_header` —
+    // callers that care about the distinction between "full" and "corrupt"
+    // should use that.
     pub fn free_space(buf: &[u8; PAGE_SIZE]) -> usize {
         match Self::validate_header(buf) {
             Some((free_start, free_end, _)) => free_end - free_start,
@@ -182,8 +157,7 @@ impl DataPage {
     // backward). The two pointers converge into the central hole.
     //
     // The returned slot index is always the pre-insertion slot_count, making
-    // indices monotonically increasing and stable for the page's lifetime
-    // (until compact() renumbers them).
+    // indices monotonically increasing and stable for the page's lifetime.
     //
     // Note (v1 simplification per ARCHITECTURE.md): the transaction layer calls
     // PageCache::new_page() for every insert rather than scanning existing
@@ -204,7 +178,7 @@ impl DataPage {
 
         // Write slot directory entry at free_start.
         // The directory is append-only during inserts; dead slots retain their
-        // positions and are only collapsed by compact().
+        // positions.
         let slot_offset = free_start;
         buf[slot_offset..slot_offset + 2].copy_from_slice(&(data_offset as u16).to_le_bytes());
         buf[slot_offset + 2..slot_offset + 4].copy_from_slice(&(value.len() as u16).to_le_bytes());
@@ -244,148 +218,12 @@ impl DataPage {
         Some(&buf[offset..offset + length])
     }
 
-    /// Update a value in-place. If the new value fits in the old slot's space,
-    /// it's written directly. If larger, the old space becomes a hole and new
-    /// data is allocated from the free region.
-    //
-    // In-place path (fits): preserves the old offset, only the length changes.
-    // This keeps data packing stable when values shrink.
-    //
-    // Side effect of the in-place shrink: when the new value is strictly
-    // shorter, the tail bytes between the new length and old_length stay
-    // packed inside the page but are no longer referenced by any slot.
-    // free_end is deliberately NOT advanced to reclaim them (the data region
-    // grows backward from free_end, and this slot's offset is below other
-    // live data), so those bytes are unrecoverable orphans until compact()
-    // rebuilds the page. They don't count toward used_space() (which reads the
-    // current slot length), so the page can report less occupancy than its
-    // physical packing — intentional: reclaiming mid-region holes is compact()'s
-    // job, not update()'s.
-    //
-    // Relocate path (doesn't fit): the old bytes are abandoned in place and
-    // become dead space until compact() runs. The new data is carved from the
-    // central hole exactly like insert(), but free_start is NOT advanced —
-    // only free_end moves — because we're reusing an existing slot entry, not
-    // adding a new one.
-    //
-    // Returns false if the slot is dead/out-of-range, or if the relocate path
-    // has insufficient free space. The page is left unmodified on failure.
-    pub fn update(buf: &mut [u8; PAGE_SIZE], slot: u16, value: &[u8]) -> bool {
-        let Some((free_start, free_end, slot_count)) = Self::validate_header(buf) else {
-            return false;
-        };
-        if slot >= slot_count {
-            return false;
-        }
-        let Some((old_offset, old_length, flags)) = Self::read_slot_entry(buf, slot) else {
-            return false;
-        };
-        if flags != SLOT_FLAG_LIVE {
-            return false;
-        }
-
-        if value.len() <= old_length {
-            buf[old_offset..old_offset + value.len()].copy_from_slice(value);
-            Self::write_slot_length(buf, slot, value.len() as u16);
-            true
-        } else {
-            let available = free_end - free_start;
-            if available < value.len() {
-                return false;
-            }
-            let new_offset = free_end - value.len();
-            buf[new_offset..new_offset + value.len()].copy_from_slice(value);
-            Self::write_slot_offset(buf, slot, new_offset as u16);
-            Self::write_slot_length(buf, slot, value.len() as u16);
-            // Only free_end advances: the slot entry already exists in the
-            // directory, so free_start stays put.
-            buf[6..8].copy_from_slice(&(new_offset as u16).to_le_bytes());
-            true
-        }
-    }
-
-    /// Mark a slot as dead. The data space becomes a hole (reclaimed by compact).
-    //
-    // Tombstone-style delete: the slot entry and its data bytes remain so that
-    // live slot indices don't shift. Actual space reclamation is deferred to
-    // compact(). This is required because external references (the handle
-    // table) point at (page, slot) pairs.
-    pub fn delete(buf: &mut [u8; PAGE_SIZE], slot: u16) {
-        // No-op on corrupt header: a tombstone-write into garbage is worse
-        // than leaving the page alone (the transaction layer will surface
-        // the corruption via the next read).
-        let Some((_, _, slot_count)) = Self::validate_header(buf) else {
-            return;
-        };
-        if slot < slot_count {
-            Self::write_slot_flags(buf, slot, SLOT_FLAG_DEAD);
-        }
-    }
-
-    /// Compact the page: remove dead slots, pack surviving data contiguously,
-    /// and rebuild the slot directory. Returns a mapping of (old_slot → new_slot).
-    //
-    // Strategy: copy all live values out to a temporary Vec, re-init the page,
-    // and re-insert. This is simple but O(n) allocations and a full copy.
-    //
-    // Bytes 8..16 (the I31 common-header reserved region) are preserved
-    // across the re-init because init_page() zeroes the buffer. Today
-    // those bytes are always zero and the preservation is a no-op; the
-    // moment any future common-header field lives in that region we'll
-    // depend on this save/restore to keep compact non-destructive.
-    // Other header fields are regenerated correctly by the reinsert loop.
-    //
-    // Returned mapping must be consumed by the caller (transaction layer) to
-    // rewrite any handle-table entries that reference this page, since slot
-    // indices will have changed. Live slots retain their original relative
-    // order, but their indices are renumbered starting from 0.
-    pub fn compact(buf: &mut [u8; PAGE_SIZE]) -> Vec<(u16, u16)> {
-        // Refuse to compact a corrupt page: no mapping is returned, so
-        // callers (defrag) see "nothing changed" and can surface the
-        // underlying corruption through the ordinary read path rather
-        // than scribbling over the buffer here.
-        let Some((_, _, count)) = Self::validate_header(buf) else {
-            return Vec::new();
-        };
-        let mut live_entries: Vec<(u16, Vec<u8>)> = Vec::new();
-
-        for i in 0..count {
-            let Some((offset, length, flags)) = Self::read_slot_entry(buf, i) else {
-                // A single bad slot entry aborts the whole compact — same
-                // reasoning as the header check above.
-                return Vec::new();
-            };
-            if flags == SLOT_FLAG_LIVE {
-                let data = buf[offset..offset + length].to_vec();
-                live_entries.push((i, data));
-            }
-        }
-
-        // Preserve the I31 reserved common-header bytes (8..16) across the
-        // re-init (init_page zero-fills the whole buf). Universally zero today,
-        // but saved/restored so a future common-header field survives compaction.
-        let reserved_header_bytes: [u8; 8] = buf[8..16].try_into().unwrap();
-        Self::init_page(buf);
-        buf[8..16].copy_from_slice(&reserved_header_bytes);
-
-        let mut mapping = Vec::new();
-        for (old_slot, data) in &live_entries {
-            // unwrap is safe: the live data came from this same page, so it
-            // must fit after removing dead space.
-            let new_slot = Self::insert(buf, data).unwrap();
-            mapping.push((*old_slot, new_slot));
-        }
-
-        mapping
-    }
-
     /// Total occupied bytes (live data + slot directory), for computing occupancy.
     //
     // Used by defrag/stats to decide whether a page is sparse enough to merit
     // consolidation. Counts only live entries' payload plus the full slot
     // directory overhead for those live slots — dead slots' directory bytes
-    // and orphaned data bytes are not included, matching "what would remain
-    // after compact()".
+    // and orphaned data bytes are not included.
     pub fn used_space(buf: &[u8; PAGE_SIZE]) -> usize {
         // Corrupt header ⇒ occupancy is meaningless; returning 0 keeps
         // defrag's density math defined without pretending the page has
@@ -414,8 +252,8 @@ impl DataPage {
     // across the iteration — important for defrag, which rewrites handle
     // table entries.
     pub fn iter_live(buf: &[u8; PAGE_SIZE]) -> Vec<(u16, &[u8])> {
-        // Corrupt header ⇒ no slots are reported; see compact/used_space
-        // for the same reasoning.
+        // Corrupt header ⇒ no slots are reported; see used_space for the
+        // same reasoning.
         let Some((_, _, count)) = Self::validate_header(buf) else {
             return Vec::new();
         };
@@ -434,11 +272,8 @@ impl DataPage {
     // --- Private helpers ---
     //
     // `read_slot_entry` returns Option so every caller is forced to decide
-    // what a structurally-broken slot entry means. The other helpers
-    // (`write_slot_*`) skip validation because the only callers are
-    // `insert`/`update`/`compact` AFTER `validate_header` has confirmed
-    // the directory fits within the page. Whenever a slot index comes
-    // from the on-disk file (not a freshly-produced index), route it
+    // what a structurally-broken slot entry means. Whenever a slot index
+    // comes from the on-disk file (not a freshly-produced index), route it
     // through `read_slot_entry` rather than indexing directly.
 
     /// Parse a single slot directory entry. Returns None if the slot
@@ -470,21 +305,6 @@ impl DataPage {
             return None;
         }
         Some((offset, length, flags))
-    }
-
-    fn write_slot_offset(buf: &mut [u8; PAGE_SIZE], slot: u16, offset: u16) {
-        let base = DATA_PAGE_HEADER_SIZE + (slot as usize) * SLOT_ENTRY_SIZE;
-        buf[base..base + 2].copy_from_slice(&offset.to_le_bytes());
-    }
-
-    fn write_slot_length(buf: &mut [u8; PAGE_SIZE], slot: u16, length: u16) {
-        let base = DATA_PAGE_HEADER_SIZE + (slot as usize) * SLOT_ENTRY_SIZE;
-        buf[base + 2..base + 4].copy_from_slice(&length.to_le_bytes());
-    }
-
-    fn write_slot_flags(buf: &mut [u8; PAGE_SIZE], slot: u16, flags: u16) {
-        let base = DATA_PAGE_HEADER_SIZE + (slot as usize) * SLOT_ENTRY_SIZE;
-        buf[base + 4..base + 6].copy_from_slice(&flags.to_le_bytes());
     }
 }
 
@@ -599,22 +419,6 @@ mod corruption_tests {
     }
 
     #[test]
-    fn update_returns_false_on_corrupt_header() {
-        let mut buf = fresh_page();
-        let slot = DataPage::insert(&mut buf, b"hello").unwrap();
-        // Now corrupt: slot_count says 10_000 entries.
-        buf[2..4].copy_from_slice(&10_000u16.to_le_bytes());
-        assert!(!DataPage::update(&mut buf, slot, b"world"));
-    }
-
-    #[test]
-    fn compact_returns_empty_on_corrupt_page() {
-        let mut buf = fresh_page();
-        buf[0] = 0x00;
-        assert!(DataPage::compact(&mut buf).is_empty());
-    }
-
-    #[test]
     fn insert_refuses_corrupt_header() {
         let mut buf = fresh_page();
         buf[4..6].copy_from_slice(&(CHECKSUM_OFFSET as u16 + 1).to_le_bytes());
@@ -658,31 +462,6 @@ mod corruption_tests {
         assert_eq!(DataPage::read(&buf, s1).unwrap(), b"bbb");
         assert_eq!(DataPage::read(&buf, s2).unwrap(), b"ccc");
         assert_eq!(DataPage::slot_count(&buf), 3);
-    }
-
-    #[test]
-    fn test_data_page_delete_and_compact() {
-        let mut buf = [0u8; PAGE_SIZE];
-        DataPage::init_page(&mut buf);
-        let s0 = DataPage::insert(&mut buf, b"aaa").unwrap();
-        let s1 = DataPage::insert(&mut buf, b"bbb").unwrap();
-        let _s2 = DataPage::insert(&mut buf, b"ccc").unwrap();
-        DataPage::delete(&mut buf, s1);
-        assert!(DataPage::read(&buf, s1).is_none());
-        let free_before = DataPage::free_space(&buf);
-        DataPage::compact(&mut buf);
-        let free_after = DataPage::free_space(&buf);
-        assert!(free_after > free_before);
-        assert_eq!(DataPage::read(&buf, s0).unwrap(), b"aaa");
-    }
-
-    #[test]
-    fn test_data_page_update_same_size() {
-        let mut buf = [0u8; PAGE_SIZE];
-        DataPage::init_page(&mut buf);
-        let slot = DataPage::insert(&mut buf, b"hello").unwrap();
-        assert!(DataPage::update(&mut buf, slot, b"world"));
-        assert_eq!(DataPage::read(&buf, slot).unwrap(), b"world");
     }
 
     #[test]
