@@ -226,7 +226,8 @@ impl Overflow {
         Ok(result)
     }
 
-    /// Delete an overflow chain. Returns the list of page IDs freed.
+    /// Walk an overflow chain and return all page IDs in it. Returns the list
+    /// of page IDs in the chain.
     //
     // Walks the chain collecting page ids without touching any data. The
     // caller (transaction layer) is responsible for actually releasing the
@@ -238,7 +239,7 @@ impl Overflow {
     // us a bound for the walk. If the walk exceeds that bound, the
     // chain has a cycle or a malformed next_page link, and we return
     // `CorruptPage` rather than accumulating page ids forever.
-    pub fn delete(cache: &mut PageCache, first_page: u64) -> Result<Vec<u64>> {
+    pub fn collect_chain_pages(cache: &mut PageCache, first_page: u64) -> Result<Vec<u64>> {
         let total_length = {
             let buf = cache.get(first_page)?;
             // Same wrong-type guard as `read` (review 2026-06-22): the checksum
@@ -376,7 +377,7 @@ mod tests {
         let third = read_next_page(&mut cache, second);
         patch_next_page(&mut cache, third, first);
 
-        match Overflow::delete(&mut cache, first) {
+        match Overflow::collect_chain_pages(&mut cache, first) {
             Err(ChiselError::CorruptPage { page_id: _ }) => {}
             other => panic!("expected CorruptPage, got {other:?}"),
         }
@@ -454,7 +455,7 @@ mod tests {
         let mut cache = make_cache();
         let value = vec![0xEF; 20000];
         let first_page = Overflow::write(&mut cache, &value).unwrap();
-        let freed = Overflow::delete(&mut cache, first_page).unwrap();
+        let freed = Overflow::collect_chain_pages(&mut cache, first_page).unwrap();
         assert!(freed.len() >= 3);
     }
 
@@ -485,8 +486,8 @@ mod tests {
             "read must reject a wrong-type first page before trusting its total_length"
         );
         assert!(
-            matches!(Overflow::delete(&mut cache, id), Err(ChiselError::CorruptPage { page_id }) if page_id == id),
-            "delete must reject a wrong-type first page"
+            matches!(Overflow::collect_chain_pages(&mut cache, id), Err(ChiselError::CorruptPage { page_id }) if page_id == id),
+            "collect_chain_pages must reject a wrong-type first page"
         );
     }
 
