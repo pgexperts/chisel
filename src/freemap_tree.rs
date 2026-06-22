@@ -1,0 +1,684 @@
+// freemap_tree.rs — Multi-page freemap: a copy-on-write radix tree of bitmap
+// leaves (layer 4: page-type-specific logic, alongside handle_table.rs and
+// membership_index.rs).
+//
+// Role in the system: removes the single-page freemap's ~512 MB reclamation
+// ceiling (one FreeMap page tracks only PAGE_BODY_SIZE*8 = 65,344 page ids;
+// past that, mark_free silently no-ops and freed pages leak — a 2026-06-22
+// fresh-eyes finding). The tree generalizes the freemap to
+// LEAF_CAPACITY * PTRS_PER_INTERIOR^depth ids, so depth grows logarithmically
+// with database size. Depth 0 IS today's format: a single FreeMap leaf pointed
+// at directly by the root, so existing databases load unchanged.
+// See docs/specs/2026-06-22-multi-page-freemap-design.md.
+//
+//   Leaf:     PageType::FreeMap (0x04) — a bitmap page, 1 bit = 1 page id,
+//             unchanged byte-for-byte from the single-page format.
+//   Interior: PageType::FreeMapInterior (0x07) — up to PTRS_PER_INTERIOR u64
+//             child pointers (8-byte LE, from DATA_PAGE_HEADER_SIZE). A zero
+//             child pointer = absent subtree = "that whole sub-range is all in
+//             use" (lazy/sparse, mirroring the other two radixes).
+//
+// TERMINATION INVARIANT (critical): all structural page allocation — every
+// interior/leaf COW copy AND every newly-materialized node — goes through the
+// caller-supplied `extend` closure (in production `PageCache::new_page`, which
+// extends the file; in tests `&mut |c| c.new_page()`), NEVER through the
+// freemap itself. This breaks the "the free-list needs a free page to record
+// free pages" recursion: a freemap mutation can never reuse a freemap-tracked
+// page, so it always terminates. The freemap NEVER allocates from itself.
+//
+// COW discipline: every mutation rewrites the root + the spine down to the
+// touched leaf into FRESH pages (via `extend`) and pushes each superseded OLD
+// page id onto `pending_superseded`. The committed tree stays intact until the
+// superblock flips; the integration unit drains `pending_superseded` into the
+// freed list at commit. Growth (`grow`) reparents the old root as child 0 — the
+// old root is NOT superseded (it lives on under the new root), so grow queues
+// nothing.
+//
+// Page-type validation on descent: reading any tree page validates buf[0] is
+// the expected type (FreeMap or FreeMapInterior); a checksum-valid wrong-type
+// page (reached via a stale/corrupt child pointer) surfaces as
+// ChiselError::CorruptPage, mirroring the overflow/data-page hardening.
+
+use crate::error::{ChiselError, Result};
+use crate::freemap::FreeMap;
+use crate::page::{
+    self, PageType, CHECKSUM_OFFSET, DATA_PAGE_HEADER_SIZE, PAGE_BODY_SIZE, PAGE_SIZE,
+};
+use crate::page_cache::PageCache;
+
+// One leaf bitmap covers PAGE_BODY_SIZE*8 = 65,344 page ids (≈ 2^16).
+const LEAF_CAPACITY: u64 = (PAGE_BODY_SIZE * 8) as u64;
+
+// Child pointers per interior page: same fan-out and layout as the membership
+// interior. 1021 = (8184 - 16) / 8 ≈ 2^10.
+const PTR_SIZE: usize = 8;
+const PTRS_PER_INTERIOR: usize = (CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE) / PTR_SIZE; // 1021
+
+// Maximum valid tree depth. capacity(depth) = LEAF_CAPACITY * PTRS_PER_INTERIOR^depth.
+// The leaf fans out to 2^16 and each level multiplies by ~2^10, so depth 5
+// already covers 2^16 * 2^50 = 2^66 > u64::MAX page ids — the bound is 5
+// (distinct from the membership tree's 6, which has no 2^16 leaf factor). A
+// spine or stored depth claiming deeper is corrupt; capacity() saturates so a
+// bad on-disk depth fails closed (rejects the descent) rather than overflowing.
+const MAX_DEPTH: u32 = 5;
+
+fn read_child(buf: &[u8; PAGE_SIZE], index: usize) -> u64 {
+    let off = DATA_PAGE_HEADER_SIZE + index * PTR_SIZE;
+    u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+fn write_child(buf: &mut [u8; PAGE_SIZE], index: usize, value: u64) {
+    let off = DATA_PAGE_HEADER_SIZE + index * PTR_SIZE;
+    buf[off..off + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Initialize a fresh zeroed interior page in `buf` and stamp it. A zeroed
+/// child array reads as "all subtrees absent", the sparse-tree base case.
+fn init_interior(buf: &mut [u8; PAGE_SIZE]) {
+    buf.fill(0);
+    buf[0] = PageType::FreeMapInterior as u8;
+    buf[1] = page::current_version(PageType::FreeMapInterior); // version at byte 1
+    page::stamp_checksum(buf);
+}
+
+/// Validate a freemap tree page's type byte before trusting its contents. The
+/// cache verifies only the XXH3 checksum (catching bit-flips), NOT a
+/// checksum-valid page of the WRONG type reached via a corrupt child pointer.
+/// Mirrors overflow::read / data_page::validate_header.
+fn check_type(buf: &[u8; PAGE_SIZE], expected: PageType, page_id: u64) -> Result<()> {
+    if buf[0] != expected as u8 {
+        return Err(ChiselError::CorruptPage { page_id });
+    }
+    Ok(())
+}
+
+/// A copy-on-write radix tree of bitmap leaves tracking free page ids. The
+/// caller (the integration unit / transaction layer) owns `root` and `depth`,
+/// threading them through the superblock; `pending_superseded` accumulates the
+/// old page ids this tree's mutations have COW-superseded, for the caller to
+/// drain into the freed list at commit.
+#[allow(dead_code)] // standalone unit: the integration unit is the production consumer.
+pub(crate) struct FreeMapTree {
+    pub root: u64,
+    pub depth: u32,
+    pub pending_superseded: Vec<u64>,
+}
+
+#[allow(dead_code)] // standalone unit: the integration unit is the production consumer.
+impl FreeMapTree {
+    /// Reconstruct a tree handle from a committed `(root, depth)` (open path).
+    /// Starts with an empty `pending_superseded` — nothing has been superseded
+    /// in the new transaction yet.
+    pub fn from_roots(root: u64, depth: u32) -> FreeMapTree {
+        FreeMapTree {
+            root,
+            depth,
+            pending_superseded: Vec::new(),
+        }
+    }
+
+    /// Create a fresh depth-0 tree: one zeroed FreeMap leaf (all bits 0 = all in
+    /// use, the bootstrap-safe starting state). The leaf is allocated via
+    /// `extend` like every structural page.
+    pub fn create(
+        cache: &mut PageCache,
+        extend: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+    ) -> Result<FreeMapTree> {
+        let root = extend(cache)?;
+        let buf = cache.get_mut(root)?;
+        FreeMap::init_page(buf);
+        page::stamp_checksum(buf);
+        Ok(FreeMapTree {
+            root,
+            depth: 0,
+            pending_superseded: Vec::new(),
+        })
+    }
+
+    // capacity()/child_span() SATURATE (not `*=`): a valid tree never exceeds
+    // MAX_DEPTH, but a corrupt-but-checksummed superblock could supply an
+    // out-of-range depth. Saturating to u64::MAX keeps the descent's range guard
+    // correct (every id is "in range" only when capacity truly covers u64)
+    // instead of a debug panic / release wrap. Mirrors RadixU64::capacity.
+    fn capacity(&self) -> u64 {
+        let mut cap = LEAF_CAPACITY;
+        for _ in 0..self.depth {
+            cap = cap.saturating_mul(PTRS_PER_INTERIOR as u64);
+        }
+        cap
+    }
+
+    // Page ids covered by ONE child pointer at interior `level` (1..=depth).
+    // Level 1's children are leaves, each covering LEAF_CAPACITY; each deeper
+    // level multiplies by PTRS_PER_INTERIOR. saturating, same rationale as above.
+    fn child_span(&self, level: u32) -> u64 {
+        let mut span = LEAF_CAPACITY;
+        for _ in 1..level {
+            span = span.saturating_mul(PTRS_PER_INTERIOR as u64);
+        }
+        span
+    }
+
+    /// Descend (read-only) to the leaf covering `id`. Returns the leaf page id,
+    /// or `None` if `id` is past the tree's reach OR any subtree on the path is
+    /// absent (a zero child pointer = "that whole range is all in use"). Every
+    /// page read is type-validated.
+    fn find_leaf(&self, cache: &mut PageCache, id: u64) -> Result<Option<u64>> {
+        // Reject ids past the tree's reach. When capacity saturated to u64::MAX
+        // (depth where the real capacity exceeds u64), every id is in reach, so
+        // skip the guard — otherwise id == u64::MAX would be wrongly rejected.
+        let cap = self.capacity();
+        if cap != u64::MAX && id >= cap {
+            return Ok(None);
+        }
+        if self.depth == 0 {
+            check_type(cache.get(self.root)?, PageType::FreeMap, self.root)?;
+            return Ok(Some(self.root));
+        }
+        let mut current = self.root;
+        let mut remaining = id;
+        for level in (1..=self.depth).rev() {
+            let buf = cache.get(current)?;
+            check_type(buf, PageType::FreeMapInterior, current)?;
+            let span = self.child_span(level);
+            let child_idx = (remaining / span) as usize;
+            // Defense-in-depth: a validated depth keeps child_idx in bounds, but
+            // guard the slot index so a corrupt one reads as "absent" rather than
+            // slicing past the page.
+            if child_idx >= PTRS_PER_INTERIOR {
+                return Ok(None);
+            }
+            let child = read_child(buf, child_idx);
+            if child == 0 {
+                return Ok(None); // absent subtree => all-in-use
+            }
+            remaining %= span;
+            current = child;
+        }
+        check_type(cache.get(current)?, PageType::FreeMap, current)?;
+        Ok(Some(current))
+    }
+
+    /// Is `id` currently free? Absent subtree (or past reach) reads as in-use.
+    pub fn is_free(&self, cache: &mut PageCache, id: u64) -> Result<bool> {
+        let Some(leaf) = self.find_leaf(cache, id)? else {
+            return Ok(false);
+        };
+        Ok(FreeMap::is_free(cache.get(leaf)?, id % LEAF_CAPACITY))
+    }
+
+    /// Add a level: a fresh interior root with the old root reparented as child
+    /// 0. depth += 1. No-op at MAX_DEPTH (the tree already covers all of u64).
+    ///
+    /// The old root is reparented, NOT cloned, so it is NOT superseded and pushes
+    /// nothing onto `pending_superseded` — `grow` allocates via `extend` but frees
+    /// nothing. (Mirrors RadixU64::grow.)
+    pub fn grow(
+        &mut self,
+        cache: &mut PageCache,
+        extend: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+    ) -> Result<()> {
+        if self.depth >= MAX_DEPTH {
+            return Ok(());
+        }
+        let new_root = extend(cache)?;
+        let buf = cache.get_mut(new_root)?;
+        init_interior(buf);
+        write_child(buf, 0, self.root); // old root becomes child 0
+        page::stamp_checksum(buf);
+        self.root = new_root;
+        self.depth += 1;
+        Ok(())
+    }
+
+    /// COW-rewrite the root + spine down to `id`'s leaf — materializing absent
+    /// children along the way, pushing every superseded OLD page onto
+    /// `pending_superseded`, stamping each interior after its child pointer is
+    /// written — then apply `leaf_op(leaf_buf, id % LEAF_CAPACITY)` to the COW'd
+    /// leaf and stamp it. The single tested spine implementation shared by both
+    /// `mark_free` (leaf_op = set bit) and `clear_bit` (leaf_op = clear bit), so
+    /// set and clear can never diverge. Assumes `id` is in range (callers grow
+    /// first if needed).
+    fn cow_descend(
+        &mut self,
+        cache: &mut PageCache,
+        id: u64,
+        extend: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+        leaf_op: &mut dyn FnMut(&mut [u8; PAGE_SIZE], u64),
+    ) -> Result<()> {
+        // COW the root first; the new root replaces self.root and the old one is
+        // superseded. (grow has already ensured depth covers id, if needed.)
+        let new_root = self.cow_node(cache, self.root, extend)?;
+        let old_root = self.root;
+        self.root = new_root;
+        self.pending_superseded.push(old_root);
+
+        // Walk interiors, COWing each child (materializing absent ones) and
+        // rewriting the parent's pointer to the new child. `current` is the
+        // already-COW'd page we are editing in place this frame.
+        let mut current = new_root;
+        let mut remaining = id;
+        for level in (1..=self.depth).rev() {
+            let span = self.child_span(level);
+            let child_idx = (remaining / span) as usize;
+            let child = read_child(cache.get(current)?, child_idx);
+            let new_child = if child == 0 {
+                // Absent subtree: materialize a fresh node (leaf at level 1,
+                // interior above). This is structural allocation — extend-only.
+                let id_new = extend(cache)?;
+                let buf = cache.get_mut(id_new)?;
+                if level == 1 {
+                    FreeMap::init_page(buf);
+                    page::stamp_checksum(buf);
+                } else {
+                    init_interior(buf);
+                }
+                id_new
+            } else {
+                // Present subtree: COW it; the old child is superseded.
+                let copied = self.cow_node(cache, child, extend)?;
+                self.pending_superseded.push(child);
+                copied
+            };
+            // Rewrite the parent's pointer to the new child and re-stamp.
+            let buf = cache.get_mut(current)?;
+            write_child(buf, child_idx, new_child);
+            page::stamp_checksum(buf);
+            remaining %= span;
+            current = new_child;
+        }
+
+        // `current` is now the COW'd (or freshly materialized) leaf. Apply the
+        // bit op and re-stamp.
+        let buf = cache.get_mut(current)?;
+        check_type(buf, PageType::FreeMap, current)?;
+        leaf_op(buf, remaining % LEAF_CAPACITY);
+        page::stamp_checksum(buf);
+        Ok(())
+    }
+
+    /// COW-copy one existing tree page into a fresh `extend`-allocated page,
+    /// validating its type first. Returns the new page id. The caller queues the
+    /// old page on `pending_superseded` (cow_descend does so per frame).
+    fn cow_node(
+        &self,
+        cache: &mut PageCache,
+        page_id: u64,
+        extend: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+    ) -> Result<u64> {
+        // Validate before copying so a corrupt wrong-type page on the spine
+        // fails closed rather than propagating into a fresh COW page.
+        let buf = cache.get(page_id)?;
+        let expected = if self.is_leaf_page(buf) {
+            PageType::FreeMap
+        } else {
+            PageType::FreeMapInterior
+        };
+        check_type(buf, expected, page_id)?;
+        let new_id = extend(cache)?;
+        cache.copy_page(page_id, new_id)?;
+        Ok(new_id)
+    }
+
+    // A page is a leaf iff its type byte is FreeMap. Used by cow_node to pick the
+    // expected type for validation without threading the level through.
+    fn is_leaf_page(&self, buf: &[u8; PAGE_SIZE]) -> bool {
+        buf[0] == PageType::FreeMap as u8
+    }
+
+    /// Mark `id` free (set its bit), COWing the spine and materializing any
+    /// absent nodes. Assumes `id` is in range; use `mark_free_growing` when it
+    /// may exceed capacity.
+    pub fn mark_free(
+        &mut self,
+        cache: &mut PageCache,
+        id: u64,
+        extend: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+    ) -> Result<()> {
+        self.cow_descend(cache, id, extend, &mut |buf, bit| {
+            FreeMap::mark_free(buf, bit)
+        })
+    }
+
+    /// Clear `id`'s bit (mark it in-use again), COWing the spine. Used by
+    /// `allocate_first` to claim the id it found. The leaf is assumed present
+    /// (the scan that chose `id` already proved it), but materialization is
+    /// harmless if not.
+    fn clear_bit(
+        &mut self,
+        cache: &mut PageCache,
+        id: u64,
+        extend: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+    ) -> Result<()> {
+        self.cow_descend(cache, id, extend, &mut |buf, bit| {
+            FreeMap::clear_bit(buf, bit)
+        })
+    }
+
+    /// Grow until `id` is in range, then `mark_free` it. The manager-facing entry
+    /// point: a page id only ever needs a freemap bit when it is *freed*, so
+    /// freeing an id beyond capacity is the sole growth trigger (an
+    /// allocated-and-never-freed page needs no leaf — absent subtree = in-use).
+    pub fn mark_free_growing(
+        &mut self,
+        cache: &mut PageCache,
+        id: u64,
+        extend: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+    ) -> Result<()> {
+        // Grow until capacity covers id. MAX_DEPTH covers all of u64, so the loop
+        // terminates; grow() no-ops at MAX_DEPTH and capacity() saturates to
+        // u64::MAX, breaking the loop.
+        while self.capacity() <= id && self.depth < MAX_DEPTH {
+            self.grow(cache, extend)?;
+        }
+        self.mark_free(cache, id, extend)
+    }
+
+    /// Find the lowest free id at/above `*hint`, clear its bit (COW), advance
+    /// `*hint` to it, and return `Some(found_id)`. `None` if the tree holds no
+    /// free id at/above the hint.
+    ///
+    /// The scan skips absent subtrees (a zero child = all-in-use) and walks
+    /// left-to-right, so it returns the true lowest free id >= hint. Clearing
+    /// goes through `clear_bit` -> `cow_descend`, so the claim is a normal COW.
+    /// `*hint` is advanced to the found id (not past it): the next call resumes
+    /// here, and the just-cleared id will be skipped because its bit is now 0.
+    pub fn allocate_first(
+        &mut self,
+        cache: &mut PageCache,
+        hint: &mut u64,
+        extend: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+    ) -> Result<Option<u64>> {
+        let Some(found) = self.scan_from(cache, *hint)? else {
+            return Ok(None);
+        };
+        self.clear_bit(cache, found, extend)?;
+        *hint = found;
+        Ok(Some(found))
+    }
+
+    /// Read-only left-to-right scan for the lowest free id >= `lo`. Skips absent
+    /// subtrees. Returns the global id (not leaf-local). Every page is type-
+    /// validated on the way down.
+    fn scan_from(&self, cache: &mut PageCache, lo: u64) -> Result<Option<u64>> {
+        self.scan_node(cache, self.root, self.depth, 0, lo)
+    }
+
+    // Recursive scan. `base` is the global id of this subtree's first covered id;
+    // `lo` is the global lower bound. At a leaf, scan bits >= max(lo, base) - base
+    // via first_free_bit_from. At an interior, walk children left-to-right,
+    // skipping those whose covered range ends at/below `lo` or that are absent.
+    fn scan_node(
+        &self,
+        cache: &mut PageCache,
+        page_id: u64,
+        level: u32,
+        base: u64,
+        lo: u64,
+    ) -> Result<Option<u64>> {
+        if level == 0 {
+            let buf = cache.get(page_id)?;
+            check_type(buf, PageType::FreeMap, page_id)?;
+            // Leaf-local lower bound: ids below `base` are out of this leaf;
+            // below `lo` are excluded by the hint.
+            let local_lo = lo.saturating_sub(base);
+            return Ok(FreeMap::first_free_bit_from(buf, local_lo).map(|b| base + b));
+        }
+        let buf = cache.get(page_id)?;
+        check_type(buf, PageType::FreeMapInterior, page_id)?;
+        let span = self.child_span(level);
+        // Collect children first so the read borrow is released before recursing.
+        let children: Vec<(usize, u64)> = (0..PTRS_PER_INTERIOR)
+            .map(|i| (i, read_child(buf, i)))
+            .filter(|(_, c)| *c != 0)
+            .collect();
+        for (i, child) in children {
+            let child_base = base.saturating_add((i as u64).saturating_mul(span));
+            // Skip a child whose entire covered range is below `lo`.
+            let child_end = child_base.saturating_add(span);
+            if child_end <= lo {
+                continue;
+            }
+            if let Some(found) = self.scan_node(cache, child, level - 1, child_base, lo)? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::page_cache::PageCache;
+
+    fn make_cache() -> PageCache {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let io = crate::page_io::PageIo::open(file.path(), false).unwrap();
+        let mut cache = PageCache::new(
+            io,
+            256 * crate::page::PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
+        cache.set_next_page_id(2);
+        cache
+    }
+
+    // A bigger cache for tests that materialize many pages (deep trees, large
+    // proptest sequences) so COW spines do not thrash against the 256-page cap.
+    fn make_big_cache() -> PageCache {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let io = crate::page_io::PageIo::open(file.path(), false).unwrap();
+        let mut cache = PageCache::new(
+            io,
+            1_000_000 * crate::page::PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
+        cache.set_next_page_id(2);
+        cache
+    }
+
+    fn extend(c: &mut PageCache) -> Result<u64> {
+        c.new_page()
+    }
+
+    #[test]
+    fn depth0_is_free_round_trip() {
+        let mut c = make_cache();
+        let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
+        assert_eq!(t.depth, 0);
+        t.mark_free(&mut c, 5, &mut extend).unwrap();
+        assert!(t.is_free(&mut c, 5).unwrap());
+        assert!(!t.is_free(&mut c, 6).unwrap());
+    }
+
+    #[test]
+    fn mark_free_materializes_absent_subtree_at_depth1() {
+        let mut c = make_cache();
+        let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
+        t.grow(&mut c, &mut extend).unwrap();
+        assert_eq!(t.depth, 1);
+        // Both ids live in child 1 (LEAF_CAPACITY..2*LEAF_CAPACITY), which is
+        // absent until the first mark_free materializes its leaf.
+        let id_a = LEAF_CAPACITY + 42;
+        let id_b = LEAF_CAPACITY + 99;
+        t.mark_free(&mut c, id_a, &mut extend).unwrap();
+        assert!(t.is_free(&mut c, id_a).unwrap());
+        t.mark_free(&mut c, id_b, &mut extend).unwrap();
+        assert!(t.is_free(&mut c, id_b).unwrap());
+        // The first child's range (child 0) stays absent => in-use.
+        assert!(!t.is_free(&mut c, 7).unwrap());
+    }
+
+    #[test]
+    fn mark_free_structural_alloc_is_extend_only() {
+        let mut c = make_cache();
+        // Spy: count how many times `extend` is invoked. Materializing a leaf in
+        // an absent subtree must call it >= 1 (proves structural COW draws from
+        // extend, never from the freemap itself). A Cell lets the closure share
+        // the counter without holding an exclusive borrow across the reads below.
+        let count = std::cell::Cell::new(0usize);
+        let mut spy = |cache: &mut PageCache| -> Result<u64> {
+            count.set(count.get() + 1);
+            cache.new_page()
+        };
+        let mut t = FreeMapTree::create(&mut c, &mut spy).unwrap();
+        t.grow(&mut c, &mut spy).unwrap();
+        let before = count.get();
+        t.mark_free(&mut c, LEAF_CAPACITY + 7, &mut spy).unwrap();
+        assert!(
+            count.get() > before,
+            "materializing an absent leaf must allocate via extend"
+        );
+    }
+
+    #[test]
+    fn grow_increases_depth_and_preserves_existing_frees() {
+        let mut c = make_cache();
+        let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
+        t.mark_free(&mut c, 7, &mut extend).unwrap();
+        t.grow(&mut c, &mut extend).unwrap();
+        assert_eq!(t.depth, 1);
+        // The old leaf is now child 0, so id 7 is still free.
+        assert!(t.is_free(&mut c, 7).unwrap());
+        // A child-1 id whose subtree is absent reads in-use.
+        assert!(!t.is_free(&mut c, LEAF_CAPACITY + 3).unwrap());
+    }
+
+    #[test]
+    fn mark_free_growing_grows_to_reach_high_id() {
+        let mut c = make_cache();
+        let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
+        let id = LEAF_CAPACITY * 3 + 17;
+        t.mark_free_growing(&mut c, id, &mut extend).unwrap();
+        assert!(t.depth >= 1, "high id must grow the tree");
+        assert!(t.is_free(&mut c, id).unwrap());
+    }
+
+    #[test]
+    fn allocate_first_returns_lowest_free_and_clears_it() {
+        let mut c = make_cache();
+        let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
+        t.mark_free_growing(&mut c, 500, &mut extend).unwrap();
+        t.mark_free_growing(&mut c, 9, &mut extend).unwrap();
+        t.mark_free_growing(&mut c, LEAF_CAPACITY + 4, &mut extend)
+            .unwrap();
+
+        let mut hint = 0u64;
+        assert_eq!(
+            t.allocate_first(&mut c, &mut hint, &mut extend).unwrap(),
+            Some(9)
+        );
+        assert_eq!(
+            t.allocate_first(&mut c, &mut hint, &mut extend).unwrap(),
+            Some(500)
+        );
+        assert_eq!(
+            t.allocate_first(&mut c, &mut hint, &mut extend).unwrap(),
+            Some(LEAF_CAPACITY + 4)
+        );
+        assert_eq!(
+            t.allocate_first(&mut c, &mut hint, &mut extend).unwrap(),
+            None
+        );
+
+        // Each allocated id now reads not-free.
+        assert!(!t.is_free(&mut c, 9).unwrap());
+        assert!(!t.is_free(&mut c, 500).unwrap());
+        assert!(!t.is_free(&mut c, LEAF_CAPACITY + 4).unwrap());
+    }
+
+    // Descent must reject a checksum-valid WRONG-type page reached as an
+    // interior child (a corrupt/stale child pointer) as CorruptPage rather than
+    // parsing its bytes as a freemap leaf. Mirrors the overflow/data-page
+    // hardening: the cache verifies only the XXH3 checksum, not the type tag.
+    #[test]
+    fn descent_rejects_wrong_type_child_as_corrupt_page() {
+        let mut c = make_cache();
+        let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
+        t.grow(&mut c, &mut extend).unwrap(); // depth 1: root is an interior
+                                              // Materialize child 0's leaf by freeing an id in its range.
+        t.mark_free(&mut c, 5, &mut extend).unwrap();
+        // Corrupt child 0's leaf into a (checksum-valid) Data page.
+        let leaf = read_child(c.get(t.root).unwrap(), 0);
+        {
+            let buf = c.get_mut(leaf).unwrap();
+            buf[0] = PageType::Data as u8;
+            page::stamp_checksum(buf);
+        }
+        let err = match t.is_free(&mut c, 5) {
+            Ok(v) => panic!("is_free accepted a wrong-type leaf: {v}"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ChiselError::CorruptPage { .. }),
+            "expected CorruptPage, got {err:?}"
+        );
+    }
+
+    // Oracle proptest — the correctness backbone. Random (is_free_op, id)
+    // sequence over a range that crosses the depth-0 -> depth-1+ boundary
+    // (LEAF_CAPACITY*1200 forces depth >= 2). A BTreeSet models the free set:
+    //   free  -> mark_free_growing + oracle.insert
+    //   alloc -> allocate_first must equal the oracle's min, then remove it.
+    // `pending_superseded` is cleared after every op to mirror the manager's
+    // commit-time drain (so it never grows unbounded and the tree handle stays
+    // the live working state). After the sequence, every remaining oracle id
+    // must read is_free.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn prop_tree_matches_oracle(
+            ops in proptest::collection::vec(
+                (proptest::bool::ANY, 0u64..(LEAF_CAPACITY * 1200)),
+                1..120usize,
+            )
+        ) {
+            let mut c = make_big_cache();
+            let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
+            let mut oracle: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+            let mut hint = 0u64;
+
+            for (is_free_op, id) in ops {
+                if is_free_op {
+                    t.mark_free_growing(&mut c, id, &mut extend).unwrap();
+                    oracle.insert(id);
+                    // A free at an id below the current hint must be reachable by
+                    // the next alloc, so pull the hint back to cover it. (Mirrors
+                    // a manager that lowers its hint when a lower id is freed.)
+                    hint = hint.min(id);
+                } else {
+                    // The hint must never run ahead of the true lowest free id,
+                    // else scan_from would skip it — assert the test maintains
+                    // that so the oracle genuinely constrains the tree (and a tree
+                    // bug cannot hide behind a sloppy hint).
+                    if let Some(&min) = oracle.iter().next() {
+                        proptest::prop_assert!(
+                            hint <= min,
+                            "test hint {} ran ahead of oracle min {}", hint, min
+                        );
+                    }
+                    let got = t.allocate_first(&mut c, &mut hint, &mut extend).unwrap();
+                    let expected = oracle.iter().next().copied();
+                    proptest::prop_assert_eq!(got, expected);
+                    if let Some(min) = expected {
+                        oracle.remove(&min);
+                    }
+                }
+                t.pending_superseded.clear();
+            }
+
+            for id in &oracle {
+                proptest::prop_assert!(
+                    t.is_free(&mut c, *id).unwrap(),
+                    "remaining oracle id {} must read free", id
+                );
+            }
+        }
+    }
+}
