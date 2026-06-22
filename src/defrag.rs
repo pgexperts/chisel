@@ -189,6 +189,12 @@ pub fn defrag(txm: &mut TransactionManager, options: &DefragOptions) -> Result<D
     // I39: single-field accessor replaces the pre-I39 positional
     // `(u64, u64, u64)` tuple return; only the handle-table root is
     // consulted here.
+    // Skipping the freemap orphan-sweep (step 7) here is safe: the
+    // handle-table root materialises permanently on the first `allocate`
+    // and never reverts to PAGE_ID_NONE, so an empty handle table implies
+    // no allocation has ever succeeded — therefore no freemap tree exists
+    // (the tree is seeded only when a freed page needs a bitmap bit) and
+    // no orphans are possible.
     if txm.current_handle_table_root_page() == PAGE_ID_NONE {
         return Ok(stats);
     }
@@ -322,6 +328,120 @@ mod tests {
             again.freemap_orphans_reclaimed, 0,
             "second sweep must find no orphans (idempotent)"
         );
+        let _ = orphan;
+    }
+
+    // Cover the `structural_superseded` exclusion in `reclaim_freemap_orphans`.
+    //
+    // When defrag step 5 (data relocation) and step 7 (orphan sweep) run in the
+    // SAME transaction, step-5 `update()` calls allocate fresh data pages via
+    // `cow_alloc` → `allocate_first`, which claims a free bit from the freemap
+    // bitmap and COWs the containing leaf.  The OLD (pre-COW) leaf id lands in
+    // `structural_superseded`.  That page is unreachable from the current tree
+    // and is NOT marked free in the bitmap — exactly the shape of an orphan —
+    // yet it is NOT an orphan: it is live recycling state that commit will hand
+    // to the next transaction.  If `reclaim_freemap_orphans` didn't exclude
+    // `structural_superseded`, step 7 would wrongly reclaim those pages, marking
+    // their adjacent data pages reusable and corrupting any live value that still
+    // references them.
+    //
+    // Counterfactual: temporarily removing the `structural_superseded` term from
+    // the exclusion set causes this test to fail — the reclaimed count exceeds 1
+    // (the COW'd leaf is swept as an orphan) and subsequent reads return wrong
+    // data.  With the exclusion in place, exactly the one forged orphan is
+    // reclaimed and all surviving handles read back their original values.
+    #[test]
+    fn defrag_compact_and_sweep_excludes_structural_superseded() {
+        let mut tm = fresh_manager();
+
+        // Use values large enough that each takes a significant fraction of a
+        // data page (~400 bytes), so ~20 fit per page.  Allocate 60 handles
+        // across ~3 data pages, then delete 45 of them (every third is kept),
+        // making the source pages ~33% full — below the default 0.25 threshold
+        // only when the kept fraction is low enough.  Use a harsher threshold
+        // (0.5) so the pages reliably qualify as sparse.
+        //
+        // The deletes free ~3 data pages back into the freemap bitmap, giving
+        // `allocate_first` free bits to claim during step-5 updates.  Each
+        // claim COWs the freemap leaf, pushing the old leaf id into
+        // `structural_superseded`.
+        let value: Vec<u8> = vec![0xAB; 400];
+        let mut all_handles: Vec<u64> = Vec::new();
+        tm.begin().unwrap();
+        for _ in 0..60 {
+            all_handles.push(tm.allocate(&value).unwrap());
+        }
+        tm.commit().unwrap();
+
+        // Delete 45 of 60 handles (keep every 4th) so 3 of the ~3 data pages
+        // become heavily sparse.
+        let kept: Vec<u64> = all_handles
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(i, _)| i % 4 == 0)
+            .map(|(_, h)| h)
+            .collect();
+        let deleted: Vec<u64> = all_handles
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(i, _)| i % 4 != 0)
+            .map(|(_, h)| h)
+            .collect();
+
+        tm.begin().unwrap();
+        for h in &deleted {
+            tm.delete(*h).unwrap();
+        }
+        tm.commit().unwrap();
+
+        // Forge exactly one freemap orphan before the defrag transaction.
+        let orphan = tm.test_forge_freemap_orphan().unwrap();
+
+        // Run defrag with a generous sparse threshold (0.5) so the source pages
+        // definitely qualify.  Steps 5 and 7 execute inside the SAME transaction.
+        //
+        // Step 5 triggers at least one `allocate_data_page` → `allocate_first`
+        // call, which COWs a freemap leaf and pushes its old id into
+        // `structural_superseded`.  Step 7 must then exclude that id so only the
+        // forged orphan is reclaimed.
+        tm.begin().unwrap();
+        let opts = DefragOptions::default().sparse_threshold(0.5);
+        let stats = defrag(&mut tm, &opts).unwrap();
+
+        // Step 5 must have actually relocated values (otherwise structural_superseded
+        // would be empty and this test is vacuous).
+        assert!(
+            stats.values_moved > 0,
+            "precondition: step 5 must have relocated at least one value (got 0); \
+             increase the value count or lower the kept fraction so pages are sparse"
+        );
+
+        // Exactly one orphan reclaimed — the forged one.  If a COW'd leaf were
+        // wrongly swept, the count would exceed 1.
+        assert_eq!(
+            stats.freemap_orphans_reclaimed, 1,
+            "exactly the forged orphan must be reclaimed (not a COW'd leaf from \
+             step 5); got {}",
+            stats.freemap_orphans_reclaimed
+        );
+
+        tm.commit().unwrap();
+
+        // Every surviving handle must still read back its original value — a
+        // live freemap page wrongly reclaimed would corrupt the bitmap and could
+        // cause a data-page double-hand-out, breaking subsequent reads.
+        tm.begin().unwrap();
+        for h in &kept {
+            let v = tm.read(*h).unwrap();
+            assert_eq!(
+                v, value,
+                "handle {h} returned wrong data after compact+sweep defrag"
+            );
+        }
+        tm.commit().unwrap();
+
         let _ = orphan;
     }
 }

@@ -1110,6 +1110,10 @@ impl TransactionManager {
         let mut excluded: FxHashSet<u64> = FxHashSet::default();
         excluded.extend(self.structural_reuse.iter().copied());
         excluded.extend(self.structural_superseded.iter().copied());
+        // Belt-and-suspenders: `begin()` clones `pending_structural_frees`
+        // into `structural_reuse`, so every id here is already covered by the
+        // `structural_reuse` term above. Kept explicitly so the exclusion
+        // remains correct if `begin()`'s seeding ever changes.
         excluded.extend(self.pending_structural_frees.iter().copied());
 
         // Collect orphan ids read-only inside a single cache-borrow scope, then
