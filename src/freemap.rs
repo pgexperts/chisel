@@ -135,6 +135,57 @@ impl FreeMap {
         None
     }
 
+    /// Return the lowest free page id that is `>= lo`, or `None` if every free
+    /// bit in this leaf is below `lo`.
+    ///
+    /// The non-mutating leaf finder the freemap tree's scan composes with COW:
+    /// `scan_node` calls this with a leaf-local lower bound derived from the
+    /// caller's hint, so the scan resumes mid-page without rescanning an already-
+    /// exhausted prefix. Pass `lo = 0` to find the absolute lowest free bit.
+    ///
+    /// The starting byte is masked so that bits below `lo` within that byte are
+    /// ignored; subsequent bytes scan whole. Uses the same `trailing_zeros`
+    /// LSB-first convention as `allocate_first`.
+    // `#[allow(dead_code)]`: the freemap tree is the production caller; no
+    // non-test caller exists yet in this unit.
+    #[allow(dead_code)]
+    pub fn first_free_bit_from(buf: &[u8; PAGE_SIZE], lo: u64) -> Option<u64> {
+        let start_byte = (lo / 8) as usize;
+        if start_byte >= PAGE_BODY_SIZE {
+            return None;
+        }
+        let start_bit = (lo % 8) as u32;
+        for byte_idx in start_byte..PAGE_BODY_SIZE {
+            let mut byte = buf[BITMAP_OFFSET + byte_idx];
+            // In the first byte, clear the bits below `lo` so a free id we've
+            // already passed cannot be re-reported.
+            if byte_idx == start_byte {
+                byte &= !((1u8 << start_bit).wrapping_sub(1));
+            }
+            if byte != 0 {
+                return Some((byte_idx * 8 + byte.trailing_zeros() as usize) as u64);
+            }
+        }
+        None
+    }
+
+    /// Clear one specific bit (mark the page as in-use).
+    ///
+    /// The inverse of `mark_free` for a single id: `allocate_first` on the tree
+    /// uses this to claim a found id by clearing exactly its bit (rather than
+    /// the leaf-local `FreeMap::allocate_first`, which clears the *lowest* bit —
+    /// the tree has already decided *which* id to hand out by descending the
+    /// spine). Silently ignores out-of-range ids and does not re-stamp the
+    /// checksum, matching `mark_free`'s contract.
+    // `#[allow(dead_code)]`: the freemap tree is the production caller.
+    #[allow(dead_code)]
+    pub fn clear_bit(buf: &mut [u8; PAGE_SIZE], page_id: u64) {
+        let (byte_idx, bit_idx) = Self::bit_position(page_id);
+        if byte_idx < PAGE_BODY_SIZE {
+            buf[BITMAP_OFFSET + byte_idx] &= !(1 << bit_idx);
+        }
+    }
+
     // Maps a page_id to (byte_index_within_bitmap, bit_index_within_byte).
     // LSB-first within a byte: page_id 0 = bit 0 of byte 0, page_id 7 = bit 7
     // of byte 0, page_id 8 = bit 0 of byte 1. `allocate_first` depends on
@@ -175,6 +226,51 @@ mod tests {
     #[test]
     fn test_freemap_capacity() {
         assert_eq!(FreeMap::capacity(), PAGE_BODY_SIZE * 8);
+    }
+
+    #[test]
+    fn first_free_bit_from_returns_lowest_at_or_above_lo() {
+        let mut buf = [0u8; PAGE_SIZE];
+        FreeMap::init_page(&mut buf);
+        FreeMap::mark_free(&mut buf, 12);
+        FreeMap::mark_free(&mut buf, 40);
+        FreeMap::mark_free(&mut buf, 300);
+        // lo below the lowest free bit: returns the lowest free id.
+        assert_eq!(FreeMap::first_free_bit_from(&buf, 0), Some(12));
+        // lo exactly on a free bit: returns it.
+        assert_eq!(FreeMap::first_free_bit_from(&buf, 12), Some(12));
+        // lo just past a free bit: skips it for the next one.
+        assert_eq!(FreeMap::first_free_bit_from(&buf, 13), Some(40));
+        // lo within the same byte as a free bit but above it.
+        assert_eq!(FreeMap::first_free_bit_from(&buf, 41), Some(300));
+    }
+
+    #[test]
+    fn first_free_bit_from_is_none_when_all_below_lo() {
+        let mut buf = [0u8; PAGE_SIZE];
+        FreeMap::init_page(&mut buf);
+        FreeMap::mark_free(&mut buf, 5);
+        FreeMap::mark_free(&mut buf, 100);
+        // Every free bit is below `lo` -> None.
+        assert_eq!(FreeMap::first_free_bit_from(&buf, 101), None);
+        // `lo` past capacity is also None (and does not panic).
+        assert_eq!(
+            FreeMap::first_free_bit_from(&buf, PAGE_BODY_SIZE as u64 * 8),
+            None
+        );
+    }
+
+    #[test]
+    fn clear_bit_clears_named_id_and_leaves_others() {
+        let mut buf = [0u8; PAGE_SIZE];
+        FreeMap::init_page(&mut buf);
+        FreeMap::mark_free(&mut buf, 7);
+        FreeMap::mark_free(&mut buf, 8);
+        FreeMap::mark_free(&mut buf, 9);
+        FreeMap::clear_bit(&mut buf, 8);
+        assert!(FreeMap::is_free(&buf, 7), "7 must remain free");
+        assert!(!FreeMap::is_free(&buf, 8), "8 must be cleared");
+        assert!(FreeMap::is_free(&buf, 9), "9 must remain free");
     }
 
     // I71 (ISSUES.md, 2026-05-22): property test — for any page_id

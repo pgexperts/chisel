@@ -40,6 +40,7 @@ pub(crate) mod data_page;
 pub(crate) mod defrag;
 pub(crate) mod error;
 pub(crate) mod freemap;
+pub(crate) mod freemap_tree;
 pub(crate) mod handle;
 pub(crate) mod handle_table;
 mod lru;
