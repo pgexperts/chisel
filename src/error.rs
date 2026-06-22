@@ -382,6 +382,50 @@ mod tests {
         );
     }
 
+    // I106: the CorruptSuperblock Display is the operator-facing diagnostic, so
+    // pin its exact format — the empty/single/multiple separator logic (":" on
+    // the first slot, ";" between, no trailing punctuation) is easy to break.
+    #[test]
+    fn corrupt_superblock_display_format() {
+        use crate::superblock::{SlotDefect, SuperblockDefect};
+        // No defects (the test-constructor case): bare message, no punctuation.
+        let empty = ChiselError::CorruptSuperblock { defects: vec![] };
+        assert_eq!(format!("{empty}"), "no valid superblock found");
+        // One defect: colon-introduced slot detail.
+        let one = ChiselError::CorruptSuperblock {
+            defects: vec![SlotDefect {
+                slot: 0,
+                defect: SuperblockDefect::BadChecksum,
+            }],
+        };
+        assert_eq!(
+            format!("{one}"),
+            "no valid superblock found: slot 0: bad checksum"
+        );
+        // Multiple: colon first, semicolons between, no trailing separator; also
+        // exercises BadCount's value rendering.
+        let many = ChiselError::CorruptSuperblock {
+            defects: vec![
+                SlotDefect {
+                    slot: 0,
+                    defect: SuperblockDefect::BadChecksum,
+                },
+                SlotDefect {
+                    slot: 1,
+                    defect: SuperblockDefect::BadMagic,
+                },
+                SlotDefect {
+                    slot: 2,
+                    defect: SuperblockDefect::BadCount(99),
+                },
+            ],
+        };
+        assert_eq!(
+            format!("{many}"),
+            "no valid superblock found: slot 0: bad checksum; slot 1: bad magic; slot 2: bad superblock_count 99"
+        );
+    }
+
     // I104 (ISSUES.md, 2026-06-21): exhaustiveness guard for is_fatal(). The
     // `documented_is_fatal` helper classifies every variant via a match with NO
     // `_` arm; because this is the DEFINING crate, #[non_exhaustive] does not
