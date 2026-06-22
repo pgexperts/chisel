@@ -1058,7 +1058,7 @@ impl PageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::page_io::PageIo;
+    use crate::page_io::{Fault, PageIo};
     use tempfile::{NamedTempFile, TempDir};
 
     fn fresh_cache(max_pages: usize) -> (TempDir, PageCache) {
@@ -1566,5 +1566,33 @@ mod tests {
         assert_eq!(cache.get(p0).unwrap()[0], 0x01);
         assert_eq!(cache.get(p1).unwrap()[0], 0x02);
         assert_eq!(cache.get(p2).unwrap()[0], 0x03);
+    }
+
+    #[test]
+    fn failed_flush_fsync_leaves_pages_clean_but_nondurable() {
+        // I112 (durability window — see the flush() comment): flush clears each
+        // page's dirty flag in phase 1a BEFORE the trailing fsync. If that fsync
+        // fails, the pages are now CLEAN in the cache yet NOT durable on disk —
+        // a state that is safe ONLY because the transaction manager poisons on
+        // the fatal IoError (proven in transaction.rs). This makes the hazard
+        // observable. spillway_max_bytes=0 keeps flush to a single fsync.
+        let (_dir, mut cache) = fresh_cache_with_spillway(64, 0);
+        let id = cache.new_page().unwrap();
+        assert!(cache.is_dirty(id));
+        assert_eq!(cache.dirty_count, 1);
+
+        cache.io().arm_fault(Fault::FailFsync(0));
+        let result = cache.flush();
+        assert!(
+            matches!(result, Err(ChiselError::IoError(_))),
+            "flush must surface the fsync IoError, got {result:?}"
+        );
+        // The dirty flags were already cleared (phase 1a) before the failed
+        // fsync. This is the durability window; poison (asserted in
+        // transaction.rs) is what makes it safe.
+        assert_eq!(
+            cache.dirty_count, 0,
+            "phase-1a cleared dirty flags before the (failed) fsync"
+        );
     }
 }
