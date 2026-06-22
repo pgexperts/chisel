@@ -407,10 +407,19 @@ fn test_recovery_both_superblocks_corrupt() {
         f.write_all(&[0u8; PAGE_SIZE]).unwrap();
         f.sync_all().unwrap();
     }
-    let result = Chisel::open(&path, Default::default());
+    // Tightened beyond bare is_err() to assert the error is FATAL (the open is
+    // unrecoverable). Deliberately NOT matching the CorruptSuperblock variant
+    // shape: I106 (PR #63) concurrently reshapes that variant to
+    // `CorruptSuperblock { defects }`, and a nullary-variant match here would
+    // silently fail to compile once both branches land on main. `match` rather
+    // than `expect_err` because `Chisel` does not implement `Debug`.
+    let err = match Chisel::open(&path, Default::default()) {
+        Ok(_) => panic!("both-superblocks-corrupt must fail to open"),
+        Err(e) => e,
+    };
     assert!(
-        matches!(result, Err(ChiselError::CorruptSuperblock)),
-        "both-superblocks-corrupt must surface CorruptSuperblock"
+        err.is_fatal(),
+        "both-superblocks-corrupt must be a fatal error, got {err:?}"
     );
 }
 
