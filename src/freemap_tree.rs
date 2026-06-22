@@ -248,7 +248,14 @@ impl FreeMapTree {
     ) -> Result<()> {
         // COW the root first; the new root replaces self.root and the old one is
         // superseded. (grow has already ensured depth covers id, if needed.)
-        let new_root = self.cow_node(cache, self.root, extend)?;
+        // The root's position type follows depth exactly as the read paths see it:
+        // an interior at depth > 0, the lone leaf at depth 0.
+        let root_expected = if self.depth > 0 {
+            PageType::FreeMapInterior
+        } else {
+            PageType::FreeMap
+        };
+        let new_root = self.cow_node(cache, self.root, root_expected, extend)?;
         let old_root = self.root;
         self.root = new_root;
         self.pending_superseded.push(old_root);
@@ -262,12 +269,19 @@ impl FreeMapTree {
             let span = self.child_span(level);
             let child_idx = (remaining / span) as usize;
             let child = read_child(cache.get(current)?, child_idx);
+            // A child below interior `level` is a leaf at level 1 and an interior
+            // at deeper levels — the same position type the read paths validate.
+            let child_expected = if level == 1 {
+                PageType::FreeMap
+            } else {
+                PageType::FreeMapInterior
+            };
             let new_child = if child == 0 {
-                // Absent subtree: materialize a fresh node (leaf at level 1,
-                // interior above). This is structural allocation — extend-only.
+                // Absent subtree: materialize a fresh node of the expected kind.
+                // This is structural allocation — extend-only.
                 let id_new = extend(cache)?;
                 let buf = cache.get_mut(id_new)?;
-                if level == 1 {
+                if child_expected == PageType::FreeMap {
                     FreeMap::init_page(buf);
                     page::stamp_checksum(buf);
                 } else {
@@ -275,8 +289,9 @@ impl FreeMapTree {
                 }
                 id_new
             } else {
-                // Present subtree: COW it; the old child is superseded.
-                let copied = self.cow_node(cache, child, extend)?;
+                // Present subtree: COW it (validating its position type); the old
+                // child is superseded.
+                let copied = self.cow_node(cache, child, child_expected, extend)?;
                 self.pending_superseded.push(child);
                 copied
             };
@@ -298,32 +313,31 @@ impl FreeMapTree {
     }
 
     /// COW-copy one existing tree page into a fresh `extend`-allocated page,
-    /// validating its type first. Returns the new page id. The caller queues the
-    /// old page on `pending_superseded` (cow_descend does so per frame).
+    /// validating it is the `expected` POSITION type first. Returns the new page
+    /// id. The caller queues the old page on `pending_superseded` (cow_descend
+    /// does so per frame).
+    ///
+    /// `expected` is the type the descent level says must live here (interior vs
+    /// leaf). Validating against it — rather than self-classifying from buf[0] —
+    /// makes the COW spine reject a checksum-valid but POSITION-wrong page (e.g. a
+    /// FreeMap leaf reached where an interior is expected): 0x04 and 0x07 are both
+    /// valid tree types, so a self-classifying check could not catch that, but the
+    /// read paths (find_leaf/scan_node) already reject it. This closes that gap so
+    /// mark_free/mark_free_growing — which reach the spine without a prior
+    /// position-validating read — fail closed identically.
     fn cow_node(
         &self,
         cache: &mut PageCache,
         page_id: u64,
+        expected: PageType,
         extend: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
     ) -> Result<u64> {
         // Validate before copying so a corrupt wrong-type page on the spine
         // fails closed rather than propagating into a fresh COW page.
-        let buf = cache.get(page_id)?;
-        let expected = if self.is_leaf_page(buf) {
-            PageType::FreeMap
-        } else {
-            PageType::FreeMapInterior
-        };
-        check_type(buf, expected, page_id)?;
+        check_type(cache.get(page_id)?, expected, page_id)?;
         let new_id = extend(cache)?;
         cache.copy_page(page_id, new_id)?;
         Ok(new_id)
-    }
-
-    // A page is a leaf iff its type byte is FreeMap. Used by cow_node to pick the
-    // expected type for validation without threading the level through.
-    fn is_leaf_page(&self, buf: &[u8; PAGE_SIZE]) -> bool {
-        buf[0] == PageType::FreeMap as u8
     }
 
     /// Mark `id` free (set its bit), COWing the spine and materializing any
@@ -617,6 +631,47 @@ mod tests {
         assert!(
             matches!(err, ChiselError::CorruptPage { .. }),
             "expected CorruptPage, got {err:?}"
+        );
+    }
+
+    // The COW spine must reject a checksum-valid but POSITION-wrong page exactly
+    // like the read paths. Here an INTERIOR child is corrupted into a FreeMap
+    // LEAF (0x04) — a perfectly valid TREE type, so cow_node's old self-
+    // classifying check (which only asked "is buf[0] one of the two tree types?")
+    // would have accepted it and copied a leaf where an interior belongs. Only the
+    // positional check (expected = FreeMapInterior at this descent level) catches
+    // it. mark_free reaches the spine without a prior position-validating read, so
+    // this is the exposed path that needed the hardening.
+    #[test]
+    fn mark_free_rejects_wrong_position_page_on_cow_spine() {
+        let mut c = make_cache();
+        let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
+        // Depth 2: root (level 2) -> interior children (level 1's parents) -> leaves.
+        t.grow(&mut c, &mut extend).unwrap();
+        t.grow(&mut c, &mut extend).unwrap();
+        assert_eq!(t.depth, 2);
+        // Materialize the spine for an id, creating the level-2 child interior and
+        // its leaf. id 5 lives under root child 0 (an INTERIOR), then leaf child 0.
+        t.mark_free(&mut c, 5, &mut extend).unwrap();
+        let interior_child = read_child(c.get(t.root).unwrap(), 0);
+        // Corrupt that interior into a checksum-valid FreeMap LEAF: right checksum,
+        // valid tree type byte, WRONG position (a leaf where an interior is
+        // expected). FreeMap::init_page stamps a leaf type byte; re-stamp the
+        // checksum so the cache accepts it.
+        {
+            let buf = c.get_mut(interior_child).unwrap();
+            FreeMap::init_page(buf);
+            page::stamp_checksum(buf);
+        }
+        // Mark a fresh id whose spine traverses the corrupted child (anything under
+        // root child 0). The COW descent must reject it on the positional check.
+        let err = match t.mark_free(&mut c, 5, &mut extend) {
+            Ok(()) => panic!("mark_free accepted a position-wrong interior child"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ChiselError::CorruptPage { page_id } if page_id == interior_child),
+            "expected CorruptPage {{ page_id: {interior_child} }}, got {err:?}"
         );
     }
 
