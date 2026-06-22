@@ -72,8 +72,8 @@ pub use handle::{Handle, Tag, TagDropProgress};
 pub use page::PAGE_SIZE;
 pub use stats::{ChiselCounters, Stats};
 pub use superblock::{
-    DEFAULT_SUPERBLOCK_COUNT, MAX_SUPERBLOCKS, MIN_SUPERBLOCKS, NAMED_ROOT_COUNT,
-    NAMED_ROOT_NAME_LEN,
+    SlotDefect, SuperblockDefect, DEFAULT_SUPERBLOCK_COUNT, MAX_SUPERBLOCKS, MIN_SUPERBLOCKS,
+    NAMED_ROOT_COUNT, NAMED_ROOT_NAME_LEN,
 };
 
 use std::path::Path;

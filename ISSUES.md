@@ -1360,7 +1360,7 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 **Fixed (2026-06-21, ErrorKind-inspection option, per maintainer decision):** the `From<io::Error>` impl now matches on `e.kind()` and routes `io::ErrorKind::NotFound` → operational `FileNotFound`; every other kind stays fatal `IoError`. Scope was deliberately limited to `NotFound` (not `AlreadyExists`): NotFound can only arise from resolving a missing *path* (open of a non-existent file), never from a read/write on the already-open, flock'd fd, so demoting it is safe — whereas demoting a kind that might signal real corruption would be the same fail-open hazard as I104. `Chisel::open` already pre-checks the missing-file case at `lib.rs:295` and returns `FileNotFound` directly, so the tested open path is unchanged; this makes any *stray* NotFound that reaches a `?` classify consistently instead of poisoning. Full suite green (no test regressed). The stale "every io::Error becomes a fatal IoError" comment was rewritten.
 
-#### I106. `CorruptSuperblock` folds three distinct causes into one nullary fatal variant [deepdive 2026-06-21] — **P3**
+#### I106. `CorruptSuperblock` folds three distinct causes into one nullary fatal variant [deepdive 2026-06-21] — **P3** ✅ FIXED 2026-06-21
 **Where:** `src/error.rs:106`
 
 **Problem:** bad checksum, bad magic, and out-of-range `superblock_count` all surface as the same nullary, fatal, unrecoverable `CorruptSuperblock`; the comment admits operators "should look at the raw slot bytes." Discarding which-slot-and-why on the engine's worst failure is an operability loss. (Related: `InvalidMagic` at `:111` is likely unreachable because a bad magic already surfaces here via `select` — see I115.)

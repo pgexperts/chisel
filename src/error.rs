@@ -10,6 +10,7 @@
 // Anything promoted from Operational to Fatal (or vice versa) is a breaking
 // change for users doing error-class matching.
 
+use crate::superblock::SlotDefect;
 use std::fmt;
 use std::io;
 
@@ -100,10 +101,12 @@ pub enum ChiselError {
     // XXH3 checksum, correct magic, AND a `superblock_count` inside
     // `MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS`. A slot that passes checksum
     // but has an out-of-range `superblock_count` counts as corrupt for
-    // this purpose — the Display message is generic, so operators
-    // diagnosing a bad file should look at the raw slot bytes if a
-    // more specific cause is needed.
-    CorruptSuperblock,
+    // this purpose. `defects` contains one `SlotDefect` per candidate slot
+    // that failed validation, so operators can pinpoint the exact cause
+    // without reaching for the raw slot bytes (I106).
+    CorruptSuperblock {
+        defects: Vec<SlotDefect>,
+    },
     FileSizeMismatch {
         expected: u64,
         actual: u64,
@@ -169,7 +172,7 @@ impl ChiselError {
             self,
             ChiselError::IoError(_)
                 | ChiselError::ChecksumMismatch { .. }
-                | ChiselError::CorruptSuperblock
+                | ChiselError::CorruptSuperblock { .. }
                 | ChiselError::FileSizeMismatch { .. }
                 | ChiselError::LockFailed
                 | ChiselError::UnsupportedFormatVersion { .. }
@@ -231,7 +234,14 @@ impl fmt::Display for ChiselError {
             ChiselError::ChecksumMismatch { page_id } => {
                 write!(f, "checksum mismatch on page {page_id}")
             }
-            ChiselError::CorruptSuperblock => write!(f, "no valid superblock found"),
+            ChiselError::CorruptSuperblock { defects } => {
+                write!(f, "no valid superblock found")?;
+                for (i, sd) in defects.iter().enumerate() {
+                    let sep = if i == 0 { ":" } else { ";" };
+                    write!(f, "{sep} slot {}: {}", sd.slot, sd.defect)?;
+                }
+                Ok(())
+            }
             ChiselError::FileSizeMismatch { expected, actual } => {
                 write!(
                     f,
@@ -330,7 +340,7 @@ mod tests {
             ChiselError::InvalidHandle(0),
             ChiselError::NoActiveTransaction,
             ChiselError::ChecksumMismatch { page_id: 0 },
-            ChiselError::CorruptSuperblock,
+            ChiselError::CorruptSuperblock { defects: vec![] },
             ChiselError::Poisoned,
         ];
         for e in &cases {
@@ -372,6 +382,50 @@ mod tests {
         );
     }
 
+    // I106: the CorruptSuperblock Display is the operator-facing diagnostic, so
+    // pin its exact format — the empty/single/multiple separator logic (":" on
+    // the first slot, ";" between, no trailing punctuation) is easy to break.
+    #[test]
+    fn corrupt_superblock_display_format() {
+        use crate::superblock::{SlotDefect, SuperblockDefect};
+        // No defects (the test-constructor case): bare message, no punctuation.
+        let empty = ChiselError::CorruptSuperblock { defects: vec![] };
+        assert_eq!(format!("{empty}"), "no valid superblock found");
+        // One defect: colon-introduced slot detail.
+        let one = ChiselError::CorruptSuperblock {
+            defects: vec![SlotDefect {
+                slot: 0,
+                defect: SuperblockDefect::BadChecksum,
+            }],
+        };
+        assert_eq!(
+            format!("{one}"),
+            "no valid superblock found: slot 0: bad checksum"
+        );
+        // Multiple: colon first, semicolons between, no trailing separator; also
+        // exercises BadCount's value rendering.
+        let many = ChiselError::CorruptSuperblock {
+            defects: vec![
+                SlotDefect {
+                    slot: 0,
+                    defect: SuperblockDefect::BadChecksum,
+                },
+                SlotDefect {
+                    slot: 1,
+                    defect: SuperblockDefect::BadMagic,
+                },
+                SlotDefect {
+                    slot: 2,
+                    defect: SuperblockDefect::BadCount(99),
+                },
+            ],
+        };
+        assert_eq!(
+            format!("{many}"),
+            "no valid superblock found: slot 0: bad checksum; slot 1: bad magic; slot 2: bad superblock_count 99"
+        );
+    }
+
     // I104 (ISSUES.md, 2026-06-21): exhaustiveness guard for is_fatal(). The
     // `documented_is_fatal` helper classifies every variant via a match with NO
     // `_` arm; because this is the DEFINING crate, #[non_exhaustive] does not
@@ -408,7 +462,7 @@ mod tests {
                 // Fatal — integrity in question; close and reopen.
                 ChiselError::IoError(_)
                 | ChiselError::ChecksumMismatch { .. }
-                | ChiselError::CorruptSuperblock
+                | ChiselError::CorruptSuperblock { .. }
                 | ChiselError::FileSizeMismatch { .. }
                 | ChiselError::LockFailed
                 | ChiselError::UnsupportedFormatVersion { .. }
@@ -442,7 +496,7 @@ mod tests {
             ChiselError::Poisoned,
             ChiselError::IoError(io::Error::other("io")),
             ChiselError::ChecksumMismatch { page_id: 0 },
-            ChiselError::CorruptSuperblock,
+            ChiselError::CorruptSuperblock { defects: vec![] },
             ChiselError::FileSizeMismatch {
                 expected: 0,
                 actual: 0,
