@@ -34,7 +34,6 @@ def test_fatal_hierarchy():
         "ChecksumMismatchError",
         "CorruptSuperblockError",
         "FileSizeMismatchError",
-        "InvalidMagicError",
         "LockFailedError",
         "UnsupportedFormatVersionError",
         "CorruptPageError",

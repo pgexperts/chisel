@@ -281,7 +281,7 @@ let options = Options {
 
 **Fatal errors** — storage integrity is in question. Drop the handle and reopen.
 
-`IoError`, `ChecksumMismatch`, `CorruptSuperblock`, `FileSizeMismatch`, `InvalidMagic`, `LockFailed`, `UnsupportedFormatVersion`, `CorruptPage`, `InvalidPageId`, `Poisoned`.
+`IoError`, `ChecksumMismatch`, `CorruptSuperblock`, `FileSizeMismatch`, `LockFailed`, `UnsupportedFormatVersion`, `CorruptPage`, `InvalidPageId`, `Poisoned`.
 
 Use `ChiselError::is_fatal()` to classify at runtime.
 
