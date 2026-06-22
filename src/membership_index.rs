@@ -63,12 +63,16 @@ fn init_page(
 /// `create_root` for the tag reuse them instead of extending the file.
 ///
 /// Safe to free as a unit: when a tag empties, its whole inner tree is orphaned
-/// (the outer entry is removed by the caller right after), and a valid radix
-/// tree has no cycles, so each page is visited and freed exactly once. The pages
-/// are a mix of this-txn COW pages and committed pages — NOT the COW-superseded
-/// old pages, which `delete` already queued in `freed` — so there is no
-/// double-free. Recursion is bounded by `depth` (<= `MAX_DEPTH`): a corrupt
-/// child pointer cannot loop forever, the descent terminates at depth 0.
+/// (the outer entry is removed by the caller right after). The pages are a mix
+/// of this-txn COW pages and committed pages — NOT the COW-superseded old
+/// pages, which `delete` already queued in `freed`. No double-free hazard:
+/// `FreeMap::mark_free` is a bitmap set operation — idempotent by design, so
+/// pushing the same page twice is harmless. In the common case a valid tree has
+/// no cycles, so each page is visited exactly once; but the safety guarantee
+/// comes from idempotency, not from the acyclicity invariant (a corrupt interior
+/// page could repeat a child id and cause a double-push, which is still safe).
+/// Recursion is bounded by `depth` (<= `MAX_DEPTH`): even a corrupt child
+/// pointer cannot cause an infinite loop; the descent terminates at depth 0.
 fn free_subtree(cache: &mut PageCache, root: u64, depth: u32, freed: &mut Vec<u64>) -> Result<()> {
     if root == PAGE_ID_NONE {
         return Ok(());
