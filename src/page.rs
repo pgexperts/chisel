@@ -151,6 +151,10 @@ pub enum PageType {
     FreeMap = 0x04,
     MembershipInterior = 0x05,
     MembershipLeaf = 0x06,
+    // Interior node of the multi-page radix freemap tree (COW radix of bitmap
+    // leaves). Introduced for the multi-page freemap feature; 0x07 is the next
+    // slot after MembershipLeaf. Leaf pages reuse PageType::FreeMap (0x04).
+    FreeMapInterior = 0x07,
 }
 
 /// The per-page format version a freshly-initialized page of `page_type`
@@ -167,7 +171,8 @@ pub const fn current_version(page_type: PageType) -> u8 {
         | PageType::Overflow
         | PageType::FreeMap
         | PageType::MembershipInterior
-        | PageType::MembershipLeaf => PAGE_FORMAT_VERSION_CURRENT,
+        | PageType::MembershipLeaf
+        | PageType::FreeMapInterior => PAGE_FORMAT_VERSION_CURRENT,
     }
 }
 
@@ -386,6 +391,12 @@ mod tests {
         ] {
             assert_eq!(current_version(pt), 0, "type {pt:?}");
         }
+    }
+
+    #[test]
+    fn freemap_interior_type_tag_and_version() {
+        assert_eq!(PageType::FreeMapInterior as u8, 0x07);
+        assert_eq!(current_version(PageType::FreeMapInterior), PAGE_FORMAT_VERSION_CURRENT);
     }
 
     #[test]
