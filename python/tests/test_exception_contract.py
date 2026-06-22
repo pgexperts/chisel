@@ -251,19 +251,21 @@ def test_spillway_full_exact_class(tmp_db):
 
 
 def test_two_thread_mutex_contention(tmp_db):
-    # I139 / I75: the binding wraps the engine in a Mutex so concurrent access
-    # from multiple Python threads is memory-safe (each call locks the Mutex and
-    # releases the GIL during the Rust call). Drive that contention with two
-    # threads hammering READS of the same handles concurrently, then assert no
-    # deadlock, no error, correct data, and no spurious poison.
+    # I139 / I75: the binding wraps the engine in a Mutex (required for Sync in
+    # PyO3 0.24+). Per-op calls do NOT release the GIL (see db.rs
+    # with_inner_io / with_inner_mut_io — only open() releases it); the GIL
+    # serializes every Chisel call across threads. The Mutex is a Sync-
+    # satisfying wrapper, not the primary serialization point here. Drive two
+    # threads concurrently hammering READS of the same handles to confirm no
+    # panic, no deadlock, no data corruption — the GIL serializes their calls.
     #
     # The threads do READS, not begin/commit cycles, ON PURPOSE: the single-
-    # writer transaction state is a SHARED resource. The Mutex makes individual
-    # calls safe but does NOT make a begin..commit SPAN atomic across threads, so
-    # two threads independently transacting on one Chisel race on
+    # writer transaction state is a SHARED resource. Even with GIL serialization,
+    # two threads independently transacting on one Chisel would race on
     # `TransactionAlreadyActive` (the engine is single-writer by design — see the
     # single-client design note). Reads take `&self` and need no active
-    # transaction, so they are the correct way to exercise Mutex contention.
+    # transaction, so they are the correct way to exercise GIL-serialized
+    # concurrent access.
     ITERATIONS = 200
     db = chisel.open(str(tmp_db))
     # Single-threaded setup: commit a handful of handles to read concurrently.
