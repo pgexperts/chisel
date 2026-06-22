@@ -529,6 +529,47 @@ impl FreeMapTree {
         }
         Ok(None)
     }
+
+    /// Test-only: collect every page id physically reachable from the tree root
+    /// (root + every present interior + every materialized leaf). Mirrors
+    /// `HandleTable::collect_page_ids`. Used by the structural-recycle pin-tests
+    /// to assert disjointness between the LIVE tree and the dead-page reuse pool
+    /// (a reuse-pool page must never still be reachable). Returns an empty set
+    /// when the tree is unmaterialized (`root == PAGE_ID_NONE`).
+    #[cfg(test)]
+    pub(crate) fn reachable_pages(&self, cache: &mut PageCache) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        if self.root != crate::page::PAGE_ID_NONE {
+            self.collect_reachable(cache, self.root, self.depth, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    fn collect_reachable(
+        &self,
+        cache: &mut PageCache,
+        page: u64,
+        level: u32,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        out.push(page);
+        if level > 0 {
+            // Materialize child pointers before recursing (the recursive call
+            // needs &mut PageCache, invalidating the borrow on `page`).
+            let children: Vec<u64> = {
+                let buf = cache.get(page)?;
+                (0..PTRS_PER_INTERIOR)
+                    .map(|i| read_child(buf, i))
+                    .filter(|c| *c != 0)
+                    .collect()
+            };
+            for child in children {
+                self.collect_reachable(cache, child, level - 1, out)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
