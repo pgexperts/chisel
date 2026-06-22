@@ -50,11 +50,11 @@ use std::cell::{Cell, RefCell};
 // Keys are trusted local u64 page ids — no DoS surface — so SipHash is pure cost,
 // exactly the I77 rationale; that pass converted the page cache/LRU but missed
 // these. FxHashMap is a drop-in std HashMap with a faster non-DoS-resistant hasher.
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::data_page::DataPage;
 use crate::error::{ChiselError, Result};
-use crate::freemap::FreeMap;
+use crate::freemap_tree::FreeMapTree;
 use crate::handle_table::{HandleEntry, HandleFlags, HandleTable};
 use crate::membership_index::{MembershipIndex, RadixU64};
 use crate::overflow::Overflow;
@@ -81,31 +81,89 @@ const MAX_INLINE_VALUE: usize =
 /// Freemap-aware page allocator shared by data-page allocation and the
 /// handle-table / membership-index COW paths.
 ///
-/// When `reuse_enabled`, it first tries to reuse a page freed by a *prior*
-/// committed transaction (a free bit in `current_freemap`), falling back to
-/// extending the file via `PageCache::new_page`. `reuse_enabled` is false while
-/// savepoints are active (R2: savepoint scopes disable freemap reuse to keep
-/// `rollback_to` semantics simple) — matching the historical `allocate_data_page`
-/// behavior, which this now also routes through.
+/// When `reuse_enabled`, it asks the freemap `tree` for the lowest free id
+/// at/above `*hint` (clearing its bit via a COW so it cannot be handed out
+/// twice), falling back to extending the file via `PageCache::new_page`.
+/// `reuse_enabled` is false while savepoints are active (R2: savepoint scopes
+/// disable freemap reuse to keep `rollback_to` semantics simple) — matching the
+/// historical `allocate_data_page` behavior, which this also routes through.
+///
+/// The tree's own COW of the claimed leaf supersedes pages, which the caller
+/// drains from `tree.pending_superseded` into `txn_freed_pages` after the call.
+///
+/// LAZY-CREATE GUARD: a fresh database has `tree.root == PAGE_ID_NONE` (no tree
+/// materialized yet). `PAGE_ID_NONE` is `u64::MAX`, NOT the tree's internal
+/// zero-child sentinel, so `allocate_first` would try to read page u64::MAX and
+/// error rather than reporting "nothing free". We short-circuit that here: a
+/// None-root tree holds nothing reusable, so we fall straight through to
+/// `new_page`. The tree is first materialized when a page is *freed* (see
+/// persist_freemap), never on the allocation side.
 ///
 /// Pages freed during the CURRENT transaction live in `txn_freed_pages` and are
-/// NOT in `current_freemap` until commit, so `allocate_first` can never hand
+/// NOT in the committed tree until commit, so `allocate_first` can never hand
 /// back a page still referenced by the live tree (the I18 invariant). Routing
 /// handle-table and membership COW allocation through here — rather than the
 /// monotonic `new_page` — is what lets those structures reach a bounded
 /// steady-state page count instead of leaking one page per mutation.
 fn cow_alloc(
     cache: &mut PageCache,
-    freemap: &mut [u8; PAGE_SIZE],
+    tree: &mut FreeMapTree,
+    hint: &mut u64,
+    structural_reuse: &mut Vec<u64>,
     reuse_enabled: bool,
 ) -> Result<u64> {
-    if reuse_enabled {
-        if let Some(id) = FreeMap::allocate_first(freemap) {
+    if reuse_enabled && tree.root != PAGE_ID_NONE {
+        // `allocate_first` claims a free DATA page (clearing its bit), which COWs
+        // the freemap leaf. That leaf COW's structural `extend` reuses a dead
+        // freemap page from `structural_reuse` before extending the file — what
+        // keeps the freemap from marching the file upward one page per commit.
+        let mut extend = |c: &mut PageCache| structural_extend(c, structural_reuse);
+        if let Some(id) = tree.allocate_first(cache, hint, &mut extend)? {
             cache.claim_page(id)?;
             return Ok(id);
         }
     }
     cache.new_page()
+}
+
+// Verification hook (tests only): every page id drawn from `structural_reuse`
+// as a freemap-COW target is recorded here, so the recycle pin-tests can assert
+// the one-commit defer (a reused id was promoted by a PRIOR commit, never one
+// this transaction itself superseded). A thread-local keeps the production
+// `structural_extend` signature and both inline pop sites untouched; the
+// recording calls are `#[cfg(test)]` no-ops in release builds. The single-writer
+// model means at most one manager drives this per thread at a time.
+#[cfg(test)]
+thread_local! {
+    static STRUCTURAL_REUSE_LOG: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_structural_reuse(id: u64) {
+    STRUCTURAL_REUSE_LOG.with(|log| log.borrow_mut().push(id));
+}
+
+/// Drain and return every structural-reuse pop recorded since the last drain.
+#[cfg(test)]
+fn take_structural_reuse_log() -> Vec<u64> {
+    STRUCTURAL_REUSE_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
+}
+
+/// Structural-page allocator for the freemap tree's COW: reuse a dead freemap
+/// page (deferred from a prior commit, now safe to overwrite) before extending
+/// the file. NEVER draws from the freemap's own free bits — that would re-COW a
+/// leaf and recurse — preserving the extend-only termination guarantee while
+/// bounding steady-state growth. `claim_page` evicts any stale cache entry for
+/// the reused id before the COW writes its fresh contents.
+fn structural_extend(cache: &mut PageCache, structural_reuse: &mut Vec<u64>) -> Result<u64> {
+    if let Some(id) = structural_reuse.pop() {
+        #[cfg(test)]
+        record_structural_reuse(id);
+        cache.claim_page(id)?;
+        Ok(id)
+    } else {
+        cache.new_page()
+    }
 }
 
 /// Snapshot of the mutable "pointers" that define a consistent database state.
@@ -119,7 +177,16 @@ fn cow_alloc(
 #[derive(Debug, Clone)]
 struct Roots {
     handle_table_page: u64,
+    // Root page of the freemap tree (PageType::FreeMap leaf at depth 0, or a
+    // FreeMapInterior at depth > 0). PAGE_ID_NONE until the first free
+    // materializes the tree (see persist_freemap). Paired with `freemap_depth`,
+    // these two words ARE the committed freemap; cloning Roots at
+    // begin/commit/rollback/savepoint carries them with no extra plumbing.
     freemap_page: u64,
+    // Depth of the freemap tree rooted at `freemap_page`. Depth 0 = today's
+    // single-leaf format (a lone FreeMap page reached directly), so existing
+    // databases load unchanged. Grows logarithmically with database size.
+    freemap_depth: u32,
     next_handle: u64,
     total_pages: u64,
     named_roots: [NamedRoot; NAMED_ROOT_COUNT],
@@ -203,17 +270,66 @@ pub struct TransactionManager {
     // their old contents must stay readable via `committed_roots` until
     // commit promotes the new roots.
     txn_freed_pages: Vec<u64>,
-    // Freemap state (ISSUES.md R2). Single-page bitmap (capacity ~65K
-    // pages ≈ 512 MB in v1). `committed_freemap` mirrors the on-disk
-    // freemap page pointed to by `committed_roots.freemap_page`;
-    // `current_freemap` is a working copy cloned at begin() time. Page
-    // allocations during a transaction pull from `current_freemap` (so
-    // they don't touch pages that are only logically free after commit),
-    // and `txn_freed_pages` is merged into `current_freemap` at commit
-    // time before the new freemap page is written. On rollback,
-    // `current_freemap` is reset from `committed_freemap`.
-    committed_freemap: Box<[u8; PAGE_SIZE]>,
-    current_freemap: Box<[u8; PAGE_SIZE]>,
+    // Best-effort lower bound on the lowest free page id in the committed
+    // freemap tree, threaded into `FreeMapTree::allocate_first` so a scan
+    // starts near the answer instead of at id 0. Deliberately NOT
+    // transactionally tracked: a too-low hint only costs a wasted left-to-right
+    // scan, never correctness (the scan still returns the true lowest free id),
+    // so it needs no begin/rollback snapshotting. `allocate_first` advances it;
+    // a free at a lower id is invisible to the hint until the next scan walks
+    // back over it, which is acceptable slack. Init 0.
+    freemap_hint: u64,
+    // Dead freemap pages carried BETWEEN commits, the engine's bounded-growth
+    // mechanism for the extend-only freemap (ISSUES.md I18, generalized to the
+    // tree). Lifecycle:
+    //
+    //   * A freemap mutation (data-alloc-side leaf COW, or persist's frees) must
+    //     COW the committed freemap pages it touches — it can never overwrite a
+    //     page the last-durable superblock still references. Each COW supersedes
+    //     an OLD freemap page.
+    //   * That old page cannot be reused IN THE SAME COMMIT (the commit's new
+    //     freemap root may still reference it until the superblock flips), so it
+    //     is DEFERRED one commit: collected in `structural_superseded` this
+    //     transaction, promoted to `pending_structural_frees` at commit.
+    //   * The NEXT transaction reuses them: `begin()` moves them into
+    //     `structural_reuse`, and every structural `extend` (freemap COW target)
+    //     pops from that pool before extending the file. This is what makes the
+    //     freemap leaf ROTATE among a small set of pages instead of marching the
+    //     file upward ~1 page/commit forever. Reusing a DEAD page (vs. a free bit
+    //     in the tree) keeps the extend-only TERMINATION guarantee — no freemap
+    //     mutation ever draws structural space from the freemap's own bits.
+    //
+    // Not data-reusable (never enters `txn_freed_pages`): a freed freemap page
+    // sits at a high id, and the lowest-first data allocator would starve it, so
+    // routing it back as structural reuse (where demand matches supply at steady
+    // state) is what actually reclaims it.
+    pending_structural_frees: Vec<u64>,
+    // The dead-freemap-page pool available to reuse as structural COW targets in
+    // the CURRENT transaction. Seeded from `pending_structural_frees` at
+    // `begin()`; drained by every structural `extend`; the unconsumed remainder
+    // is carried forward (back into `pending_structural_frees`) at commit. On
+    // rollback it is moved back wholesale, restoring the pre-transaction
+    // `pending_structural_frees`.
+    structural_reuse: Vec<u64>,
+    // This transaction's freemap-COW supersedes (old freemap pages this txn
+    // replaced). Accumulated as transient handles drain `tree.pending_superseded`
+    // here via `put_freemap_tree`; promoted to `pending_structural_frees` at
+    // commit (the one-commit defer). Dropped on rollback (those COWs are
+    // truncated above the watermark).
+    structural_superseded: Vec<u64>,
+    // Freemap pages already COW'd/extended by the CURRENT transaction. Because
+    // the manager rebuilds a transient `FreeMapTree` handle at every allocation
+    // site (data-page alloc, each HT/membership COW, persist_freemap), this set
+    // is what lets those handles share the "first touch this txn => COW, later
+    // touches => in-place" discipline: without it every site would re-COW the
+    // same freemap leaf, turning reclamation into unbounded file growth. Swapped
+    // into each transient handle and read back out (see `freemap_tree` helper).
+    // Cleared at begin (fresh per transaction); also cleared on commit/rollback
+    // so the next transaction starts empty. A stale entry pointing at a
+    // now-committed page would be a CORRECTNESS bug (it would suppress a needed
+    // COW and mutate a live committed page in place), which is exactly why it is
+    // transaction-scoped, not cross-transaction.
+    freemap_session_owned: FxHashSet<u64>,
     // Live-slot count per data page (ISSUES.md R1). Tracks how many
     // handle-table entries currently point at each data page — this
     // is the information needed to decide when a page is fully empty
@@ -347,7 +463,12 @@ impl TransactionManager {
 
         let roots = Roots {
             handle_table_page: PAGE_ID_NONE,
+            // No freemap tree yet: the first allocation falls through to extend
+            // (nothing to reuse) and the first free materializes the tree lazily
+            // (persist_freemap calls FreeMapTree::create). Depth 0 matches the
+            // single-leaf format.
             freemap_page: PAGE_ID_NONE,
+            freemap_depth: 0,
             // Start at 1: handle 0 is reserved as the "no handle" sentinel and is
             // never minted (see Superblock::new_empty, which seeds the persisted
             // superblock the same way). Must match new_empty so the in-memory
@@ -357,15 +478,6 @@ impl TransactionManager {
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
             membership_index_page: PAGE_ID_NONE,
         };
-
-        // A brand-new database has no freemap page on disk yet. Both
-        // in-memory freemaps start as "nothing free" (FreeMap::init_page
-        // sets the type tag and zero-initializes the bitmap); the
-        // freemap page will be materialized on the first commit that
-        // has something to persist.
-        let mut committed_freemap = Box::new([0u8; PAGE_SIZE]);
-        FreeMap::init_page(&mut committed_freemap);
-        let current_freemap = committed_freemap.clone();
 
         Ok(TransactionManager {
             cache: RefCell::new(cache),
@@ -381,8 +493,11 @@ impl TransactionManager {
             active_txn: false,
             savepoints: Vec::new(),
             txn_freed_pages: Vec::new(),
-            committed_freemap,
-            current_freemap,
+            freemap_hint: 0,
+            pending_structural_frees: Vec::new(),
+            structural_reuse: Vec::new(),
+            structural_superseded: Vec::new(),
+            freemap_session_owned: FxHashSet::default(),
             // A fresh database has no data pages and no live slots yet.
             committed_live_slots: FxHashMap::default(),
             current_live_slots: FxHashMap::default(),
@@ -523,7 +638,11 @@ impl TransactionManager {
 
         let roots = Roots {
             handle_table_page: sb.root_handle_table_page,
+            // The committed freemap tree IS {root, depth} from the superblock —
+            // no separate in-memory mirror is loaded. Depth 0 (the default for
+            // pre-multi-page databases) reaches today's single-leaf format.
             freemap_page: sb.root_freemap_page,
+            freemap_depth: sb.freemap_depth,
             next_handle: sb.next_handle,
             total_pages: sb.total_pages,
             named_roots: sb.named_roots,
@@ -555,20 +674,13 @@ impl TransactionManager {
             membership_index.set_outer_depth(depth);
         }
 
-        // Load the freemap, if this database has ever persisted one.
-        // A DB created under v1 (pre-R2) will have root_freemap_page ==
-        // PAGE_ID_NONE because the freemap was never wired into the
-        // allocator — in that case we start with an empty freemap just
-        // like a fresh database. Loading via cache.get validates the
-        // XXH3 checksum so a torn or corrupt freemap surfaces as a
-        // fatal error rather than silent reuse of the wrong pages.
-        let mut committed_freemap = Box::new([0u8; PAGE_SIZE]);
-        FreeMap::init_page(&mut committed_freemap);
-        if sb.root_freemap_page != PAGE_ID_NONE {
-            let loaded = cache.get(sb.root_freemap_page)?;
-            *committed_freemap = *loaded;
-        }
-        let current_freemap = committed_freemap.clone();
+        // The committed freemap tree is reconstructed on demand from
+        // {root_freemap_page, freemap_depth} via FreeMapTree::from_roots — no
+        // eager in-memory mirror is loaded here. A DB created under v1 (pre-R2)
+        // or a fresh one has root_freemap_page == PAGE_ID_NONE, which
+        // from_roots treats as the empty (nothing-free) tree. Tree pages are
+        // checksum-validated on cache miss as they are descended, so a torn or
+        // corrupt freemap surfaces as a fatal error rather than silent reuse.
 
         // Rebuild the live-slot count map (ISSUES.md R1) by scanning the
         // handle table. Every Live entry contributes one live slot to
@@ -602,8 +714,11 @@ impl TransactionManager {
             active_txn: false,
             savepoints: Vec::new(),
             txn_freed_pages: Vec::new(),
-            committed_freemap,
-            current_freemap,
+            freemap_hint: 0,
+            pending_structural_frees: Vec::new(),
+            structural_reuse: Vec::new(),
+            structural_superseded: Vec::new(),
+            freemap_session_owned: FxHashSet::default(),
             committed_live_slots,
             current_live_slots,
             insert_cursor: None,
@@ -668,6 +783,49 @@ impl TransactionManager {
     #[cfg(test)]
     pub fn force_poison_for_test(&self) {
         self.poisoned.set(true);
+    }
+
+    /// Test-only: forge a freemap orphan exactly as a crash would leave one.
+    /// Extend a fresh page, stamp it as a checksum-valid `FreeMapInterior`, and
+    /// return its id WITHOUT referencing it from the live tree or marking it free
+    /// — the precise state of a structural-recycle-pool page stranded when an
+    /// in-memory pool is lost to a crash. The orphan sweep
+    /// (`reclaim_freemap_orphans`) must reclaim it. Returns the forged page id.
+    ///
+    /// FreeMapInterior (not FreeMap) is used deliberately: it cannot be mistaken
+    /// for a freed-bit leaf, and it exercises the interior arm of the type test.
+    #[cfg(test)]
+    pub(crate) fn test_forge_freemap_orphan(&mut self) -> Result<u64> {
+        let mut cache = self.cache.borrow_mut();
+        let id = cache.new_page()?;
+        let buf = cache.get_mut(id)?;
+        buf.fill(0);
+        buf[0] = crate::page::PageType::FreeMapInterior as u8;
+        buf[1] = page::current_version(crate::page::PageType::FreeMapInterior);
+        page::stamp_checksum(buf);
+        Ok(id)
+    }
+
+    /// Test-only: forge a CORRUPT, non-reachable page on disk. Extend a fresh
+    /// page, fill it with garbage, deliberately do NOT stamp a valid checksum,
+    /// flush it to the backing file, then drop it from the cache so a later
+    /// `get(id)` re-reads it from disk and fails with `ChecksumMismatch`. The
+    /// page is never referenced from any tree, so it is a corrupt DEAD page —
+    /// exactly what the orphan sweep must SKIP rather than poison on. Returns the
+    /// forged page id.
+    #[cfg(test)]
+    pub(crate) fn test_forge_corrupt_dead_page(&mut self) -> Result<u64> {
+        let mut cache = self.cache.borrow_mut();
+        let id = cache.new_page()?;
+        let buf = cache.get_mut(id)?;
+        // Garbage bytes with a freemap-ish type byte but a checksum that will not
+        // verify (we never call stamp_checksum). The type byte is irrelevant —
+        // the read fails the checksum gate before the type is ever inspected.
+        buf.fill(0xAB);
+        buf[0] = crate::page::PageType::FreeMap as u8;
+        cache.flush()?; // write the garbage bytes to the main file
+        cache.test_drop_from_cache(id); // force a disk re-read (and checksum check) next get
+        Ok(id)
     }
 
     /// True if this manager has been poisoned by a previous fatal error.
@@ -735,10 +893,53 @@ impl TransactionManager {
     // reclaim them. Routing overflow through the freemap too would need the
     // same allocator-closure plumbing at the overflow module boundary; left as
     // a v1 simplification since overflow churn is far smaller than HT churn.
+    /// Build a transient `FreeMapTree` handle from the current freemap roots,
+    /// MOVING the transaction's `freemap_session_owned` set into it so this
+    /// handle treats pages an earlier site already COW'd this transaction as
+    /// in-place-mutable. Pair with `put_freemap_tree`, which moves the (possibly
+    /// grown) set back out — never drop a handle from `take_` without a matching
+    /// `put_`, or the session set is lost and later sites re-COW.
+    fn take_freemap_tree(&mut self) -> FreeMapTree {
+        let mut tree = FreeMapTree::from_roots(
+            self.current_roots.freemap_page,
+            self.current_roots.freemap_depth,
+        );
+        tree.session_owned = std::mem::take(&mut self.freemap_session_owned);
+        tree
+    }
+
+    /// Write a transient handle's grown root/depth back into the current roots,
+    /// move its session-owned set back into the manager, and drain its
+    /// COW-superseded freemap pages into `structural_superseded` (the one-commit
+    /// defer stream — NOT `txn_freed_pages`, since freed freemap pages are
+    /// recycled as structural reuse, not as data frees).
+    fn put_freemap_tree(&mut self, mut tree: FreeMapTree) {
+        self.current_roots.freemap_page = tree.root;
+        self.current_roots.freemap_depth = tree.depth;
+        self.structural_superseded
+            .append(&mut tree.pending_superseded);
+        self.freemap_session_owned = std::mem::take(&mut tree.session_owned);
+    }
+
     fn allocate_data_page(&mut self) -> Result<u64> {
         let reuse = self.savepoints.is_empty();
-        let mut cache = self.cache.borrow_mut();
-        cow_alloc(&mut cache, &mut self.current_freemap, reuse)
+        let mut tree = self.take_freemap_tree();
+        let id = {
+            let mut cache = self.cache.borrow_mut();
+            cow_alloc(
+                &mut cache,
+                &mut tree,
+                &mut self.freemap_hint,
+                &mut self.structural_reuse,
+                reuse,
+            )
+        };
+        // Write back tree growth + drain supersedes even on error: the freemap
+        // pages were extended (never freed), so on a non-fatal failure they are
+        // harmless above-watermark scratch, and the session set must still be
+        // returned so a retry/commit in the same transaction stays consistent.
+        self.put_freemap_tree(tree);
+        id
     }
 
     /// COW `handle`'s handle-table entry to `entry`, installing the new root
@@ -751,11 +952,17 @@ impl TransactionManager {
     /// current old tree keeps all its pages — never freeing a live page.
     fn ht_insert(&mut self, handle: u64, entry: &HandleEntry) -> Result<()> {
         let mut freed: Vec<u64> = Vec::new();
-        let new_root = {
+        let reuse = self.savepoints.is_empty();
+        // Build the freemap-tree handle (with the session set moved in) and
+        // borrow the hint + structural-reuse pool as locals, all disjoint from
+        // `self.handle_table`, so the alloc closure (which mutates them) and the
+        // handle-table insert can both borrow `self` at once.
+        let mut tree = self.take_freemap_tree();
+        let result = {
+            let hint = &mut self.freemap_hint;
+            let pool = &mut self.structural_reuse;
             let mut cache = self.cache.borrow_mut();
-            let reuse = self.savepoints.is_empty();
-            let fm = &mut *self.current_freemap;
-            let mut alloc = |c: &mut PageCache| cow_alloc(c, fm, reuse);
+            let mut alloc = |c: &mut PageCache| cow_alloc(c, &mut tree, hint, pool, reuse);
             self.handle_table.insert(
                 &mut cache,
                 self.current_roots.handle_table_page,
@@ -763,83 +970,249 @@ impl TransactionManager {
                 entry,
                 &mut alloc,
                 &mut freed,
-            )?
+            )
         };
+        // Write back freemap growth (its supersedes go to structural_superseded
+        // via put_freemap_tree). Done before the `?` so a freemap COW that
+        // happened before an insert error still returns the session set and
+        // records the extended root. Handle-table supersedes (`freed`) only land
+        // in txn_freed_pages after the new root is installed.
+        self.put_freemap_tree(tree);
+        let new_root = result?;
         self.current_roots.handle_table_page = new_root;
         self.txn_freed_pages.append(&mut freed);
         Ok(())
     }
 
-    // Persist the freemap at commit time (ISSUES.md R2 / I11 / I18).
+    // Persist the freemap tree at commit time (ISSUES.md R2 / I11 / I18,
+    // generalized to the multi-page COW tree).
     //
-    // Called once at the very start of `commit_inner`, BEFORE cache.flush().
+    // Called once at the very start of `commit_inner`, BEFORE cache.flush(), so
+    // the freemap pages it COWs join the same durable write set as every other
+    // dirty page this transaction produced.
     //
-    // STEP ORDER IS LOAD-BEARING (ISSUES.md I18). The at-risk set during
-    // commit is the union of `committed_roots.freemap_page` and every id
-    // in `txn_freed_pages` — both are still referenced by the currently-
-    // committed on-disk superblock. If any of those ids were visible to
-    // `allocate_data_page` when it picks the page for the new freemap
-    // snapshot, the subsequent `cache.flush()` would overwrite a page
-    // whose bytes the last-durable superblock still depends on. A crash
-    // in the window between that flush and the superblock fsync would
-    // then leave recovery pointing at bytes that no longer match what
-    // was committed — shadow-paging invariant broken.
+    // TWO FREE-STREAMS (the load-bearing distinction the reviewer scrutinizes):
     //
-    // We close that window by ALLOCATING FIRST and MERGING LAST:
-    //   1. Early-exit if nothing in the freemap has changed.
-    //   2. Allocate a page for the new freemap snapshot. At this point
-    //      `current_freemap` still excludes both `old_freemap_page` and
-    //      `txn_freed_pages`, so `FreeMap::allocate_first` can only
-    //      return (a) a page that was already free in `committed_freemap`
-    //      (safe: not referenced by the committed superblock) or
-    //      (b) a freshly-extended page beyond `total_pages` (also safe).
-    //   3. NOW merge `txn_freed_pages` and `old_freemap_page` into
-    //      `current_freemap`. These frees land on disk as part of the
-    //      new freemap snapshot (so future transactions can reclaim
-    //      them) but they are never visible to THIS commit's
-    //      allocator — the window is already closed.
-    //   4. Serialize the resulting freemap into the allocated page and
-    //      point `current_roots.freemap_page` at it.
+    //   * `txn_freed_pages` (DATA frees) — pages freed by this commit's
+    //     data/handle-table/membership COW supersedes. Recorded as FREE in this
+    //     commit's new freemap tree, so the NEXT transaction's data/HT
+    //     allocations can reuse them. Safe to mark now: the new tree becomes
+    //     authoritative only when this commit's superblock flips, by which point
+    //     these pages are genuinely dead.
+    //
+    //   * `structural_superseded` / `pending_structural_frees` /
+    //     `structural_reuse` (FREEMAP-page frees) — the freemap tree's OWN COW
+    //     supersedes. These are NOT marked free in the tree: a freemap page sits
+    //     at a high id where the lowest-first data allocator would starve it, and
+    //     marking a freemap page free inside the tree that is recording frees
+    //     could cascade. Instead they ride a separate recycle: superseded this
+    //     commit (`structural_superseded`) -> deferred one commit
+    //     (`pending_structural_frees`, since the old page is still referenced
+    //     until the superblock flips) -> reused as structural COW targets next
+    //     transaction (`structural_reuse`). This makes the freemap pages ROTATE
+    //     among a small set rather than marching the file upward ~1/commit.
+    //
+    // I18 ORDERING preserved by construction. The structural COW never draws a
+    // page from the freemap's own free bits (that would re-COW a leaf and
+    // recurse); it only ever extends the file or reuses a DEAD page from a prior
+    // commit (one no durable superblock still references). So a to-be-freed id
+    // can never be handed back to record these same frees — the I18 window
+    // cannot open. `persist_freemap_does_not_reuse_committed_live_pages` is the
+    // guardrail.
+    //
+    // DEPTH-0 EQUIVALENCE. With one leaf this reduces to: COW the leaf once
+    // (reusing the prior commit's dead leaf id when available, else extend), set
+    // the freed bits, defer the old leaf to the structural recycle. Steady-state
+    // page count matches the pre-tree single-page freemap.
+    /// Mark a single page id free in the working freemap tree, routing every
+    /// structural COW target through the pooled `structural_extend` (reuse a dead
+    /// freemap page before extending the file) and lazily materializing the
+    /// depth-0 root on first use. Lowers `freemap_hint` to cover `id` so the next
+    /// `allocate_first` scan can reach it.
+    ///
+    /// The ONE marking path shared by `persist_freemap` (this commit's data
+    /// frees) and `reclaim_freemap_orphans` (the defrag orphan-sweep). Both must
+    /// flow through the same COW + recycle discipline so the structural reuse pool
+    /// and supersede streams stay consistent; a second marking implementation
+    /// could silently diverge from the one-commit-defer crash-safety the recycle
+    /// depends on. Take/put the tree per call: the session-owned set and the
+    /// reuse pool persist on the manager across calls, so a multi-id loop still
+    /// COWs each leaf at most once (the session dedup carries across handles).
+    fn freemap_mark_free_committed_path(&mut self, id: u64) -> Result<()> {
+        // Take the working handle WITH the transaction's session set so a leaf an
+        // earlier call (or this commit's data allocations) already COW'd is
+        // recognized as in-place here, not re-COW'd.
+        let mut tree = self.take_freemap_tree();
+        // RefCell so the structural-`extend` closure can drain the shared reuse
+        // pool by `&mut` while the rest of the method still owns `self`.
+        let structural_reuse = std::cell::RefCell::new(std::mem::take(&mut self.structural_reuse));
+        let result = (|| {
+            let mut cache = self.cache.borrow_mut();
+            let mut extend =
+                |c: &mut PageCache| structural_extend(c, &mut structural_reuse.borrow_mut());
+
+            // Lazy materialization: a database that has never freed a page has no
+            // tree yet (root == PAGE_ID_NONE). Create the depth-0 leaf now, before
+            // marking, since `mark_free_growing` needs a real root to COW.
+            // Preserve the session set across the swap.
+            if tree.root == PAGE_ID_NONE {
+                let session = std::mem::take(&mut tree.session_owned);
+                tree = FreeMapTree::create(&mut cache, &mut extend)?;
+                tree.session_owned.extend(session);
+            }
+            tree.mark_free_growing(&mut cache, id, &mut extend)
+        })();
+        // Pull the hint back to cover `id`: the hint advances monotonically via
+        // `allocate_first`, so a too-high hint would start the next scan above
+        // `id` and never reuse it. A too-low hint only costs a wasted scan.
+        // (Mirrors the oracle proptest's `hint = hint.min(id)`.)
+        self.freemap_hint = self.freemap_hint.min(id);
+        // Return the (partly drained) reuse pool and write the tree back even on
+        // error: its COW supersedes flow to `structural_superseded` via
+        // put_freemap_tree; commit promotes structural_superseded + the leftover
+        // reuse pool into pending_structural_frees (the one-commit defer).
+        self.structural_reuse = structural_reuse.into_inner();
+        self.put_freemap_tree(tree);
+        result
+    }
+
     fn persist_freemap(&mut self) -> Result<()> {
-        // Step 1: early-exit if this transaction produced neither a
-        // free nor an allocation-from-freemap. An all-extend
-        // transaction leaves `current_freemap == committed_freemap`
-        // and `txn_freed_pages` empty; the committed freemap snapshot
-        // is still valid as-is.
-        if self.txn_freed_pages.is_empty() && self.current_freemap == self.committed_freemap {
+        // Nothing freed this commit => the committed tree is still exactly right,
+        // no COW needed. (Structural reuse / supersede streams are only ever
+        // non-empty when there were frees, so this single check suffices.)
+        if self.txn_freed_pages.is_empty() {
             return Ok(());
         }
 
-        // Step 2: allocate the new freemap page BEFORE merging any of
-        // the at-risk ids into `current_freemap`. See the I18 note in
-        // this method's header for why ordering matters.
-        let new_freemap_page = self.allocate_data_page()?;
-
-        // Step 3: merge the transaction's frees and the old freemap
-        // page id. After this, `current_freemap` reflects the full
-        // post-commit view that goes onto disk, but the allocation
-        // above has already chosen a safe id.
-        for &id in &self.txn_freed_pages {
-            FreeMap::mark_free(&mut self.current_freemap, id);
+        // Mark this commit's DATA frees free in the new tree via the shared
+        // marking path. Each call take/puts the tree, but the session-owned set
+        // persists on the manager, so a leaf hit by several frees is COW'd once.
+        let freed: Vec<u64> = std::mem::take(&mut self.txn_freed_pages);
+        for id in freed.iter().copied() {
+            self.freemap_mark_free_committed_path(id)?;
         }
-        let old_freemap_page = self.committed_roots.freemap_page;
-        if old_freemap_page != PAGE_ID_NONE {
-            FreeMap::mark_free(&mut self.current_freemap, old_freemap_page);
+        self.txn_freed_pages = freed;
+        Ok(())
+    }
+
+    /// Reclaim freemap-typed pages orphaned by a crash that lost the in-memory
+    /// recycle pool. The structural recycle (decision 6 of the design) is held
+    /// only in memory, so a crash strands its entries: `FreeMap`/`FreeMapInterior`
+    /// pages that are no longer reachable from the committed tree and were never
+    /// marked free in the bitmap (a bounded handful — the last commit's structural
+    /// supersedes). This sweep walks the live tree to find the reachable set,
+    /// scans the file for freemap-typed pages that are neither reachable nor
+    /// already free, and marks each free — routing the mark through the SAME
+    /// `freemap_mark_free_committed_path` the commit uses (COW + recycle), so a
+    /// reclaimed orphan lands in the BITMAP (data-reusable), disjoint from the
+    /// in-memory recycle pool. Requires an active transaction (called by defrag).
+    /// Returns the count reclaimed.
+    ///
+    /// THE EXCLUSION SET (get this exactly right): a page in the CURRENT
+    /// in-memory recycle pool (`structural_reuse` ∪ `structural_superseded` ∪
+    /// `pending_structural_frees`) is LIVE recycling state, NOT an orphan —
+    /// reclaiming it into the bitmap while it is also pool-reusable would
+    /// double-hand-out the page. After a crash the pool is empty, so the
+    /// crash-orphaned pages are correctly flagged; in a normal (no-crash) defrag
+    /// the live pool is excluded so the two reclamation channels never overlap.
+    ///
+    /// Reading each non-reachable page through the cache checksum-verifies it.
+    /// A page that fails because it is GARBAGE/corrupt (`CorruptPage` /
+    /// `ChecksumMismatch`) is SKIPPED, not propagated (2026-06-22 review:
+    /// "skip unreadable dead pages") — a non-reachable page we cannot read
+    /// cannot be confirmed as a freemap orphan, and a dead page's corruption is
+    /// irrelevant to correctness. Any OTHER read error (e.g. `IoError`, a real
+    /// device fault) is propagated and poisons, preserving fail-closed for true
+    /// hardware faults. The LIVE-tree walk (`reachable_pages`) still propagates
+    /// fatal on a corrupt LIVE node — only the dead-page scan is softened. The
+    /// scan is O(total_pages) I/O — off the hot path (defrag), bounded, and
+    /// acceptable.
+    pub(crate) fn reclaim_freemap_orphans(&mut self) -> Result<u64> {
+        // Skip the sweep entirely while a savepoint is active. The sweep is the
+        // ONLY path that COWs the freemap (draining committed-LIVE pages into the
+        // structural recycle streams) while a savepoint is open — ordinary
+        // allocation already disables structural reuse under a savepoint
+        // (`reuse = self.savepoints.is_empty()`). But `rollback_to` rewinds only
+        // the roots + cache watermark, NOT the structural streams: a page the
+        // sweep drained into `structural_superseded` would survive the rollback,
+        // get promoted at commit, and be reused as a COW target in the next
+        // transaction while the last-durable superblock still references it —
+        // silent durable freemap corruption. Deferring orphan reclamation to a
+        // defrag run with no active savepoint avoids the whole interaction, so
+        // `rollback_to_inner` correctly needs no structural-stream reset.
+        if !self.savepoints.is_empty() {
+            return Ok(0);
+        }
+        let root = self.current_roots.freemap_page;
+        let depth = self.current_roots.freemap_depth;
+        if root == PAGE_ID_NONE {
+            return Ok(0); // no tree yet => no freemap pages can be orphaned
         }
 
-        // Step 4: serialize current_freemap into the new page and
-        // update the roots so the new superblock picks it up. The
-        // in-memory buffer already carries the FreeMap page-type
-        // tag (byte 0 = 0x04) and the bitmap body; a direct copy is
-        // the correct on-disk format.
+        // Pages that are NOT orphans even though unreachable + not-free: the live
+        // recycle pool (all three streams). See "THE EXCLUSION SET" above.
+        let mut excluded: FxHashSet<u64> = FxHashSet::default();
+        excluded.extend(self.structural_reuse.iter().copied());
+        excluded.extend(self.structural_superseded.iter().copied());
+        // Belt-and-suspenders: `begin()` clones `pending_structural_frees`
+        // into `structural_reuse`, so every id here is already covered by the
+        // `structural_reuse` term above. Kept explicitly so the exclusion
+        // remains correct if `begin()`'s seeding ever changes.
+        excluded.extend(self.pending_structural_frees.iter().copied());
+
+        // Collect orphan ids read-only inside a single cache-borrow scope, then
+        // drop the borrow before marking (the mark path re-borrows the cache).
+        let tree = FreeMapTree::from_roots(root, depth);
+        let mut orphans: Vec<u64> = Vec::new();
         {
             let mut cache = self.cache.borrow_mut();
-            let buf = cache.get_mut(new_freemap_page)?;
-            *buf = *self.current_freemap;
-            page::stamp_checksum(buf);
+            // Upper bound: the allocation high-water (`next_page_id`), NOT the
+            // committed `total_pages`. After a real crash + reopen these are
+            // equal (open seeds next_page_id from the committed superblock), and
+            // every orphan — a structural supersede from a committed transaction —
+            // sits below it. Using next_page_id also covers a page extended
+            // earlier in THIS session (e.g. the forge-orphan test), which a stale
+            // committed total_pages would miss.
+            let total = cache.next_page_id();
+            let reachable = tree.reachable_pages(&mut cache)?;
+            // Pages 0..superblock_count are superblocks; start the scan above them.
+            for id in self.superblock_count as u64..total {
+                if reachable.contains(&id) || excluded.contains(&id) {
+                    continue;
+                }
+                // Skip a non-reachable page that is GARBAGE/corrupt rather than
+                // letting it poison the whole maintenance pass (2026-06-22 review
+                // decision: "skip unreadable dead pages"). A page that is not in
+                // the live tree cannot be confirmed as a freemap orphan if we
+                // cannot read its type, and a DEAD page's corruption does not
+                // affect correctness — so on `CorruptPage`/`ChecksumMismatch` we
+                // `continue`. We deliberately PROPAGATE every other read error
+                // (e.g. `IoError`): a real device fault should still surface and
+                // poison, not be silently swallowed. NOTE: the live-tree walk
+                // (`reachable_pages` above) still propagates fatal on a corrupt
+                // LIVE page — only the dead-page scan is softened.
+                let buf = match cache.get(id) {
+                    Ok(buf) => buf,
+                    Err(ChiselError::CorruptPage { .. } | ChiselError::ChecksumMismatch { .. }) => {
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                let ty = buf[0];
+                if (ty == crate::page::PageType::FreeMap as u8
+                    || ty == crate::page::PageType::FreeMapInterior as u8)
+                    && !tree.is_free(&mut cache, id)?
+                {
+                    orphans.push(id);
+                }
+            }
         }
-        self.current_roots.freemap_page = new_freemap_page;
-        Ok(())
+        // Mark each orphan free through the shared committed-marking path (COW +
+        // recycle), landing them in the bitmap as data-reusable space.
+        for id in &orphans {
+            self.freemap_mark_free_committed_path(*id)?;
+        }
+        Ok(orphans.len() as u64)
     }
 
     /// Begin a new transaction.
@@ -866,9 +1239,25 @@ impl TransactionManager {
             return Err(ChiselError::TransactionAlreadyActive);
         }
         self.current_roots = self.committed_roots.clone();
-        // Clone the freemap so allocations during this transaction mutate
-        // a working copy; a rollback will snap it back to committed_freemap.
-        self.current_freemap = self.committed_freemap.clone();
+        // The freemap root+depth ride in current_roots (cloned just above), so
+        // there is no separate freemap working copy to reset here. The hint is
+        // untracked (a stale hint only costs a scan), so it is left as-is too.
+        // The session-owned set is strictly per-transaction: a page COW'd last
+        // transaction is now committed and must NOT be mutated in place, so start
+        // empty. (begin already requires no active txn, so it is normally empty,
+        // but clear defensively.)
+        self.freemap_session_owned.clear();
+        // Seed the structural reuse pool from the prior commit's deferred dead
+        // freemap pages: those superblock-unreferenced pages are now safe to
+        // reuse as this transaction's freemap COW targets, so the freemap rotates
+        // among a bounded set instead of extending. CLONE (not move) so
+        // `pending_structural_frees` stays intact as the rollback fallback — a
+        // rolled-back transaction never reached commit, so its structural recycle
+        // is exactly the pre-transaction one. `commit_inner` overwrites it on the
+        // success path. `structural_superseded` is empty here (only
+        // persist_freemap fills it); clear defensively.
+        self.structural_reuse = self.pending_structural_frees.clone();
+        self.structural_superseded.clear();
         // R1: clone the live-slot counts and reset the insert cursor.
         // The cursor is always None at begin — it only tracks pages
         // allocated during the current transaction.
@@ -1019,13 +1408,12 @@ impl TransactionManager {
         // persist_freemap adds.
         self.cache.borrow_mut().flush()?;
 
-        // Step 0 (ISSUES.md R2 / I11): persist the freemap. This merges
-        // `txn_freed_pages` into `current_freemap`, reclaims the old
-        // freemap page id, allocates a new page for the updated freemap,
-        // serializes it into that page's cache buffer, and updates
-        // `current_roots.freemap_page`. Runs BEFORE the main flush so
-        // the new freemap page is part of the same durable write set as
-        // all other dirty data pages.
+        // Step 0 (ISSUES.md R2 / I11): persist the freemap tree. This marks
+        // `txn_freed_pages` (plus the prior commit's deferred structural frees)
+        // free in a COW of the committed tree and updates
+        // `current_roots.{freemap_page, freemap_depth}`. Runs BEFORE the main
+        // flush so the new freemap pages join the same durable write set as all
+        // other dirty data pages.
         self.persist_freemap()?;
 
         // Hold one RefMut for the remaining steps. Dropping and
@@ -1067,8 +1455,9 @@ impl TransactionManager {
             // external hints.
             superblock_count: self.superblock_count,
             root_membership_index_page: self.current_roots.membership_index_page,
-            // Freemap tree depth; 0 until the multi-page freemap is wired in.
-            freemap_depth: 0,
+            // Freemap tree depth, paired with root_freemap_page. 0 = today's
+            // single-leaf format; grows as the tree deepens.
+            freemap_depth: self.current_roots.freemap_depth,
         };
         let buf = sb.serialize();
         // Step 3: Write to the INACTIVE slot. For N superblock slots,
@@ -1089,19 +1478,31 @@ impl TransactionManager {
         // Step 5: Promote in-memory state. Only now is the txn officially committed.
         self.committed_roots = self.current_roots.clone();
         self.committed_roots.total_pages = total_pages;
-        // The in-memory freemap also advances: current_freemap reflects
-        // every allocation and free from this transaction (merged in
-        // persist_freemap above). This value is now durable.
-        self.committed_freemap = self.current_freemap.clone();
+        // The committed freemap tree advances automatically: its {root, depth}
+        // ride in current_roots, promoted into committed_roots just above. No
+        // separate in-memory freemap copy to advance.
         // R1: promote the live-slot counts. The cursor is per-transaction
         // and gets reset for the next begin().
         self.committed_live_slots = self.current_live_slots.clone();
         self.insert_cursor = None;
         self.active_txn = false;
         self.savepoints.clear();
-        // txn_freed_pages were already merged into current_freemap by
-        // persist_freemap; clear the vector now that it's done its job.
+        // txn_freed_pages were already marked free in the new committed freemap
+        // tree by persist_freemap; clear the vector now that it's done its job.
         self.txn_freed_pages.clear();
+        // Every freemap page COW'd this transaction is now committed; the next
+        // transaction must COW (not edit in place) any of them it touches.
+        self.freemap_session_owned.clear();
+        // Promote the freemap structural recycle for the next transaction: the
+        // pages this commit superseded (`structural_superseded`) become dead the
+        // instant the superblock flips above — and the reuse-pool remainder
+        // (`structural_reuse` ids not consumed as COW targets) is likewise still
+        // dead and reusable. Both become next transaction's `pending_structural_frees`.
+        self.pending_structural_frees.clear();
+        self.pending_structural_frees
+            .append(&mut self.structural_superseded);
+        self.pending_structural_frees
+            .append(&mut self.structural_reuse);
 
         Ok(())
     }
@@ -1175,9 +1576,27 @@ impl TransactionManager {
                 HandleTable::recover_depth(&mut cache, self.current_roots.handle_table_page)?;
             self.handle_table.set_depth(depth);
         }
-        // Revert the freemap working copy — any marks (free or allocate)
-        // made during the transaction are discarded.
-        self.current_freemap = self.committed_freemap.clone();
+        // The freemap root+depth were restored by `current_roots =
+        // committed_roots.clone()` above; any dirty freemap pages this
+        // transaction COW'd sit above the watermark and were dropped by the
+        // truncate. The hint is untracked, so nothing to revert.
+        //
+        // `pending_structural_frees` is left intact: begin() CLONED it into
+        // `structural_reuse` rather than moving it, so it still holds the
+        // pre-transaction dead-freemap-page set — correct, since a rolled-back
+        // transaction's structural recycle is exactly the pre-transaction one.
+        // We DISCARD the in-transaction structural working state:
+        //   * `structural_superseded` holds committed-tree freemap pages this
+        //     aborted transaction COW'd-over; the abort means the committed tree
+        //     still references them, so they are NOT dead and must never be
+        //     recycled.
+        //   * `structural_reuse` was the working copy; drop it.
+        //   * the session-owned set: any freemap pages this aborted transaction
+        //     COW'd sit above the watermark and were just truncated, so their ids
+        //     must not be treated as in-place-mutable next transaction.
+        self.structural_superseded.clear();
+        self.structural_reuse.clear();
+        self.freemap_session_owned.clear();
         // R1: revert the live-slot counts and drop the insert cursor.
         self.current_live_slots = self.committed_live_slots.clone();
         self.insert_cursor = None;
@@ -1362,18 +1781,31 @@ impl TransactionManager {
         handle: u64,
         freed: &mut Vec<u64>,
     ) -> Result<u64> {
-        let mut cache = self.cache.borrow_mut();
         let reuse = self.savepoints.is_empty();
-        let fm = &mut *self.current_freemap;
-        let mut alloc = |c: &mut PageCache| cow_alloc(c, fm, reuse);
-        self.membership_index.insert(
-            &mut cache,
-            self.current_roots.membership_index_page,
-            tag,
-            handle,
-            &mut alloc,
-            freed,
-        )
+        let mut tree = self.take_freemap_tree();
+        let result = {
+            let hint = &mut self.freemap_hint;
+            let pool = &mut self.structural_reuse;
+            let mut cache = self.cache.borrow_mut();
+            let mut alloc = |c: &mut PageCache| cow_alloc(c, &mut tree, hint, pool, reuse);
+            self.membership_index.insert(
+                &mut cache,
+                self.current_roots.membership_index_page,
+                tag,
+                handle,
+                &mut alloc,
+                freed,
+            )
+        };
+        // Freemap growth is installed into roots regardless of success: the tree
+        // pages were extended (never freed), so a non-fatal failure that discards
+        // `freed`/the candidate root leaves these extra pages as harmless
+        // above-watermark scratch, exactly like the other COW pages on an aborted
+        // prepare. put_freemap_tree drains the freemap COW supersedes into
+        // structural_superseded and returns the session set so the next site in
+        // this transaction stays in-place.
+        self.put_freemap_tree(tree);
+        result
     }
 
     /// Compute the handle-table root produced by inserting `entry` for `handle`
@@ -1398,18 +1830,29 @@ impl TransactionManager {
         if self.fail_next_handle_table_op.replace(false) {
             return Err(ChiselError::CacheFull { limit: 0 });
         }
-        let mut cache = self.cache.borrow_mut();
         let reuse = self.savepoints.is_empty();
-        let fm = &mut *self.current_freemap;
-        let mut alloc = |c: &mut PageCache| cow_alloc(c, fm, reuse);
-        self.handle_table.insert(
-            &mut cache,
-            self.current_roots.handle_table_page,
-            handle,
-            entry,
-            &mut alloc,
-            freed,
-        )
+        let mut tree = self.take_freemap_tree();
+        let result = {
+            let hint = &mut self.freemap_hint;
+            let pool = &mut self.structural_reuse;
+            let mut cache = self.cache.borrow_mut();
+            let mut alloc = |c: &mut PageCache| cow_alloc(c, &mut tree, hint, pool, reuse);
+            self.handle_table.insert(
+                &mut cache,
+                self.current_roots.handle_table_page,
+                handle,
+                entry,
+                &mut alloc,
+                freed,
+            )
+        };
+        // Install freemap growth into roots (and return the session set) so the
+        // NEXT candidate in this allocate (the reverse-map insert) threads the
+        // up-to-date tree and treats already-COW'd freemap pages as in-place. The
+        // freemap COW supersedes go to structural_superseded via put_freemap_tree.
+        // See membership_insert_candidate for the abort-safety reasoning.
+        self.put_freemap_tree(tree);
+        result
     }
 
     /// Unwind the in-memory side effects of a partially-completed
@@ -1446,18 +1889,24 @@ impl TransactionManager {
         handle: u64,
         freed: &mut Vec<u64>,
     ) -> Result<(u64, bool)> {
-        let mut cache = self.cache.borrow_mut();
         let reuse = self.savepoints.is_empty();
-        let fm = &mut *self.current_freemap;
-        let mut alloc = |c: &mut PageCache| cow_alloc(c, fm, reuse);
-        self.membership_index.remove(
-            &mut cache,
-            self.current_roots.membership_index_page,
-            tag,
-            handle,
-            &mut alloc,
-            freed,
-        )
+        let mut tree = self.take_freemap_tree();
+        let result = {
+            let hint = &mut self.freemap_hint;
+            let pool = &mut self.structural_reuse;
+            let mut cache = self.cache.borrow_mut();
+            let mut alloc = |c: &mut PageCache| cow_alloc(c, &mut tree, hint, pool, reuse);
+            self.membership_index.remove(
+                &mut cache,
+                self.current_roots.membership_index_page,
+                tag,
+                handle,
+                &mut alloc,
+                freed,
+            )
+        };
+        self.put_freemap_tree(tree);
+        result
     }
 
     /// Test-only fault decision for the reverse-map (membership-index) step,
@@ -1934,19 +2383,26 @@ impl TransactionManager {
         // handle was absent or already a tombstone; we escalate None to
         // InvalidHandle to preserve the public-API behavior.
         let mut ht_freed: Vec<u64> = Vec::new();
-        let (ht_new_root, prev_entry) = {
+        let reuse = self.savepoints.is_empty();
+        let mut tree = self.take_freemap_tree();
+        let delete_result = {
+            let hint = &mut self.freemap_hint;
+            let pool = &mut self.structural_reuse;
             let mut cache = self.cache.borrow_mut();
-            let reuse = self.savepoints.is_empty();
-            let fm = &mut *self.current_freemap;
-            let mut alloc = |c: &mut PageCache| cow_alloc(c, fm, reuse);
+            let mut alloc = |c: &mut PageCache| cow_alloc(c, &mut tree, hint, pool, reuse);
             self.handle_table.delete(
                 &mut cache,
                 self.current_roots.handle_table_page,
                 handle,
                 &mut alloc,
                 &mut ht_freed,
-            )?
+            )
         };
+        // Install freemap growth (supersedes go to structural_superseded). Done
+        // BEFORE the `?` so a delete that COW'd the freemap leaf yet then errored
+        // still records the extended root and returns the session set.
+        self.put_freemap_tree(tree);
+        let (ht_new_root, prev_entry) = delete_result?;
         let entry = prev_entry.ok_or(ChiselError::InvalidHandle(handle))?;
 
         // Stage the value-storage release. The only FALLIBLE part — walking an
@@ -2709,11 +3165,19 @@ mod tests {
                 }
             }
         }
+        // Query freeness through the committed freemap TREE (reconstructed from
+        // {root, depth}) rather than a flat in-memory bitmap — same C1 invariant,
+        // new storage representation.
+        let mut cache = tm.cache.borrow_mut();
+        let tree = FreeMapTree::from_roots(
+            tm.committed_roots.freemap_page,
+            tm.committed_roots.freemap_depth,
+        );
         for id in reachable {
             assert!(
-                !FreeMap::is_free(&tm.committed_freemap, id),
+                !tree.is_free(&mut cache, id).unwrap(),
                 "page {id} is reachable from committed_roots but marked FREE in \
-                 committed_freemap — a still-referenced page was freed (C1 violation)"
+                 the committed freemap — a still-referenced page was freed (C1 violation)"
             );
         }
     }
@@ -3149,17 +3613,694 @@ mod tests {
         // commit_inner merges them into txn_freed_pages first.
         tm.commit().unwrap();
 
-        for id in &frozen_txn_freed {
-            assert!(
-                FreeMap::is_free(&tm.committed_freemap, *id),
-                "I27: freed page {id} should be marked free in committed_freemap \
-                 after commit-with-active-savepoint; frozen_txn_freed={frozen_txn_freed:?}"
+        {
+            let mut cache = tm.cache.borrow_mut();
+            let tree = FreeMapTree::from_roots(
+                tm.committed_roots.freemap_page,
+                tm.committed_roots.freemap_depth,
             );
+            for id in &frozen_txn_freed {
+                assert!(
+                    tree.is_free(&mut cache, *id).unwrap(),
+                    "I27: freed page {id} should be marked free in the committed \
+                     freemap tree after commit-with-active-savepoint; \
+                     frozen_txn_freed={frozen_txn_freed:?}"
+                );
+            }
         }
 
         // Sanity: the surviving handle still reads back (rules out a
         // wider corruption that happens to also trip the is_free check).
         assert_eq!(tm.read(h_keepalive).unwrap(), big);
+    }
+
+    // ── Structural-page recycle: adversarial pin-tests ──────────────────────
+    //
+    // These three lock down the durability-critical freemap structural recycle
+    // (docs/specs/2026-06-22 "Structural-page reclamation"): the one-commit
+    // defer, the rollback reset of the recycle pools, and no lost/double free
+    // across reuse cycles. They are the GATE for the Phase 2 work — a violation
+    // is a crash-safety bug, not a cosmetic one.
+
+    // Drive a commit that actually COWs the freemap and supersedes structural
+    // pages: allocate `n` overflow-sized values (each its own whole page chain),
+    // commit, then delete `del` of them and commit. The second commit's
+    // `persist_freemap` marks the freed pages free, COWing the freemap leaf/spine
+    // and superseding the old freemap pages — exactly the churn the recycle
+    // model is built around. Returns the surviving handles.
+    fn structural_churn(tm: &mut TransactionManager, big: &[u8], n: usize, del: usize) -> Vec<u64> {
+        tm.begin().unwrap();
+        let mut handles: Vec<u64> = (0..n).map(|_| tm.allocate(big).unwrap()).collect();
+        tm.commit().unwrap();
+
+        tm.begin().unwrap();
+        for h in handles.drain(..del) {
+            tm.delete(h).unwrap();
+        }
+        tm.commit().unwrap();
+        handles
+    }
+
+    // PROPERTY 1 — one-commit-defer crash-safety.
+    //
+    // A freemap page `P` superseded in transaction `T` is still referenced by
+    // the pre-`T` superblock until `T` commits, so it may be reused as a
+    // structural COW target ONLY starting in `T+1` (the one-commit defer). If
+    // `T+1` ever drew a COW target from a page it superseded THIS transaction,
+    // a crash before `T+1`'s superblock fsync would corrupt the page the
+    // recovered (pre-`T+1`) superblock still points at — a durability BUG.
+    //
+    // We capture the promoted recycle set at the START of the measured
+    // transaction `T+1` (== what `begin()` cloned into `structural_reuse`), then
+    // instrument every structural-reuse pop in `T+1` and assert each popped id is
+    // drawn from EXACTLY that promoted set — never an id minted or superseded
+    // within `T+1`. The thread-local reuse log records both pop sites
+    // (`structural_extend` and `persist_freemap`'s inline closure).
+    //
+    // Crucially, `T+1` is a WARMED-UP steady-state transaction doing many
+    // interleaved allocate+delete ops: each allocate reuses a bitmap-free data
+    // page, which COWs the freemap leaf in the transaction BODY and supersedes a
+    // freemap page mid-flight — so a later body allocation in the same
+    // transaction WOULD pop that just-superseded page if the defer were broken.
+    // (A single-op transaction supersedes the freemap only at persist_freemap,
+    // the last structural op, leaving no later pop to expose the bug — this test
+    // is structured to defeat that blind spot.)
+    #[test]
+    fn structural_recycle_one_commit_defer() {
+        let mut tm = fresh_manager();
+        let big: Vec<u8> = vec![0xAB; MAX_INLINE_VALUE + 32];
+
+        // Warm up to steady state: a rotating live population so the bitmap holds
+        // free data pages (making body allocations COW the freemap) and the
+        // structural recycle is non-trivially populated. Run several
+        // delete-then-reallocate commits.
+        let mut live: Vec<u64> = Vec::new();
+        tm.begin().unwrap();
+        for _ in 0..16 {
+            live.push(tm.allocate(&big).unwrap());
+        }
+        tm.commit().unwrap();
+        for _ in 0..6 {
+            tm.begin().unwrap();
+            let recycled: Vec<u64> = live.drain(..8).collect();
+            for h in recycled {
+                tm.delete(h).unwrap();
+            }
+            for _ in 0..8 {
+                live.push(tm.allocate(&big).unwrap());
+            }
+            tm.commit().unwrap();
+        }
+
+        // Capture the promoted recycle the measured transaction inherits, and
+        // drain the warm-up's reuse log so only the measured transaction is seen.
+        let promoted: std::collections::HashSet<u64> =
+            tm.pending_structural_frees.iter().copied().collect();
+        assert!(
+            !promoted.is_empty(),
+            "precondition: warm-up must leave a non-empty deferred recycle"
+        );
+        let _ = take_structural_reuse_log();
+
+        // T+1 (measured): MANY interleaved allocate+delete ops. Each allocate
+        // claims a bitmap-free data page (COWing + superseding the freemap in the
+        // body), each delete frees a page; the heavy interleave means a freemap
+        // page superseded early in the body has many later body allocations that
+        // would pop it if the defer leaked same-txn supersedes into the pool.
+        tm.begin().unwrap();
+        for _ in 0..6 {
+            let recycled: Vec<u64> = live.drain(..4).collect();
+            for h in recycled {
+                tm.delete(h).unwrap();
+            }
+            for _ in 0..4 {
+                live.push(tm.allocate(&big).unwrap());
+            }
+        }
+        // Pages T+1 superseded so far (the body). persist_freemap adds more at
+        // commit; both must stay out of the reuse pops.
+        let superseded_in_t1: std::collections::HashSet<u64> =
+            tm.structural_superseded.iter().copied().collect();
+        tm.commit().unwrap();
+
+        // Read the log IMMEDIATELY after T+1's commit — before any later
+        // transaction can pop from its OWN (legitimately) promoted recycle and
+        // pollute the capture with ids that were never inherited here.
+        let reused_in_t1 = take_structural_reuse_log();
+        assert!(
+            !reused_in_t1.is_empty(),
+            "precondition: T+1 must actually reuse at least one deferred page \
+             (else the defer is untested)"
+        );
+        // NOTE: this block is a weak guard on its own. Under session-COW dedup a
+        // leaf is COW'd at most once per commit, so a same-transaction supersede
+        // and its only in-txn reuse pop are the SAME event — they cannot both be
+        // observed here. The load-bearing defer check is the cross-commit
+        // REACHABILITY assertion below; this block is kept as a cheap sanity rail.
+        for id in &reused_in_t1 {
+            assert!(
+                promoted.contains(id),
+                "one-commit-defer VIOLATION: T+1 reused freemap page {id} that was \
+                 NOT in the promoted recycle set {promoted:?} — it was minted or \
+                 superseded within T+1, so a pre-commit crash would corrupt the page \
+                 the last-durable superblock still references"
+            );
+            assert!(
+                !superseded_in_t1.contains(id),
+                "one-commit-defer VIOLATION: T+1 reused page {id} that T+1 itself \
+                 superseded this transaction (still live under the last-durable \
+                 superblock) — reusing it pre-commit is a crash-safety bug"
+            );
+        }
+
+        // The defer's DURABLE consequence: a page T+1 superseded is now (post-
+        // commit) dead and queued for T+2 — but it must NOT be reachable in the
+        // just-committed live tree. A broken defer that re-routed a same-txn
+        // supersede into the reuse pool would surface here as a pool page still
+        // live in the committed tree (the corruption a pre-commit crash would
+        // expose). This is the cross-boundary half of the defer the in-txn pop
+        // check above cannot see (session-COW dedup COWs each leaf once, so the
+        // supersede and its only in-txn pop are the same event).
+        let reachable: std::collections::HashSet<u64> = {
+            let mut cache = tm.cache.borrow_mut();
+            let committed = FreeMapTree::from_roots(
+                tm.committed_roots.freemap_page,
+                tm.committed_roots.freemap_depth,
+            );
+            committed
+                .reachable_pages(&mut cache)
+                .unwrap()
+                .into_iter()
+                .collect()
+        };
+        for id in &tm.pending_structural_frees {
+            assert!(
+                !reachable.contains(id),
+                "one-commit-defer VIOLATION: page {id} is queued for reuse in T+2 but is \
+                 still reachable in the committed freemap tree — a same-transaction \
+                 supersede leaked into the reuse pool while still live"
+            );
+        }
+    }
+
+    // PROPERTY 2 — rollback resets the recycle pools and session state.
+    //
+    // A rollback must leave the structural recycle exactly as a clean begin would
+    // see it: `structural_reuse` restored to the committed recycle state (derived
+    // from `pending_structural_frees`), `structural_superseded` cleared, and
+    // `freemap_session_owned` cleared. Leaking any of these into the next
+    // transaction would let it reuse a page the committed tree still references,
+    // or skip a needed COW on a now-committed page — both corruption.
+    #[test]
+    fn structural_recycle_rollback_resets_pools() {
+        let mut tm = fresh_manager();
+        let big: Vec<u8> = vec![0xAB; MAX_INLINE_VALUE + 32];
+
+        // Establish a non-empty committed recycle so the test exercises a real
+        // restore target, not just emptiness.
+        let survivors = structural_churn(&mut tm, &big, 8, 4);
+        let committed_recycle: Vec<u64> = tm.pending_structural_frees.clone();
+        assert!(
+            !committed_recycle.is_empty(),
+            "precondition: a prior commit must leave a non-empty deferred recycle"
+        );
+
+        // A transaction that mutates all three pools: allocations + deletes COW
+        // the freemap (filling session-owned + superseded), and the deletes' frees
+        // make persist-side reuse pops drain `structural_reuse`. Do NOT commit.
+        tm.begin().unwrap();
+        let _fresh: Vec<u64> = (0..6).map(|_| tm.allocate(&big).unwrap()).collect();
+        for h in &survivors {
+            tm.delete(*h).unwrap();
+        }
+        // The session-owned set is populated by freemap COWs on the alloc/delete
+        // path; assert the test actually dirtied the state it is about to roll
+        // back (else the reset assertions are vacuous).
+        assert!(
+            !tm.freemap_session_owned.is_empty() || !tm.structural_superseded.is_empty(),
+            "precondition: the pre-rollback churn must have mutated freemap session/supersede state"
+        );
+
+        tm.rollback().unwrap();
+
+        // begin() CLONES `pending_structural_frees` into `structural_reuse`, so an
+        // aborted transaction's recycle is exactly the pre-transaction one: the
+        // committed recycle must be intact, and the working pools cleared.
+        assert_eq!(
+            tm.pending_structural_frees, committed_recycle,
+            "rollback must leave the committed deferred recycle intact"
+        );
+        let recycle_after: std::collections::HashSet<u64> =
+            tm.pending_structural_frees.iter().copied().collect();
+        let committed_set: std::collections::HashSet<u64> =
+            committed_recycle.iter().copied().collect();
+        assert_eq!(
+            recycle_after, committed_set,
+            "the post-rollback recycle (what the next begin will seed structural_reuse from) \
+             must equal the committed recycle state"
+        );
+        assert!(
+            tm.structural_superseded.is_empty(),
+            "rollback must clear structural_superseded — those committed-tree pages are \
+             still referenced and must never be recycled"
+        );
+        assert!(
+            tm.freemap_session_owned.is_empty(),
+            "rollback must clear freemap_session_owned — leaking it would suppress a needed \
+             COW and mutate a live committed page in place next transaction"
+        );
+
+        // Crucial follow-through: the next transaction must reuse ONLY the
+        // committed recycle, proving no aborted-transaction page leaked into the
+        // pool. (An aborted supersede leaking into reuse is a classic double-free.)
+        let _ = take_structural_reuse_log();
+        tm.begin().unwrap();
+        let mut next: Vec<u64> = (0..8).map(|_| tm.allocate(&big).unwrap()).collect();
+        for h in survivors {
+            tm.delete(h).unwrap();
+        }
+        tm.commit().unwrap();
+        for id in take_structural_reuse_log() {
+            assert!(
+                committed_set.contains(&id),
+                "post-rollback transaction reused freemap page {id} not in the committed \
+                 recycle {committed_set:?} — rollback leaked structural pool state"
+            );
+        }
+        for h in next.drain(..) {
+            tm.begin().unwrap();
+            tm.delete(h).unwrap();
+            tm.commit().unwrap();
+        }
+    }
+
+    // PROPERTY 2b — the orphan sweep must NOT run under a savepoint.
+    //
+    // `rollback_to(savepoint)` rewinds the roots + cache watermark but does NOT
+    // reset the structural recycle streams. The only path that COWs the freemap
+    // (mutating those streams) while a savepoint is open is the defrag orphan
+    // sweep. If the sweep ran under a savepoint, it could drain a committed-LIVE
+    // freemap page into `structural_superseded`; after `rollback_to` (which
+    // leaves the stream intact) + commit (which promotes it), the NEXT
+    // transaction would reuse that still-durably-referenced page as a COW target
+    // and overwrite it — silent durable freemap corruption.
+    //
+    // The fix guards `reclaim_freemap_orphans` with `savepoints.is_empty()`.
+    // This test reproduces the trigger end-to-end and asserts the committed
+    // freemap tree survives intact. Counterfactual: removing the guard makes the
+    // committed-tree-intact assertion (or the no-reuse-of-committed-page check)
+    // fail.
+    #[test]
+    fn orphan_sweep_skipped_under_savepoint_preserves_committed_freemap() {
+        let mut tm = fresh_manager();
+        let big: Vec<u8> = vec![0xAB; MAX_INLINE_VALUE + 32];
+
+        // Build a real multi-page freemap with committed structural state so the
+        // committed tree has actual nodes to corrupt. After this the committed
+        // freemap root/depth describe a non-trivial tree.
+        let survivors = structural_churn(&mut tm, &big, 8, 4);
+
+        // Snapshot the committed freemap's free-set and reachable node set BEFORE
+        // the savepoint episode. These are the ground truth the episode must not
+        // disturb.
+        let committed_root = tm.committed_roots.freemap_page;
+        let committed_depth = tm.committed_roots.freemap_depth;
+        assert_ne!(
+            committed_root, PAGE_ID_NONE,
+            "precondition: a committed freemap tree must exist"
+        );
+        let (free_before, reachable_before): (
+            std::collections::BTreeSet<u64>,
+            std::collections::HashSet<u64>,
+        ) = {
+            let mut cache = tm.cache.borrow_mut();
+            let tree = FreeMapTree::from_roots(committed_root, committed_depth);
+            let reachable: std::collections::HashSet<u64> = tree
+                .reachable_pages(&mut cache)
+                .unwrap()
+                .into_iter()
+                .collect();
+            // The set of currently-free ids, scanned over the allocation range.
+            let total = cache.next_page_id();
+            let mut free = std::collections::BTreeSet::new();
+            for id in 0..total {
+                if tree.is_free(&mut cache, id).unwrap() {
+                    free.insert(id);
+                }
+            }
+            (free, reachable)
+        };
+
+        // Episode: open a transaction, take a savepoint, forge a freemap orphan,
+        // and invoke the sweep. With the guard the sweep is a no-op (returns 0)
+        // and touches NO structural stream; without the guard it would reclaim the
+        // forged orphan, COWing the committed freemap and draining the superseded
+        // live page into `structural_superseded`.
+        tm.begin().unwrap();
+        tm.savepoint("sp").unwrap();
+        let _orphan = tm.test_forge_freemap_orphan().unwrap();
+        let reclaimed = tm.reclaim_freemap_orphans().unwrap();
+        assert_eq!(
+            reclaimed, 0,
+            "the orphan sweep must be a no-op under an active savepoint (got {reclaimed})"
+        );
+        // The streams the rollback_to does NOT reset must be untouched by the
+        // sweep, or the rollback leaves dangerous residue.
+        assert!(
+            tm.structural_superseded.is_empty(),
+            "sweep under savepoint leaked into structural_superseded: {:?}",
+            tm.structural_superseded
+        );
+
+        // Roll back to the savepoint (discards the forged page) and commit the
+        // now-empty transaction. With the guard this commit promotes nothing
+        // dangerous; without it, the committed-live page the sweep superseded is
+        // promoted into the reusable pool.
+        tm.rollback_to("sp").unwrap();
+        tm.commit().unwrap();
+
+        // Next transaction does a freemap-COWing operation (delete a survivor,
+        // which marks its page free and COWs the freemap). If a committed-live
+        // freemap page had been promoted into the reuse pool, this is where it
+        // would be drawn as a COW target and OVERWRITTEN.
+        tm.begin().unwrap();
+        tm.delete(survivors[0]).unwrap();
+        tm.commit().unwrap();
+
+        // The committed freemap tree the ORIGINAL (pre-episode) commit described
+        // must still be readable and self-consistent: no node it referenced was
+        // overwritten. We re-open the ORIGINAL committed root/depth and confirm
+        // its reachable set and free-set are unchanged by everything above.
+        // (Deleting survivors[0] in the final txn only ADDS a free bit; it never
+        // removes one and never makes a previously-reachable node unreadable.)
+        let (free_after, reachable_after): (
+            std::collections::BTreeSet<u64>,
+            std::collections::HashSet<u64>,
+        ) = {
+            let mut cache = tm.cache.borrow_mut();
+            let tree = FreeMapTree::from_roots(committed_root, committed_depth);
+            let reachable: std::collections::HashSet<u64> = tree
+                .reachable_pages(&mut cache)
+                .unwrap()
+                .into_iter()
+                .collect();
+            let total = cache.next_page_id();
+            let mut free = std::collections::BTreeSet::new();
+            for id in 0..total {
+                if tree.is_free(&mut cache, id).unwrap() {
+                    free.insert(id);
+                }
+            }
+            (free, reachable)
+        };
+        assert_eq!(
+            reachable_after, reachable_before,
+            "the original committed freemap tree's node set changed — a committed \
+             freemap page was reused-and-overwritten (savepoint guard regression)"
+        );
+        assert_eq!(
+            free_after, free_before,
+            "the original committed freemap tree's free-set changed — its on-disk \
+             bitmap pages were overwritten by a COW into a reused committed page"
+        );
+    }
+
+    // A corrupt DEAD (non-reachable) page must NOT poison the orphan sweep.
+    //
+    // 2026-06-22 review decision ("skip unreadable dead pages"): the sweep scans
+    // every non-reachable page id to classify it as a freemap orphan. A page that
+    // is not in the live tree but fails to read because it is GARBAGE cannot be
+    // confirmed as an orphan, and its corruption is irrelevant (it is dead), so
+    // the sweep SKIPS it instead of propagating fatal. Contrast: a corrupt page
+    // REACHABLE from the live tree must still surface fatal via `reachable_pages`
+    // — that path is deliberately NOT weakened (asserted below).
+    #[test]
+    fn corrupt_dead_page_does_not_poison_orphan_sweep() {
+        let mut tm = fresh_manager();
+        let big: Vec<u8> = vec![0xAB; MAX_INLINE_VALUE + 32];
+
+        // Build a committed multi-page freemap and a real orphan to reclaim, so
+        // the sweep has live work to do AND a corrupt dead page to step over.
+        let _survivors = structural_churn(&mut tm, &big, 8, 4);
+
+        tm.begin().unwrap();
+        let real_orphan = tm.test_forge_freemap_orphan().unwrap();
+        let corrupt = tm.test_forge_corrupt_dead_page().unwrap();
+        assert_ne!(real_orphan, corrupt);
+
+        // The sweep must succeed (NOT poison) despite the corrupt dead page, and
+        // must still reclaim the legitimate orphan it can read.
+        let reclaimed = tm.reclaim_freemap_orphans().unwrap();
+        assert!(
+            reclaimed >= 1,
+            "sweep must skip the corrupt dead page yet still reclaim the readable \
+             orphan (reclaimed={reclaimed})"
+        );
+        assert!(
+            !tm.is_poisoned(),
+            "a corrupt DEAD page must not poison the orphan sweep"
+        );
+        tm.commit().unwrap();
+
+        // Contrast: the live-tree walk MUST still propagate fatal on a corrupt
+        // node reachable from the committed tree — `reachable_pages` is NOT
+        // weakened by the dead-page softening above. Corrupt a REAL live node on
+        // disk (flip its type byte to the wrong PageType but keep the checksum
+        // valid — a type-corruption reached via a live pointer) and confirm the
+        // walk surfaces `CorruptPage` for exactly that node.
+        let live_root = tm.committed_roots.freemap_page;
+        let live_depth = tm.committed_roots.freemap_depth;
+        {
+            let mut cache = tm.cache.borrow_mut();
+            // Pick a non-root reachable node so the root's own type check passes
+            // and the failure happens during descent (the path the softening must
+            // NOT touch). If the tree is a single root (depth 0), the root IS the
+            // only node; corrupt it directly.
+            let tree = FreeMapTree::from_roots(live_root, live_depth);
+            let reachable: Vec<u64> = tree
+                .reachable_pages(&mut cache)
+                .unwrap()
+                .into_iter()
+                .collect();
+            let victim = reachable
+                .iter()
+                .copied()
+                .find(|&id| id != live_root)
+                .unwrap_or(live_root);
+            // Wrong type byte, valid checksum: not a bit-flip, a position-type
+            // corruption that `check_type` rejects. Flip FreeMap<->FreeMapInterior.
+            {
+                let buf = cache.get_mut(victim).unwrap();
+                let wrong = if buf[0] == crate::page::PageType::FreeMap as u8 {
+                    crate::page::PageType::FreeMapInterior as u8
+                } else {
+                    crate::page::PageType::FreeMap as u8
+                };
+                buf[0] = wrong;
+                page::stamp_checksum(buf);
+            }
+            let err = tree.reachable_pages(&mut cache).unwrap_err();
+            assert!(
+                matches!(err, ChiselError::CorruptPage { .. }),
+                "reachable_pages must surface fatal CorruptPage on a corrupt LIVE \
+                 node — the dead-page softening must not weaken the live walk \
+                 (got {err:?})"
+            );
+        }
+    }
+
+    // PROPERTY 3 — no lost/double free across reuse cycles.
+    //
+    // Churn for several commits, each freeing whole pages. After EACH commit:
+    //   (a) every page freed that commit reads `is_free == true` via a fresh
+    //       `FreeMapTree::from_roots(committed root, depth)` (no lost free); and
+    //   (b) NO page id is simultaneously reachable in the LIVE freemap tree and
+    //       present in `structural_reuse`-derived pool (`pending_structural_frees`)
+    //       — a reuse-pool page MUST be dead (no double-allocation: the same page
+    //       cannot be both a live tree node and a free structural target).
+    #[test]
+    fn structural_recycle_no_lost_or_double_free() {
+        let mut tm = fresh_manager();
+        let big: Vec<u8> = vec![0xAB; MAX_INLINE_VALUE + 32];
+
+        // Seed a rotating population so each round both allocates and frees whole
+        // pages, keeping the freemap COWing every commit.
+        let mut live: Vec<u64> = Vec::new();
+        tm.begin().unwrap();
+        for _ in 0..10 {
+            live.push(tm.allocate(&big).unwrap());
+        }
+        tm.commit().unwrap();
+
+        for round in 0..8u32 {
+            // Delete half, allocate a fresh half: whole-page frees every commit.
+            let to_delete: Vec<u64> = live.drain(..5).collect();
+            tm.begin().unwrap();
+            for h in &to_delete {
+                tm.delete(*h).unwrap();
+            }
+            // Capture this commit's data frees BEFORE commit clears the vector.
+            let freed_this_commit: Vec<u64> = tm.txn_freed_pages.clone();
+            for _ in 0..5 {
+                live.push(tm.allocate(&big).unwrap());
+            }
+            // Re-snapshot: allocations may have reused some freed ids already,
+            // pulling them back out of the free set. The invariant we pin is on
+            // the pages STILL freed at commit time, so take the union of frees and
+            // exclude any id re-claimed as a live value this same transaction.
+            tm.commit().unwrap();
+
+            assert!(
+                !freed_this_commit.is_empty(),
+                "round {round}: deletes must free at least one whole page"
+            );
+
+            // (a) No lost free: every page this commit freed (and did not re-claim
+            // as a live value) reads free in the committed tree.
+            let live_set: std::collections::HashSet<u64> = live.iter().copied().collect();
+            {
+                let mut cache = tm.cache.borrow_mut();
+                let committed = FreeMapTree::from_roots(
+                    tm.committed_roots.freemap_page,
+                    tm.committed_roots.freemap_depth,
+                );
+                for id in &freed_this_commit {
+                    // A freed data page re-claimed as a live value this same
+                    // transaction is correctly NOT free; skip those.
+                    if live_set.contains(id) {
+                        continue;
+                    }
+                    assert!(
+                        committed.is_free(&mut cache, *id).unwrap(),
+                        "round {round}: page {id} was freed this commit but is NOT free in \
+                         the committed freemap tree — a lost free"
+                    );
+                }
+            }
+
+            // (b) No double-free: a page in the structural reuse pool must be DEAD,
+            // i.e. never simultaneously reachable in the live freemap tree. Walk
+            // the committed tree and intersect with the deferred recycle pool.
+            let reachable: std::collections::HashSet<u64> = {
+                let mut cache = tm.cache.borrow_mut();
+                let committed = FreeMapTree::from_roots(
+                    tm.committed_roots.freemap_page,
+                    tm.committed_roots.freemap_depth,
+                );
+                committed
+                    .reachable_pages(&mut cache)
+                    .unwrap()
+                    .into_iter()
+                    .collect()
+            };
+            for id in &tm.pending_structural_frees {
+                assert!(
+                    !reachable.contains(id),
+                    "round {round}: freemap page {id} is in the structural reuse pool AND \
+                     still reachable in the live committed freemap tree — a reuse-pool page \
+                     must be dead (handing it out as a COW target would double-allocate it)"
+                );
+            }
+            // A reuse-pool page must also not be marked free in the bitmap (the
+            // two reclamation channels are disjoint by design — a structural page
+            // rides the in-memory pool, never the bitmap).
+            {
+                let mut cache = tm.cache.borrow_mut();
+                let committed = FreeMapTree::from_roots(
+                    tm.committed_roots.freemap_page,
+                    tm.committed_roots.freemap_depth,
+                );
+                for id in &tm.pending_structural_frees {
+                    assert!(
+                        !committed.is_free(&mut cache, *id).unwrap(),
+                        "round {round}: structural-reuse page {id} is ALSO marked free in the \
+                         bitmap — the two reclamation channels overlap, risking a double hand-out"
+                    );
+                }
+            }
+        }
+    }
+
+    // The defrag orphan-sweep reclaims a freemap-typed page that a crash would
+    // have stranded: forge one (a checksum-valid FreeMapInterior unreferenced by
+    // the live tree and not marked free), sweep, and confirm it now reads free in
+    // the committed tree. This is the crash-recovery story for the in-memory
+    // structural recycle — without the sweep these pages leak permanently.
+    #[test]
+    fn reclaim_freemap_orphans_marks_lost_freemap_pages_free() {
+        let mut tm = fresh_manager();
+        // Churn so a real multi-page freemap (leaf + spine) exists: overflow-sized
+        // values give each handle its own page, so deletes free whole pages.
+        let big: Vec<u8> = vec![0xCD; MAX_INLINE_VALUE + 32];
+        tm.begin().unwrap();
+        let mut hs = Vec::new();
+        for _ in 0..40 {
+            hs.push(tm.allocate(&big).unwrap());
+        }
+        tm.commit().unwrap();
+        tm.begin().unwrap();
+        for h in hs.iter().step_by(2) {
+            tm.delete(*h).unwrap();
+        }
+        tm.commit().unwrap();
+
+        // Forge an orphan exactly as a crash leaves a lost recycle-pool page:
+        // extended, freemap-typed, unreferenced, not free.
+        let orphan = tm.test_forge_freemap_orphan().unwrap();
+
+        tm.begin().unwrap();
+        let reclaimed = tm.reclaim_freemap_orphans().unwrap();
+        assert!(reclaimed >= 1, "the forged orphan must be reclaimed");
+        tm.commit().unwrap();
+
+        // The orphan now reads free in the committed tree (data-reusable bitmap
+        // space, disjoint from the structural recycle pool).
+        let mut cache = tm.cache.borrow_mut();
+        let tree = FreeMapTree::from_roots(
+            tm.committed_roots.freemap_page,
+            tm.committed_roots.freemap_depth,
+        );
+        assert!(
+            tree.is_free(&mut cache, orphan).unwrap(),
+            "reclaimed orphan {orphan} must read free in the committed freemap"
+        );
+    }
+
+    // The sweep's exclusion set is load-bearing: a page CURRENTLY in the live
+    // in-memory recycle pool (`structural_reuse`) is LIVE recycling state, not an
+    // orphan. Reclaiming it into the bitmap while it is also pool-reusable would
+    // double-hand-out the page. Seed the pool with a forged freemap-typed page
+    // (matching the orphan shape in every respect EXCEPT pool membership) and
+    // assert the sweep skips it and leaves the pool untouched.
+    #[test]
+    fn reclaim_freemap_orphans_excludes_live_recycle_pool() {
+        let mut tm = fresh_manager();
+        // Establish a real freemap tree so the sweep does not early-exit on a
+        // PAGE_ID_NONE root.
+        let big: Vec<u8> = vec![0xCD; MAX_INLINE_VALUE + 32];
+        tm.begin().unwrap();
+        let h = tm.allocate(&big).unwrap();
+        tm.commit().unwrap();
+        tm.begin().unwrap();
+        tm.delete(h).unwrap();
+        tm.commit().unwrap();
+
+        // Forge a freemap-typed page that WOULD be flagged as an orphan, then put
+        // it in the live reuse pool so the exclusion set must spare it.
+        let pooled = tm.test_forge_freemap_orphan().unwrap();
+
+        tm.begin().unwrap();
+        tm.structural_reuse.push(pooled);
+        let reclaimed = tm.reclaim_freemap_orphans().unwrap();
+        assert_eq!(
+            reclaimed, 0,
+            "a page in the live recycle pool must NOT be reclaimed as an orphan"
+        );
+        assert!(
+            tm.structural_reuse.contains(&pooled),
+            "the sweep must leave the live recycle pool untouched"
+        );
+        tm.rollback().unwrap();
     }
 
     // Regression test for ISSUES.md I28. I19 introduced `CacheFull` as
