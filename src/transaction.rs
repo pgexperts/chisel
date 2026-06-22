@@ -1067,6 +1067,8 @@ impl TransactionManager {
             // external hints.
             superblock_count: self.superblock_count,
             root_membership_index_page: self.current_roots.membership_index_page,
+            // Freemap tree depth; 0 until the multi-page freemap is wired in.
+            freemap_depth: 0,
         };
         let buf = sb.serialize();
         // Step 3: Write to the INACTIVE slot. For N superblock slots,

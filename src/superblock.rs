@@ -61,6 +61,13 @@ const SUPERBLOCK_COUNT_OFFSET: usize = 308;
 // feature; bytes were previously zeroed reserved space).
 const ROOT_MEMBERSHIP_INDEX_OFFSET: usize = 312;
 
+// Depth of the multi-page radix freemap tree. 4 bytes at 320..324.
+// 0 means the single-page freemap (pre-multi-page-freemap files, or
+// a new database that has not yet grown past one leaf's capacity).
+// Old files have these bytes zeroed; depth 0 is backward-compatible
+// because the existing single-page path is the depth-0 case.
+const FREEMAP_DEPTH_OFFSET: usize = 320;
+
 // Named-root table (ISSUES.md F2). A small fixed-width table lives inside
 // the superblock itself so that named roots get the same atomic-commit
 // semantics as the handle-table root for free. Client use case (from the
@@ -198,6 +205,12 @@ pub struct Superblock {
     // 0 → PAGE_ID_NONE on open so the rest of the engine has a single
     // "empty" sentinel.
     pub root_membership_index_page: u64,
+    // Depth of the multi-page radix freemap tree. Serialized at bytes 320..324.
+    // 0 = single-page freemap (the pre-multi-page-freemap path, compatible with
+    // old files whose reserved bytes are zeroed). Depth > 0 means the freemap
+    // is a COW radix tree of FreeMap bitmap leaves with FreeMapInterior inner
+    // nodes; root_freemap_page points to the root at that depth.
+    pub freemap_depth: u32,
 }
 
 /// The three torn-slot rules, shared by the hot path (`deserialize`) and the
@@ -255,6 +268,10 @@ impl Superblock {
         // immediately after superblock_count.
         buf[ROOT_MEMBERSHIP_INDEX_OFFSET..ROOT_MEMBERSHIP_INDEX_OFFSET + 8]
             .copy_from_slice(&self.root_membership_index_page.to_le_bytes());
+        // Freemap tree depth. Written at bytes 320..324. Old files leave these
+        // bytes zero (= single-page freemap, backward compatible).
+        buf[FREEMAP_DEPTH_OFFSET..FREEMAP_DEPTH_OFFSET + 4]
+            .copy_from_slice(&self.freemap_depth.to_le_bytes());
         page::stamp_checksum(&mut buf);
         buf
     }
@@ -306,6 +323,11 @@ impl Superblock {
             superblock_count,
             root_membership_index_page: u64::from_le_bytes(
                 buf[ROOT_MEMBERSHIP_INDEX_OFFSET..ROOT_MEMBERSHIP_INDEX_OFFSET + 8]
+                    .try_into()
+                    .unwrap(),
+            ),
+            freemap_depth: u32::from_le_bytes(
+                buf[FREEMAP_DEPTH_OFFSET..FREEMAP_DEPTH_OFFSET + 4]
                     .try_into()
                     .unwrap(),
             ),
@@ -397,6 +419,7 @@ impl Superblock {
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
             superblock_count,
             root_membership_index_page: page::PAGE_ID_NONE,
+            freemap_depth: 0,
         }
     }
 }
@@ -529,6 +552,7 @@ mod tests {
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
             superblock_count: DEFAULT_SUPERBLOCK_COUNT,
             root_membership_index_page: crate::page::PAGE_ID_NONE,
+            freemap_depth: 0,
         };
         let buf = sb.serialize();
         let sb2 = Superblock::deserialize(&buf).unwrap();
@@ -549,6 +573,7 @@ mod tests {
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
             superblock_count: DEFAULT_SUPERBLOCK_COUNT,
             root_membership_index_page: crate::page::PAGE_ID_NONE,
+            freemap_depth: 0,
         };
         let mut buf = sb.serialize();
         buf[10] ^= 0xFF;
@@ -569,6 +594,7 @@ mod tests {
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
             superblock_count: DEFAULT_SUPERBLOCK_COUNT,
             root_membership_index_page: crate::page::PAGE_ID_NONE,
+            freemap_depth: 0,
         };
         let sb2 = Superblock {
             magic: MAGIC,
@@ -582,6 +608,7 @@ mod tests {
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
             superblock_count: DEFAULT_SUPERBLOCK_COUNT,
             root_membership_index_page: crate::page::PAGE_ID_NONE,
+            freemap_depth: 0,
         };
         let buf1 = sb1.serialize();
         let buf2 = sb2.serialize();
@@ -603,6 +630,7 @@ mod tests {
             named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
             superblock_count: DEFAULT_SUPERBLOCK_COUNT,
             root_membership_index_page: crate::page::PAGE_ID_NONE,
+            freemap_depth: 0,
         };
         let sb2_buf = [0u8; PAGE_SIZE];
         let buf1 = sb1.serialize();
@@ -615,6 +643,23 @@ mod tests {
         let buf1 = [0u8; PAGE_SIZE];
         let buf2 = [0u8; PAGE_SIZE];
         assert!(Superblock::select(&[buf1, buf2]).is_none());
+    }
+
+    #[test]
+    fn freemap_depth_round_trips_and_defaults_zero() {
+        let mut sb = Superblock::new_empty(2);
+        sb.root_freemap_page = 9;
+        sb.freemap_depth = 3;
+        let buf = sb.serialize();
+        let back = Superblock::deserialize(&buf).unwrap();
+        assert_eq!(back.freemap_depth, 3);
+        assert_eq!(back.root_freemap_page, 9);
+
+        let mut legacy = sb.serialize();
+        legacy[320..324].fill(0);
+        page::stamp_checksum(&mut legacy);
+        let back0 = Superblock::deserialize(&legacy).unwrap();
+        assert_eq!(back0.freemap_depth, 0);
     }
 
     /// The new root_membership_index_page field must persist across serialize/
@@ -688,6 +733,7 @@ mod tests {
                 named_roots,
                 superblock_count,
                 root_membership_index_page,
+                freemap_depth: 0,
             };
             let buf = sb.serialize();
             let parsed = Superblock::deserialize(&buf)
@@ -705,6 +751,7 @@ mod tests {
             prop_assert_eq!(parsed.page_size, sb.page_size);
             prop_assert_eq!(parsed.superblock_count, sb.superblock_count);
             prop_assert_eq!(parsed.root_membership_index_page, sb.root_membership_index_page);
+            prop_assert_eq!(parsed.freemap_depth, sb.freemap_depth);
             for i in 0..NAMED_ROOT_COUNT {
                 prop_assert_eq!(parsed.named_roots[i].name, sb.named_roots[i].name);
                 prop_assert_eq!(parsed.named_roots[i].handle, sb.named_roots[i].handle);
