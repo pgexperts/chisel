@@ -2867,19 +2867,52 @@ mod tests {
         ));
     }
 
-    // A fatal error observed during a normal operation must also poison
-    // the manager, not just commit errors. This exercises the
-    // `poison_on_fatal` branch of the wrapper pattern.
     #[test]
     fn fatal_error_outside_commit_also_poisons() {
-        let tm = fresh_manager();
-        // Inject a fatal error via the helper's test hook: force the
-        // flag, then confirm a subsequent operation sees it through a
-        // shared reference. (A genuine fault-injection harness is out
-        // of scope; we exercise the machinery deterministically.)
-        tm.force_poison_for_test();
-        let err = tm.read(0).unwrap_err();
-        assert!(matches!(err, ChiselError::Poisoned));
+        // I112: a REAL fatal IoError on a cold read OUTSIDE any transaction
+        // poisons the manager (the non-commit fatal path, poison_on_fatal). This
+        // replaces the old force_poison_for_test() tautology with an injected
+        // fault. We reopen over the committed file so read(h) is a cache MISS
+        // that actually reaches read_page(pid).
+        let file = NamedTempFile::new().unwrap();
+        let h;
+        let pid;
+        {
+            let io = PageIo::open(file.path(), false).unwrap();
+            let cache = PageCache::new(
+                io,
+                1024 * PAGE_SIZE as u64,
+                0,
+                crate::DrainInsertion::LruTail,
+                crate::SpillwayLocation::InMemory,
+            );
+            let mut tm = TransactionManager::create_new(cache, 2).unwrap();
+            tm.begin().unwrap();
+            h = tm.allocate(b"durable").unwrap();
+            tm.commit().unwrap();
+            pid = tm.handle_live_page_id(h).unwrap().expect("live data page");
+        }
+
+        // Reopen: cold cache, so read(h) misses and calls read_page(pid).
+        let io = PageIo::open(file.path(), false).unwrap();
+        let cache = PageCache::new(
+            io,
+            1024 * PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
+        let tm = TransactionManager::open_existing(cache).unwrap();
+        tm.cache.borrow().io().arm_fault(Fault::FailReadPage(pid));
+        let result = tm.read(h);
+        assert!(
+            matches!(result, Err(ChiselError::IoError(_))),
+            "cold read fault must surface IoError, got {result:?}"
+        );
+        assert!(
+            tm.is_poisoned(),
+            "a fatal read error outside commit must poison"
+        );
     }
 
     // Regression test for ISSUES.md I3 + I7. A transaction that forces
