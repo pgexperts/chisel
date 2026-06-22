@@ -55,6 +55,42 @@ fn init_page(
     Ok(id)
 }
 
+/// Free every page of the now-empty inner tree rooted at `root` (depth `depth`)
+/// — the whole orphaned structure, not just the root. Used when a tag is dropped
+/// (I118): `RadixU64::delete` does not shrink depth or prune empty children, so
+/// an emptied multi-level tree keeps ALL its pages (every interior and leaf,
+/// just with empty slots). Returning them all to the freemap lets a later
+/// `create_root` for the tag reuse them instead of extending the file.
+///
+/// Safe to free as a unit: when a tag empties, its whole inner tree is orphaned
+/// (the outer entry is removed by the caller right after), and a valid radix
+/// tree has no cycles, so each page is visited and freed exactly once. The pages
+/// are a mix of this-txn COW pages and committed pages — NOT the COW-superseded
+/// old pages, which `delete` already queued in `freed` — so there is no
+/// double-free. Recursion is bounded by `depth` (<= `MAX_DEPTH`): a corrupt
+/// child pointer cannot loop forever, the descent terminates at depth 0.
+fn free_subtree(cache: &mut PageCache, root: u64, depth: u32, freed: &mut Vec<u64>) -> Result<()> {
+    if root == PAGE_ID_NONE {
+        return Ok(());
+    }
+    if depth > 0 {
+        // Collect child pointers first so the read borrow is released before
+        // recursing (each recursion re-borrows the cache mutably).
+        let children: Vec<u64> = {
+            let buf = cache.get(root)?;
+            (0..SLOTS_PER_PAGE)
+                .map(|idx| read_slot(buf, idx))
+                .filter(|&child| child != 0)
+                .collect()
+        };
+        for child in children {
+            free_subtree(cache, child, depth - 1, freed)?;
+        }
+    }
+    freed.push(root);
+    Ok(())
+}
+
 /// A copy-on-write radix tree: `u64` key -> `u64` value, where `0` means absent
 /// (a zeroed leaf reads as all-absent, mirroring the handle table's tombstone
 /// trick). The caller owns `depth` and the root page id.
@@ -641,24 +677,15 @@ impl MembershipIndex {
                 freed,
             )?
         } else {
-            // The tag's last member is gone: drop the outer entry and reclaim
-            // the now-empty inner tree's ROOT page (`new_inner_root`), so a later
-            // `create_root` for this tag reuses it via the freemap (I118) instead
-            // of extending the file. Safe: the root was never installed in the
-            // outer tree and the old entry is removed by the `outer.delete` below,
-            // so it is fully orphaned and freed exactly once (verified: no
-            // double-free, no use-after-free, correct across reopen).
-            //
-            // RESIDUAL (I118 follow-up): `delete` does NOT shrink depth, so if
-            // this tag's inner tree had grown to depth >= 1 (i.e. carried more
-            // than SLOTS_PER_PAGE handles at once), the emptied tree is a chain
-            // of interior pages and only its root is reclaimed here — the empty
-            // interior pages below it leak (a bounded, non-corrupting residual,
-            // strictly better than the prior "free nothing" behavior). The common
-            // single-leaf case — the scenario I118 targets — is fully reclaimed.
-            // Completing this needs either a depth-shrinking `delete` or a walk
-            // that frees the whole emptied subtree; tracked separately.
-            freed.push(new_inner_root);
+            // The tag's last member is gone: drop the outer entry and free the
+            // ENTIRE now-empty inner tree (I118). `delete` does not shrink depth
+            // or prune empty children, so an emptied multi-level tree keeps its
+            // full page structure — freeing only the root would leak every
+            // interior and leaf below it. `free_subtree` returns the whole
+            // orphaned tree to the freemap, so re-creating this tag reuses those
+            // pages instead of extending the file (see `free_subtree` for the
+            // freed-exactly-once / no-double-free reasoning).
+            free_subtree(cache, new_inner_root, inner.depth, freed)?;
             let (r, _) = outer.delete(cache, outer_root, tag as u64, alloc, freed)?;
             r
         };
@@ -920,6 +947,44 @@ mod tests {
         assert_eq!(prev, 99);
         assert_eq!(t.lookup(&mut c, r2, 5).unwrap(), 0);
         assert!(!t.any_present(&mut c, r2).unwrap());
+    }
+
+    // I118 deep-tree completion: a tree grown past one leaf page (depth >= 1) is
+    // a multi-page structure, and `delete` does not shrink depth, so an emptied
+    // multi-level tree keeps ALL its pages. `free_subtree` (called by
+    // `MembershipIndex::remove` when a tag drops) must reclaim every page — root,
+    // interiors, and leaves — not just the root, else dropping a large tag leaks
+    // its inner-tree pages.
+    #[test]
+    fn free_subtree_reclaims_every_page_of_a_multi_level_tree() {
+        let mut c = cache(8192);
+        let mut t = RadixU64::new();
+        let mut root = t
+            .create_root(&mut c, &mut |c: &mut PageCache| c.new_page())
+            .unwrap();
+        // More than SLOTS_PER_PAGE (1021) sequential keys span two depth-0
+        // leaves under a depth-1 root.
+        for k in 0..(SLOTS_PER_PAGE as u64 + 51) {
+            root = t.insert_t(&mut c, root, k, 1).unwrap();
+        }
+        assert_eq!(
+            t.depth, 1,
+            "more than SLOTS_PER_PAGE keys must grow to depth 1"
+        );
+
+        // The live tree is exactly root + 2 leaves = 3 pages.
+        let mut freed = Vec::new();
+        free_subtree(&mut c, root, t.depth, &mut freed).unwrap();
+        assert_eq!(
+            freed.len(),
+            3,
+            "free_subtree must free the whole depth-1 tree (root + 2 leaves), not just the root"
+        );
+        // Each page is freed exactly once (no double-free).
+        let mut uniq = freed.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), freed.len(), "each page freed exactly once");
     }
 
     // --- Corrupt-input robustness (deepdive review finding #3) ---------------
