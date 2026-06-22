@@ -159,7 +159,7 @@ impl PageCache {
     /// `max_pages` is clamped to at least 1. A value of 0 would trip
     /// `CacheFull` on the first allocation regardless of workload.
     pub fn new(
-        mut io: PageIo,
+        io: PageIo,
         cache_max_bytes: u64,
         spillway_max_bytes: u64,
         drain_insertion: crate::DrainInsertion,
@@ -578,7 +578,7 @@ impl PageCache {
     /// This is the PHYSICAL file size in pages, which may exceed the
     /// logical committed `total_pages` if a transaction is in-flight or a
     /// prior crash left tail garbage.
-    pub fn file_page_count(&mut self) -> Result<u64> {
+    pub fn file_page_count(&self) -> Result<u64> {
         self.io.page_count()
     }
 
@@ -814,6 +814,19 @@ impl PageCache {
     /// safe to drop at savepoint/rollback boundaries.
     pub fn is_dirty(&self, page_id: u64) -> bool {
         self.entries.get(&page_id).is_some_and(|e| e.dirty)
+    }
+
+    /// Copy `src`'s page bytes into `dst`, replacing dst's contents.
+    ///
+    /// I134 (ISSUES.md, 2026-06-21): the COW-clone step shared by the handle
+    /// table and membership index (five near-identical copies that bounced the
+    /// bytes through a named 8 KB stack array). The stack array is required by
+    /// the borrow checker — `get(src)` and `get_mut(dst)` can't both borrow the
+    /// cache at once — so naming it once keeps the call sites honest.
+    pub(crate) fn copy_page(&mut self, src: u64, dst: u64) -> Result<()> {
+        let bytes: [u8; PAGE_SIZE] = *self.get(src)?;
+        *self.get_mut(dst)? = bytes;
+        Ok(())
     }
 
     /// Load a page from disk into the cache, verifying its checksum.

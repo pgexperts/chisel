@@ -32,6 +32,8 @@ Priority legend:
 > **Status note (2026-06-01):** the `chisel-performance` + `rust-performance` full hot-path sweep (output at `docs/reviews/perf-review-2026-06-01.md`) adds I77–I96 in a new "Perf-review findings (2026-06-01)" section below. No correctness bugs and no Don't-Break-List violations were found — the engine's data-handling is confirmed tight (zero-copy reads, in-place slot mutation, dead-on-prod `compact()`, verified I18 / I51 / 3-fsync discipline). The cluster splits into engine hot-path optimizations (I77–I89) and benchmark-harness integrity (I90–I96). The central conclusion is a **sequencing constraint**: the bench harness cannot currently validate an engine change (no `black_box`, no `[profile.release]`, no in-memory-backend row), so the I90/I91/I92 measurement-integrity fixes GATE the two engine P1s (I77 SipHash hasher, I78 per-insert XXH3 re-stamp) — and `black_box` (I90) must precede the LTO profile (I91) because LTO widens the dead-code-elimination window. Prior deferred perf items are unchanged: F2 (`read` → `to_vec`) and F3 (`Cell` counters) still UNCHANGED; I33 (`delete_many` per-leaf) and I34 (mmap cache) still DEFERRED.
 >
 > **Status note (2026-06-21):** the `deepdive-rust` fresh-eyes pass (output at `docs/reviews/review-20260621-185541.md`, run after PRs #34–#50 and the per-page format-versioning feature landed) adds **I104–I140** in a new "Deepdive review findings (2026-06-21)" section below. The *entire* prior executive summary (2026-06-16) is resolved with no regressions, so the new cluster is fresh — concentrated in error-classification defaults, one CI lint hole, the radix test gap, and doc drift introduced by the #46 dead-code sweep. No new P0 / data-loss bugs were found. Highest leverage first: **I108** (the 1,300-line PyO3 binding escapes the gating `cargo clippy` because `default-members` excludes it — a real CI hole that ships clippy regressions silently) and **I111** (the radix key-math — the engine's most off-by-one-prone code — has no property tests, and its one "two-level" test only reaches depth 1). Then the cheap zero-risk cluster: **I104** (`is_fatal` exhaustiveness test, NOT a default flip — see the review's countercase), **I127** (the `live_slots` SipHash maps the I77 FxHashMap pass missed), and the doc-drift fixes **I128 / I130 / I131 / I132 / I133**. Carried-not-regressed: F2 (`read`→`to_vec`) and the `delete_with_tag` partial-progress drop (re-filed as **I107**) remain open by design. The ADR-to-repo question (**I129**) is a maintainer process call. Three 2026-05-22 fixes have narrow follow-ups here (I46→I117, I63→I131, I71→I111) — the original fix was correct but didn't cover the site this re-review found.
+>
+> **Status note (2026-06-21 — lower-priority backlog progress + handoff):** after the higher-leverage cluster shipped (PRs #51–#55), the remaining lower-priority items were worked in themed PRs. **DONE (PRs #56–#59):** I109, I110 (*resolved-not-viable* — `--tests` pulls `getrandom`/edition2024 above MSRV; msrv stays lib-only), I116, I117, I119, I121, I123, I134, I136, I137. Several review premises were **corrected** while fixing: I116 "four unguarded sites" → three already-guarded (the real fix is *saturation*; `set_cache_max_bytes` doesn't decrement); I134 "three copies" → five. **STILL OPEN (paused here by maintainer decision — resume in a fresh focused session):** the two large features come FIRST on resume — **I120 + I126 + I122** (the full Handle/Tag newtype reshape across the Rust + Python surface; maintainer chose the full reshape) and **I112** (the `FaultyFile` fault-injection layer, which *subsumes* I114 + I115 — drive a real I/O fault into poison + the IoError/CorruptSuperblock paths). Then the moderate/cosmetic P3s: **I106** (`CorruptSuperblock` cause field — design ready: `deserialize -> Result<_, SuperblockDefect>` + a `diagnose` helper + `CorruptSuperblock { defects }`, ~6 files incl. the I104 exhaustiveness test), **I107** (`delete_with_tag` runs in the caller's txn, so document "roll back on error" — no partial-progress to attach), **I113** (tighten weak assertions), **I124** (`# Errors`/`# Panics` rustdoc — do AFTER the I120 reshape so it documents final signatures), **I125** (`lookup_live` unification — note it CHANGES `tag()`/`delete_tagged()` to reject tombstones, a behaviour change to confirm), **I139** (Python typed-exception contract tests), **I118** (plumb the freemap-aware `alloc` into membership `create_root`).
 
 Dependencies and batching drove this more than raw priority. Earlier items unblocked later ones.
 
@@ -1485,12 +1487,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 **Direction of fix:** opaque `Handle(u64)` / `Tag(u32)` newtypes with `From`/`Into` — makes `delete_tagged` un-transposable and distinguishes `handles()` from `handles_with_tag()` return types.
 
-#### I121. `DefragStats` and `TagDropProgress` are outcome reports but not `#[must_use]` [deepdive 2026-06-21] — **P3**
+#### I121. `DefragStats` and `TagDropProgress` are outcome reports but not `#[must_use]` [deepdive 2026-06-21] — **P3** ✅ FIXED 2026-06-21
 **Where:** `src/defrag.rs:111` (`DefragStats`); `src/membership_index.rs:538` (`TagDropProgress`)
 
 **Problem:** `db.defrag(opts)?;` silently discards `pages_freed`; `delete_with_tag(...)?;` discards `complete` — the field the caller must loop on (see I107). The crate already added `#[must_use]` to `close()` (I38), so it values the pattern.
 
 **Direction of fix:** `#[must_use]` on both type definitions.
+
+**Fixed (2026-06-21):** `#[must_use = "…"]` on both struct defs. It immediately earned its keep — clippy `--all-targets` flagged one genuine discard (`tests/defrag.rs:81` `db.defrag(..).unwrap();`), now `let _ = …` since that test only checks post-defrag readback.
 
 #### I122. `DefragOptions::max_pages` counts values relocated, not pages [deepdive 2026-06-21] — **P3**
 **Where:** `src/defrag.rs:64-70` (the "DESPITE THE NAME…" comment)
@@ -1499,12 +1503,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 **Direction of fix:** rename to `max_values` now (and the Python `DefragOptions.max_pages` mirror), while there are no users to break.
 
-#### I123. `page_count` / `file_page_count` keep `&mut self` "for API stability" on a pure `Cell` read [deepdive 2026-06-21] — **P3**
+#### I123. `page_count` / `file_page_count` keep `&mut self` "for API stability" on a pure `Cell` read [deepdive 2026-06-21] — **P3** ✅ FIXED 2026-06-21
 **Where:** `src/page_io.rs:330,594`
 
 **Problem:** these now-pure cache reads keep `&mut self`, forcing a `borrow_mut()` on semantically-read `&self` paths — a latent double-borrow risk if a future `&self` path nests a cache read. The comment already concedes a future patch can drop the `&mut`.
 
 **Direction of fix:** drop the `&mut self` now (the ripple is small).
+
+**Fixed (2026-06-21):** `PageIo::page_count` and `PageCache::file_page_count` now take `&self` (both are pure `Cell`/field reads). Callers holding `&mut` still compile (coercion); the ripple the review predicted was indeed small — three now-unnecessary `mut` bindings (`PageCache::new`'s `io` param + two page_io tests), de-`mut`'d.
 
 #### I124. Public fallible methods broadly lack `# Errors` rustdoc; several omit `# Panics` [deepdive 2026-06-21] — **P3**
 **Where:** `savepoint`/`rollback_to`/`release`/`set_root_name`/`get_root_name` and most `TransactionManager` mutators; assert sites at `transaction.rs:307`, `membership_index.rs:167`
@@ -1600,12 +1606,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 ### Idiomaticity
 
-#### I134. The COW page copy bounces through a named 8 KB stack array for the borrow checker [deepdive 2026-06-21] — **P3**
+#### I134. The COW page copy bounces through a named 8 KB stack array for the borrow checker [deepdive 2026-06-21] — **P3** ✅ FIXED 2026-06-21
 **Where:** `src/handle_table.rs:330-333`; `src/membership_index.rs:205-208`, `:290-292`
 
 **Problem:** three sites copy a page through a named stack buffer purely to satisfy the borrow checker; the pattern is unnamed and duplicated.
 
 **Direction of fix:** a shared `cow_copy_page(cache, src, dst)` helper using `copy_from_slice`.
+
+**Fixed (2026-06-21):** added `PageCache::copy_page(src, dst)` and routed all **five** sites through it (the review counted three; there were two more in membership_index — `:316-319` and the leaf-COW at `:290-293`, plus the second handle_table interior site). The stack bounce now lives in one place. The borrow-checker reason (can't `get(src)` and `get_mut(dst)` at once) is documented on the helper.
 
 #### I135. `u64::from_le_bytes(buf[off..off+8].try_into().unwrap())` repeated ~15× [deepdive 2026-06-21] — **P3**
 **Where:** across `src/handle_table.rs` and `src/superblock.rs::deserialize`

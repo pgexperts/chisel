@@ -334,11 +334,12 @@ impl PageIo {
     /// flock + private-process ownership of the file makes the cache
     /// always coherent — no external mutator can desync it.
     ///
-    /// `&mut self` retained for API stability with the pre-I51 version
-    /// (the cache read itself only needs `&self`, but changing the
-    /// signature would touch every caller). A future patch can drop
-    /// the `&mut` if the broader signature ripple is worth landing.
-    pub fn page_count(&mut self) -> Result<u64> {
+    /// I123 (ISSUES.md, 2026-06-21): takes `&self` — the body is a pure `Cell`
+    /// read (the I51 cached page count), so it never needed `&mut`. Dropping it
+    /// removes the latent double-borrow risk of forcing a `borrow_mut()` /
+    /// `io_mut()` on a semantically-read path. Callers holding `&mut` still work
+    /// (coercion); read-only paths can now use a shared borrow.
+    pub fn page_count(&self) -> Result<u64> {
         Ok(self.cached_page_count.get())
     }
 
@@ -559,7 +560,7 @@ mod read_only_tests {
             assert_eq!(io.page_count().unwrap(), 3);
             // io drops here, releasing the flock.
         }
-        let mut io = PageIo::open(f.path(), false).unwrap();
+        let io = PageIo::open(f.path(), false).unwrap();
         assert_eq!(io.page_count().unwrap(), 3);
     }
 }
@@ -576,7 +577,7 @@ mod memory_backing_tests {
 
     #[test]
     fn memory_starts_with_zero_pages() {
-        let mut io = PageIo::open_in_memory().unwrap();
+        let io = PageIo::open_in_memory().unwrap();
         assert_eq!(io.page_count().unwrap(), 0);
     }
 

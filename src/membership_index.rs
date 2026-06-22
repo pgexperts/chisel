@@ -202,10 +202,7 @@ impl RadixU64 {
     ) -> Result<u64> {
         let new_page = alloc(cache)?;
         debug_assert_ne!(new_page, 0);
-        {
-            let old: [u8; PAGE_SIZE] = *cache.get(page)?;
-            cache.get_mut(new_page)?.copy_from_slice(&old);
-        }
+        cache.copy_page(page, new_page)?;
         // `page` is superseded by `new_page`; queue it for reclamation.
         freed.push(page);
         if level == 0 {
@@ -287,10 +284,7 @@ impl RadixU64 {
             }
             let new_leaf = alloc(cache)?;
             debug_assert_ne!(new_leaf, 0);
-            {
-                let old: [u8; PAGE_SIZE] = *cache.get(page)?;
-                *cache.get_mut(new_leaf)? = old;
-            }
+            cache.copy_page(page, new_leaf)?;
             {
                 let buf = cache.get_mut(new_leaf)?;
                 write_slot(buf, idx, 0);
@@ -313,10 +307,7 @@ impl RadixU64 {
             }
             let new_page = alloc(cache)?;
             debug_assert_ne!(new_page, 0);
-            {
-                let old: [u8; PAGE_SIZE] = *cache.get(page)?;
-                *cache.get_mut(new_page)? = old;
-            }
+            cache.copy_page(page, new_page)?;
             {
                 let buf = cache.get_mut(new_page)?;
                 write_slot(buf, child_idx, new_child);
@@ -535,6 +526,9 @@ fn unpack_inner(packed: u64) -> (u64, u32) {
 /// the handles dropped before the failure are not reported (the per-delete
 /// state stays consistent — see `Chisel::delete_with_tag` — only the reporting
 /// is lost).
+// I121 (ISSUES.md, 2026-06-21): #[must_use] so a caller cannot drop the
+// progress report — `complete` is the field a resumable drop must loop on.
+#[must_use = "TagDropProgress.complete tells you whether the tag drop finished; loop on it or bind with `let _`"]
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct TagDropProgress {
