@@ -1,3 +1,12 @@
+"""Python bindings for the Chisel transactional storage engine.
+
+Handles and tags are plain integers. Tags are integers >= 1: ``0`` is not a
+valid tag — create an untagged value with ``allocate`` (not ``allocate_tagged``),
+and ``tag()`` returns ``None`` for an untagged handle. Passing ``tag=0`` to a
+tagged operation (``allocate_tagged``, ``delete_tagged``, ``handles_with_tag``,
+``delete_with_tag``) raises ``ValueError``.
+"""
+
 from dataclasses import dataclass
 from typing import Optional
 

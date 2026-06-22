@@ -119,7 +119,8 @@ fn test_recovery_corrupt_membership_inner_depth_is_corrupt_page() {
     {
         let mut db = Chisel::open(&path, Default::default()).unwrap();
         db.begin().unwrap();
-        db.allocate_tagged(b"row", 7).unwrap();
+        db.allocate_tagged(b"row", crate::Tag::new(7).unwrap())
+            .unwrap();
         db.commit().unwrap();
     }
     // The outer (tag) tree is depth 0: its root IS the outer leaf, packing tag
@@ -132,7 +133,7 @@ fn test_recovery_corrupt_membership_inner_depth_is_corrupt_page() {
         buf[off..off + 8].copy_from_slice(&corrupt.to_le_bytes());
     });
     let db = Chisel::open(&path, Default::default()).unwrap();
-    match db.handles_with_tag(7) {
+    match db.handles_with_tag(crate::Tag::new(7).unwrap()) {
         Err(ChiselError::CorruptPage { .. }) => {}
         other => panic!("expected CorruptPage, got {other:?}"),
     }
@@ -169,7 +170,9 @@ fn test_recovery_uncommitted_data_lost() {
     }
     let db = Chisel::open(&path, Default::default()).unwrap();
     assert_eq!(db.read(committed_handle).unwrap(), b"committed");
-    assert!(db.read(committed_handle + 1).is_err());
+    assert!(db
+        .read(crate::Handle::from(committed_handle.get() + 1))
+        .is_err());
 }
 
 #[test]
@@ -220,10 +223,14 @@ fn test_recovery_tagged_index_recovers_from_prior_superblock() {
     {
         let mut db = Chisel::open(&path, Default::default()).unwrap();
         db.begin().unwrap();
-        h1 = db.allocate_tagged(b"row1", 9).unwrap();
+        h1 = db
+            .allocate_tagged(b"row1", crate::Tag::new(9).unwrap())
+            .unwrap();
         db.commit().unwrap(); // prior state -> superblock slot A (page 0)
         db.begin().unwrap();
-        h2 = db.allocate_tagged(b"row2", 9).unwrap();
+        h2 = db
+            .allocate_tagged(b"row2", crate::Tag::new(9).unwrap())
+            .unwrap();
         db.commit().unwrap(); // newer state -> superblock slot B (page 1), now active
     }
     // Corrupt the active superblock slot (page 1) by zeroing it.
@@ -238,8 +245,11 @@ fn test_recovery_tagged_index_recovers_from_prior_superblock() {
     // Teeth: if recovery had instead kept the corrupted active slot, this would
     // be [h1, h2] (the counterfactual: corrupting page 0 makes it fail that way).
     let db = Chisel::open(&path, Default::default()).unwrap();
-    assert_eq!(db.handles_with_tag(9).unwrap(), vec![h1]);
-    assert_eq!(db.tag(h1).unwrap(), 9);
+    assert_eq!(
+        db.handles_with_tag(crate::Tag::new(9).unwrap()).unwrap(),
+        vec![h1]
+    );
+    assert_eq!(db.tag(h1).unwrap().unwrap(), 9);
     // h2 existed only in the corrupted newer state -> gone after recovery.
     assert!(db.read(h2).is_err());
 }
@@ -730,7 +740,7 @@ fn test_read_takes_shared_reference() {
 
     // Hand out a shared reference and prove we can do all read-side work
     // through it without any interior wrapper.
-    fn read_only_probe(db: &Chisel, h: u64) -> Vec<u8> {
+    fn read_only_probe(db: &Chisel, h: crate::Handle) -> Vec<u8> {
         assert!(!db.is_poisoned());
         let _ = db.handles().unwrap();
         let _ = db.stats().unwrap();
@@ -862,24 +872,29 @@ fn test_named_roots_validation_errors() {
 
     // Empty name.
     assert!(matches!(
-        db.set_root_name("", 0),
+        db.set_root_name("", crate::Handle::from(0)),
         Err(ChiselError::InvalidRootName)
     ));
     // Too long (> 24 bytes).
     let too_long = "a".repeat(25);
     assert!(matches!(
-        db.set_root_name(&too_long, 0),
+        db.set_root_name(&too_long, crate::Handle::from(0)),
         Err(ChiselError::InvalidRootName)
     ));
     // Contains NUL.
     assert!(matches!(
-        db.set_root_name("bad\0name", 0),
+        db.set_root_name("bad\0name", crate::Handle::from(0)),
         Err(ChiselError::InvalidRootName)
     ));
     // Max length (exactly 24 bytes) is valid.
     let exactly_24 = "a".repeat(24);
-    assert!(db.set_root_name(&exactly_24, 42).is_ok());
-    assert_eq!(db.get_root_name(&exactly_24).unwrap(), Some(42));
+    assert!(db
+        .set_root_name(&exactly_24, crate::Handle::from(42))
+        .is_ok());
+    assert_eq!(
+        db.get_root_name(&exactly_24).unwrap(),
+        Some(crate::Handle::from(42))
+    );
     db.commit().unwrap();
 }
 
@@ -897,22 +912,31 @@ fn test_named_roots_table_full() {
     // assertion below stops testing the boundary.
     for i in 0..8 {
         let name = format!("r{i}");
-        db.set_root_name(&name, i as u64).unwrap();
+        db.set_root_name(&name, crate::Handle::from(i as u64))
+            .unwrap();
     }
     // Overwriting an existing name must still work even when full.
-    db.set_root_name("r3", 999).unwrap();
-    assert_eq!(db.get_root_name("r3").unwrap(), Some(999));
+    db.set_root_name("r3", crate::Handle::from(999)).unwrap();
+    assert_eq!(
+        db.get_root_name("r3").unwrap(),
+        Some(crate::Handle::from(999))
+    );
 
     // Adding a NEW name must fail.
     assert!(matches!(
-        db.set_root_name("overflow", 1234),
+        db.set_root_name("overflow", crate::Handle::from(1234)),
         Err(ChiselError::RootNameTableFull)
     ));
 
     // Clearing a slot must reopen capacity.
     db.clear_root_name("r0").unwrap();
-    assert!(db.set_root_name("new_one", 1234).is_ok());
-    assert_eq!(db.get_root_name("new_one").unwrap(), Some(1234));
+    assert!(db
+        .set_root_name("new_one", crate::Handle::from(1234))
+        .is_ok());
+    assert_eq!(
+        db.get_root_name("new_one").unwrap(),
+        Some(crate::Handle::from(1234))
+    );
     db.commit().unwrap();
 }
 
@@ -923,7 +947,7 @@ fn test_named_roots_clear_is_idempotent() {
 
     let mut db = Chisel::open(&path, Default::default()).unwrap();
     db.begin().unwrap();
-    db.set_root_name("meta", 7).unwrap();
+    db.set_root_name("meta", crate::Handle::from(7)).unwrap();
     db.clear_root_name("meta").unwrap();
     assert_eq!(db.get_root_name("meta").unwrap(), None);
     // Clearing a non-existent name is a no-op, not an error.
@@ -1059,7 +1083,7 @@ fn test_delete_many_atomicity() {
 
     let mut db = Chisel::open(&path, Default::default()).unwrap();
     db.begin().unwrap();
-    let handles: Vec<u64> = (0..10)
+    let handles: Vec<crate::Handle> = (0..10)
         .map(|i| db.allocate(format!("h{i}").as_bytes()).unwrap())
         .collect();
     db.commit().unwrap();
@@ -1138,7 +1162,7 @@ fn test_r1_packed_values_are_readable_after_reopen() {
     let file = NamedTempFile::new().unwrap();
     let path = file.path().to_owned();
 
-    let handles: Vec<u64>;
+    let handles: Vec<crate::Handle>;
     {
         let mut db = Chisel::open(&path, Default::default()).unwrap();
         db.begin().unwrap();
@@ -1170,7 +1194,7 @@ fn test_r1_deleting_last_slot_frees_the_page() {
 
     let mut db = Chisel::open(&path, Default::default()).unwrap();
     db.begin().unwrap();
-    let handles: Vec<u64> = (0..5)
+    let handles: Vec<crate::Handle> = (0..5)
         .map(|i| db.allocate(format!("s{i}").as_bytes()).unwrap())
         .collect();
     db.commit().unwrap();

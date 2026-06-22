@@ -89,7 +89,9 @@ fn durable_and_independent_of_tag_across_reopen() {
     {
         let mut db = Chisel::open(&path, Default::default()).unwrap();
         db.begin().unwrap();
-        h = db.allocate_tagged(b"row", 1234).unwrap();
+        h = db
+            .allocate_tagged(b"row", chisel::Tag::new(1234).unwrap())
+            .unwrap();
         db.set_client_byte(h, 0xC9).unwrap();
         db.commit().unwrap();
         db.close().unwrap();
@@ -97,7 +99,11 @@ fn durable_and_independent_of_tag_across_reopen() {
     {
         let db = Chisel::open(&path, Default::default()).unwrap();
         assert_eq!(db.client_byte(h).unwrap(), 0xC9, "client byte durable");
-        assert_eq!(db.tag(h).unwrap(), 1234, "tag undisturbed by client byte");
+        assert_eq!(
+            db.tag(h).unwrap().unwrap(),
+            1234,
+            "tag undisturbed by client byte"
+        );
         db.close().unwrap();
     }
 }
@@ -113,7 +119,9 @@ fn tagged_overflow_value_byte_and_tag_durable_across_update_and_reopen() {
     {
         let mut db = Chisel::open(&path, Default::default()).unwrap();
         db.begin().unwrap();
-        h = db.allocate_tagged(b"small", 4321).unwrap();
+        h = db
+            .allocate_tagged(b"small", chisel::Tag::new(4321).unwrap())
+            .unwrap();
         db.set_client_byte(h, 0x5E).unwrap();
         // Grow past the inline limit so update() relocates the value to an
         // overflow chain and rewrites the entry — exercising carry-forward of
@@ -131,7 +139,7 @@ fn tagged_overflow_value_byte_and_tag_durable_across_update_and_reopen() {
             "client byte durable for overflow value"
         );
         assert_eq!(
-            db.tag(h).unwrap(),
+            db.tag(h).unwrap().unwrap(),
             4321,
             "tag durable across update + reopen"
         );
@@ -146,12 +154,12 @@ fn invalid_and_deleted_handles_error() {
     let mut db = Chisel::open(file.path(), Default::default()).unwrap();
     // Unknown handle without any transaction.
     assert!(matches!(
-        db.client_byte(999),
+        db.client_byte(chisel::Handle::from(999)),
         Err(ChiselError::InvalidHandle(999))
     ));
     db.begin().unwrap();
     assert!(matches!(
-        db.set_client_byte(999, 1),
+        db.set_client_byte(chisel::Handle::from(999), 1),
         Err(ChiselError::InvalidHandle(999))
     ));
     // Deleted handle (tombstone) is rejected like read(), not read as a stale value.

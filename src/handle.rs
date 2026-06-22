@@ -140,6 +140,27 @@ impl fmt::Display for Tag {
     }
 }
 
+/// Progress report from `Chisel::delete_with_tag`. `deleted` lists the handles
+/// removed in this pass (the engine deletes their chunks); `complete` is `true`
+/// when the tag has no remaining members. Produced only on the success path —
+/// a mid-pass error returns `Err` and no progress (the per-delete state stays
+/// consistent; only the reporting is lost).
+//
+// Lives here, above the engine, because its `deleted` field is `Vec<Handle>` —
+// a public-surface type. The engine's `delete_with_tag` returns a raw
+// `(Vec<u64>, bool)`; `Chisel::delete_with_tag` wraps it into this.
+// #[must_use] (ISSUES.md I121): `complete` is the field a resumable drop loops on.
+#[must_use = "TagDropProgress.complete tells you whether the tag drop finished; loop on it or bind with `let _`"]
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct TagDropProgress {
+    /// Handles removed from the index in this pass. May be fewer than `max` if
+    /// the tag emptied first.
+    pub deleted: Vec<Handle>,
+    /// `true` if the tag has no remaining members after this pass.
+    pub complete: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

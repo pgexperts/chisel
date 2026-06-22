@@ -15,7 +15,7 @@
 
 mod common;
 
-use chisel::Options;
+use chisel::{Handle, Options, Tag};
 use common::{open_chisel, open_chisel_with, Backing};
 
 fn back_to_back_handles_body(b: &Backing) {
@@ -23,10 +23,10 @@ fn back_to_back_handles_body(b: &Backing) {
     db.begin().unwrap();
     let mut expected = vec![
         db.allocate(b"untagged-a").unwrap(),
-        db.allocate_tagged(b"t42-a", 42).unwrap(),
+        db.allocate_tagged(b"t42-a", Tag::new(42).unwrap()).unwrap(),
         db.allocate(b"untagged-b").unwrap(),
-        db.allocate_tagged(b"t7-a", 7).unwrap(),
-        db.allocate_tagged(b"t42-b", 42).unwrap(),
+        db.allocate_tagged(b"t7-a", Tag::new(7).unwrap()).unwrap(),
+        db.allocate_tagged(b"t42-b", Tag::new(42).unwrap()).unwrap(),
     ];
     db.commit().unwrap();
 
@@ -49,14 +49,14 @@ dual_backing_test!(back_to_back_handles, back_to_back_handles_body);
 fn back_to_back_handles_with_tag_body(b: &Backing) {
     let mut db = open_chisel(b);
     db.begin().unwrap();
-    let t42_a = db.allocate_tagged(b"t42-a", 42).unwrap();
-    let _t7 = db.allocate_tagged(b"t7", 7).unwrap();
-    let t42_b = db.allocate_tagged(b"t42-b", 42).unwrap();
+    let t42_a = db.allocate_tagged(b"t42-a", Tag::new(42).unwrap()).unwrap();
+    let _t7 = db.allocate_tagged(b"t7", Tag::new(7).unwrap()).unwrap();
+    let t42_b = db.allocate_tagged(b"t42-b", Tag::new(42).unwrap()).unwrap();
     let _untagged = db.allocate(b"untagged").unwrap();
     db.commit().unwrap();
 
-    let first = db.handles_with_tag(42).unwrap();
-    let second = db.handles_with_tag(42).unwrap();
+    let first = db.handles_with_tag(Tag::new(42).unwrap()).unwrap();
+    let second = db.handles_with_tag(Tag::new(42).unwrap()).unwrap();
     assert_eq!(
         first, second,
         "repeated handles_with_tag() must be identical"
@@ -81,7 +81,7 @@ dual_backing_test!(
 fn reads_between_scans_body(b: &Backing) {
     let mut db = open_chisel(b);
     db.begin().unwrap();
-    let handles: Vec<u64> = (0..16)
+    let handles: Vec<Handle> = (0..16)
         .map(|i| db.allocate(format!("row-{i}").as_bytes()).unwrap())
         .collect();
     db.commit().unwrap();
@@ -109,12 +109,14 @@ fn update_between_scans_body(b: &Backing) {
     let mut db = open_chisel(b);
     db.begin().unwrap();
     let h_small = db.allocate(b"small").unwrap();
-    let h_tagged = db.allocate_tagged(b"tagged-small", 42).unwrap();
+    let h_tagged = db
+        .allocate_tagged(b"tagged-small", Tag::new(42).unwrap())
+        .unwrap();
     let h_other = db.allocate(b"other").unwrap();
     db.commit().unwrap();
 
     let first_all = db.handles().unwrap();
-    let first_t42 = db.handles_with_tag(42).unwrap();
+    let first_t42 = db.handles_with_tag(Tag::new(42).unwrap()).unwrap();
 
     // `update` preserves the handle (and the immutable tag), so the live set —
     // and each handle's radix position — is unchanged. Grow one value past
@@ -127,7 +129,7 @@ fn update_between_scans_body(b: &Backing) {
     db.commit().unwrap();
 
     let second_all = db.handles().unwrap();
-    let second_t42 = db.handles_with_tag(42).unwrap();
+    let second_t42 = db.handles_with_tag(Tag::new(42).unwrap()).unwrap();
     assert_eq!(first_all, second_all, "update must not perturb handles()");
     assert_eq!(
         first_t42, second_t42,
@@ -188,19 +190,22 @@ fn rolled_back_transaction_body(b: &Backing) {
     let mut db = open_chisel(b);
     db.begin().unwrap();
     let mut baseline_tag = vec![
-        db.allocate_tagged(b"base-1", TAG).unwrap(),
-        db.allocate_tagged(b"base-2", TAG).unwrap(),
-        db.allocate_tagged(b"base-3", TAG).unwrap(),
+        db.allocate_tagged(b"base-1", Tag::new(TAG).unwrap())
+            .unwrap(),
+        db.allocate_tagged(b"base-2", Tag::new(TAG).unwrap())
+            .unwrap(),
+        db.allocate_tagged(b"base-3", Tag::new(TAG).unwrap())
+            .unwrap(),
     ];
     let _base_untagged = db.allocate(b"base-untagged").unwrap();
     db.commit().unwrap();
 
     let baseline_all = db.handles().unwrap();
-    let baseline_t = db.handles_with_tag(TAG).unwrap();
+    let baseline_t = db.handles_with_tag(Tag::new(TAG).unwrap()).unwrap();
 
     db.begin().unwrap();
     for i in 0..GROW {
-        db.allocate_tagged(format!("ephemeral-{i}").as_bytes(), TAG)
+        db.allocate_tagged(format!("ephemeral-{i}").as_bytes(), Tag::new(TAG).unwrap())
             .unwrap();
     }
     db.rollback().unwrap();
@@ -212,13 +217,13 @@ fn rolled_back_transaction_body(b: &Backing) {
         "rollback must restore handles()"
     );
     assert_eq!(
-        db.handles_with_tag(TAG).unwrap(),
+        db.handles_with_tag(Tag::new(TAG).unwrap()).unwrap(),
         baseline_t,
         "rollback must restore handles_with_tag()"
     );
 
     // Order-normalized: the tag retains exactly its three committed members.
-    let mut got = db.handles_with_tag(TAG).unwrap();
+    let mut got = db.handles_with_tag(Tag::new(TAG).unwrap()).unwrap();
     got.sort_unstable();
     baseline_tag.sort_unstable();
     assert_eq!(got, baseline_tag);
@@ -232,20 +237,22 @@ fn savepoint_rollback_body(b: &Backing) {
     let mut db = open_chisel(b);
     db.begin().unwrap();
     let mut baseline_tag = vec![
-        db.allocate_tagged(b"keep-1", TAG).unwrap(),
-        db.allocate_tagged(b"keep-2", TAG).unwrap(),
+        db.allocate_tagged(b"keep-1", Tag::new(TAG).unwrap())
+            .unwrap(),
+        db.allocate_tagged(b"keep-2", Tag::new(TAG).unwrap())
+            .unwrap(),
     ];
     db.commit().unwrap();
 
     let baseline_all = db.handles().unwrap();
-    let baseline_t = db.handles_with_tag(TAG).unwrap();
+    let baseline_t = db.handles_with_tag(Tag::new(TAG).unwrap()).unwrap();
 
     // Grow both trees inside a savepoint, then roll the savepoint back. Like a
     // full rollback, rollback_to must re-derive depth (I99/C1).
     db.begin().unwrap();
     db.savepoint("grow").unwrap();
     for i in 0..GROW {
-        db.allocate_tagged(format!("ephemeral-{i}").as_bytes(), TAG)
+        db.allocate_tagged(format!("ephemeral-{i}").as_bytes(), Tag::new(TAG).unwrap())
             .unwrap();
     }
     db.rollback_to("grow").unwrap();
@@ -257,12 +264,12 @@ fn savepoint_rollback_body(b: &Backing) {
         "savepoint rollback must restore handles()"
     );
     assert_eq!(
-        db.handles_with_tag(TAG).unwrap(),
+        db.handles_with_tag(Tag::new(TAG).unwrap()).unwrap(),
         baseline_t,
         "savepoint rollback must restore handles_with_tag()"
     );
 
-    let mut got = db.handles_with_tag(TAG).unwrap();
+    let mut got = db.handles_with_tag(Tag::new(TAG).unwrap()).unwrap();
     got.sort_unstable();
     baseline_tag.sort_unstable();
     assert_eq!(got, baseline_tag);

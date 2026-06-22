@@ -133,7 +133,7 @@ fn test_defrag_stats_are_page_accurate_body(b: &Backing) {
     // 200-byte values pack ~39 per 8 KB page, so 100 values land
     // on ~3 data pages.
     db.begin().unwrap();
-    let handles: Vec<u64> = (0..100)
+    let handles: Vec<chisel::Handle> = (0..100)
         .map(|i| db.allocate(&[i as u8; 200]).unwrap())
         .collect();
     db.commit().unwrap();
@@ -183,7 +183,7 @@ fn test_defrag_respects_max_values_body(b: &Backing) {
     let mut db = open_chisel(b);
 
     db.begin().unwrap();
-    let handles: Vec<u64> = (0..50)
+    let handles: Vec<chisel::Handle> = (0..50)
         .map(|i| db.allocate(&[i as u8; 200]).unwrap())
         .collect();
     db.commit().unwrap();

@@ -35,7 +35,7 @@ dual_backing_test!(
 
 fn test_update_without_begin_errors_body(b: &Backing) {
     let mut db = open_chisel(b);
-    let err = db.update(0, b"x").unwrap_err();
+    let err = db.update(chisel::Handle::from(0), b"x").unwrap_err();
     assert!(matches!(err, ChiselError::NoActiveTransaction));
 }
 
@@ -46,7 +46,7 @@ dual_backing_test!(
 
 fn test_delete_without_begin_errors_body(b: &Backing) {
     let mut db = open_chisel(b);
-    let err = db.delete(0).unwrap_err();
+    let err = db.delete(chisel::Handle::from(0)).unwrap_err();
     assert!(matches!(err, ChiselError::NoActiveTransaction));
 }
 
@@ -57,7 +57,13 @@ dual_backing_test!(
 
 fn test_delete_many_without_begin_errors_body(b: &Backing) {
     let mut db = open_chisel(b);
-    let err = db.delete_many(&[0, 1, 2]).unwrap_err();
+    let err = db
+        .delete_many(&[
+            chisel::Handle::from(0),
+            chisel::Handle::from(1),
+            chisel::Handle::from(2),
+        ])
+        .unwrap_err();
     assert!(matches!(err, ChiselError::NoActiveTransaction));
 }
 
@@ -101,7 +107,9 @@ dual_backing_test!(
 
 fn test_set_root_name_without_begin_errors_body(b: &Backing) {
     let mut db = open_chisel(b);
-    let err = db.set_root_name("meta", 0).unwrap_err();
+    let err = db
+        .set_root_name("meta", chisel::Handle::from(0))
+        .unwrap_err();
     assert!(matches!(err, ChiselError::NoActiveTransaction));
 }
 
@@ -137,7 +145,9 @@ dual_backing_test!(test_begin_twice_errors, test_begin_twice_errors_body);
 fn test_update_invalid_handle_errors_body(b: &Backing) {
     let mut db = open_chisel(b);
     db.begin().unwrap();
-    let err = db.update(999_999, b"nope").unwrap_err();
+    let err = db
+        .update(chisel::Handle::from(999_999), b"nope")
+        .unwrap_err();
     assert!(matches!(err, ChiselError::InvalidHandle(999_999)));
     // Handle is still alive after an operational error.
     assert!(!db.is_poisoned());
@@ -152,7 +162,7 @@ dual_backing_test!(
 fn test_delete_invalid_handle_errors_body(b: &Backing) {
     let mut db = open_chisel(b);
     db.begin().unwrap();
-    let err = db.delete(42).unwrap_err();
+    let err = db.delete(chisel::Handle::from(42)).unwrap_err();
     assert!(matches!(err, ChiselError::InvalidHandle(42)));
     assert!(!db.is_poisoned());
     db.rollback().unwrap();
@@ -165,7 +175,7 @@ dual_backing_test!(
 
 fn test_read_invalid_handle_on_empty_db_errors_body(b: &Backing) {
     let db = open_chisel(b);
-    let err = db.read(0).unwrap_err();
+    let err = db.read(chisel::Handle::from(0)).unwrap_err();
     assert!(matches!(err, ChiselError::InvalidHandle(0)));
     assert!(!db.is_poisoned());
 }
@@ -287,7 +297,9 @@ fn test_delete_many_bad_handle_mid_batch_stops_at_first_error_body(b: &Backing) 
     db.commit().unwrap();
 
     db.begin().unwrap();
-    let err = db.delete_many(&[h1, 999_999, h3]).unwrap_err();
+    let err = db
+        .delete_many(&[h1, chisel::Handle::from(999_999), h3])
+        .unwrap_err();
     assert!(matches!(err, ChiselError::InvalidHandle(999_999)));
     // h1 is already gone inside the txn; h2 was never touched; h3 was
     // never reached. Rollback to restore.

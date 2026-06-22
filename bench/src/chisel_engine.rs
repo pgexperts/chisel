@@ -73,30 +73,30 @@ impl Engine for ChiselEngine {
     }
 
     fn allocate(&mut self, value: &[u8]) -> EngineResult<Identifier> {
-        Ok(Identifier(self.db.allocate(value)?))
+        Ok(Identifier(self.db.allocate(value)?.get()))
     }
 
     fn read(&self, id: Identifier) -> EngineResult<Vec<u8>> {
-        Ok(self.db.read(id.0)?)
+        Ok(self.db.read(chisel::Handle::from(id.0))?)
     }
 
     fn update(&mut self, id: Identifier, value: &[u8]) -> EngineResult<()> {
-        Ok(self.db.update(id.0, value)?)
+        Ok(self.db.update(chisel::Handle::from(id.0), value)?)
     }
 
     fn delete(&mut self, id: Identifier) -> EngineResult<()> {
-        Ok(self.db.delete(id.0)?)
+        Ok(self.db.delete(chisel::Handle::from(id.0))?)
     }
 
     fn delete_many(&mut self, ids: &[Identifier]) -> EngineResult<()> {
-        // SAFETY: Identifier is #[repr(transparent)] over u64, so a
-        // slice of Identifier and a slice of u64 have identical
-        // layout. The borrow ends with this call; no aliasing
-        // concern; no 'static lifetime escapes. Saves the per-call
-        // Vec<u64> allocation that the previous safe-collect form
-        // required (audit F5).
-        let handles: &[u64] =
-            unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const u64, ids.len()) };
+        // SAFETY: Identifier and chisel::Handle are both
+        // #[repr(transparent)] over u64, so a slice of Identifier and a
+        // slice of Handle have identical layout. The borrow ends with
+        // this call; no aliasing concern; no 'static lifetime escapes.
+        // Saves the per-call Vec allocation that the safe-collect form
+        // would require (audit F5).
+        let handles: &[chisel::Handle] =
+            unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const chisel::Handle, ids.len()) };
         Ok(self.db.delete_many(handles)?)
     }
 

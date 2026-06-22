@@ -48,3 +48,28 @@ def test_delete_tagged_wrong_tag_raises(mem_db):
         mem_db.delete_tagged(h, 8)
     assert mem_db.handles_with_tag(7) == [h]
     mem_db.commit()
+
+
+# I126: tag 0 is no longer a valid tag — "untagged" is the absence of a tag.
+def test_allocate_tagged_rejects_zero(mem_db):
+    with pytest.raises(ValueError):
+        mem_db.allocate_tagged(b"row", 0)
+
+
+def test_handles_with_tag_rejects_zero(mem_db):
+    with pytest.raises(ValueError):
+        mem_db.handles_with_tag(0)
+
+
+def test_tag_of_untagged_handle_is_none(mem_db):
+    mem_db.begin()
+    h = mem_db.allocate(b"plain")
+    mem_db.commit()
+    assert mem_db.tag(h) is None
+
+
+def test_tag_of_tagged_handle_is_int(mem_db):
+    mem_db.begin()
+    h = mem_db.allocate_tagged(b"row", 9)
+    mem_db.commit()
+    assert mem_db.tag(h) == 9
