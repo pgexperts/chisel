@@ -154,6 +154,9 @@ pub enum PageType {
     // Interior node of the multi-page radix freemap tree (COW radix of bitmap
     // leaves). Introduced for the multi-page freemap feature; 0x07 is the next
     // slot after MembershipLeaf. Leaf pages reuse PageType::FreeMap (0x04).
+    // No non-test constructor yet — the freemap tree implementation unit is
+    // the production caller.
+    #[allow(dead_code)]
     FreeMapInterior = 0x07,
 }
 
@@ -396,7 +399,10 @@ mod tests {
     #[test]
     fn freemap_interior_type_tag_and_version() {
         assert_eq!(PageType::FreeMapInterior as u8, 0x07);
-        assert_eq!(current_version(PageType::FreeMapInterior), PAGE_FORMAT_VERSION_CURRENT);
+        assert_eq!(
+            current_version(PageType::FreeMapInterior),
+            PAGE_FORMAT_VERSION_CURRENT
+        );
     }
 
     #[test]
