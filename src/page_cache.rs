@@ -1004,11 +1004,32 @@ impl PageCache {
             // clean page sit at the LRU tail during a spill can't underflow.
             self.untrack_dirty(entry.dirty);
 
-            // Spill (may return SpillwayFull, in which case we DO NOT
-            // re-insert — the entry is dropped and the caller will
-            // observe SpillwayFull on this allocation).
-            let spw = self.ensure_spillway()?;
-            spw.spill(victim_id, &entry.buf)?;
+            // Attempt the spill. On failure the victim's uncommitted bytes must
+            // NOT be lost: SpillwayFull is operational (non-fatal, doesn't
+            // poison — error.rs is_fatal()), and the public contract (lib.rs)
+            // says operational errors leave the handle usable, so a caller may
+            // continue or commit afterward. Dropping the removed victim here
+            // would let `flush()` write a cache that no longer holds this page,
+            // and the committed superblock would point at a handle-table page
+            // that silently reverted to stale committed content — a durability/
+            // atomicity violation (review 2026-06-22). So restore the victim
+            // (entries + LRU tail + dirty_count) before propagating: a later
+            // commit then flushes it correctly, and a rollback discards it
+            // cleanly. `entry` was lifted out of `self.entries` above precisely
+            // so `&entry.buf` does not conflict with the `&mut self` borrow that
+            // `ensure_spillway` takes. An `ensure_spillway()` open error (I/O)
+            // is restored the same way.
+            let spill_result = self
+                .ensure_spillway()
+                .and_then(|spw| spw.spill(victim_id, &entry.buf));
+            if let Err(e) = spill_result {
+                if entry.dirty {
+                    self.dirty_count += 1;
+                }
+                self.lru.push_back(victim_id); // back to the LRU tail it came from
+                self.entries.insert(victim_id, entry);
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -1193,12 +1214,59 @@ mod tests {
             matches!(err, ChiselError::SpillwayFull { limit_bytes } if limit_bytes == spillway_bytes),
             "expected SpillwayFull {{ limit_bytes: {spillway_bytes} }}, got {err:?}"
         );
-        // After SpillwayFull, the cache must still be at exactly
-        // max_pages — the failed-allocation's bytes are dropped from
-        // both cache and spillway, but the prior dirty entries are
-        // unchanged.
-        assert_eq!(cache.entries.len(), max_pages);
-        assert_eq!(cache.dirty_count, max_pages);
+        // After SpillwayFull NOTHING is dropped (review 2026-06-22 fix): the
+        // eviction victim that could not be spilled is restored to the cache, so
+        // it transiently holds max_pages + 1 dirty pages (the new allocation
+        // plus the restored victim). The caller must rollback or surface the
+        // error — neither path loses a page. Previously this asserted
+        // max_pages, which encoded the silent victim-drop bug.
+        assert_eq!(cache.entries.len(), max_pages + 1);
+        assert_eq!(cache.dirty_count, max_pages + 1);
+    }
+
+    // Regression (review 2026-06-22): on SpillwayFull during Phase-B eviction,
+    // maybe_evict removed the dirty LRU-tail victim from the cache BEFORE the
+    // spill was attempted and then dropped it on the `?` error. Because
+    // SpillwayFull is operational (non-fatal), a caller could continue and
+    // commit, at which point the committed superblock pointed at a page that had
+    // silently reverted to stale committed content. The victim — with its
+    // uncommitted write — must survive a failed spill.
+    #[test]
+    fn spillway_full_during_evict_preserves_victim_page() {
+        let max_pages = 4;
+        let spillway_bytes = 4 * PAGE_SIZE as u64; // 8 dirty pages before SpillwayFull
+        let (_dir, mut cache) = fresh_cache_with_spillway(max_pages, spillway_bytes);
+
+        // Fill cache (4) + spillway (4) to the brink: the next allocation's
+        // Phase-B spill will fail.
+        for _ in 0..(max_pages + 4) {
+            cache.new_page().unwrap();
+        }
+
+        // Identify the page that WILL be evicted (the LRU tail) and stamp a
+        // sentinel into it via direct field access — `get_mut` would touch the
+        // LRU and change which page is the victim.
+        let victim = cache.lru.iter_lru_to_mru().next().unwrap();
+        cache.entries.get_mut(&victim).unwrap().buf[0] = 0xCD;
+
+        // Trigger the failing spill.
+        let err = cache.new_page().unwrap_err();
+        assert!(
+            matches!(err, ChiselError::SpillwayFull { .. }),
+            "expected SpillwayFull, got {err:?}"
+        );
+
+        // The victim must still be retrievable WITH its uncommitted byte. With
+        // the bug it was dropped, so get() would (mis)read stale/disk content.
+        assert!(
+            cache.entries.contains_key(&victim),
+            "victim was silently dropped from the cache on SpillwayFull"
+        );
+        assert_eq!(
+            cache.get(victim).unwrap()[0],
+            0xCD,
+            "victim's uncommitted write was lost on SpillwayFull"
+        );
     }
 
     #[test]
