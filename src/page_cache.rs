@@ -1058,7 +1058,7 @@ impl PageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::page_io::PageIo;
+    use crate::page_io::{Fault, PageIo};
     use tempfile::{NamedTempFile, TempDir};
 
     fn fresh_cache(max_pages: usize) -> (TempDir, PageCache) {
@@ -1254,6 +1254,43 @@ mod tests {
         let id = cache.new_page().unwrap();
         assert!(cache.is_dirty(id));
         let _ = cache.claim_page(id);
+    }
+
+    #[test]
+    fn claim_page_keeps_dirty_count_consistent() {
+        // I114: the I20 debug_assert! in claim_page is a no-op under
+        // `cargo test --release` (the wheel gate, wheels.yml). This asserts the
+        // OBSERVABLE accounting consequence that holds in EVERY profile: claiming
+        // a CLEAN page (the legitimate freemap-reuse path) adds exactly one dirty
+        // entry. A regression that mis-tracks dirty_count fails here in release
+        // too — complementing the debug-only claim_page_asserts_on_dirty_page,
+        // which catches the illegitimate (claim-a-dirty-page) path.
+        let (_dir, mut cache) = fresh_cache(64);
+        let id = cache.new_page().unwrap();
+        cache.flush().unwrap(); // page becomes clean
+        assert!(
+            !cache.is_dirty(id),
+            "precondition: page clean before reclaim"
+        );
+
+        let before = cache.dirty_count;
+        cache.claim_page(id).unwrap();
+        assert!(cache.is_dirty(id), "reclaimed page is dirty");
+        assert_eq!(
+            cache.dirty_count,
+            before + 1,
+            "claim of a clean page must add exactly one dirty entry (I20 accounting)"
+        );
+        // The real I20 invariant is counter/flag CONSISTENCY: dirty_count must
+        // equal the actual number of dirty entries. A mis-accounting claim (the
+        // bug the debug_assert guards) would desync the counter from the flags
+        // even on this legitimate clean-page path — the delta assertion above
+        // alone could not catch a desync that predated the claim.
+        let actual_dirty = cache.entries.values().filter(|e| e.dirty).count();
+        assert_eq!(
+            cache.dirty_count, actual_dirty,
+            "dirty_count must equal the live dirty-entry count (I20 accounting)"
+        );
     }
 
     #[test]
@@ -1566,5 +1603,42 @@ mod tests {
         assert_eq!(cache.get(p0).unwrap()[0], 0x01);
         assert_eq!(cache.get(p1).unwrap()[0], 0x02);
         assert_eq!(cache.get(p2).unwrap()[0], 0x03);
+    }
+
+    #[test]
+    fn failed_flush_fsync_leaves_pages_clean_but_nondurable() {
+        // I112 (durability window — see the flush() comment): flush clears each
+        // page's dirty flag in phase 1a BEFORE the trailing fsync. If that fsync
+        // fails, the pages are now CLEAN in the cache yet NOT durable on disk —
+        // a state that is safe ONLY because the transaction manager poisons on
+        // the fatal IoError (proven in transaction.rs). This makes the hazard
+        // observable. spillway_max_bytes=0 keeps flush to a single fsync.
+        let (_dir, mut cache) = fresh_cache_with_spillway(64, 0);
+        let id = cache.new_page().unwrap();
+        assert!(cache.is_dirty(id));
+        assert_eq!(cache.dirty_count, 1);
+
+        cache.io().arm_fault(Fault::FailFsync(0));
+        let result = cache.flush();
+        assert!(
+            matches!(result, Err(ChiselError::IoError(_))),
+            "flush must surface the fsync IoError, got {result:?}"
+        );
+        // The dirty flags were already cleared (phase 1a) before the failed
+        // fsync. This is the durability window; poison (asserted in
+        // transaction.rs) is what makes it safe. Cross-check the counter against
+        // the ACTUAL entry flags: both the `dirty_count` counter and every
+        // entry's `dirty` bit are cleared even though the fsync — and thus
+        // durability — failed. (The `Err(IoError)` assertion above is what
+        // proves the fault actually fired; this pair documents the hazard.)
+        assert_eq!(
+            cache.dirty_count, 0,
+            "phase-1a cleared dirty flags before the (failed) fsync"
+        );
+        assert_eq!(
+            cache.entries.values().filter(|e| e.dirty).count(),
+            0,
+            "phase-1a cleared the real dirty flags, not just the counter"
+        );
     }
 }

@@ -44,6 +44,26 @@ enum Backing {
     Memory { pages: Vec<[u8; PAGE_SIZE]> },
 }
 
+/// Test-only fault plan armed via `PageIo::arm_fault` (I112). `Copy` so it
+/// lives in a `Cell` (the `io::Error` is synthesized at the failure site, not
+/// stored). One fault is armed at a time; faults are one-shot except the fsync
+/// countdown, which decrements on each fsync until it fires.
+#[cfg(test)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Fault {
+    #[default]
+    None,
+    /// Fail an fsync via a countdown: `FailFsync(0)` fails the NEXT fsync;
+    /// `FailFsync(n)` lets `n` fsyncs succeed (decrementing each) then fails the
+    /// one after. Lets a test target a specific fsync in commit's three-fsync
+    /// protocol (pre-drain / data-flush / superblock).
+    FailFsync(u32),
+    /// Fail `write_page` for exactly this page id (one-shot).
+    FailWritePage(u64),
+    /// Fail `read_page` for exactly this page id (one-shot).
+    FailReadPage(u64),
+}
+
 pub struct PageIo {
     backing: Backing,
     // Tracked alongside the backing so every mutating path can fail-fast
@@ -69,6 +89,11 @@ pub struct PageIo {
     // stale. Used by both File and Memory backings — for Memory the
     // cache mirrors `pages.len()` and the maintenance cost is negligible.
     cached_page_count: Cell<u64>,
+    // I112: test-only fault injector. Checked at the top of read_page/
+    // write_page/fsync; cfg(test) so it is compiled out of production builds
+    // entirely (same discipline as transaction.rs::fail_next_membership_op).
+    #[cfg(test)]
+    fault: Cell<Fault>,
 }
 
 impl PageIo {
@@ -109,6 +134,8 @@ impl PageIo {
             read_only,
             fsync_calls: Cell::new(0),
             cached_page_count: Cell::new(initial_page_count),
+            #[cfg(test)]
+            fault: Cell::new(Fault::None),
         })
     }
 
@@ -128,6 +155,8 @@ impl PageIo {
             // I51: seeded to 0; write_page() and set_page_count() keep
             // it in sync with pages.len() as the Vec grows or shrinks.
             cached_page_count: Cell::new(0),
+            #[cfg(test)]
+            fault: Cell::new(Fault::None),
         })
     }
 
@@ -215,6 +244,13 @@ impl PageIo {
         if page_id >= page_count {
             return Err(ChiselError::InvalidPageId { page_id });
         }
+        #[cfg(test)]
+        if self.fault.get() == Fault::FailReadPage(page_id) {
+            self.fault.set(Fault::None);
+            return Err(ChiselError::IoError(std::io::Error::other(
+                "fault-injected read failure",
+            )));
+        }
         match &mut self.backing {
             Backing::File { file } => {
                 let offset = page_id * PAGE_SIZE as u64;
@@ -247,6 +283,13 @@ impl PageIo {
     pub fn write_page(&mut self, page_id: u64, buf: &[u8; PAGE_SIZE]) -> Result<()> {
         if self.read_only {
             return Err(ChiselError::ReadOnlyMode);
+        }
+        #[cfg(test)]
+        if self.fault.get() == Fault::FailWritePage(page_id) {
+            self.fault.set(Fault::None);
+            return Err(ChiselError::IoError(std::io::Error::other(
+                "fault-injected write failure",
+            )));
         }
         match &mut self.backing {
             Backing::File { file } => {
@@ -299,6 +342,17 @@ impl PageIo {
         if self.read_only {
             return Err(ChiselError::ReadOnlyMode);
         }
+        #[cfg(test)]
+        match self.fault.get() {
+            Fault::FailFsync(0) => {
+                self.fault.set(Fault::None);
+                return Err(ChiselError::IoError(std::io::Error::other(
+                    "fault-injected fsync failure",
+                )));
+            }
+            Fault::FailFsync(n) => self.fault.set(Fault::FailFsync(n - 1)),
+            _ => {}
+        }
         match &self.backing {
             Backing::File { file } => {
                 file.sync_all()?;
@@ -323,6 +377,12 @@ impl PageIo {
     /// meaning beyond "at least this many succeeded").
     pub fn fsync_count(&self) -> u64 {
         self.fsync_calls.get()
+    }
+
+    /// Arm a test fault (I112). The next matching I/O op returns `IoError`.
+    #[cfg(test)]
+    pub(crate) fn arm_fault(&self, f: Fault) {
+        self.fault.set(f);
     }
 
     /// Return the number of whole pages in the file.
@@ -727,4 +787,52 @@ mod memory_backing_tests {
     // The remaining two I51 tests are file-backed and live in
     // `read_only_tests` below (which already imports NamedTempFile
     // and defines the `seeded_file` helper).
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn armed_fsync_fault_returns_io_error_once() {
+        let io = PageIo::open_in_memory().unwrap();
+        io.arm_fault(Fault::FailFsync(0));
+        assert!(matches!(io.fsync(), Err(ChiselError::IoError(_))));
+        assert!(io.fsync().is_ok(), "one-shot: next fsync succeeds");
+    }
+
+    #[test]
+    fn armed_fsync_countdown_fires_on_the_nth() {
+        let io = PageIo::open_in_memory().unwrap();
+        io.arm_fault(Fault::FailFsync(2));
+        assert!(io.fsync().is_ok(), "1st succeeds (2 -> 1)");
+        assert!(io.fsync().is_ok(), "2nd succeeds (1 -> 0)");
+        assert!(
+            matches!(io.fsync(), Err(ChiselError::IoError(_))),
+            "3rd fires"
+        );
+    }
+
+    #[test]
+    fn armed_write_fault_targets_one_page_then_clears() {
+        let mut io = PageIo::open_in_memory().unwrap();
+        let buf = [0u8; PAGE_SIZE];
+        io.write_page(0, &buf).unwrap();
+        io.arm_fault(Fault::FailWritePage(0));
+        assert!(matches!(
+            io.write_page(0, &buf),
+            Err(ChiselError::IoError(_))
+        ));
+        assert!(io.write_page(0, &buf).is_ok(), "one-shot cleared");
+    }
+
+    #[test]
+    fn armed_read_fault_targets_one_page_then_clears() {
+        let mut io = PageIo::open_in_memory().unwrap();
+        let buf = [0u8; PAGE_SIZE];
+        io.write_page(0, &buf).unwrap();
+        io.arm_fault(Fault::FailReadPage(0));
+        assert!(matches!(io.read_page(0), Err(ChiselError::IoError(_))));
+        assert!(io.read_page(0).is_ok(), "one-shot cleared");
+    }
 }

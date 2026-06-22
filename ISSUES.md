@@ -1414,12 +1414,14 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 **Fixed (2026-06-21):** **correction to the direction above** — the depth-2 boundary is `capacity(1) = ENTRIES_PER_LEAF * PTRS_PER_INTERIOR = 510 * 1021 = 520_710`, NOT `ENTRIES_PER_LEAF²` (= 260_100, still depth 1). Changes: (1) renamed `test_handle_table_grows_to_two_levels` → `test_handle_table_grows_to_depth_one` and added `assert_eq!(ht.depth(), 1)` so it honestly pins what it exercises; (2) added `test_handle_table_grows_to_depth_two` — inserts a sparse handle set including one ≥ 520_710, asserts `depth() == 2`, reads every entry back, and asserts an uninserted in-capacity handle reads absent (the historical I6/I26 phantom-descent guard); (3) added two `HandleTable` proptests — a `HashMap`-oracle insert/lookup over handles `0..1_100_000` (cases routinely reach depth 2, last-write-wins) and a `grow → recover_depth` round-trip over `0..600M` (depths 0–3); (4) mirrored both proptests onto the membership index's generic `RadixU64` (the second radix implementation — `prop_radix_insert_lookup_matches_oracle` over keys `0..2.5M` crossing its `capacity(1) = 1021² = 1_042_441` boundary, and `prop_radix_recover_depth_matches` over `0..1.1e9`). All six new tests pass; full suite green. The `transaction.rs` stateful-commit proptest noted above is NOT done here — deferred as its own item.
 
-#### I112. Fault-injection test layer absent — the poison/flush coupling and the fatal-`IoError` path are reasoned, not tested [deepdive 2026-06-21] — **P2**
+#### I112. Fault-injection test layer absent — the poison/flush coupling and the fatal-`IoError` path are reasoned, not tested [deepdive 2026-06-21] — **P2** ✅ FIXED 2026-06-21
 **Where:** `src/page_cache.rs` flush (clears dirty flags before the trailing fsync); `src/transaction.rs:2833` (`fatal_error_outside_commit_also_poisons`); `error.rs:94` (`IoError`)
 
 **Problem:** flush clears per-page dirty flags *before* the trailing fsync — safe *only* under the poison model, and the comment warns it breaks if poisoning is weakened. No test asserts a flush/fsync error actually poisons: `test_poison_recovery_by_reopen` can't inject a fault, and `fatal_error_outside_commit_also_poisons` is tautological (`force_poison_for_test()` then asserts `Poisoned`). The most-traveled fatal path (`IoError`) is constructed-only — no test induces a real I/O fault and observes the engine returning it.
 
 **Direction of fix:** a `Backing::FaultyFile` test variant that fails a chosen syscall closes the poison/flush gap and exercises `IoError` / `CorruptSuperblock` / `InvalidMagic` end-to-end (also addresses open question 4 and several I115 gaps at once).
+
+**Fixed (2026-06-21, PR #62):** the mechanism landed NOT as a `Backing` variant but as a `#[cfg(test)] fault: Cell<Fault>` field on `PageIo` — it mirrors the existing `fail_next_membership_op` injection pattern, composes with BOTH backings (so the poison tests run on the fast in-memory `PageIo`), and avoids duplicating the Memory page-store. `Fault` is a `Copy` enum — `None | FailFsync(u32 countdown) | FailWritePage(u64) | FailReadPage(u64)` — checked at the top of `read_page`/`write_page`/`fsync`, one-shot (the io::Error is synthesized at the site so the enum stays `Copy`); `arm_fault` is the test-only setter. Tests: (a) `page_cache.rs::failed_flush_fsync_leaves_pages_clean_but_nondurable` confirms `dirty_count == 0` after a faulted flush — the durability window made observable; (b) `transaction.rs::commit_fsync_failure_poisons_at_each_of_the_three_fsyncs` drives the `FailFsync` countdown at each of commit's three fsyncs (a one-shot would only have hit the pre-drain — the countdown was a required refinement found in design verification); (c) `commit_write_failure_poisons`; (d) `fatal_error_outside_commit_also_poisons` REWRITTEN to drive a real `FailReadPage` fault through a cold reopen instead of the `force_poison_for_test` tautology (`force_poison_for_test` kept — `poisoned_manager_rejects_every_public_entry_point` still uses it as a precondition). Deferred non-goals: faulting `set_page_count` and open-time `IoError`. Subsumes I114 + I115.
 
 #### I113. Weak assertions that survive a subtle break [deepdive 2026-06-21] — **P3**
 **Where:** `tests/defrag.rs:63`; `src/page_cache.rs:1294`; `tests/spillway_runtime_mutability.rs:33`; assorted `assert!(x.is_some()/is_err())` sites
@@ -1428,19 +1430,23 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 
 **Direction of fix:** tighten each to assert the actual expected value/variant/bound.
 
-#### I114. `claim_page_asserts_on_dirty_page` is `#[cfg(debug_assertions)]` and vanishes under `--release` [deepdive 2026-06-21] — **P3**
+#### I114. `claim_page_asserts_on_dirty_page` is `#[cfg(debug_assertions)]` and vanishes under `--release` [deepdive 2026-06-21] — **P3** ✅ FIXED 2026-06-21
 **Where:** `src/page_cache.rs:1236`; the release-profile gate at `wheels.yml:17`
 
 **Problem:** the test guarding the I20 dirty-page invariant is debug-only, so it silently disappears under `cargo test --release` — which the wheel gate uses. The invariant is checked only in dev-profile runs.
 
 **Direction of fix:** either keep the `debug_assert!` but assert the *observable* consequence in a release-safe test, or document why debug-only coverage is acceptable here.
 
-#### I115. Error-variant coverage gaps; `InvalidMagic` likely unreachable; `CorruptSuperblock` never pinned [deepdive 2026-06-21] — **P3**
+**Fixed (2026-06-21, PR #62):** kept the `debug_assert!` (cheap dev guard) and the debug-only `claim_page_asserts_on_dirty_page`, and ADDED a release-compiled `claim_page_keeps_dirty_count_consistent` that asserts the *observable* accounting consequence — claiming a clean page (the legitimate freemap-reuse path) adds exactly one dirty entry, so `dirty_count` stays consistent with the live entry set in EVERY profile. Verified passing under both `cargo test` and `cargo test --release`.
+
+#### I115. Error-variant coverage gaps; `InvalidMagic` likely unreachable; `CorruptSuperblock` never pinned [deepdive 2026-06-21] — **P3** ✅ FIXED 2026-06-21
 **Where:** `src/error.rs:111` (`InvalidMagic`); `tests/recovery_tests.rs:533` (the OR-arm); the `Poisoned` end-to-end loop
 
 **Problem:** `InvalidMagic` is probably unreachable (a bad magic surfaces as `CorruptSuperblock` via `select` — see I106); `CorruptSuperblock` is never *pinned* as the expected variant (only matched in an OR-arm); the `Poisoned` end-to-end path is synthetic (`force_poison_for_test`, never a real fatal error driven into a live manager — see I112). **Memory correction:** the project note "ReadOnlyMode never raised" is stale — `tests/options_validation.rs:240` genuinely drives and matches it.
 
 **Direction of fix:** pin `CorruptSuperblock` as the sole expected variant in the recovery tests; decide whether `InvalidMagic` is dead (remove) or reachable (add a test); drive a real fatal error for the `Poisoned` loop (depends on I112).
+
+**Fixed (2026-06-21, PR #62):** `recovery_tests.rs::corrupt_magic_surfaces_as_corrupt_superblock_not_invalid_magic` corrupts the 4-byte magic in EVERY superblock slot (re-stamping the checksum so the magic check, not the checksum check, is the failing gate) and asserts `CorruptSuperblock` as the SOLE expected variant — pinning it AND proving `InvalidMagic` unreachable in one test. `InvalidMagic` was then REMOVED as provably-dead public API (mechanism: a bad magic makes `Superblock::deserialize` return `None` for every slot → `select` returns `None` → the open path surfaces `CorruptSuperblock`, never `InvalidMagic`). Removal spanned the enum decl, `is_fatal`/`Display`/exhaustiveness-test arms, the fatal-variant tripwire count (9 → 8), the PyO3 binding (`InvalidMagicError` exception + registration + match arm), the Python package (`__init__`, `.pyi`, `test_errors.py`), and both READMEs — maintainer-approved (single Chisel client, can adapt). The `Poisoned` end-to-end path is now driven by a real fault (see I112's rewritten `fatal_error_outside_commit_also_poisons`).
 
 ### Correctness
 

@@ -12,7 +12,7 @@ use crate::superblock::Superblock;
 use crate::{Chisel, ChiselError, Options};
 use std::fs;
 use std::io::{Read as _, Seek, SeekFrom, Write};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 
 /// Scan the file for the first page whose type tag matches `want` and
 /// return its page id. Panics if no such page exists; test helper only.
@@ -1441,4 +1441,34 @@ fn test_file_not_found_without_create() {
     let _ = fs::remove_file(&path);
     let result = Chisel::open(&path, Options::default().create_if_missing(false));
     assert!(result.is_err());
+}
+
+// I115: corrupt the 4-byte magic (superblock offset 0..4) in EVERY superblock
+// slot, re-stamping the checksum so the magic check (not the checksum check) is
+// the failing gate. Superblock::deserialize then returns None for every slot,
+// Superblock::select returns None, and open surfaces CorruptSuperblock. This
+// PINS CorruptSuperblock as the sole expected variant AND proves InvalidMagic is
+// unreachable (a bad magic never produces it) — the basis for removing the dead
+// variant in the next task.
+#[test]
+fn corrupt_magic_surfaces_as_corrupt_superblock_not_invalid_magic() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.chisel");
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        db.allocate(b"x").unwrap();
+        db.commit().unwrap();
+        db.close().unwrap();
+    }
+    for slot in 0..crate::superblock::DEFAULT_SUPERBLOCK_COUNT as u64 {
+        rewrite_page_with_valid_checksum(&path, slot, |buf| {
+            buf[0] ^= 0xFF; // flip a magic byte; magic lives at bytes 0..4
+        });
+    }
+    match Chisel::open(&path, Default::default()) {
+        Err(ChiselError::CorruptSuperblock) => {}
+        Err(e) => panic!("bad magic must surface as CorruptSuperblock (sole variant), got {e:?}"),
+        Ok(_) => panic!("Chisel::open accepted a fully-corrupted-magic file"),
+    };
 }

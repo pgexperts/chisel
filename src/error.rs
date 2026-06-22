@@ -108,7 +108,6 @@ pub enum ChiselError {
         expected: u64,
         actual: u64,
     },
-    InvalidMagic,
     LockFailed,
     // Raised when a superblock's checksum is valid but its format_version
     // field does not match the binary's supported version. Distinct from
@@ -172,7 +171,6 @@ impl ChiselError {
                 | ChiselError::ChecksumMismatch { .. }
                 | ChiselError::CorruptSuperblock
                 | ChiselError::FileSizeMismatch { .. }
-                | ChiselError::InvalidMagic
                 | ChiselError::LockFailed
                 | ChiselError::UnsupportedFormatVersion { .. }
                 | ChiselError::CorruptPage { .. }
@@ -240,7 +238,6 @@ impl fmt::Display for ChiselError {
                     "file size mismatch: expected {expected} bytes, got {actual}"
                 )
             }
-            ChiselError::InvalidMagic => write!(f, "invalid magic number"),
             ChiselError::LockFailed => write!(f, "failed to acquire exclusive file lock"),
             ChiselError::UnsupportedFormatVersion { found, expected } => write!(
                 f,
@@ -413,7 +410,6 @@ mod tests {
                 | ChiselError::ChecksumMismatch { .. }
                 | ChiselError::CorruptSuperblock
                 | ChiselError::FileSizeMismatch { .. }
-                | ChiselError::InvalidMagic
                 | ChiselError::LockFailed
                 | ChiselError::UnsupportedFormatVersion { .. }
                 | ChiselError::CorruptPage { .. }
@@ -451,7 +447,6 @@ mod tests {
                 expected: 0,
                 actual: 0,
             },
-            ChiselError::InvalidMagic,
             ChiselError::LockFailed,
             ChiselError::UnsupportedFormatVersion {
                 found: 0,
@@ -467,9 +462,9 @@ mod tests {
                 "is_fatal() disagrees with the documented Fatal/Operational block for {e:?}"
             );
         }
-        // Tripwire: exactly 9 variants are fatal today. If this count moves, the
+        // Tripwire: exactly 8 variants are fatal today. If this count moves, the
         // Fatal/Operational split changed — confirm that was intentional (it is a
         // breaking change for callers doing error-class matching, per the header).
-        assert_eq!(all.iter().filter(|e| e.is_fatal()).count(), 9);
+        assert_eq!(all.iter().filter(|e| e.is_fatal()).count(), 8);
     }
 }

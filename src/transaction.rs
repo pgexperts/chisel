@@ -2611,7 +2611,7 @@ impl TransactionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::page_io::PageIo;
+    use crate::page_io::{Fault, PageIo};
     use tempfile::{NamedTempFile, TempDir};
 
     fn fresh_manager() -> TransactionManager {
@@ -2842,19 +2842,52 @@ mod tests {
         ));
     }
 
-    // A fatal error observed during a normal operation must also poison
-    // the manager, not just commit errors. This exercises the
-    // `poison_on_fatal` branch of the wrapper pattern.
     #[test]
     fn fatal_error_outside_commit_also_poisons() {
-        let tm = fresh_manager();
-        // Inject a fatal error via the helper's test hook: force the
-        // flag, then confirm a subsequent operation sees it through a
-        // shared reference. (A genuine fault-injection harness is out
-        // of scope; we exercise the machinery deterministically.)
-        tm.force_poison_for_test();
-        let err = tm.read(0).unwrap_err();
-        assert!(matches!(err, ChiselError::Poisoned));
+        // I112: a REAL fatal IoError on a cold read OUTSIDE any transaction
+        // poisons the manager (the non-commit fatal path, poison_on_fatal). This
+        // replaces the old force_poison_for_test() tautology with an injected
+        // fault. We reopen over the committed file so read(h) is a cache MISS
+        // that actually reaches read_page(pid).
+        let file = NamedTempFile::new().unwrap();
+        let h;
+        let pid;
+        {
+            let io = PageIo::open(file.path(), false).unwrap();
+            let cache = PageCache::new(
+                io,
+                1024 * PAGE_SIZE as u64,
+                0,
+                crate::DrainInsertion::LruTail,
+                crate::SpillwayLocation::InMemory,
+            );
+            let mut tm = TransactionManager::create_new(cache, 2).unwrap();
+            tm.begin().unwrap();
+            h = tm.allocate(b"durable").unwrap();
+            tm.commit().unwrap();
+            pid = tm.handle_live_page_id(h).unwrap().expect("live data page");
+        }
+
+        // Reopen: cold cache, so read(h) misses and calls read_page(pid).
+        let io = PageIo::open(file.path(), false).unwrap();
+        let cache = PageCache::new(
+            io,
+            1024 * PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
+        let tm = TransactionManager::open_existing(cache).unwrap();
+        tm.cache.borrow().io().arm_fault(Fault::FailReadPage(pid));
+        let result = tm.read(h);
+        assert!(
+            matches!(result, Err(ChiselError::IoError(_))),
+            "cold read fault must surface IoError, got {result:?}"
+        );
+        assert!(
+            tm.is_poisoned(),
+            "a fatal read error outside commit must poison"
+        );
     }
 
     // Regression test for ISSUES.md I3 + I7. A transaction that forces
@@ -4118,5 +4151,51 @@ mod tests {
         assert_eq!(tm.read(5).unwrap(), b"v4");
         tm.commit().unwrap();
         assert_eq!(tm.read(5).unwrap(), b"v4");
+    }
+
+    #[test]
+    fn commit_fsync_failure_poisons_at_each_of_the_three_fsyncs() {
+        // I112: commit performs THREE fsyncs (pre-drain, data-flush, superblock).
+        // A real IoError at ANY of them must surface as IoError AND poison the
+        // manager. The FailFsync countdown targets each in turn. A small inline
+        // value keeps commit to exactly three fsyncs (no spillway: fresh_manager
+        // sets spillway_max_bytes=0).
+        for nth in 0..3u32 {
+            let mut tm = fresh_manager();
+            tm.begin().unwrap();
+            tm.allocate(b"v").unwrap();
+            tm.cache.borrow().io().arm_fault(Fault::FailFsync(nth));
+            let result = tm.commit();
+            assert!(
+                matches!(result, Err(ChiselError::IoError(_))),
+                "commit fsync #{} failure must surface IoError, got {result:?}",
+                nth + 1
+            );
+            assert!(tm.is_poisoned(), "fsync #{} failure must poison", nth + 1);
+            assert!(
+                matches!(tm.read(0), Err(ChiselError::Poisoned)),
+                "a poisoned manager rejects all further ops"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_write_failure_poisons() {
+        // I112: a real write_page IoError during commit must surface and poison.
+        // Target the value's own data page, which is written during commit flush.
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+        let h = tm.allocate(b"v").unwrap();
+        let pid = tm
+            .handle_live_page_id(h)
+            .unwrap()
+            .expect("allocated value has a live data page");
+        tm.cache.borrow().io().arm_fault(Fault::FailWritePage(pid));
+        let result = tm.commit();
+        assert!(
+            matches!(result, Err(ChiselError::IoError(_))),
+            "commit write failure must surface IoError, got {result:?}"
+        );
+        assert!(tm.is_poisoned(), "write failure during commit must poison");
     }
 }

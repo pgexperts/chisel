@@ -42,7 +42,6 @@
 //         ChecksumMismatchError
 //         CorruptSuperblockError
 //         FileSizeMismatchError
-//         InvalidMagicError
 //         LockFailedError
 //         UnsupportedFormatVersionError
 //         CorruptPageError
@@ -136,7 +135,6 @@ create_exception!(_chisel, AlreadyFinishedError, OperationalError);
 create_exception!(_chisel, ChecksumMismatchError, FatalError);
 create_exception!(_chisel, CorruptSuperblockError, FatalError);
 create_exception!(_chisel, FileSizeMismatchError, FatalError);
-create_exception!(_chisel, InvalidMagicError, FatalError);
 create_exception!(_chisel, LockFailedError, FatalError);
 create_exception!(_chisel, UnsupportedFormatVersionError, FatalError);
 create_exception!(_chisel, CorruptPageError, FatalError);
@@ -218,7 +216,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "FileSizeMismatchError",
         py.get_type::<FileSizeMismatchError>(),
     )?;
-    m.add("InvalidMagicError", py.get_type::<InvalidMagicError>())?;
     m.add("LockFailedError", py.get_type::<LockFailedError>())?;
     m.add(
         "UnsupportedFormatVersionError",
@@ -313,7 +310,6 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
         RustChiselError::ChecksumMismatch { .. } => ChecksumMismatchError::new_err(msg),
         RustChiselError::CorruptSuperblock => CorruptSuperblockError::new_err(msg),
         RustChiselError::FileSizeMismatch { .. } => FileSizeMismatchError::new_err(msg),
-        RustChiselError::InvalidMagic => InvalidMagicError::new_err(msg),
         RustChiselError::LockFailed => LockFailedError::new_err(msg),
         RustChiselError::UnsupportedFormatVersion { .. } => {
             UnsupportedFormatVersionError::new_err(msg)

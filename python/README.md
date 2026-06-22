@@ -360,7 +360,6 @@ Drop the handle and reopen.
 | `ChecksumMismatchError` | A page's XXH3 checksum did not validate on load |
 | `CorruptSuperblockError` | No readable superblock slot found |
 | `FileSizeMismatchError` | File size inconsistent with the superblock's claim |
-| `InvalidMagicError` | File magic bytes not recognized |
 | `LockFailedError` | Could not acquire `flock` — another process holds the file |
 | `UnsupportedFormatVersionError` | File's `format_version` beyond this binary's support |
 | `CorruptPageError` | Page structure violates its invariants (e.g., overflow-chain cycle) |

@@ -58,7 +58,6 @@ fn test_is_fatal_storage_integrity_variants_are_fatal() {
             expected: 0,
             actual: 0,
         },
-        ChiselError::InvalidMagic,
         ChiselError::LockFailed,
         ChiselError::UnsupportedFormatVersion {
             // Arbitrary values: the test only checks that is_fatal()
@@ -105,7 +104,6 @@ fn test_error_display_is_non_empty_for_every_variant() {
             expected: 1,
             actual: 2,
         },
-        ChiselError::InvalidMagic,
         ChiselError::LockFailed,
         ChiselError::UnsupportedFormatVersion {
             found: 1,
