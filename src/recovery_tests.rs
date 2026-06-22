@@ -251,7 +251,10 @@ fn test_recovery_tagged_index_recovers_from_prior_superblock() {
     );
     assert_eq!(db.tag(h1).unwrap().unwrap(), 9);
     // h2 existed only in the corrupted newer state -> gone after recovery.
-    assert!(db.read(h2).is_err());
+    assert!(
+        matches!(db.read(h2), Err(ChiselError::InvalidHandle(_))),
+        "h2 must be InvalidHandle after recovery to pre-h2 state"
+    );
 }
 
 #[test]
@@ -404,8 +407,20 @@ fn test_recovery_both_superblocks_corrupt() {
         f.write_all(&[0u8; PAGE_SIZE]).unwrap();
         f.sync_all().unwrap();
     }
-    let result = Chisel::open(&path, Default::default());
-    assert!(result.is_err());
+    // Tightened beyond bare is_err() to assert the error is FATAL (the open is
+    // unrecoverable). Deliberately NOT matching the CorruptSuperblock variant
+    // shape: I106 (PR #63) concurrently reshapes that variant to
+    // `CorruptSuperblock { defects }`, and a nullary-variant match here would
+    // silently fail to compile once both branches land on main. `match` rather
+    // than `expect_err` because `Chisel` does not implement `Debug`.
+    let err = match Chisel::open(&path, Default::default()) {
+        Ok(_) => panic!("both-superblocks-corrupt must fail to open"),
+        Err(e) => e,
+    };
+    assert!(
+        err.is_fatal(),
+        "both-superblocks-corrupt must be a fatal error, got {err:?}"
+    );
 }
 
 #[test]
@@ -1440,7 +1455,10 @@ fn test_file_not_found_without_create() {
     let path = std::path::PathBuf::from("/tmp/chisel_nonexistent_test.db");
     let _ = fs::remove_file(&path);
     let result = Chisel::open(&path, Options::default().create_if_missing(false));
-    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(ChiselError::FileNotFound)),
+        "open of nonexistent file with create_if_missing=false must be FileNotFound"
+    );
 }
 
 // I115: corrupt the 4-byte magic (superblock offset 0..4) in EVERY superblock

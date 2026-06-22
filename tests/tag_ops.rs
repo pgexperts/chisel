@@ -4,12 +4,13 @@
 //! no orphans, leaving other tags intact and the dropped chunks unreadable), and
 //! backward compatibility with pre-tag databases (everything reads as tag 0).
 //!
-//! Page-level reclamation (freed pages returning to the freemap for reuse) is
-//! deliberately NOT asserted here: file-size deltas are dominated by COW
-//! write-amplification of the radix structures, not by data-page frees, so they
-//! are a poor signal. That property is covered by focused freemap unit tests
-//! (`src/freemap.rs`, `persist_freemap_*` in `src/transaction.rs`). The F1/I12
-//! concern these tests guard is orphan-handle integrity, which is deterministic.
+//! Page-level reclamation of tag tree pages is asserted in
+//! `recreating_a_dropped_tag_reuses_freed_pages` (I118): `create_root` now
+//! routes through the freemap-aware allocator so dropped-tag pages are reused
+//! on re-create rather than extending the file. General data-page reclamation
+//! is covered by focused freemap unit tests (`src/freemap.rs`,
+//! `persist_freemap_*` in `src/transaction.rs`). The F1/I12 concern these
+//! tests guard is orphan-handle integrity, which is deterministic.
 mod common;
 
 use chisel::{Chisel, ChiselError, Handle, Tag};
@@ -97,7 +98,10 @@ fn delete_tagged_verifies_tag_then_self_maintains_index() {
     db.begin().unwrap();
     db.delete_tagged(a, Tag::new(42).unwrap()).unwrap();
     db.commit().unwrap();
-    assert!(db.read(a).is_err(), "chunk gone after delete_tagged");
+    assert!(
+        matches!(db.read(a), Err(ChiselError::InvalidHandle(_))),
+        "chunk gone after delete_tagged: expected InvalidHandle"
+    );
     assert_eq!(
         db.handles_with_tag(Tag::new(42).unwrap()).unwrap(),
         vec![b],
@@ -159,7 +163,10 @@ fn dropping_a_relation_removes_all_handles_no_orphans() {
         "no orphan index entries remain for the dropped tag"
     );
     for h in &hs {
-        assert!(db.read(*h).is_err(), "dropped chunk {h} must be unreadable");
+        assert!(
+            matches!(db.read(*h), Err(ChiselError::InvalidHandle(_))),
+            "dropped chunk {h} must be InvalidHandle after delete_with_tag"
+        );
     }
     // The untouched relation is fully intact.
     assert_eq!(db.tag(keep).unwrap().unwrap(), 2);
@@ -251,6 +258,40 @@ fn tag_of_tagged_handle_is_some() {
     db.commit().unwrap();
     assert_eq!(db.tag(h).unwrap(), Some(Tag::new(42).unwrap()));
     assert_eq!(db.tag(h).unwrap().unwrap(), 42);
+}
+
+// I118: a tag's inner-tree root now allocates via the freemap-aware path,
+// so dropping a tag fully (freeing its tree) and re-creating it reuses the
+// freed page(s) rather than extending the file.
+#[test]
+fn recreating_a_dropped_tag_reuses_freed_pages() {
+    let mut db = Chisel::open_in_memory().unwrap();
+    // Establish a steady state: create tag 1, fully drop it, commit (so its
+    // freed pages land in the freemap), so the NEXT create can reuse them.
+    db.begin().unwrap();
+    db.allocate_tagged(b"row", Tag::new(1).unwrap()).unwrap();
+    db.commit().unwrap();
+    db.begin().unwrap();
+    loop {
+        let p = db.delete_with_tag(Tag::new(1).unwrap(), 64).unwrap();
+        if p.complete {
+            break;
+        }
+    }
+    db.commit().unwrap();
+    let pages_after_drop = db.stats().unwrap().total_pages;
+    // Re-create the same tag: with the fix, create_root reuses a freed page,
+    // so total_pages must NOT grow.
+    db.begin().unwrap();
+    db.allocate_tagged(b"row again", Tag::new(1).unwrap())
+        .unwrap();
+    db.commit().unwrap();
+    let pages_after_recreate = db.stats().unwrap().total_pages;
+    assert!(
+        pages_after_recreate <= pages_after_drop,
+        "re-creating a dropped tag must reuse freed pages, not extend: \
+         {pages_after_drop} -> {pages_after_recreate}"
+    );
 }
 
 // I125: a tombstoned handle is rejected as InvalidHandle by EVERY read/delete

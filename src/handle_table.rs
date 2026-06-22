@@ -1448,7 +1448,11 @@ mod tests {
         root = ht.insert_t(&mut cache, root, 0, &entry).unwrap();
         let (new_root, prev) = ht.delete_t(&mut cache, root, 0).unwrap();
         root = new_root;
-        assert!(prev.is_some(), "delete of a live entry must return Some");
+        assert_eq!(
+            prev,
+            Some(entry),
+            "delete of a live entry must return the original entry"
+        );
         let found = ht.lookup(&mut cache, root, 0).unwrap();
         assert!(found.is_none());
     }

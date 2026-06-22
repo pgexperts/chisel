@@ -38,8 +38,14 @@ fn write_slot(buf: &mut [u8; PAGE_SIZE], index: usize, value: u64) {
 }
 
 /// Initialize a fresh zeroed radix page of the given type and stamp it.
-fn init_page(cache: &mut PageCache, page_type: PageType) -> Result<u64> {
-    let id = cache.new_page()?;
+/// `alloc` is the caller's page allocator (freemap-aware in production; plain
+/// `cache.new_page()` in tests that do not need freemap reuse).
+fn init_page(
+    cache: &mut PageCache,
+    page_type: PageType,
+    alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+) -> Result<u64> {
+    let id = alloc(cache)?;
     debug_assert_ne!(id, 0, "membership-index pages must not use page id 0");
     let buf = cache.get_mut(id)?;
     buf.fill(0);
@@ -62,10 +68,16 @@ impl RadixU64 {
         RadixU64 { depth: 0 }
     }
 
-    /// Create a new empty root leaf. Returns its page id.
-    pub fn create_root(&mut self, cache: &mut PageCache) -> Result<u64> {
+    /// Create a new empty root leaf. Returns its page id. `alloc` is the
+    /// freemap-aware allocator so that re-creating a tag's inner tree reuses
+    /// pages freed by prior committed transactions instead of extending the file.
+    pub fn create_root(
+        &mut self,
+        cache: &mut PageCache,
+        alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+    ) -> Result<u64> {
         self.depth = 0;
-        init_page(cache, PageType::MembershipLeaf)
+        init_page(cache, PageType::MembershipLeaf, alloc)
     }
 
     // saturating_mul (not `*=`): a valid tree never exceeds MAX_DEPTH (capacity
@@ -560,7 +572,7 @@ impl MembershipIndex {
             depth: self.outer_depth,
         };
         let root = if outer_root == PAGE_ID_NONE {
-            outer.create_root(cache)?
+            outer.create_root(cache, alloc)?
         } else {
             outer_root
         };
@@ -576,7 +588,7 @@ impl MembershipIndex {
         }
         let mut inner = RadixU64 { depth: inner_depth };
         if inner_root == 0 {
-            inner_root = inner.create_root(cache)?;
+            inner_root = inner.create_root(cache, alloc)?;
         }
         let new_inner_root = inner.insert(cache, inner_root, handle, 1, alloc, freed)?;
         let packed = pack_inner(new_inner_root, inner.depth);
@@ -629,10 +641,24 @@ impl MembershipIndex {
                 freed,
             )?
         } else {
-            // The tag's last member is gone: drop the outer entry. NOTE: the
-            // now-orphaned inner tree (`new_inner_root` and its pages) is NOT
-            // reclaimed here — that is the separate emptied-subtree compaction
-            // concern, out of scope for COW-supersession reclamation.
+            // The tag's last member is gone: drop the outer entry and reclaim
+            // the now-empty inner tree's ROOT page (`new_inner_root`), so a later
+            // `create_root` for this tag reuses it via the freemap (I118) instead
+            // of extending the file. Safe: the root was never installed in the
+            // outer tree and the old entry is removed by the `outer.delete` below,
+            // so it is fully orphaned and freed exactly once (verified: no
+            // double-free, no use-after-free, correct across reopen).
+            //
+            // RESIDUAL (I118 follow-up): `delete` does NOT shrink depth, so if
+            // this tag's inner tree had grown to depth >= 1 (i.e. carried more
+            // than SLOTS_PER_PAGE handles at once), the emptied tree is a chain
+            // of interior pages and only its root is reclaimed here — the empty
+            // interior pages below it leak (a bounded, non-corrupting residual,
+            // strictly better than the prior "free nothing" behavior). The common
+            // single-leaf case — the scenario I118 targets — is fully reclaimed.
+            // Completing this needs either a depth-shrinking `delete` or a walk
+            // that frees the whole emptied subtree; tracked separately.
+            freed.push(new_inner_root);
             let (r, _) = outer.delete(cache, outer_root, tag as u64, alloc, freed)?;
             r
         };
@@ -883,7 +909,9 @@ mod tests {
     fn insert_lookup_delete_single_level() {
         let mut c = cache(64);
         let mut t = RadixU64::new();
-        let root = t.create_root(&mut c).unwrap();
+        let root = t
+            .create_root(&mut c, &mut |c: &mut PageCache| c.new_page())
+            .unwrap();
         assert_eq!(t.lookup(&mut c, root, 5).unwrap(), 0);
         let r = t.insert_t(&mut c, root, 5, 99).unwrap();
         assert_eq!(t.lookup(&mut c, r, 5).unwrap(), 99);
@@ -993,7 +1021,9 @@ mod tests {
     fn grows_and_iterates_across_levels() {
         let mut c = cache(8192);
         let mut t = RadixU64::new();
-        let mut root = t.create_root(&mut c).unwrap();
+        let mut root = t
+            .create_root(&mut c, &mut |c: &mut PageCache| c.new_page())
+            .unwrap();
         for k in [0u64, 1, 1021, 2000, 1_000_000] {
             root = t.insert_t(&mut c, root, k, k + 7).unwrap();
         }
@@ -1019,7 +1049,9 @@ mod tests {
     fn iter_bounded_caps_collection() {
         let mut c = cache(8192);
         let mut t = RadixU64::new();
-        let mut root = t.create_root(&mut c).unwrap();
+        let mut root = t
+            .create_root(&mut c, &mut |c: &mut PageCache| c.new_page())
+            .unwrap();
         for k in 0..50u64 {
             root = t.insert_t(&mut c, root, k, k + 1).unwrap();
         }
@@ -1031,7 +1063,9 @@ mod tests {
     fn delete_absent_is_noop() {
         let mut c = cache(64);
         let mut t = RadixU64::new();
-        let root = t.create_root(&mut c).unwrap();
+        let root = t
+            .create_root(&mut c, &mut |c: &mut PageCache| c.new_page())
+            .unwrap();
         let (r, prev) = t.delete_t(&mut c, root, 42).unwrap();
         assert_eq!(prev, 0);
         assert_eq!(r, root, "no COW for an absent key");
@@ -1041,7 +1075,9 @@ mod tests {
     fn recover_depth_matches_after_grow() {
         let mut c = cache(8192);
         let mut t = RadixU64::new();
-        let mut root = t.create_root(&mut c).unwrap();
+        let mut root = t
+            .create_root(&mut c, &mut |c: &mut PageCache| c.new_page())
+            .unwrap();
         root = t.insert_t(&mut c, root, 5_000_000, 1).unwrap();
         let recovered = RadixU64::recover_depth(&mut c, root).unwrap();
         assert_eq!(recovered, t.depth);
@@ -1067,7 +1103,7 @@ mod tests {
         ) {
             let mut c = cache(4096);
             let mut t = RadixU64::new();
-            let mut root = t.create_root(&mut c).unwrap();
+            let mut root = t.create_root(&mut c, &mut |c: &mut PageCache| c.new_page()).unwrap();
             let mut oracle: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
             for (key, value) in &ops {
                 root = t.insert_t(&mut c, root, *key, *value).unwrap();
@@ -1090,7 +1126,7 @@ mod tests {
         fn prop_radix_recover_depth_matches(key in 0u64..1_100_000_000u64) {
             let mut c = cache(256);
             let mut t = RadixU64::new();
-            let mut root = t.create_root(&mut c).unwrap();
+            let mut root = t.create_root(&mut c, &mut |c: &mut PageCache| c.new_page()).unwrap();
             root = t.insert_t(&mut c, root, key, 1).unwrap();
             proptest::prop_assert_eq!(RadixU64::recover_depth(&mut c, root).unwrap(), t.depth);
         }

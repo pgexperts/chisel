@@ -3358,7 +3358,10 @@ mod tests {
             "failed forward step left a lazily-materialized handle-table root installed"
         );
         assert_eq!(tm.current_roots.next_handle, ghost);
-        assert!(tm.tag(ghost).is_err(), "no forward entry should exist");
+        assert!(
+            matches!(tm.tag(ghost), Err(ChiselError::InvalidHandle(_))),
+            "ghost handle after failed allocate_tagged must be InvalidHandle"
+        );
         assert!(tm.handles_with_tag(7).unwrap().is_empty());
         assert!(
             tm.current_live_slots.is_empty(),
@@ -3407,7 +3410,10 @@ mod tests {
 
         // A disarmed retry succeeds and removes `h` from BOTH maps.
         tm.delete(h).unwrap();
-        assert!(tm.read(h).is_err());
+        assert!(
+            matches!(tm.read(h), Err(ChiselError::InvalidHandle(_))),
+            "handle must be InvalidHandle after successful delete"
+        );
         assert!(!tm.handles_with_tag(7).unwrap().contains(&h));
         tm.commit().unwrap();
         assert!(!tm.handles_with_tag(7).unwrap().contains(&h));
@@ -4073,7 +4079,10 @@ mod tests {
         assert_eq!(tm.handles_with_tag(3).unwrap(), Vec::<u64>::new());
         // The chunks themselves are gone too.
         for h in hs {
-            assert!(tm.read(h).is_err());
+            assert!(
+                matches!(tm.read(h), Err(ChiselError::InvalidHandle(_))),
+                "handle {h} must be InvalidHandle after delete_with_tag"
+            );
         }
     }
 
