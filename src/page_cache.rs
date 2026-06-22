@@ -1257,6 +1257,33 @@ mod tests {
     }
 
     #[test]
+    fn claim_page_keeps_dirty_count_consistent() {
+        // I114: the I20 debug_assert! in claim_page is a no-op under
+        // `cargo test --release` (the wheel gate, wheels.yml). This asserts the
+        // OBSERVABLE accounting consequence that holds in EVERY profile: claiming
+        // a CLEAN page (the legitimate freemap-reuse path) adds exactly one dirty
+        // entry. A regression that mis-tracks dirty_count fails here in release
+        // too — complementing the debug-only claim_page_asserts_on_dirty_page,
+        // which catches the illegitimate (claim-a-dirty-page) path.
+        let (_dir, mut cache) = fresh_cache(64);
+        let id = cache.new_page().unwrap();
+        cache.flush().unwrap(); // page becomes clean
+        assert!(
+            !cache.is_dirty(id),
+            "precondition: page clean before reclaim"
+        );
+
+        let before = cache.dirty_count;
+        cache.claim_page(id).unwrap();
+        assert!(cache.is_dirty(id), "reclaimed page is dirty");
+        assert_eq!(
+            cache.dirty_count,
+            before + 1,
+            "claim of a clean page must add exactly one dirty entry (I20 accounting)"
+        );
+    }
+
+    #[test]
     fn cache_hits_and_misses_track_correctly() {
         // Setup: open an in-memory PageIo, populate page 0 with a checksummed
         // buffer (writing through the cache so the file actually grows).
