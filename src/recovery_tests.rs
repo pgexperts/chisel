@@ -623,6 +623,63 @@ fn test_recovery_superblock_pointing_past_eof_is_rejected() {
 }
 
 #[test]
+fn test_recovery_superblock_total_pages_max_is_rejected_not_panic() {
+    // Regression: a checksum-valid superblock whose `total_pages` is near
+    // u64::MAX must surface a typed `FileSizeMismatch` from `Chisel::open`, NOT
+    // overflow-panic in `total_pages * PAGE_SIZE`. `deserialize` does not bound
+    // `total_pages`, so a crafted/externally-edited file can reach this path. The
+    // sibling test above only exercises total_pages=1_000_000 (≈8.2 GB, far below
+    // the u64::MAX/8192 overflow threshold), so it would not catch this — without
+    // saturating_mul this test panics in debug (how CI runs) at the multiply.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        db.allocate(b"seed").unwrap();
+        db.commit().unwrap();
+    }
+
+    let sb = Superblock {
+        magic: page::MAGIC,
+        format_version: page::FORMAT_VERSION,
+        txn_counter: u64::MAX / 2, // ensure this slot wins select()
+        root_handle_table_page: page::PAGE_ID_NONE,
+        root_freemap_page: page::PAGE_ID_NONE,
+        total_pages: u64::MAX, // u64::MAX * PAGE_SIZE overflows without saturation
+        next_handle: 0,
+        page_size: PAGE_SIZE as u32,
+        named_roots: [crate::superblock::NamedRoot::EMPTY; crate::superblock::NAMED_ROOT_COUNT],
+        superblock_count: crate::superblock::DEFAULT_SUPERBLOCK_COUNT,
+        root_membership_index_page: page::PAGE_ID_NONE,
+    };
+    let buf = sb.serialize();
+    {
+        let mut f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&buf).unwrap();
+        // Stomp slot 1 so select() has no alternative.
+        f.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        f.write_all(&[0u8; PAGE_SIZE]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    match Chisel::open(&path, Default::default()) {
+        Err(ChiselError::FileSizeMismatch { expected, actual }) => {
+            // The byte count saturates to u64::MAX rather than wrapping.
+            assert_eq!(
+                expected,
+                u64::MAX,
+                "expected byte count must saturate, not wrap"
+            );
+            assert!(actual < expected);
+        }
+        Err(other) => panic!("expected FileSizeMismatch, got {other:?}"),
+        Ok(_) => panic!("expected FileSizeMismatch, open succeeded"),
+    }
+}
+
+#[test]
 fn test_recovery_torn_second_superblock_falls_back_to_previous() {
     // Models the precise crash window the commit protocol is designed
     // to survive: data pages for commit N+1 are fully fsync'd (step 1
