@@ -29,9 +29,8 @@ impl TransactionManager {
         // insert path stops packing into the cursor (same posture as
         // freemap reuse: savepoints disable the optimization so the
         // rollback_to semantics stay simple).
-        let live_slots = self.current_live_slots.clone();
-        let insert_cursor = self.insert_cursor;
-        self.insert_cursor = None;
+        let (live_slots, insert_cursor) = self.packer.snapshot();
+        self.packer.clear_cursor();
         self.savepoints.push(Savepoint {
             name: name.to_string(),
             roots: self.current_roots.clone(),
@@ -96,8 +95,11 @@ impl TransactionManager {
         // created, so this sets the cursor back to whatever value it
         // held BEFORE the savepoint was taken (typically also None,
         // since savepoint-bearing transactions disable packing).
-        self.current_live_slots = self.savepoints[idx].live_slots.clone();
-        self.insert_cursor = self.savepoints[idx].insert_cursor;
+        let snap = (
+            self.savepoints[idx].live_slots.clone(),
+            self.savepoints[idx].insert_cursor,
+        );
+        self.packer.restore(snap);
         self.savepoints.truncate(idx + 1);
         self.txn_freed_pages.clear();
 

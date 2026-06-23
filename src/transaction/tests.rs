@@ -1226,9 +1226,9 @@ fn reclaim_freemap_orphans_excludes_live_recycle_pool() {
 // Regression test for ISSUES.md I28. I19 introduced `CacheFull` as
 // an **operational** error (documented as "commit or rollback to
 // recover"), but `commit_inner` runs `persist_freemap` BEFORE
-// `cache.flush()` — and `persist_freemap` itself calls
-// `allocate_data_page`, which may trip `maybe_evict`'s ceiling
-// check when every existing cache entry is dirty. Pre-fix the
+// `cache.flush()` — and `persist_freemap` itself allocates a
+// freemap page (`structural_extend`), which may trip `maybe_evict`'s
+// ceiling check when every existing cache entry is dirty. Pre-fix the
 // resulting `CacheFull` propagated out of commit_inner and
 // commit()'s poison wrapper poisoned the manager unconditionally.
 // The recovery advice ("commit to flush") became impossible to
@@ -1303,8 +1303,8 @@ fn commit_does_not_poison_when_cache_is_at_strict_cap() {
     );
 
     // The actual I28 check. Pre-fix, `persist_freemap`'s internal
-    // `allocate_data_page` trips the ceiling and propagates
-    // CacheFull out of commit_inner; commit()'s poison wrapper
+    // freemap-page allocation (`structural_extend`) trips the ceiling and
+    // propagates CacheFull out of commit_inner; commit()'s poison wrapper
     // then sets the poison flag. Post-fix commit drains first.
     let result = tm.commit();
     assert!(
@@ -1386,12 +1386,13 @@ fn allocate_membership_failure_leaves_maps_consistent() {
     // insert cursor survives to skew later packing / defrag density / page
     // reclamation. (Pre-fix this leaked `{page: 1}` and `Some(page)`.)
     assert!(
-        tm.current_live_slots.is_empty(),
+        tm.packer.is_current_empty(),
         "failed allocate left a phantom live-slot count: {:?}",
-        tm.current_live_slots
+        tm.packer.current_live_slots()
     );
     assert_eq!(
-        tm.insert_cursor, None,
+        tm.packer.insert_cursor(),
+        None,
         "failed allocate left a ghost insert cursor"
     );
 
@@ -1445,11 +1446,11 @@ fn allocate_handle_table_failure_leaves_maps_consistent() {
     );
     assert!(tm.handles_with_tag(7).unwrap().is_empty());
     assert!(
-        tm.current_live_slots.is_empty(),
+        tm.packer.is_current_empty(),
         "failed forward step left a phantom live-slot count: {:?}",
-        tm.current_live_slots
+        tm.packer.current_live_slots()
     );
-    assert_eq!(tm.insert_cursor, None);
+    assert_eq!(tm.packer.insert_cursor(), None);
 
     // Disarmed retry succeeds and is consistent across both maps.
     let h = tm.allocate_tagged(b"payload", 7).unwrap();
@@ -1760,10 +1761,10 @@ fn update_handle_table_failure_preserves_old_value_and_releases_new_slot() {
     // had exactly one live slot (for `old`), and the failed update must
     // leave precisely that — no phantom count for the abandoned new value.
     assert_eq!(
-        tm.current_live_slots.values().sum::<u32>(),
+        tm.packer.current_live_slots().values().sum::<u32>(),
         1,
         "failed update left a phantom live-slot: {:?}",
-        tm.current_live_slots
+        tm.packer.current_live_slots()
     );
 
     // Durability: commit, assert C1, force reuse, re-read the old value.

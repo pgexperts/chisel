@@ -624,7 +624,7 @@ impl PageCache {
     ///     directly; any dirty entries at id >= watermark are pages
     ///     allocated AFTER the savepoint, exactly the ones we want
     ///     gone. Savepoint-bearing transactions disable freemap reuse
-    ///     (see `allocate_data_page`) so there are no dirty reused-id
+    ///     (see `cow_alloc`) so there are no dirty reused-id
     ///     pages to worry about.
     ///
     /// If a future caller needs "truncate without dropping any dirty
@@ -736,7 +736,7 @@ impl PageCache {
     pub fn claim_page(&mut self, page_id: u64) -> Result<()> {
         // ISSUES.md I20: enforce the "freemap never returns an already-dirty
         // id" invariant in debug builds. The only legitimate caller is
-        // `allocate_data_page` via the freemap, which — post-I18 — keeps the
+        // `cow_alloc` (the shared freemap-aware allocator), which — post-I18 — keeps the
         // at-risk id sets out of the in-commit free pool. A violation here
         // would silently drop the caller's pending writes on `page_id`; an
         // assertion surfaces the bug at its source rather than hours later
@@ -1325,8 +1325,8 @@ mod tests {
     // Regression test for ISSUES.md I20. claim_page previously silently
     // dropped any prior dirty writes on the claimed id: it unconditionally
     // removed the existing cache entry and inserted a fresh zeroed one.
-    // The only legitimate caller is `allocate_data_page` via the freemap,
-    // which must never return an id already dirty in the current txn —
+    // The only legitimate caller is `cow_alloc` (the shared freemap-aware
+    // allocator), which must never return an id already dirty in the current txn —
     // but the invariant was unenforced. I20 adds a debug_assert so the
     // rule is checked in debug builds; a violation fires immediately
     // rather than surfacing hours later as silent data loss.

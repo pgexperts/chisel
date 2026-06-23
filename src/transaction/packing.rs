@@ -1,81 +1,86 @@
-//! transaction::packing — R1 data-page slot packing: releasing a data
-//! slot, lazily materializing the handle table, and inserting a value into
-//! a data page. Split out of `transaction.rs` verbatim; see the parent
-//! module for the type and fields.
+//! transaction::packing — R1 data-page slot packing as an owned unit.
+//!
+//! `SlotPacker` owns the three fields that together implement the R1
+//! live-slot / insert-cursor model: `committed_live_slots`,
+//! `current_live_slots`, and `insert_cursor`. No code outside this file
+//! touches those fields directly; everything goes through the narrow
+//! interface below. `TransactionManager` holds one `SlotPacker` (the
+//! `packer` field) and delegates via thin wrappers (`insert_into_data_page`
+//! / `release_data_slot`) plus the lifecycle/savepoint/stats hooks.
+//!
+//! Live-slot model (ISSUES.md R1): `current_live_slots[page_id]` counts how
+//! many handle-table entries currently point at each data page — the
+//! information needed to decide when a page is fully empty and can be
+//! returned to the freemap. `committed_live_slots` is the durable state
+//! (rebuilt at open time by scanning the handle table); `current_live_slots`
+//! is the in-transaction working copy. Both are kept purely in memory:
+//! storing a slot count ON the data page would force a COW (and a
+//! handle-table rewrite for every entry pointing into it) on every delete —
+//! an O(live-slots-in-page) amplification shadow paging does not handle well.
+//!
+//! Packing cursor: a data page allocated earlier in THIS transaction that
+//! still has free space. New values pack into it until it fills, at which
+//! point a new page is allocated and becomes the new cursor. `None` at the
+//! start of each transaction (only pages allocated during the current
+//! transaction — dirty in the cache and safe to modify — are ever the
+//! cursor; a committed data page is never the cursor, since that would
+//! require COW). Packing is disabled entirely when savepoints are active
+//! (the `packing_enabled` gate below): the savepoint-snapshot cost becomes
+//! manageable when only one code path interacts with packing state. The
+//! packer itself does NOT know about savepoints — the caller passes the gate.
+//!
+//! Split out of the historical `transaction.rs`; see the parent module for
+//! `TransactionManager` and the freemap fields the wrappers borrow.
 
 use super::*;
 
-impl TransactionManager {
-    // --- Private helpers ---
+/// Owned R1 slot-packing state. See the module header for the live-slot and
+/// cursor models. Constructed empty (`new`) by `create_new`, or seeded from a
+/// scanned committed map (`from_committed`) by `open_existing`.
+pub(super) struct SlotPacker {
+    // Durable live-slot counts (promoted from `current_live_slots` at commit;
+    // rebuilt at open time by scanning the handle table).
+    committed_live_slots: FxHashMap<u64, u32>,
+    // In-transaction working copy of the live-slot counts.
+    current_live_slots: FxHashMap<u64, u32>,
+    // The current in-progress insert cursor; see the module header.
+    insert_cursor: Option<u64>,
+}
 
-    /// Release one slot from a data page (ISSUES.md R1). Decrements
-    /// `current_live_slots[page_id]`; if the count reaches zero, the
-    /// whole page becomes unreferenced and is pushed to
-    /// `txn_freed_pages` so commit can return it to the freemap.
-    /// Otherwise the slot becomes a tombstone: dead weight inside a
-    /// still-live page, reclaimable only via defrag.
-    ///
-    /// If the page is somehow not tracked in `current_live_slots` (a
-    /// bug; open-time scan should catch every live data page), this is
-    /// a no-op — we prefer leaking to a spurious free.
-    ///
-    /// NOTE: a stray orphaned line "Lazily create a handle table root
-    /// on first insert. A fresh database has" previously sat at the
-    /// top of this doc block (an interleaved remnant of
-    /// `ensure_handle_table`'s docstring); removed 2026-04-17 during
-    /// the commenting pass. The counterpart ("root_handle_table_page
-    /// == PAGE_ID_NONE; we don't materialize...") still sits above
-    /// `ensure_handle_table` below — both belong together.
-    pub(super) fn release_data_slot(&mut self, page_id: u64) {
-        let Some(count) = self.current_live_slots.get_mut(&page_id) else {
-            return;
-        };
-        if *count > 0 {
-            *count -= 1;
-        }
-        if *count == 0 {
-            self.current_live_slots.remove(&page_id);
-            // If this page is the active insert cursor, clear the
-            // cursor — it's about to become free space, and we don't
-            // want future inserts to pack into it and then find it
-            // disappearing at commit time.
-            if self.insert_cursor == Some(page_id) {
-                self.insert_cursor = None;
-            }
-            self.txn_freed_pages.push(page_id);
+impl SlotPacker {
+    /// Empty packer: no live slots, no cursor. Used for a freshly created
+    /// database (`create_new`), which has no data pages yet.
+    pub(super) fn new() -> Self {
+        SlotPacker {
+            committed_live_slots: FxHashMap::default(),
+            current_live_slots: FxHashMap::default(),
+            insert_cursor: None,
         }
     }
 
-    /// Lazily create a handle table root on first insert. A fresh
-    /// database has `root_handle_table_page == PAGE_ID_NONE`; we don't
-    /// materialize the root until there is a handle to put in it, so
-    /// empty databases never pay for a handle-table page. No per-page
-    /// rollback bookkeeping — the watermark rollback mechanism (I3)
-    /// handles any page allocated here automatically.
-    pub(super) fn ensure_handle_table(&mut self) -> Result<()> {
-        if self.current_roots.handle_table_page == PAGE_ID_NONE {
-            let root = {
-                let mut cache = self.cache.borrow_mut();
-                self.handle_table.create_root(&mut cache)?
-            };
-            self.current_roots.handle_table_page = root;
+    /// Seed from a committed live-slot map scanned at open time. The working
+    /// copy starts equal to the committed map; the cursor starts None (it only
+    /// ever tracks pages allocated during a live transaction).
+    pub(super) fn from_committed(committed: FxHashMap<u64, u32>) -> Self {
+        let current_live_slots = committed.clone();
+        SlotPacker {
+            committed_live_slots: committed,
+            current_live_slots,
+            insert_cursor: None,
         }
-        Ok(())
     }
 
     /// Place a value in a data page and return (page_id, slot_index).
     ///
-    /// Post-R1 packing model: the transaction maintains an "insert
-    /// cursor" — a data page allocated earlier in THIS transaction
-    /// that still has space — and packs successive small-value inserts
-    /// into it until it fills. When the cursor is absent/full, a new
-    /// page is allocated (via `allocate_data_page`, which prefers
-    /// freemap reuse over file extension — R2) and becomes the new
-    /// cursor. Packing is disabled while savepoints are active: the
-    /// cursor is force-cleared by `savepoint()` and is NOT set when a
-    /// new page is allocated inside a savepoint scope, so each insert
-    /// under a savepoint gets its own page (the pre-R1 behavior). This
-    /// keeps the per-savepoint snapshot cheap to restore.
+    /// Post-R1 packing model: try to reuse the current cursor page if it has
+    /// room; when the cursor is absent/full, call `alloc` for a fresh page and
+    /// (when `packing_enabled`) install it as the new cursor. `alloc` is the
+    /// data-page allocator (formerly `TransactionManager::allocate_data_page`),
+    /// hoisted to the call site so the freemap dance it performs does not
+    /// borrow-conflict with `&mut self` here; it receives `cache` as a param.
+    /// `packing_enabled` is the caller's `savepoints.is_empty()` check: under a
+    /// savepoint the cursor stays None so each insert gets its own page (the
+    /// pre-R1 behavior), keeping per-savepoint snapshots cheap to restore.
     ///
     /// Checksum is stamped eagerly after every mutation so the page carries a
     /// valid internal checksum before any path could write it to the main
@@ -97,20 +102,22 @@ impl TransactionManager {
     /// main-file write. See ISSUES.md.
     ///
     /// Live-slot bookkeeping: every successful insert increments
-    /// `current_live_slots[page_id]`. `delete`/`update` consult this
-    /// map (via `release_data_slot`) to decide when a page is fully
-    /// empty and can be freed back to the freemap on commit. The map
-    /// is kept purely in memory — storing a slot count ON the data
-    /// page would force a COW (and a handle-table rewrite for every
-    /// entry pointing into it) on every delete.
-    pub(super) fn insert_into_data_page(&mut self, value: &[u8]) -> Result<(u64, u16)> {
-        // Packing path: try to reuse the current cursor page if it
-        // has room. The cursor only exists when savepoints are empty
-        // (see savepoint_inner) so this branch implicitly respects
-        // the "no packing under savepoints" rule.
+    /// `current_live_slots[page_id]`. `delete`/`update` consult this map (via
+    /// `release`) to decide when a page is fully empty and can be freed back to
+    /// the freemap on commit.
+    pub(super) fn insert(
+        &mut self,
+        cache: &mut PageCache,
+        alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
+        packing_enabled: bool,
+        value: &[u8],
+    ) -> Result<(u64, u16)> {
+        // Packing path: try to reuse the current cursor page if it has room.
+        // The cursor only exists when packing is enabled (savepoints empty),
+        // so this branch implicitly respects the "no packing under savepoints"
+        // rule.
         if let Some(cursor_page_id) = self.insert_cursor {
             let slot_option = {
-                let mut cache = self.cache.borrow_mut();
                 let buf = cache.get_mut(cursor_page_id)?;
                 let result = DataPage::insert(buf, value);
                 if result.is_some() {
@@ -126,15 +133,13 @@ impl TransactionManager {
             // the new page becomes the new cursor.
         }
 
-        // Allocate a fresh data page. Under active savepoints, the
-        // cursor stays None (set below, then cleared by the savepoint
-        // check in subsequent calls) so each insert gets its own page —
-        // matching the pre-R1 "one value per page" behavior within
-        // savepoint scopes, which is the price of keeping rollback_to
+        // Allocate a fresh data page. Under active savepoints
+        // (`packing_enabled == false`) the cursor stays None so each insert
+        // gets its own page — matching the pre-R1 "one value per page" behavior
+        // within savepoint scopes, which is the price of keeping rollback_to
         // semantics simple.
-        let page_id = self.allocate_data_page()?;
+        let page_id = alloc(cache)?;
         let slot = {
-            let mut cache = self.cache.borrow_mut();
             let buf = cache.get_mut(page_id)?;
             DataPage::init_page(buf);
             // I46 INVARIANT: DataPage::insert can only return None for
@@ -149,13 +154,174 @@ impl TransactionManager {
             slot
         };
 
-        // Only install the new page as the cursor if we're outside any
-        // savepoint scope. During a savepoint scope the cursor stays
-        // None so packing is effectively disabled.
-        if self.savepoints.is_empty() {
+        // Only install the new page as the cursor when packing is enabled
+        // (outside any savepoint scope). During a savepoint scope the cursor
+        // stays None so packing is effectively disabled.
+        if packing_enabled {
             self.insert_cursor = Some(page_id);
         }
         *self.current_live_slots.entry(page_id).or_insert(0) += 1;
         Ok((page_id, slot))
+    }
+
+    /// Release one slot from a data page (ISSUES.md R1). Decrements
+    /// `current_live_slots[page_id]`; if the count reaches zero, the whole
+    /// page becomes unreferenced. Returns `Some(page_id)` in that case so the
+    /// caller can push it to `txn_freed_pages` (commit returns it to the
+    /// freemap); `None` otherwise. Either way, if the freed page was the
+    /// active insert cursor the cursor is cleared here — it's about to become
+    /// free space, and we don't want future inserts to pack into it and then
+    /// find it disappearing at commit time. A non-zero residual count leaves
+    /// the slot a tombstone: dead weight inside a still-live page, reclaimable
+    /// only via defrag.
+    ///
+    /// If the page is somehow not tracked in `current_live_slots` (a bug;
+    /// open-time scan should catch every live data page), this is a no-op — we
+    /// prefer leaking to a spurious free.
+    pub(super) fn release(&mut self, page_id: u64) -> Option<u64> {
+        let count = self.current_live_slots.get_mut(&page_id)?;
+        if *count > 0 {
+            *count -= 1;
+        }
+        if *count == 0 {
+            self.current_live_slots.remove(&page_id);
+            if self.insert_cursor == Some(page_id) {
+                self.insert_cursor = None;
+            }
+            return Some(page_id);
+        }
+        None
+    }
+
+    /// Begin a transaction: clone the committed counts into the working copy
+    /// and reset the cursor (it only tracks pages allocated during the current
+    /// transaction, so it is always None at begin).
+    pub(super) fn begin(&mut self) {
+        self.current_live_slots = self.committed_live_slots.clone();
+        self.insert_cursor = None;
+    }
+
+    /// Commit: promote the working counts to committed and reset the cursor
+    /// (per-transaction state that gets re-established at the next begin).
+    pub(super) fn commit(&mut self) {
+        self.committed_live_slots = self.current_live_slots.clone();
+        self.insert_cursor = None;
+    }
+
+    /// Roll back: revert the working counts to the committed baseline and drop
+    /// the cursor.
+    pub(super) fn rollback(&mut self) {
+        self.current_live_slots = self.committed_live_slots.clone();
+        self.insert_cursor = None;
+    }
+
+    /// Read-only snapshot of the working state for a savepoint: the current
+    /// live-slot map (cloned) and the cursor. The savepoint-CREATE path clears
+    /// the cursor separately via `clear_cursor` after snapshotting — snapshot
+    /// itself does not mutate.
+    pub(super) fn snapshot(&self) -> (FxHashMap<u64, u32>, Option<u64>) {
+        (self.current_live_slots.clone(), self.insert_cursor)
+    }
+
+    /// Restore the working state from a savepoint snapshot.
+    pub(super) fn restore(&mut self, snap: (FxHashMap<u64, u32>, Option<u64>)) {
+        self.current_live_slots = snap.0;
+        self.insert_cursor = snap.1;
+    }
+
+    /// Clear the insert cursor. Used by the savepoint-create path: once a
+    /// savepoint exists the insert path stops packing (same posture as freemap
+    /// reuse — savepoints disable the optimization to keep rollback_to simple).
+    pub(super) fn clear_cursor(&mut self) {
+        self.insert_cursor = None;
+    }
+
+    /// The in-transaction working live-slot map. Read-only access for stats
+    /// (sparse-page detection, the defrag page-id snapshot) and tests.
+    pub(super) fn current_live_slots(&self) -> &FxHashMap<u64, u32> {
+        &self.current_live_slots
+    }
+
+    /// Whether the working live-slot map is empty (no data page holds a live
+    /// slot). Convenience accessor used by tests asserting a clean no-op.
+    #[cfg(test)]
+    pub(super) fn is_current_empty(&self) -> bool {
+        self.current_live_slots.is_empty()
+    }
+
+    /// The current insert cursor. Read-only accessor for tests asserting the
+    /// packing state after a failed mutation.
+    #[cfg(test)]
+    pub(super) fn insert_cursor(&self) -> Option<u64> {
+        self.insert_cursor
+    }
+}
+
+impl TransactionManager {
+    /// Place a value in a data page and return (page_id, slot_index).
+    ///
+    /// Thin wrapper over `SlotPacker::insert`. The freemap dance that
+    /// `allocate_data_page` performs (take/put the transient `FreeMapTree`,
+    /// touching `current_roots`, `freemap_session_owned`,
+    /// `structural_superseded`, `freemap_hint`, `structural_reuse`) is hoisted
+    /// HERE, around the closure, exactly like `ht_insert`: those are
+    /// `&mut self` operations and cannot run inside a closure that the packer
+    /// borrow (`&mut self.packer`) would also need. The closure captures only
+    /// the disjoint freemap field refs plus the local `tree`, and takes `cache`
+    /// as a param.
+    ///
+    /// `put_freemap_tree` runs even on the error path — matching the historical
+    /// `allocate_data_page`, which wrote tree growth back before returning the
+    /// allocation result. The freemap pages were extended (never freed), so on a
+    /// non-fatal failure they are harmless above-watermark scratch, and the
+    /// session set must still be returned for a retry/commit in the same
+    /// transaction to stay consistent.
+    pub(super) fn insert_into_data_page(&mut self, value: &[u8]) -> Result<(u64, u16)> {
+        // `reuse` gates freemap reuse inside cow_alloc; `packing_enabled` gates
+        // installing the freshly-allocated page as the cursor. Both are the
+        // same `savepoints.is_empty()` check today, but they are distinct
+        // concerns (the packer must not know about savepoints), so they are
+        // named separately.
+        let reuse = self.savepoints.is_empty();
+        let packing_enabled = self.savepoints.is_empty();
+        let mut tree = self.take_freemap_tree();
+        let result = {
+            let hint = &mut self.freemap_hint;
+            let pool = &mut self.structural_reuse;
+            let mut cache = self.cache.borrow_mut();
+            let mut alloc =
+                |c: &mut PageCache| super::freemap::cow_alloc(c, &mut tree, hint, pool, reuse);
+            self.packer
+                .insert(&mut cache, &mut alloc, packing_enabled, value)
+        };
+        self.put_freemap_tree(tree);
+        result
+    }
+
+    /// Release one slot from a data page. Thin wrapper over
+    /// `SlotPacker::release`: when the page hits zero live slots the packer
+    /// returns its id and we push it to `txn_freed_pages` so commit returns it
+    /// to the freemap.
+    pub(super) fn release_data_slot(&mut self, page_id: u64) {
+        if let Some(freed) = self.packer.release(page_id) {
+            self.txn_freed_pages.push(freed);
+        }
+    }
+
+    /// Lazily create a handle table root on first insert. A fresh
+    /// database has `root_handle_table_page == PAGE_ID_NONE`; we don't
+    /// materialize the root until there is a handle to put in it, so
+    /// empty databases never pay for a handle-table page. No per-page
+    /// rollback bookkeeping — the watermark rollback mechanism (I3)
+    /// handles any page allocated here automatically.
+    pub(super) fn ensure_handle_table(&mut self) -> Result<()> {
+        if self.current_roots.handle_table_page == PAGE_ID_NONE {
+            let root = {
+                let mut cache = self.cache.borrow_mut();
+                self.handle_table.create_root(&mut cache)?
+            };
+            self.current_roots.handle_table_page = root;
+        }
+        Ok(())
     }
 }

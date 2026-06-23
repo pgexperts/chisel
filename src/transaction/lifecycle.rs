@@ -109,8 +109,7 @@ impl TransactionManager {
         // R1: clone the live-slot counts and reset the insert cursor.
         // The cursor is always None at begin — it only tracks pages
         // allocated during the current transaction.
-        self.current_live_slots = self.committed_live_slots.clone();
-        self.insert_cursor = None;
+        self.packer.begin();
         self.active_txn = true;
         self.savepoints.clear();
         self.txn_freed_pages.clear();
@@ -230,7 +229,8 @@ impl TransactionManager {
         }
 
         // I28: drain the page cache BEFORE persist_freemap runs. Without
-        // this, `persist_freemap`'s own `allocate_data_page` can trip
+        // this, `persist_freemap`'s own freemap-page allocation
+        // (`structural_extend` → `new_page`) can trip
         // `maybe_evict`'s spill-or-CacheFull decision (every existing entry
         // dirty, nothing evictable, and either spillway disabled or full)
         // and return `ChiselError::CacheFull` or `ChiselError::SpillwayFull`.
@@ -331,8 +331,7 @@ impl TransactionManager {
         // separate in-memory freemap copy to advance.
         // R1: promote the live-slot counts. The cursor is per-transaction
         // and gets reset for the next begin().
-        self.committed_live_slots = self.current_live_slots.clone();
-        self.insert_cursor = None;
+        self.packer.commit();
         self.active_txn = false;
         self.savepoints.clear();
         // txn_freed_pages were already marked free in the new committed freemap
@@ -446,8 +445,7 @@ impl TransactionManager {
         self.structural_reuse.clear();
         self.freemap_session_owned.clear();
         // R1: revert the live-slot counts and drop the insert cursor.
-        self.current_live_slots = self.committed_live_slots.clone();
-        self.insert_cursor = None;
+        self.packer.rollback();
         self.active_txn = false;
         self.savepoints.clear();
         self.txn_freed_pages.clear();
