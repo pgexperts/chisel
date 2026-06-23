@@ -54,13 +54,23 @@ pub struct Spillway {
     /// page_id -> slot index. Built up by `spill`; consulted by
     /// `is_resident` and `rehydrate`; cleared by `truncate`.
     slots: HashMap<u64, u64>,
-    /// Monotonic on-disk WRITE CURSOR — the next free slot offset. Bumped by
-    /// every new spill; reused on re-spill of an already-resident page id (no
-    /// bump); reset to 0 on truncate. NOT the capacity accounting basis: it
-    /// never decrements on `forget`, so a forget/respill cycle climbs it past
-    /// the live set. Capacity (`logical_bytes` / `SpillwayFull`) is charged
-    /// against `slots.len()` instead; the cursor's tail garbage past the live
-    /// set is reclaimed by `truncate`.
+    /// Monotonic WRITE CURSOR — the next free slot index. Bumped by every
+    /// new spill; reused on re-spill of an already-resident page id (no bump);
+    /// reset to 0 on truncate. NOT the capacity accounting basis: it never
+    /// decrements on `forget`, so a forget/respill cycle climbs it past the
+    /// live set. Capacity (`logical_bytes` / `SpillwayFull`) is charged against
+    /// `slots.len()` instead; the cursor's tail garbage is reclaimed by
+    /// `truncate`.
+    ///
+    /// For the FILE backing, the cursor directly maps to the on-disk write
+    /// position. For the MEMORY backing, the `Vec<u8>` in `Backing::Memory`
+    /// grows by SLOT_SIZE for every distinct page spilled within a transaction
+    /// (forget/respill of the same page reuses an existing slot and does NOT
+    /// shrink the vec). A long transaction that forget/respills many distinct
+    /// pages therefore grows the in-memory vec cumulatively — bounded by the
+    /// number of distinct page ids ever spilled in that transaction, not by
+    /// the live set (`slots.len()`). `truncate` at commit/rollback reclaims
+    /// all of it; the risk is peak memory during a single large transaction.
     next_slot_index: u64,
     /// Strict upper bound on the LIVE resident set's logical size in bytes,
     /// excluding per-slot headers (`slots.len() * PAGE_SIZE`). Captured at
@@ -217,9 +227,9 @@ impl Spillway {
     }
 
     /// Return up to `batch_size` page_ids currently in the resident set.
-    /// This is a read-only peek: despite the `&mut self` receiver,
-    /// `drain_batch` removes nothing from the resident set and drops no file
-    /// content — the caller is responsible for removing drained entries
+    /// This is a read-only peek: `drain_batch` removes nothing from the
+    /// resident set and drops no file content — the caller is responsible
+    /// for removing drained entries
     /// (`forget()`) and shrinking the spillway (`truncate()`). The PageCache
     /// drain reads each pair, rehydrates the page, then flushes it to the main
     /// file. After all batches are processed, `truncate()` is called
@@ -229,7 +239,7 @@ impl Spillway {
     /// The drain doesn't need a particular order; one batch's
     /// rehydrates all flush together with later batches under a
     /// single fsync.
-    pub fn drain_batch(&mut self, batch_size: usize) -> Vec<u64> {
+    pub fn drain_batch(&self, batch_size: usize) -> Vec<u64> {
         let mut ids = Vec::with_capacity(batch_size.min(self.slots.len()));
         for &id in self.slots.keys().take(batch_size) {
             ids.push(id);
@@ -311,6 +321,9 @@ fn write_slot(
             file.write_all(page_bytes)?;
         }
         Backing::Memory { bytes } => {
+            // The vec grows to accommodate `slot_index` monotonically; it is
+            // never trimmed mid-transaction. See `next_slot_index` field doc
+            // for the cumulative-growth worst-case in memory mode.
             let needed = (offset + SLOT_SIZE as u64) as usize;
             if bytes.len() < needed {
                 bytes.resize(needed, 0);

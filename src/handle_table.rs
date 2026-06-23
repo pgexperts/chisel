@@ -414,11 +414,13 @@ impl HandleTable {
     }
 
     /// Rebuild the tree depth by walking the left spine from `root` until a leaf
-    /// (the flag byte `buf[1]` != `FLAG_INTERIOR`; the page-type tag lives at
-    /// `buf[0]`, not the byte tested here). Returns 0 for an empty tree
-    /// (`PAGE_ID_NONE`) or a leaf root. The in-memory `depth` is NOT carried in
-    /// `Roots`, so the transaction layer re-derives it from the restored root both
-    /// at open AND after a rollback rewinds to a shallower committed/savepoint root.
+    /// (the flag byte `buf[1]` != `FLAG_INTERIOR`). Also validates `buf[0]` is
+    /// `PageType::HandleTable` on every interior page so a wrong-type page handed
+    /// in as a bogus root stops with `CorruptPage` rather than being mis-walked.
+    /// Returns 0 for an empty tree (`PAGE_ID_NONE`) or a leaf root. The in-memory
+    /// `depth` is NOT carried in `Roots`, so the transaction layer re-derives it
+    /// from the restored root both at open AND after a rollback rewinds to a
+    /// shallower committed/savepoint root.
     pub fn recover_depth(cache: &mut PageCache, root: u64) -> Result<u32> {
         if root == PAGE_ID_NONE {
             return Ok(0);
@@ -429,6 +431,11 @@ impl HandleTable {
             let buf = cache.get(current)?;
             if buf[1] != FLAG_INTERIOR {
                 break;
+            }
+            // Validate page type. A checksum-valid page with the right FLAG byte
+            // but the wrong type tag is corrupt — stop rather than mis-walk it.
+            if buf[0] != PageType::HandleTable as u8 {
+                return Err(ChiselError::CorruptPage { page_id: current });
             }
             depth += 1;
             // Cap the walk at MAX_DEPTH. A valid spine is never deeper; a corrupt
