@@ -175,6 +175,11 @@ impl Overflow {
             });
         }
         let max_pages = total_length.div_ceil(OVERFLOW_PAYLOAD);
+        // Ordering matters: the wrong-type and zero-length guards above run
+        // BEFORE this allocation, so an untrusted `total_length` (e.g. a
+        // stale handle pointing at a non-overflow page whose bytes 16..24
+        // read as u64::MAX) can never drive a speculative giant allocation
+        // here. The per-page loop guard alone would be too late.
         let mut result = Vec::with_capacity(total_length);
 
         let mut current_page = first_page;

@@ -85,6 +85,16 @@ pub struct PageCache {
     /// allocation in a write-heavy transaction (where all pages are
     /// dirty and no victim exists), trivially making page-allocation
     /// O(n) per call. With this counter the early-out is O(1).
+    ///
+    /// INVARIANT: this counts ONLY dirty entries currently resident in
+    /// `entries`, never pages that have been spilled to the spillway.
+    /// That is exactly why the `dirty_count == entries.len()`
+    /// short-circuit is sound — both sides measure the in-cache set. A
+    /// Phase-B spill decrements this as it removes the victim from
+    /// `entries` (and re-increments on a failed spill that restores it),
+    /// so `dirty_count <= entries.len()` always holds; `forget_above`
+    /// (truncate's spillway prune) deliberately does NOT touch it,
+    /// because spilled pages were never counted here.
     dirty_count: usize,
     /// I52 (ISSUES.md, 2026-05-22): reusable scratch buffer for
     /// `flush()` and `discard_all_dirty()`. Both functions iterate
