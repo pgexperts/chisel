@@ -14,6 +14,12 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # `--release` compiles out #[cfg(debug_assertions)] tests (e.g.
+      # page_cache::claim_page_asserts_on_dirty_page in page_cache.rs).
+      # That is a known, accepted coverage boundary: the debug-gated
+      # invariant tests are covered by ci.yml's debug `test` job on the
+      # PR that precedes the tag. A hotfix tagged outside the normal PR
+      # flow would bypass them; this is accepted as-is.
       - run: cargo test --release
       # I109 (ISSUES.md, 2026-06-21): audit the tag/release path too. ci.yml's
       # audit job only runs on push/PR to main, so a vulnerable dependency
