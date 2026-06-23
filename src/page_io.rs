@@ -326,11 +326,12 @@ impl PageIo {
     /// on Apple hardware — a plain `fsync` on macOS does NOT flush the
     /// drive's own write cache. Rust's `sync_all` does the right thing.
     ///
-    /// Ordering invariant: the transaction manager calls this twice per
-    /// commit — once after writing all data pages, once after writing the
+    /// Ordering invariant: the transaction manager calls this three times
+    /// per commit — the I28 pre-drain flush, then after writing all data
+    /// pages, then after writing the
     /// new superblock into its inactive slot (slot index =
-    /// `txn_counter % superblock_count`). Reversing or dropping either
-    /// fsync breaks durability: a superblock that reaches the platter
+    /// `txn_counter % superblock_count`). Reversing or dropping the data or
+    /// superblock fsync breaks durability: a superblock that reaches the platter
     /// before its referenced data pages can point into garbage, and the
     /// crash-recovery path has no WAL to replay.
     ///
@@ -358,8 +359,8 @@ impl PageIo {
                 file.sync_all()?;
             }
             // No durable storage to flush. The commit protocol still calls
-            // fsync twice per commit; that overhead (two method calls and
-            // two matches) is preserved for benchmark fidelity.
+            // fsync three times per commit; that overhead (three method calls
+            // and three matches) is preserved for benchmark fidelity.
             Backing::Memory { .. } => {}
         }
         // Increment AFTER the operation succeeds. A failed fsync is fatal

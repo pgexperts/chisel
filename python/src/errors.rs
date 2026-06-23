@@ -1,7 +1,8 @@
 // errors.rs — defines the Python exception hierarchy and converts a
 // chisel::ChiselError into the appropriate PyErr. The two-tier split
 // (OperationalError / FatalError) mirrors ChiselError::is_fatal() in
-// src/error.rs exactly, so `except chisel.FatalError` in Python
+// src/error.rs (with one deliberate exception, PoisonedError — see the
+// Fatal block below), so `except chisel.FatalError` in Python
 // captures the same set of "drop-and-reopen" conditions that would
 // poison the Rust TransactionManager.
 //
@@ -130,7 +131,10 @@ create_exception!(_chisel, ClosedError, OperationalError);
 // circuits without raising) so context-manager usage is unaffected.
 create_exception!(_chisel, AlreadyFinishedError, OperationalError);
 
-// Fatal — matches ChiselError::is_fatal() in src/error.rs exactly.
+// Fatal — matches ChiselError::is_fatal() in src/error.rs, plus PoisonedError:
+// it is a FatalError subclass (a drop-and-reopen condition for the caller) even
+// though ChiselError::Poisoned is classified non-fatal by is_fatal() — Poisoned
+// just means the manager is already dead, not a fresh fatal.
 // IoError is NOT declared here: it needs two bases (FatalError + OSError) and is
 // built in `register` via `build_io_error_class` / cached in `IO_ERROR_CLASS`.
 create_exception!(_chisel, ChecksumMismatchError, FatalError);

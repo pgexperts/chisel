@@ -9,9 +9,10 @@
 // handle-table / membership-index COW paths prefer `FreeMap::allocate_first`
 // (reusing a page freed by a prior committed transaction) and fall back to
 // extending the file only when the freemap has no free id to hand out.
-// Reclamation happens during commit via `persist_freemap`, which merges
-// `txn_freed_pages` into `current_freemap` BEFORE writing the new freemap
-// snapshot (I18 ordering) so allocation cannot reuse a page the last-durable
+// Reclamation happens during commit via `persist_freemap` (now
+// `FreemapRecycle::persist`), which marks `txn_freed_pages` free in a COW of
+// the committed freemap tree BEFORE the new snapshot is durable
+// (I18 ordering) so allocation cannot reuse a page the last-durable
 // superblock still references. The handle table and membership index both feed
 // their COW-superseded pages into `txn_freed_pages` and allocate through
 // `cow_alloc`, so they reach a bounded steady-state page count rather than

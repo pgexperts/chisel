@@ -325,13 +325,17 @@ impl PageCache {
     /// page past the current high-water mark, so no committed page is ever
     /// overwritten during the transaction. On commit, `flush()` writes the
     /// page to disk (implicitly extending the file) and the superblock
-    /// swap makes it visible; on rollback, `discard()` drops the in-memory
+    /// swap makes it visible; on rollback, the watermark truncate
+    /// (`discard_all_dirty()` + `truncate()`, I3) drops the in-memory
     /// buffer and the on-disk bytes (if any) become orphaned garbage that
     /// the next `truncate()` or freemap reclaim can recover.
     ///
     /// Known v1 simplification (per ARCHITECTURE.md): this allocator never
-    /// consults the freemap. It always extends past EOF, so freed pages
-    /// from previous transactions remain unreclaimed until a defrag pass.
+    /// consults the freemap — it always extends past EOF. Freed pages from
+    /// previous transactions are still reclaimed, but via the freemap-aware
+    /// reuse path (`cow_alloc` -> `claim_page`, reuse-before-extend), which
+    /// is where steady-state allocation goes; `new_page` is only the
+    /// fallback when the freemap has no id to hand out.
     ///
     /// The page is inserted BEFORE `maybe_evict()` runs, so the new page
     /// itself is never the eviction victim (it is MRU and dirty anyway).
@@ -428,7 +432,8 @@ impl PageCache {
         //   - evict back to max_pages if the insertions over-filled the cache
         //
         // No per-batch fsync is issued. The single trailing fsync in Phase 2
-        // covers every write here, preserving the two-fsync commit cost.
+        // covers every write here, preserving the commit's fsync count (the
+        // three-fsync protocol: I28 pre-drain + data flush + superblock).
         // A crash before Phase 2's fsync is a rolled-back transaction —
         // no main-file bytes are committed without the superblock swap that
         // follows flush().
