@@ -1140,6 +1140,8 @@ Source: `docs/reviews/perf-review-2026-06-01.md` (read-only full hot-path sweep,
 
 **Direction of fix:** `std::mem::swap(&mut committed_*, &mut current_*)` at step 5, then reseed `current_*` from `committed_*` at the next `begin()` (which already clones). Same shape as the accepted I52 fix; strictly fewer allocations, so it does not need a bench to justify (one would size it). **Don't-Break:** the swap must occur after the step-4 fsync linearization point (it does).
 
+**Re-validated 2026-06-22 — RE-SCOPED; no longer the free win it was when filed (this entry predates the multi-page freemap rewrite + the `transaction.rs` extraction, so its line refs are stale).** (1) The 8 KB freemap-bitmap clone is **gone**: the freemap is now a COW tree (`FreemapRecycle`); `commit` promotes the structural-recycle streams with no full-bitmap copy. That half is obsolete. (2) The `current_live_slots` clone survives, now in `SlotPacker::commit` (`src/transaction/packing.rs:207`). But a `mem::swap` there is **not free**: after a swap, `current_live_slots` holds the PRE-transaction state until the next `begin()` reseeds it, and it is read post-commit by `sparse_data_pages` / `data_page_ids_snapshot` (`src/transaction/stats.rs:124,155`) — so the swap needs a proof those readers never run between `commit` and `begin`, plus a regression test. It is also a microsecond `HashMap` clone sitting **below the fsync floor**. Verdict: do NOT treat as a no-bench win; if revisited, measure first and prove the stats-read timing.
+
 #### I80. `maybe_evict` re-scans the dirty LRU prefix per eviction in the mixed clean/dirty regime [perf-review 2026-06-01] — **P2** (PR-G, [HYPOTHESIS])
 **Where:** `src/page_cache.rs` `maybe_evict` Phase A (~:912-930)
 
@@ -1168,12 +1170,14 @@ Source: `docs/reviews/perf-review-2026-06-01.md` (read-only full hot-path sweep,
 
 **Direction of fix:** land I77 first (cuts per-descent cost for free). Whether a leaf-grouping `read_many` beats the simple loop is the hypothesis — settle with a clustered-read bench row before building the batched descent (same YAGNI posture that deferred I33). Read-only `&self`; preserve per-handle error semantics.
 
-#### I84. Freemap `allocate_first` linear-scans the bitmap from byte 0 with no cursor [perf-review 2026-06-01] — **P3** (PR-O, [HYPOTHESIS])
+#### I84. Freemap `allocate_first` linear-scans the bitmap from byte 0 with no cursor [perf-review 2026-06-01] — **P3** (PR-O, [HYPOTHESIS]) ✅ ADDRESSED 2026-06-22 (multi-page freemap hint cursor)
 **Where:** `src/freemap.rs` `allocate_first` (~:135-146); found independently by the commit and write-path agents
 
 **Problem:** every freemap-backed allocation (and the per-commit freemap-page placement) scans from byte 0. With a dense low region and frees concentrated high, each allocation re-walks the same leading zero bytes — `O(n²)` across a reuse-heavy transaction. Minor (single 8 KB page, whole-byte skip, L1/L2-resident), but pure repeated work.
 
 **Direction of fix:** an in-memory `next_free_hint` byte cursor (reset on `begin()` clone / lower-id `mark_free`), optionally `u64`-word scanning. In-memory allocator state only — no on-disk format impact, and the I18 lowest-id ordering is about which ids are visible, not scan order. ARCHITECTURE.md:434 documents the from-0 scan as behavior; this is the perf entry for it.
+
+**Re-validated 2026-06-22 — ✅ ADDRESSED by the multi-page freemap.** The single-page `src/freemap.rs::allocate_first` this targeted no longer exists; the COW tree's `FreeMapTree::allocate_first` (`src/freemap_tree.rs:470`) now takes a `hint: &mut u64`, does `scan_from(cache, *hint)`, and advances `*hint = found` on each allocation — exactly the cursor this asked for. `freemap_hint` is threaded through `cow_alloc` and persisted across the transaction (lowered on `mark_free`). No work needed; closing.
 
 #### I85. `update_inner` always relocates; in-code cost-model text inaccurate under R1 [perf-review 2026-06-01] — **P3** (PR-K, [STATIC FACT]; doc + narrow opt)
 **Where:** `src/transaction.rs` `update_inner` (~:1251-1321); unused in-place `src/data_page.rs` `DataPage::update`
