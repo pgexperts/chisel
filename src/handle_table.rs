@@ -415,8 +415,11 @@ impl HandleTable {
 
     /// Rebuild the tree depth by walking the left spine from `root` until a leaf
     /// (the flag byte `buf[1]` != `FLAG_INTERIOR`). Also validates `buf[0]` is
-    /// `PageType::HandleTable` on every interior page so a wrong-type page handed
-    /// in as a bogus root stops with `CorruptPage` rather than being mis-walked.
+    /// `PageType::HandleTable` on every interior page on the spine, so a
+    /// non-handle-table page that nonetheless carries the `FLAG_INTERIOR` byte
+    /// (e.g. a future format putting `0x02` at byte 1) stops with `CorruptPage`
+    /// rather than being mis-walked. A leaf-shaped wrong-type root is the benign
+    /// cross-type case the type tags already make safe — it returns depth 0.
     /// Returns 0 for an empty tree (`PAGE_ID_NONE`) or a leaf root. The in-memory
     /// `depth` is NOT carried in `Roots`, so the transaction layer re-derives it
     /// from the restored root both at open AND after a rollback rewinds to a
