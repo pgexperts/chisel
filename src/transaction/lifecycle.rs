@@ -88,24 +88,12 @@ impl TransactionManager {
         }
         self.current_roots = self.committed_roots.clone();
         // The freemap root+depth ride in current_roots (cloned just above), so
-        // there is no separate freemap working copy to reset here. The hint is
-        // untracked (a stale hint only costs a scan), so it is left as-is too.
-        // The session-owned set is strictly per-transaction: a page COW'd last
-        // transaction is now committed and must NOT be mutated in place, so start
-        // empty. (begin already requires no active txn, so it is normally empty,
-        // but clear defensively.)
-        self.freemap_session_owned.clear();
-        // Seed the structural reuse pool from the prior commit's deferred dead
-        // freemap pages: those superblock-unreferenced pages are now safe to
-        // reuse as this transaction's freemap COW targets, so the freemap rotates
-        // among a bounded set instead of extending. CLONE (not move) so
-        // `pending_structural_frees` stays intact as the rollback fallback — a
-        // rolled-back transaction never reached commit, so its structural recycle
-        // is exactly the pre-transaction one. `commit_inner` overwrites it on the
-        // success path. `structural_superseded` is empty here (only
-        // persist_freemap fills it); clear defensively.
-        self.structural_reuse = self.pending_structural_frees.clone();
-        self.structural_superseded.clear();
+        // there is no separate freemap working copy to reset here. Reset the
+        // recycle's per-transaction state: clear the session set and reseed the
+        // structural reuse pool from the prior commit's deferred dead freemap
+        // pages (the hint persists across transactions — a stale hint only costs a
+        // scan). See `FreemapRecycle::begin`.
+        self.freemap.begin();
         // R1: clone the live-slot counts and reset the insert cursor.
         // The cursor is always None at begin — it only tracks pages
         // allocated during the current transaction.
@@ -337,19 +325,11 @@ impl TransactionManager {
         // txn_freed_pages were already marked free in the new committed freemap
         // tree by persist_freemap; clear the vector now that it's done its job.
         self.txn_freed_pages.clear();
-        // Every freemap page COW'd this transaction is now committed; the next
-        // transaction must COW (not edit in place) any of them it touches.
-        self.freemap_session_owned.clear();
-        // Promote the freemap structural recycle for the next transaction: the
-        // pages this commit superseded (`structural_superseded`) become dead the
-        // instant the superblock flips above — and the reuse-pool remainder
-        // (`structural_reuse` ids not consumed as COW targets) is likewise still
-        // dead and reusable. Both become next transaction's `pending_structural_frees`.
-        self.pending_structural_frees.clear();
-        self.pending_structural_frees
-            .append(&mut self.structural_superseded);
-        self.pending_structural_frees
-            .append(&mut self.structural_reuse);
+        // Clear the freemap session set (every page COW'd this transaction is now
+        // committed) and promote the structural recycle for the next transaction:
+        // this commit's supersedes + the unconsumed reuse remainder become next
+        // transaction's `pending_structural_frees`. See `FreemapRecycle::commit`.
+        self.freemap.commit();
 
         Ok(())
     }
@@ -426,24 +406,11 @@ impl TransactionManager {
         // The freemap root+depth were restored by `current_roots =
         // committed_roots.clone()` above; any dirty freemap pages this
         // transaction COW'd sit above the watermark and were dropped by the
-        // truncate. The hint is untracked, so nothing to revert.
-        //
-        // `pending_structural_frees` is left intact: begin() CLONED it into
-        // `structural_reuse` rather than moving it, so it still holds the
-        // pre-transaction dead-freemap-page set — correct, since a rolled-back
-        // transaction's structural recycle is exactly the pre-transaction one.
-        // We DISCARD the in-transaction structural working state:
-        //   * `structural_superseded` holds committed-tree freemap pages this
-        //     aborted transaction COW'd-over; the abort means the committed tree
-        //     still references them, so they are NOT dead and must never be
-        //     recycled.
-        //   * `structural_reuse` was the working copy; drop it.
-        //   * the session-owned set: any freemap pages this aborted transaction
-        //     COW'd sit above the watermark and were just truncated, so their ids
-        //     must not be treated as in-place-mutable next transaction.
-        self.structural_superseded.clear();
-        self.structural_reuse.clear();
-        self.freemap_session_owned.clear();
+        // truncate. Discard the in-transaction structural working state
+        // (`structural_superseded` + `structural_reuse` + the session set) while
+        // leaving `pending_structural_frees` intact as the pre-transaction
+        // baseline. See `FreemapRecycle::rollback` for the per-stream reasoning.
+        self.freemap.rollback();
         // R1: revert the live-slot counts and drop the insert cursor.
         self.packer.rollback();
         self.active_txn = false;

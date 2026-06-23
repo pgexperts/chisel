@@ -635,8 +635,12 @@ fn structural_recycle_one_commit_defer() {
 
     // Capture the promoted recycle the measured transaction inherits, and
     // drain the warm-up's reuse log so only the measured transaction is seen.
-    let promoted: std::collections::HashSet<u64> =
-        tm.pending_structural_frees.iter().copied().collect();
+    let promoted: std::collections::HashSet<u64> = tm
+        .freemap
+        .pending_structural_frees()
+        .iter()
+        .copied()
+        .collect();
     assert!(
         !promoted.is_empty(),
         "precondition: warm-up must leave a non-empty deferred recycle"
@@ -661,7 +665,7 @@ fn structural_recycle_one_commit_defer() {
     // Pages T+1 superseded so far (the body). persist_freemap adds more at
     // commit; both must stay out of the reuse pops.
     let superseded_in_t1: std::collections::HashSet<u64> =
-        tm.structural_superseded.iter().copied().collect();
+        tm.freemap.structural_superseded().iter().copied().collect();
     tm.commit().unwrap();
 
     // Read the log IMMEDIATELY after T+1's commit — before any later
@@ -714,7 +718,7 @@ fn structural_recycle_one_commit_defer() {
             .into_iter()
             .collect()
     };
-    for id in &tm.pending_structural_frees {
+    for id in tm.freemap.pending_structural_frees() {
         assert!(
             !reachable.contains(id),
             "one-commit-defer VIOLATION: page {id} is queued for reuse in T+2 but is \
@@ -740,7 +744,7 @@ fn structural_recycle_rollback_resets_pools() {
     // Establish a non-empty committed recycle so the test exercises a real
     // restore target, not just emptiness.
     let survivors = structural_churn(&mut tm, &big, 8, 4);
-    let committed_recycle: Vec<u64> = tm.pending_structural_frees.clone();
+    let committed_recycle: Vec<u64> = tm.freemap.pending_structural_frees().to_vec();
     assert!(
         !committed_recycle.is_empty(),
         "precondition: a prior commit must leave a non-empty deferred recycle"
@@ -758,7 +762,7 @@ fn structural_recycle_rollback_resets_pools() {
     // path; assert the test actually dirtied the state it is about to roll
     // back (else the reset assertions are vacuous).
     assert!(
-        !tm.freemap_session_owned.is_empty() || !tm.structural_superseded.is_empty(),
+        !tm.freemap.session_owned().is_empty() || !tm.freemap.structural_superseded().is_empty(),
         "precondition: the pre-rollback churn must have mutated freemap session/supersede state"
     );
 
@@ -768,11 +772,16 @@ fn structural_recycle_rollback_resets_pools() {
     // aborted transaction's recycle is exactly the pre-transaction one: the
     // committed recycle must be intact, and the working pools cleared.
     assert_eq!(
-        tm.pending_structural_frees, committed_recycle,
+        tm.freemap.pending_structural_frees(),
+        committed_recycle.as_slice(),
         "rollback must leave the committed deferred recycle intact"
     );
-    let recycle_after: std::collections::HashSet<u64> =
-        tm.pending_structural_frees.iter().copied().collect();
+    let recycle_after: std::collections::HashSet<u64> = tm
+        .freemap
+        .pending_structural_frees()
+        .iter()
+        .copied()
+        .collect();
     let committed_set: std::collections::HashSet<u64> = committed_recycle.iter().copied().collect();
     assert_eq!(
         recycle_after, committed_set,
@@ -780,12 +789,12 @@ fn structural_recycle_rollback_resets_pools() {
              must equal the committed recycle state"
     );
     assert!(
-        tm.structural_superseded.is_empty(),
+        tm.freemap.structural_superseded().is_empty(),
         "rollback must clear structural_superseded — those committed-tree pages are \
              still referenced and must never be recycled"
     );
     assert!(
-        tm.freemap_session_owned.is_empty(),
+        tm.freemap.session_owned().is_empty(),
         "rollback must clear freemap_session_owned — leaking it would suppress a needed \
              COW and mutate a live committed page in place next transaction"
     );
@@ -887,9 +896,9 @@ fn orphan_sweep_skipped_under_savepoint_preserves_committed_freemap() {
     // The streams the rollback_to does NOT reset must be untouched by the
     // sweep, or the rollback leaves dangerous residue.
     assert!(
-        tm.structural_superseded.is_empty(),
+        tm.freemap.structural_superseded().is_empty(),
         "sweep under savepoint leaked into structural_superseded: {:?}",
-        tm.structural_superseded
+        tm.freemap.structural_superseded()
     );
 
     // Roll back to the savepoint (discards the forged page) and commit the
@@ -1113,7 +1122,7 @@ fn structural_recycle_no_lost_or_double_free() {
                 .into_iter()
                 .collect()
         };
-        for id in &tm.pending_structural_frees {
+        for id in tm.freemap.pending_structural_frees() {
             assert!(
                 !reachable.contains(id),
                 "round {round}: freemap page {id} is in the structural reuse pool AND \
@@ -1130,7 +1139,7 @@ fn structural_recycle_no_lost_or_double_free() {
                 tm.committed_roots.freemap_page,
                 tm.committed_roots.freemap_depth,
             );
-            for id in &tm.pending_structural_frees {
+            for id in tm.freemap.pending_structural_frees() {
                 assert!(
                     !committed.is_free(&mut cache, *id).unwrap(),
                     "round {round}: structural-reuse page {id} is ALSO marked free in the \
@@ -1210,14 +1219,14 @@ fn reclaim_freemap_orphans_excludes_live_recycle_pool() {
     let pooled = tm.test_forge_freemap_orphan().unwrap();
 
     tm.begin().unwrap();
-    tm.structural_reuse.push(pooled);
+    tm.freemap.push_structural_reuse_for_test(pooled);
     let reclaimed = tm.reclaim_freemap_orphans().unwrap();
     assert_eq!(
         reclaimed, 0,
         "a page in the live recycle pool must NOT be reclaimed as an orphan"
     );
     assert!(
-        tm.structural_reuse.contains(&pooled),
+        tm.freemap.structural_reuse().contains(&pooled),
         "the sweep must leave the live recycle pool untouched"
     );
     tm.rollback().unwrap();
