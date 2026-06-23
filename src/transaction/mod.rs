@@ -224,6 +224,7 @@ pub struct TransactionManager {
     fault: fault::FaultInjector,
 }
 
+mod commit;
 mod config;
 #[cfg(test)]
 mod fault;

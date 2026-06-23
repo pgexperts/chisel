@@ -199,139 +199,24 @@ impl TransactionManager {
     }
 
     fn commit_inner(&mut self) -> Result<()> {
-        // I27: flatten every still-active savepoint's `freed_pages`
-        // back into `txn_freed_pages` before persist_freemap consumes
-        // it. savepoint_inner moves `txn_freed_pages` INTO the
-        // savepoint record (via std::mem::take), so any frees that
-        // happened before a still-unreleased savepoint otherwise get
-        // dropped on the floor when step 5 calls `savepoints.clear()`
-        // — a permanent freemap leak for the "commit with savepoint
-        // active" pattern. Mirrors `release_inner`'s merge but applied
-        // across the full stack. We take the lists out of the
-        // savepoints (rather than iterating by reference) so the
-        // savepoints hold no stale `freed_pages` if we ever change
-        // step 5 to drain instead of clear; current code is equivalent
-        // either way.
-        for sp in self.savepoints.iter_mut() {
-            self.txn_freed_pages.append(&mut sp.freed_pages);
-        }
-
-        // I28: drain the page cache BEFORE persist_freemap runs. Without
-        // this, `persist_freemap`'s own freemap-page allocation
-        // (`structural_extend` → `new_page`) can trip
-        // `maybe_evict`'s spill-or-CacheFull decision (every existing entry
-        // dirty, nothing evictable, and either spillway disabled or full)
-        // and return `ChiselError::CacheFull` or `ChiselError::SpillwayFull`.
-        // The CacheFull variant is operational-by-design (I19 docs: "caller
-        // recovers by
-        // committing or rolling back"), but commit's poison wrapper fires
-        // on any error once the protocol has started — demoting an
-        // operational signal to fatal for a caller who has no legal
-        // action left (commit is precisely what failed). Pre-draining
-        // clears every dirty pin so the ceiling is reachable via normal
-        // eviction when persist_freemap itself allocates. Cost: one
-        // extra fsync on every commit. That is consistent with the
-        // project's explicit "durability over performance" posture —
-        // the alternative reclassifies CacheFull as fatal inside commit,
-        // which is both more surprising and harder to document cleanly.
-        //
-        // Ordering note: this flush is safe to do before persist_freemap.
-        // The shadow-paging invariant requires "new-freemap-page durable
-        // before superblock" (step 1's flush does that). The pre-drain
-        // only affects user-dirty pages, which are already part of the
-        // transaction's durable write set — just flushed earlier. The
-        // subsequent step 1 flush handles the one new freemap page
-        // persist_freemap adds.
-        self.cache.borrow_mut().flush()?;
-
-        // Step 0 (ISSUES.md R2 / I11): persist the freemap tree. This marks
-        // `txn_freed_pages` (plus the prior commit's deferred structural frees)
-        // free in a COW of the committed tree and updates
-        // `current_roots.{freemap_page, freemap_depth}`. Runs BEFORE the main
-        // flush so the new freemap pages join the same durable write set as all
-        // other dirty data pages.
-        self.persist_freemap()?;
-
-        // Hold one RefMut for the remaining steps. Dropping and
-        // re-borrowing between steps would be semantically identical
-        // but noisier.
-        let mut cache = self.cache.borrow_mut();
-
-        // Step 1: Flush all dirty pages (PageCache::flush internally fsyncs).
-        // After this, every page the new superblock will reference is on disk.
-        cache.flush()?;
-
-        // Step 2: Build the new superblock. Bumping txn_counter here both makes
-        // it outrank the current superblock on recovery AND (via parity) picks
-        // the target slot in step 3.
-        //
-        // I119 (ISSUES.md, 2026-06-21): checked, not `+= 1`. A wrapped counter
-        // would corrupt `Superblock::select`'s "highest counter wins" (release
-        // wrap to 0) — far worse than the loud, controlled panic here. Overflow
-        // needs 2^64 commits, so it is structurally unreachable; a dedicated
-        // fatal error variant for an impossible event would be speculative
-        // public surface, so the `expect` on the invariant is proportionate.
-        self.txn_counter = self
-            .txn_counter
-            .checked_add(1)
-            .expect("txn_counter overflowed u64 (2^64 commits) — unreachable");
-        let total_pages = cache.file_page_count()?;
-        let sb = Superblock {
-            magic: page::MAGIC,
-            format_version: page::FORMAT_VERSION,
-            txn_counter: self.txn_counter,
-            root_handle_table_page: self.current_roots.handle_table_page,
-            root_freemap_page: self.current_roots.freemap_page,
-            total_pages,
-            next_handle: self.current_roots.next_handle,
-            page_size: PAGE_SIZE as u32,
-            named_roots: self.current_roots.named_roots,
-            // R4: every slot records the current N so open-time
-            // recovery can discover it from the winning slot without
-            // external hints.
+        // The 3-fsync commit protocol lives in `commit::run_commit`, operating
+        // over the ten pieces of manager state it touches via `CommitCtx`. The
+        // ordering there is load-bearing (see the step-by-step rationale on
+        // `commit()` above and in `commit.rs`); this stays a thin caller. All
+        // `&mut self.<field>` borrows are distinct fields and `&self.cache` is a
+        // shared borrow, so the borrow checker accepts the simultaneous borrows.
+        commit::run_commit(&mut commit::CommitCtx {
+            cache: &self.cache,
+            savepoints: &mut self.savepoints,
+            txn_freed_pages: &mut self.txn_freed_pages,
+            freemap: &mut self.freemap,
+            packer: &mut self.packer,
+            committed_roots: &mut self.committed_roots,
+            current_roots: &mut self.current_roots,
+            txn_counter: &mut self.txn_counter,
+            active_txn: &mut self.active_txn,
             superblock_count: self.superblock_count,
-            root_membership_index_page: self.current_roots.membership_index_page,
-            // Freemap tree depth, paired with root_freemap_page. 0 = today's
-            // single-leaf format; grows as the tree deepens.
-            freemap_depth: self.current_roots.freemap_depth,
-        };
-        let buf = sb.serialize();
-        // Step 3: Write to the INACTIVE slot. For N superblock slots,
-        // the slot is `txn_counter % N` — a round-robin that always
-        // targets the stalest slot. With N=2 this is the parity
-        // alternation from the original layout; with N>=3 it extends
-        // to true round-robin. The currently-active slot (and every
-        // other non-target slot) is never touched, so a torn write
-        // here can only damage the new superblock, never the N-1
-        // last-known-good ones.
-        let inactive = self.txn_counter % self.superblock_count as u64;
-        cache.io_mut().write_page(inactive, &buf)?;
-        // Step 4: Durability linearization point. Until this fsync returns the
-        // transaction is not crash-safe; after it returns the new state is
-        // observable on recovery.
-        cache.io_mut().fsync()?;
-
-        // Step 5: Promote in-memory state. Only now is the txn officially committed.
-        self.committed_roots = self.current_roots.clone();
-        self.committed_roots.total_pages = total_pages;
-        // The committed freemap tree advances automatically: its {root, depth}
-        // ride in current_roots, promoted into committed_roots just above. No
-        // separate in-memory freemap copy to advance.
-        // R1: promote the live-slot counts. The cursor is per-transaction
-        // and gets reset for the next begin().
-        self.packer.commit();
-        self.active_txn = false;
-        self.savepoints.clear();
-        // txn_freed_pages were already marked free in the new committed freemap
-        // tree by persist_freemap; clear the vector now that it's done its job.
-        self.txn_freed_pages.clear();
-        // Clear the freemap session set (every page COW'd this transaction is now
-        // committed) and promote the structural recycle for the next transaction:
-        // this commit's supersedes + the unconsumed reuse remainder become next
-        // transaction's `pending_structural_frees`. See `FreemapRecycle::commit`.
-        self.freemap.commit();
-
-        Ok(())
+        })
     }
 
     /// Abort the active transaction and discard all in-memory changes.
