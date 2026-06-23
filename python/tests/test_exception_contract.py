@@ -269,18 +269,25 @@ def test_two_thread_mutex_contention(tmp_db):
     ITERATIONS = 200
     db = chisel.open(str(tmp_db))
     # Single-threaded setup: commit a handful of handles to read concurrently.
-    handles = []
+    # Build a mapping handle -> expected payload so the reader can verify the
+    # exact bytes rather than using a length-zero sentinel (b"" is a valid
+    # stored value, so len == 0 would be a fragile proxy for corruption).
+    handle_payloads = {}
     with db.transaction() as tx:
         for i in range(8):
-            handles.append(tx.allocate(b"payload-" + bytes([i])))
+            payload = b"payload-" + bytes([i])
+            h = tx.allocate(payload)
+            handle_payloads[h] = payload
+    handles = list(handle_payloads.keys())
     errors = []
 
     def reader():
         try:
             for _ in range(ITERATIONS):
                 for h in handles:
-                    if len(db.read(h)) == 0:
-                        errors.append(("empty read", h))
+                    got = db.read(h)
+                    if got != handle_payloads[h]:
+                        errors.append(("corrupt read", h, got))
         except chisel.ChiselError as exc:
             errors.append(("error", exc))
 
