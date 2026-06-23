@@ -95,9 +95,7 @@ impl TransactionManager {
             structural_superseded: Vec::new(),
             freemap_session_owned: FxHashSet::default(),
             // A fresh database has no data pages and no live slots yet.
-            committed_live_slots: FxHashMap::default(),
-            current_live_slots: FxHashMap::default(),
-            insert_cursor: None,
+            packer: packing::SlotPacker::new(),
             poisoned: Cell::new(false),
             #[cfg(test)]
             fault: fault::FaultInjector::default(),
@@ -302,8 +300,6 @@ impl TransactionManager {
                 }
             }
         }
-        let current_live_slots = committed_live_slots.clone();
-
         Ok(TransactionManager {
             cache: RefCell::new(cache),
             committed_roots: roots.clone(),
@@ -323,9 +319,7 @@ impl TransactionManager {
             structural_reuse: Vec::new(),
             structural_superseded: Vec::new(),
             freemap_session_owned: FxHashSet::default(),
-            committed_live_slots,
-            current_live_slots,
-            insert_cursor: None,
+            packer: packing::SlotPacker::from_committed(committed_live_slots),
             poisoned: Cell::new(false),
             #[cfg(test)]
             fault: fault::FaultInjector::default(),

@@ -1386,12 +1386,13 @@ fn allocate_membership_failure_leaves_maps_consistent() {
     // insert cursor survives to skew later packing / defrag density / page
     // reclamation. (Pre-fix this leaked `{page: 1}` and `Some(page)`.)
     assert!(
-        tm.current_live_slots.is_empty(),
+        tm.packer.is_current_empty(),
         "failed allocate left a phantom live-slot count: {:?}",
-        tm.current_live_slots
+        tm.packer.current_live_slots()
     );
     assert_eq!(
-        tm.insert_cursor, None,
+        tm.packer.insert_cursor(),
+        None,
         "failed allocate left a ghost insert cursor"
     );
 
@@ -1445,11 +1446,11 @@ fn allocate_handle_table_failure_leaves_maps_consistent() {
     );
     assert!(tm.handles_with_tag(7).unwrap().is_empty());
     assert!(
-        tm.current_live_slots.is_empty(),
+        tm.packer.is_current_empty(),
         "failed forward step left a phantom live-slot count: {:?}",
-        tm.current_live_slots
+        tm.packer.current_live_slots()
     );
-    assert_eq!(tm.insert_cursor, None);
+    assert_eq!(tm.packer.insert_cursor(), None);
 
     // Disarmed retry succeeds and is consistent across both maps.
     let h = tm.allocate_tagged(b"payload", 7).unwrap();
@@ -1760,10 +1761,10 @@ fn update_handle_table_failure_preserves_old_value_and_releases_new_slot() {
     // had exactly one live slot (for `old`), and the failed update must
     // leave precisely that — no phantom count for the abandoned new value.
     assert_eq!(
-        tm.current_live_slots.values().sum::<u32>(),
+        tm.packer.current_live_slots().values().sum::<u32>(),
         1,
         "failed update left a phantom live-slot: {:?}",
-        tm.current_live_slots
+        tm.packer.current_live_slots()
     );
 
     // Durability: commit, assert C1, force reuse, re-read the old value.

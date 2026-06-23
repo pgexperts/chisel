@@ -46,7 +46,8 @@
 
 use std::cell::{Cell, RefCell};
 // I127 (ISSUES.md, 2026-06-21): FxHashMap (not std SipHash) for the per-op
-// slot-accounting maps below (current/committed_live_slots, Savepoint.live_slots).
+// slot-accounting maps (the SlotPacker live-slot maps in packing.rs,
+// Savepoint.live_slots below, and the open-time scan map in recovery.rs).
 // Keys are trusted local u64 page ids — no DoS surface — so SipHash is pure cost,
 // exactly the I77 rationale; that pass converted the page cache/LRU but missed
 // these. FxHashMap is a drop-in std HashMap with a faster non-DoS-resistant hasher.
@@ -242,34 +243,13 @@ pub struct TransactionManager {
     // COW and mutate a live committed page in place), which is exactly why it is
     // transaction-scoped, not cross-transaction.
     freemap_session_owned: FxHashSet<u64>,
-    // Live-slot count per data page (ISSUES.md R1). Tracks how many
-    // handle-table entries currently point at each data page — this
-    // is the information needed to decide when a page is fully empty
-    // and can be returned to the freemap. `committed_live_slots` is
-    // the durable state (rebuilt at open time by scanning the handle
-    // table); `current_live_slots` is the in-transaction working copy.
-    //
-    // Kept in memory rather than on disk because updating a slot count
-    // on a committed data page would require COW, and COWing a data
-    // page would require rewriting every handle_table entry that
-    // points into it — an O(live-slots-in-page) amplification per
-    // delete that shadow paging does not handle well.
-    committed_live_slots: FxHashMap<u64, u32>,
-    current_live_slots: FxHashMap<u64, u32>,
-    // Per-transaction "insert cursor" (ISSUES.md R1). The id of a data
-    // page allocated earlier in the current transaction that still has
-    // free space. New values pack into it until it fills, at which
-    // point a new page is allocated and becomes the new cursor.
-    //
-    // `None` at the start of each transaction. Only set for pages
-    // allocated during THIS transaction (so they're dirty in the cache
-    // and safe to modify). A committed data page is never the cursor —
-    // that would require COW, which is prohibitively expensive for data
-    // pages (every handle_table entry pointing at the page would need
-    // to be rewritten). Disabled entirely when savepoints are active,
-    // same as freemap reuse (R2): the savepoint-snapshot cost becomes
-    // manageable when only one code path interacts with packing state.
-    insert_cursor: Option<u64>,
+    // R1 slot-packing state (live-slot counts per data page + the insert
+    // cursor), extracted into its own owned unit. No code outside `packing.rs`
+    // touches the inner fields; `TransactionManager` reaches packing through
+    // the narrow `SlotPacker` interface (the `insert_into_data_page` /
+    // `release_data_slot` wrappers plus the lifecycle/savepoint/stats hooks).
+    // See the `packing` module header for the live-slot and cursor models.
+    packer: packing::SlotPacker,
     // Poison flag (ISSUES.md I1). Once set, every public entry point returns
     // ChiselError::Poisoned until the manager is dropped. Set by commit() on
     // any error in the commit protocol, and by `poison_on_fatal()` for any

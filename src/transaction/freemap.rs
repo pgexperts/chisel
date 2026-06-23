@@ -123,9 +123,12 @@ impl TransactionManager {
 
     // --- Freemap-aware page allocation (ISSUES.md R2) ---
     //
-    // `allocate_data_page` is the single entry point for allocating a
-    // fresh data page during a transaction. It first tries to reuse an
-    // id from `current_freemap` and falls back to extending the file.
+    // `cow_alloc` (free function above) is the shared freemap-aware allocator
+    // for a fresh page during a transaction: it first tries to reuse an id from
+    // the committed freemap tree and falls back to extending the file. Data-page
+    // allocation reaches it through the freemap dance hoisted into
+    // `SlotPacker::insert`'s caller (`insert_into_data_page` in packing.rs); the
+    // handle-table / membership COW paths reach it through `ht_insert` below.
     //
     // Two important scoping rules:
     //
@@ -181,27 +184,6 @@ impl TransactionManager {
         self.structural_superseded
             .append(&mut tree.pending_superseded);
         self.freemap_session_owned = std::mem::take(&mut tree.session_owned);
-    }
-
-    pub(super) fn allocate_data_page(&mut self) -> Result<u64> {
-        let reuse = self.savepoints.is_empty();
-        let mut tree = self.take_freemap_tree();
-        let id = {
-            let mut cache = self.cache.borrow_mut();
-            cow_alloc(
-                &mut cache,
-                &mut tree,
-                &mut self.freemap_hint,
-                &mut self.structural_reuse,
-                reuse,
-            )
-        };
-        // Write back tree growth + drain supersedes even on error: the freemap
-        // pages were extended (never freed), so on a non-fatal failure they are
-        // harmless above-watermark scratch, and the session set must still be
-        // returned so a retry/commit in the same transaction stays consistent.
-        self.put_freemap_tree(tree);
-        id
     }
 
     /// COW `handle`'s handle-table entry to `entry`, installing the new root

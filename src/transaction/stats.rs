@@ -121,9 +121,9 @@ impl TransactionManager {
         if threshold_ratio <= 0.0 {
             return Ok(sparse);
         }
-        let page_ids: Vec<u64> = self.current_live_slots.keys().copied().collect();
+        let page_ids: Vec<u64> = self.packer.current_live_slots().keys().copied().collect();
         for page_id in page_ids {
-            let live = match self.current_live_slots.get(&page_id) {
+            let live = match self.packer.current_live_slots().get(&page_id) {
                 Some(&n) if n > 0 => n,
                 _ => continue,
             };
@@ -152,7 +152,7 @@ impl TransactionManager {
     /// creates a dense one; the former should count as "reclaimed"
     /// even when the latter offsets the net count.
     pub fn data_page_ids_snapshot(&self) -> std::collections::HashSet<u64> {
-        self.current_live_slots.keys().copied().collect()
+        self.packer.current_live_slots().keys().copied().collect()
     }
 
     /// Look up the data page id that currently holds `handle`. Returns
