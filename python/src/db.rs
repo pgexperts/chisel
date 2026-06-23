@@ -283,6 +283,14 @@ impl PyChisel {
     // propagates before PyTransaction is constructed — callers never
     // see a half-alive transaction object.
     //
+    // If begin() succeeds but Py::new fails (e.g., allocation failure),
+    // we roll back the just-begun transaction so the engine returns to a
+    // clean no-active-transaction state. Without this rollback the engine
+    // would have a live active transaction with no Python owner to ever
+    // commit or roll it back, and the next begin() would raise
+    // TransactionAlreadyActive. Py::new failures are extremely unlikely
+    // (Python-level allocation error) but we close the window regardless.
+    //
     // The `slf: Py<Self>` (rather than `&self`) is the PyO3 idiom for
     // "I need to store a Python-side reference to my own object."
     // PyTransaction holds that Py<PyChisel>, which keeps the PyChisel
@@ -293,7 +301,11 @@ impl PyChisel {
         py: Python<'_>,
     ) -> PyResult<Py<crate::transaction::PyTransaction>> {
         slf.bind(py).borrow().begin()?;
-        Py::new(py, crate::transaction::PyTransaction::new(slf))
+        Py::new(py, crate::transaction::PyTransaction::new(slf.clone_ref(py))).inspect_err(|_| {
+            // Py::new failed after begin() succeeded — roll back so the engine
+            // is not left with a live transaction that nothing can close.
+            let _ = slf.bind(py).borrow().rollback();
+        })
     }
 
     pub(crate) fn allocate(&self, value: &Bound<'_, PyAny>) -> PyResult<u64> {
@@ -434,7 +446,11 @@ impl PyChisel {
     // class, so a user-defined options-shaped object will also work
     // — the dataclass is just the nice ergonomic default.
     #[pyo3(signature = (options=None))]
-    pub(crate) fn defrag(&self, py: Python<'_>, options: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
+    pub(crate) fn defrag(
+        &self,
+        py: Python<'_>,
+        options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
         let rust_opts = match options {
             None => chisel::DefragOptions::default(),
             Some(obj) => {

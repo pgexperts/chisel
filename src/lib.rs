@@ -225,6 +225,11 @@ impl Options {
         self.read_only = read_only;
         self
     }
+    /// Set the number of superblock slots. Valid range is 2..=16; any other
+    /// value is accepted here and rejected at open time with
+    /// `ChiselError::InvalidSuperblockCount`. This is only consulted on
+    /// initial file creation; existing files use the count baked into their
+    /// header.
     pub fn superblock_count(mut self, count: u32) -> Self {
         self.superblock_count = count;
         self
@@ -300,7 +305,7 @@ impl Chisel {
     /// range), `FileNotFound` (no file at `path` and `create_if_missing` is
     /// false), or `LockFailed` (another handle holds the exclusive flock). When
     /// reopening an existing file, parsing the superblock can also yield
-    /// `InvalidMagic`, `UnsupportedFormatVersion`, `CorruptSuperblock`,
+    /// `UnsupportedFormatVersion`, `CorruptSuperblock`,
     /// `ChecksumMismatch`, `FileSizeMismatch`, or `IoError`.
     pub fn open(path: &Path, options: Options) -> Result<Chisel> {
         // R4: validate superblock_count before touching the file.

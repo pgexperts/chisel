@@ -158,6 +158,12 @@ jobs:
           pip install --upgrade pip
           pip install maturin pytest hypothesis
 
+      # `maturin develop --release` builds without debug_assertions, so the
+      # Python end-to-end test run here never exercises engine debug-assert
+      # invariants (e.g. page_cache::claim_page_asserts_on_dirty_page).
+      # That is a known, accepted coverage boundary: engine debug-assert
+      # invariants are covered by the Rust `test` job above, which builds
+      # in debug mode.
       - name: Build and install
         working-directory: python
         run: |

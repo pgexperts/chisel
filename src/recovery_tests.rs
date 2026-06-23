@@ -1525,9 +1525,8 @@ fn test_file_not_found_without_create() {
 // slot, re-stamping the checksum so the magic check (not the checksum check) is
 // the failing gate. Superblock::deserialize then returns None for every slot,
 // Superblock::select returns None, and open surfaces CorruptSuperblock. This
-// PINS CorruptSuperblock as the sole expected variant AND proves InvalidMagic is
-// unreachable (a bad magic never produces it) — the basis for removing the dead
-// variant in the next task.
+// PINS CorruptSuperblock as the sole expected variant for corrupt-magic input —
+// InvalidMagic was removed; bad magic now surfaces only as CorruptSuperblock.
 #[test]
 fn corrupt_magic_surfaces_as_corrupt_superblock_not_invalid_magic() {
     let dir = TempDir::new().unwrap();
