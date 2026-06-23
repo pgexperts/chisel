@@ -10,7 +10,9 @@
 //! - `fail_next_handle_table_op`: companion for the FORWARD step — the next
 //!   `allocate_inner` handle-table insert returns a non-fatal `CacheFull`, exercising
 //!   the prepare-abort/unwind path of the step carrying the eager depth bump
-//!   (HandleTable::grow).
+//!   (HandleTable::grow). Consumed inside `handle_table_insert_candidate`, which both
+//!   `allocate_inner` and `update_inner` route through, so either path's forward step
+//!   can be the one that trips it (the test that arms it controls which fires first).
 //! - `fail_next_update_value_write`: for `update_inner` — the next update returns a
 //!   non-fatal `CacheFull` at the NEW-value-write step (the first fallible step with
 //!   the fix; pre-fix it landed AFTER the old location was freed), proving the old

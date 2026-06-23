@@ -37,6 +37,8 @@
 //         TransactionInProgressError
 //         ClosedError              (I25: db.close() raced a live txn/sp)
 //         AlreadyFinishedError     (I22/I24: double-drive a finished txn/sp)
+//         TagMismatchError         (delete_tagged supplied a tag that does
+//                                   not match the handle's stored tag)
 //       FatalError                       (drop-and-reopen recovery only)
 //         IoError                  (ALSO subclasses builtin OSError — see register)
 //         ChecksumMismatchError
