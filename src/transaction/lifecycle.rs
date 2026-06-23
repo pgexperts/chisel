@@ -229,7 +229,8 @@ impl TransactionManager {
         }
 
         // I28: drain the page cache BEFORE persist_freemap runs. Without
-        // this, `persist_freemap`'s own `allocate_data_page` can trip
+        // this, `persist_freemap`'s own freemap-page allocation
+        // (`structural_extend` → `new_page`) can trip
         // `maybe_evict`'s spill-or-CacheFull decision (every existing entry
         // dirty, nothing evictable, and either spillway disabled or full)
         // and return `ChiselError::CacheFull` or `ChiselError::SpillwayFull`.

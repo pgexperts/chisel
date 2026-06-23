@@ -406,8 +406,8 @@ mod tests {
         // Run defrag with a generous sparse threshold (0.5) so the source pages
         // definitely qualify.  Steps 5 and 7 execute inside the SAME transaction.
         //
-        // Step 5 triggers at least one `allocate_data_page` → `allocate_first`
-        // call, which COWs a freemap leaf and pushes its old id into
+        // Step 5 triggers at least one data-page allocation → `cow_alloc` →
+        // `allocate_first` call, which COWs a freemap leaf and pushes its old id into
         // `structural_superseded`.  Step 7 must then exclude that id so only the
         // forged orphan is reclaimed.
         tm.begin().unwrap();

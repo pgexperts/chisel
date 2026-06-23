@@ -1226,9 +1226,9 @@ fn reclaim_freemap_orphans_excludes_live_recycle_pool() {
 // Regression test for ISSUES.md I28. I19 introduced `CacheFull` as
 // an **operational** error (documented as "commit or rollback to
 // recover"), but `commit_inner` runs `persist_freemap` BEFORE
-// `cache.flush()` — and `persist_freemap` itself calls
-// `allocate_data_page`, which may trip `maybe_evict`'s ceiling
-// check when every existing cache entry is dirty. Pre-fix the
+// `cache.flush()` — and `persist_freemap` itself allocates a
+// freemap page (`structural_extend`), which may trip `maybe_evict`'s
+// ceiling check when every existing cache entry is dirty. Pre-fix the
 // resulting `CacheFull` propagated out of commit_inner and
 // commit()'s poison wrapper poisoned the manager unconditionally.
 // The recovery advice ("commit to flush") became impossible to
@@ -1303,8 +1303,8 @@ fn commit_does_not_poison_when_cache_is_at_strict_cap() {
     );
 
     // The actual I28 check. Pre-fix, `persist_freemap`'s internal
-    // `allocate_data_page` trips the ceiling and propagates
-    // CacheFull out of commit_inner; commit()'s poison wrapper
+    // freemap-page allocation (`structural_extend`) trips the ceiling and
+    // propagates CacheFull out of commit_inner; commit()'s poison wrapper
     // then sets the poison flag. Post-fix commit drains first.
     let result = tm.commit();
     assert!(

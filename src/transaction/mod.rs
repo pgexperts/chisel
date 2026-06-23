@@ -29,8 +29,9 @@
 //     only in memory. A crash mid-transaction discards all dirty pages from cache
 //     and the on-disk superblock still references the prior committed snapshot.
 //   - NOTE: `new_page()` (file extension) extends the underlying file immediately;
-//     `allocate_data_page` prefers reuse from `current_freemap` but also calls
-//     through to `new_page()` when the freemap is empty. Either way, any pages
+//     data-page allocation (via `cow_alloc`) prefers reuse from the committed
+//     freemap tree but also calls through to `new_page()` when the freemap is
+//     empty. Either way, any pages
 //     extended-but-uncommitted before a crash are harmless because nothing in the
 //     committed superblock references them, and the rollback path
 //     (`cache.truncate(committed_roots.total_pages)` — I3) actively shrinks the
