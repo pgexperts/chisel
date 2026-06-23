@@ -1869,18 +1869,36 @@ impl TransactionManager {
         result
     }
 
-    /// Unwind the in-memory side effects of a partially-completed
-    /// `allocate_inner` PREPARE phase so a non-fatal failure is a true no-op.
-    /// Restores the handle-table root pointer (an empty DB reverts to
-    /// `PAGE_ID_NONE`, undoing any lazy `ensure_handle_table` materialization)
-    /// and the eagerly-bumped descent depth, and releases the inline value's
-    /// data slot so `current_live_slots` / the insert cursor stay consistent
-    /// with the un-installed root — a page allocated solely for this value goes
-    /// to zero and is queued for reclamation, while a shared cursor page keeps a
-    /// defrag-reclaimable dead slot (exactly like a normal delete). Overflow
-    /// value storage has no live-slot/cursor side effects, so its pages are left
-    /// as the bounded commit-after-error leak class. `next_handle` was never
-    /// consumed (it is bumped only on success), so there is nothing to undo there.
+    /// Unwind the installed state from a partially-completed `allocate_inner`
+    /// PREPARE phase after a non-fatal failure.
+    ///
+    /// WHAT IS RESTORED (the installed state is a no-op):
+    /// - `current_roots.handle_table_page` — reverts to the pre-allocate value,
+    ///   undoing any lazy `ensure_handle_table` materialization (empty DB goes
+    ///   back to `PAGE_ID_NONE`).
+    /// - `handle_table` descent depth — restored from the saved value, undoing
+    ///   the eager bump that `HandleTable::grow` applies before its fallible COW.
+    /// - Inline value's data slot — released via `release_data_slot` so
+    ///   `current_live_slots` and the insert cursor stay consistent with the
+    ///   un-installed root. A page allocated solely for this value goes to zero
+    ///   occupancy and is queued for reclamation; a shared cursor page keeps a
+    ///   defrag-reclaimable dead slot (exactly like a normal delete).
+    /// - `next_handle` — never consumed (bumped only in the infallible INSTALL
+    ///   phase), so there is nothing to undo here.
+    ///
+    /// WHAT IS NOT RESTORED (a bounded allocated-but-unreferenced residue):
+    /// - Freemap COW pages drawn during the candidate allocations. When reuse is
+    ///   enabled, `cow_alloc` may have cleared free bits in the committed freemap
+    ///   and advanced the tree to cover the candidate-spine pages, leaving those
+    ///   ids allocated-but-unreferenced. Restoring them here would require either
+    ///   re-marking them free (fighting the COW dirty-page I20 invariant) or
+    ///   re-sorting and re-queuing them as freed data pages (introducing I20
+    ///   dirty-page hazards and growth regressions on the abnormal path).
+    ///   Instead, the residue is reclaimed by the expected rollback
+    ///   (`discard_all_dirty` + watermark truncate restore the freemap to its
+    ///   committed state). Overflow value pages are in the same residue class.
+    ///   The residue leaks only if the caller commits after the operational
+    ///   error rather than rolling back — contrary to documented contract.
     fn abort_allocate_prepare(
         &mut self,
         saved_root: u64,
@@ -1951,16 +1969,26 @@ impl TransactionManager {
         // membership index, powering handles_with_tag / delete-by-tag) must
         // become durable together. We compute both candidate roots in a fallible
         // PREPARE phase that never installs into `current_roots`, then install
-        // them together in an infallible phase. A non-fatal CacheFull/
-        // SpillwayFull mid-prepare is unwound by `abort_allocate_prepare` into a
-        // COMPLETE no-op: neither map changes, the eagerly-bumped handle-table
-        // depth and any lazily-created root are restored, the inline value's data
-        // slot is released (keeping live-slot / cursor accounting consistent),
-        // and the handle id is not consumed (next_handle is bumped only on
-        // success). The lone residue is bounded allocated-but-unreferenced
-        // overflow/COW pages on a commit-after-error — the same pre-existing leak
-        // class as any post-allocation failure, fully reclaimed by the expected
-        // rollback.
+        // them together in an infallible phase.
+        //
+        // A non-fatal CacheFull/SpillwayFull mid-prepare is unwound by
+        // `abort_allocate_prepare`, which is a no-op for the INSTALLED state:
+        // neither forward nor reverse map changes, the eagerly-bumped
+        // handle-table depth and any lazily-created root are restored, the
+        // inline value's data slot is released (keeping live-slot / cursor
+        // accounting consistent), and the handle id is not consumed
+        // (next_handle is bumped only on success).
+        //
+        // What the abort does NOT restore is the freemap COW that the candidate
+        // allocations performed: when reuse is enabled, `cow_alloc` may have
+        // drawn candidate-spine pages from the freemap (clearing their bits and
+        // advancing the tree), and those page ids are now allocated-but-
+        // unreferenced. This is a BOUNDED residue — the same class as any
+        // post-allocation failure — fully reclaimed by the expected rollback
+        // (discard_all_dirty + watermark truncate restore the freemap to its
+        // committed state). It materializes as a leak only if the caller commits
+        // after the operational error instead of rolling back, which is contrary
+        // to the documented contract.
         let handle = self.current_roots.next_handle;
 
         // Value storage (PREPARE). For an inline value this also bumps
@@ -4427,9 +4455,14 @@ mod tests {
     //
     // Atomic staging computes BOTH candidate roots in a fallible prepare
     // phase and installs them together in an infallible phase, so a mid-op
-    // failure is a complete no-op. The `fail_next_membership_op` hook fires
-    // a simulated CacheFull at exactly the reverse-map step — the precise
-    // divergence window — so these are deterministic, not timing-dependent.
+    // failure is a no-op for the INSTALLED state (neither map changes, the
+    // handle id is not burned, inline slot bookkeeping is clean). There is a
+    // bounded freemap-reuse residue on the abnormal path — see the
+    // `abort_allocate_prepare` doc and the
+    // `aborted_tagged_allocate_with_freemap_reuse_is_consistent_and_rollback_reclaims`
+    // test. The `fail_next_membership_op` hook fires a simulated CacheFull at
+    // exactly the reverse-map step — the precise divergence window — so these
+    // are deterministic, not timing-dependent.
 
     #[test]
     fn allocate_membership_failure_leaves_maps_consistent() {
@@ -4456,8 +4489,8 @@ mod tests {
             "forward/reverse tag maps diverged after a failed tagged allocate"
         );
 
-        // Atomic staging makes the failed allocate a COMPLETE no-op: neither
-        // map changed and the handle id was not even burned.
+        // Atomic staging makes the failed allocate a no-op for the installed
+        // state: neither map changed and the handle id was not even burned.
         assert!(
             !in_forward,
             "failed allocate must not install the forward entry"
@@ -4925,6 +4958,176 @@ mod tests {
             tm.handles_with_tag(9).unwrap().is_empty(),
             "tag 9 should have no committed members"
         );
+    }
+
+    // When savepoints are absent (`reuse = true`), a failed tagged-allocate
+    // prepare may exercise the freemap REUSE path inside `cow_alloc` — the
+    // candidate COW clears free bits and advances the freemap tree BEFORE
+    // learning the membership step will fail. The abort restores the installed
+    // state (maps, handle id, inline slot) but intentionally leaves the
+    // freemap-reuse residue (bounded allocated-but-unreferenced pages), relying
+    // on rollback to discard them. This test seeds a committed freemap with free
+    // pages (so reuse fires), triggers the injection, and verifies:
+    //
+    //   1. The failed call returns the injected CacheFull.
+    //   2. The installed state is unchanged (both maps, next_handle, depth).
+    //   3. No C1 violation: every page reachable in the committed state is
+    //      consistent after the aborted allocate.
+    //   4. rollback() returns the freemap to its committed free-set: a fresh
+    //      `FreeMapTree::from_roots(committed_root, committed_depth)` reports
+    //      the same free bits as before the aborted allocate.
+    #[test]
+    fn aborted_tagged_allocate_with_freemap_reuse_is_consistent_and_rollback_reclaims() {
+        let mut tm = fresh_manager();
+
+        // --- Phase 1: seed a committed freemap with free DATA pages ---
+        //
+        // Allocate several overflow-sized values (each occupies at least one
+        // whole page beyond the superblock/freemap spine), commit, then delete
+        // some and commit again. The second commit's persist_freemap marks those
+        // pages free, so the committed freemap now has reuse bits set.
+        let big: Vec<u8> = vec![0xAB; MAX_INLINE_VALUE + 32];
+        let mut live_handles = Vec::new();
+        tm.begin().unwrap();
+        for _ in 0..6 {
+            live_handles.push(tm.allocate_tagged(&big, 5).unwrap());
+        }
+        tm.commit().unwrap();
+
+        // Delete the first 3 to free their overflow pages into the committed
+        // freemap. Tag 5 still has 3 live members after this commit.
+        tm.begin().unwrap();
+        for h in live_handles.drain(..3) {
+            tm.delete(h).unwrap();
+        }
+        tm.commit().unwrap();
+        assert_no_reachable_page_is_free(&tm);
+
+        // Precondition: the committed freemap must have free bits so that the
+        // next `cow_alloc` exercises the reuse path (not just extend).
+        let pre_fm_root = tm.committed_roots.freemap_page;
+        let pre_fm_depth = tm.committed_roots.freemap_depth;
+        let pre_next_handle = tm.committed_roots.next_handle;
+        let pre_ht_root = tm.committed_roots.handle_table_page;
+        let pre_mi_root = tm.committed_roots.membership_index_page;
+        assert_ne!(
+            pre_fm_root,
+            crate::page::PAGE_ID_NONE,
+            "precondition: committed freemap must be non-empty (need free bits for reuse)"
+        );
+
+        // Snapshot the committed free set so we can compare after rollback.
+        let committed_free_before: std::collections::BTreeSet<u64> = {
+            let tree = FreeMapTree::from_roots(pre_fm_root, pre_fm_depth);
+            let mut cache = tm.cache.borrow_mut();
+            let total = tm.committed_roots.total_pages;
+            (0..total)
+                .filter(|&id| tree.is_free(&mut cache, id).unwrap_or(false))
+                .collect()
+        };
+        assert!(
+            !committed_free_before.is_empty(),
+            "precondition: at least one free page in committed freemap for reuse path"
+        );
+
+        // --- Phase 2: begin a new transaction (no savepoints → reuse enabled)
+        // and inject the membership failure ---
+        tm.begin().unwrap();
+
+        // Savepoints must be empty so reuse is live.
+        assert!(
+            tm.savepoints.is_empty(),
+            "precondition: no savepoints, so freemap reuse is enabled"
+        );
+
+        let ghost = tm.current_roots.next_handle;
+        let saved_ht_depth = tm.handle_table.depth();
+
+        // Fire the injection: `cow_alloc` inside `handle_table_insert_candidate`
+        // or `membership_insert_candidate` will draw from the committed freemap
+        // before the prepare fails.
+        tm.fail_next_membership_op.set(true);
+        let err = tm.allocate_tagged(&big, 5).unwrap_err();
+        assert!(
+            matches!(err, ChiselError::CacheFull { .. }),
+            "expected injected CacheFull, got {err:?}"
+        );
+        assert!(!tm.is_poisoned(), "non-fatal CacheFull must not poison");
+
+        // --- Assertion 1: installed state is unchanged ---
+        assert_eq!(
+            tm.current_roots.next_handle, ghost,
+            "aborted allocate must not consume the handle id"
+        );
+        assert_eq!(
+            tm.current_roots.handle_table_page, pre_ht_root,
+            "aborted allocate must not install a new handle-table root"
+        );
+        assert_eq!(
+            tm.current_roots.membership_index_page, pre_mi_root,
+            "aborted allocate must not install a new membership-index root"
+        );
+        assert_eq!(
+            tm.handle_table.depth(),
+            saved_ht_depth,
+            "aborted allocate must restore the eagerly-bumped handle-table depth"
+        );
+        // Neither map has `ghost`.
+        assert!(
+            matches!(tm.tag(ghost), Err(ChiselError::InvalidHandle(_))),
+            "ghost handle must not appear in forward map"
+        );
+        assert!(
+            !tm.handles_with_tag(5).unwrap().contains(&ghost),
+            "ghost handle must not appear in reverse (membership) map"
+        );
+        // next_handle was not advanced.
+        assert_eq!(
+            tm.current_roots.next_handle, pre_next_handle,
+            "next_handle must equal the committed baseline (not burned)"
+        );
+
+        // --- Assertion 2: rollback reclaims the freemap residue ---
+        tm.rollback().unwrap();
+
+        // After rollback, committed_roots is unchanged (rollback restores
+        // current_roots to committed_roots, which did not change mid-transaction).
+        assert_eq!(tm.committed_roots.freemap_page, pre_fm_root);
+        assert_eq!(tm.committed_roots.freemap_depth, pre_fm_depth);
+
+        // The free set as seen through the committed freemap tree must equal
+        // the pre-allocate snapshot: rollback's discard_all_dirty + truncate
+        // restored the freemap's bit pattern to the committed state.
+        let committed_free_after: std::collections::BTreeSet<u64> = {
+            let tree = FreeMapTree::from_roots(
+                tm.committed_roots.freemap_page,
+                tm.committed_roots.freemap_depth,
+            );
+            let mut cache = tm.cache.borrow_mut();
+            let total = tm.committed_roots.total_pages;
+            (0..total)
+                .filter(|&id| tree.is_free(&mut cache, id).unwrap_or(false))
+                .collect()
+        };
+        assert_eq!(
+            committed_free_before, committed_free_after,
+            "rollback must restore the committed freemap free-set: \
+             before={committed_free_before:?} after={committed_free_after:?}"
+        );
+
+        // --- Assertion 3: C1 holds after rollback (no page reachable from
+        // committed_roots is marked free) ---
+        assert_no_reachable_page_is_free(&tm);
+
+        // --- Assertion 4: the manager is still fully operational ---
+        // A new transaction can retry the allocation and succeed.
+        tm.begin().unwrap();
+        let h = tm.allocate_tagged(&big, 5).unwrap();
+        assert_eq!(h, ghost, "retry must reuse the un-burned handle id");
+        assert_eq!(tm.tag(h).unwrap(), 5);
+        assert!(tm.handles_with_tag(5).unwrap().contains(&h));
+        tm.commit().unwrap();
+        assert_no_reachable_page_is_free(&tm);
     }
 
     // I29: the open-time format-version gate compares MAJOR only, not
