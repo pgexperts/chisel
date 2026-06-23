@@ -234,10 +234,12 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-// Convert a chisel::ChiselError into the right PyErr. The match is exhaustive
-// — adding a new variant to ChiselError produces a compile error here, which
-// is intended: the binding must be updated rather than silently routing to a
-// generic error.
+// Convert a chisel::ChiselError into the right PyErr. The match is
+// NON-exhaustive: ChiselError is #[non_exhaustive] (I36), so the match
+// carries a catchall `_` arm and a new variant will NOT produce a compile
+// error. The catchall routes by is_fatal() to the correct tier base
+// (FatalError or OperationalError); adding a concrete arm for each new
+// variant is still preferred over relying on the catchall.
 //
 // Called from every engine-facing site in db.rs (via with_inner_io /
 // with_inner_mut_io) and from db::open when the initial open/create
@@ -290,10 +292,24 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
             let errno = io_err.raw_os_error();
             let kind = format!("{:?}", io_err.kind());
             Python::attach(|py| {
-                let cls = IO_ERROR_CLASS
-                    .get()
-                    .expect("IoError class is cached during module init")
-                    .bind(py);
+                // IO_ERROR_CLASS is populated by register() at module init.
+                // The fallback branch (OnceLock empty) is unreachable in normal
+                // operation; it only fires if to_py_err is called before
+                // register() completes, which cannot happen today — the module
+                // init sequence sets the lock before any Python code can call
+                // into the binding. The fallback raises a plain FatalError so
+                // the error is never silently lost and the two-tier poison
+                // contract is preserved even in that hypothetical ordering.
+                let cls_owned;
+                let cls: &Bound<'_, pyo3::types::PyType> = match IO_ERROR_CLASS.get() {
+                    Some(cached) => {
+                        cls_owned = cached.bind(py).clone();
+                        &cls_owned
+                    }
+                    None => {
+                        return FatalError::new_err(msg);
+                    }
+                };
                 // Construct via OSError's 2-arg (errno, strerror) form when we
                 // have an errno so CPython populates `.errno`/`.strerror`
                 // natively; otherwise the message-only form (.errno -> None).
