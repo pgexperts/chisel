@@ -301,7 +301,11 @@ impl PyChisel {
         py: Python<'_>,
     ) -> PyResult<Py<crate::transaction::PyTransaction>> {
         slf.bind(py).borrow().begin()?;
-        Py::new(py, crate::transaction::PyTransaction::new(slf.clone_ref(py))).inspect_err(|_| {
+        Py::new(
+            py,
+            crate::transaction::PyTransaction::new(slf.clone_ref(py)),
+        )
+        .inspect_err(|_| {
             // Py::new failed after begin() succeeded — roll back so the engine
             // is not left with a live transaction that nothing can close.
             let _ = slf.bind(py).borrow().rollback();
