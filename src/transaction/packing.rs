@@ -260,17 +260,14 @@ impl SlotPacker {
 impl TransactionManager {
     /// Place a value in a data page and return (page_id, slot_index).
     ///
-    /// Thin wrapper over `SlotPacker::insert`. The freemap dance that
-    /// `allocate_data_page` performs (take/put the transient `FreeMapTree`,
-    /// touching `current_roots`, `freemap_session_owned`,
-    /// `structural_superseded`, `freemap_hint`, `structural_reuse`) is hoisted
-    /// HERE, around the closure, exactly like `ht_insert`: those are
-    /// `&mut self` operations and cannot run inside a closure that the packer
-    /// borrow (`&mut self.packer`) would also need. The closure captures only
-    /// the disjoint freemap field refs plus the local `tree`, and takes `cache`
-    /// as a param.
+    /// Thin wrapper over `SlotPacker::insert`. The freemap dance (the
+    /// transient-tree trio: `freemap.take_tree` / `cow_alloc_into` / `put_tree`)
+    /// is hoisted HERE, around the closure, exactly like `ht_insert`. The closure
+    /// captures only `&mut self.freemap` plus the local `tree` — disjoint from
+    /// `&mut self.packer` — so the packer borrow and the alloc closure both hold
+    /// `self` at once; `cache` is passed as a param.
     ///
-    /// `put_freemap_tree` runs even on the error path — matching the historical
+    /// `put_tree` runs even on the error path — matching the historical
     /// `allocate_data_page`, which wrote tree growth back before returning the
     /// allocation result. The freemap pages were extended (never freed), so on a
     /// non-fatal failure they are harmless above-watermark scratch, and the
@@ -284,17 +281,14 @@ impl TransactionManager {
         // named separately.
         let reuse = self.savepoints.is_empty();
         let packing_enabled = self.savepoints.is_empty();
-        let mut tree = self.take_freemap_tree();
+        let mut tree = self.freemap.take_tree(&self.current_roots);
         let result = {
-            let hint = &mut self.freemap_hint;
-            let pool = &mut self.structural_reuse;
             let mut cache = self.cache.borrow_mut();
-            let mut alloc =
-                |c: &mut PageCache| super::freemap::cow_alloc(c, &mut tree, hint, pool, reuse);
+            let mut alloc = |c: &mut PageCache| self.freemap.cow_alloc_into(c, &mut tree, reuse);
             self.packer
                 .insert(&mut cache, &mut alloc, packing_enabled, value)
         };
-        self.put_freemap_tree(tree);
+        self.freemap.put_tree(&mut self.current_roots, tree);
         result
     }
 

@@ -3,7 +3,6 @@
 //! roots, the abort-prepare unwind, and the membership-failure injection
 //! hook. Split out of `transaction.rs` verbatim; see the parent module.
 
-use super::freemap::cow_alloc;
 use super::*;
 
 impl TransactionManager {
@@ -45,12 +44,10 @@ impl TransactionManager {
         freed: &mut Vec<u64>,
     ) -> Result<u64> {
         let reuse = self.savepoints.is_empty();
-        let mut tree = self.take_freemap_tree();
+        let mut tree = self.freemap.take_tree(&self.current_roots);
         let result = {
-            let hint = &mut self.freemap_hint;
-            let pool = &mut self.structural_reuse;
             let mut cache = self.cache.borrow_mut();
-            let mut alloc = |c: &mut PageCache| cow_alloc(c, &mut tree, hint, pool, reuse);
+            let mut alloc = |c: &mut PageCache| self.freemap.cow_alloc_into(c, &mut tree, reuse);
             self.membership_index.insert(
                 &mut cache,
                 self.current_roots.membership_index_page,
@@ -64,10 +61,10 @@ impl TransactionManager {
         // pages were extended (never freed), so a non-fatal failure that discards
         // `freed`/the candidate root leaves these extra pages as harmless
         // above-watermark scratch, exactly like the other COW pages on an aborted
-        // prepare. put_freemap_tree drains the freemap COW supersedes into
+        // prepare. put_tree drains the freemap COW supersedes into
         // structural_superseded and returns the session set so the next site in
         // this transaction stays in-place.
-        self.put_freemap_tree(tree);
+        self.freemap.put_tree(&mut self.current_roots, tree);
         result
     }
 
@@ -94,12 +91,10 @@ impl TransactionManager {
             return Err(ChiselError::CacheFull { limit: 0 });
         }
         let reuse = self.savepoints.is_empty();
-        let mut tree = self.take_freemap_tree();
+        let mut tree = self.freemap.take_tree(&self.current_roots);
         let result = {
-            let hint = &mut self.freemap_hint;
-            let pool = &mut self.structural_reuse;
             let mut cache = self.cache.borrow_mut();
-            let mut alloc = |c: &mut PageCache| cow_alloc(c, &mut tree, hint, pool, reuse);
+            let mut alloc = |c: &mut PageCache| self.freemap.cow_alloc_into(c, &mut tree, reuse);
             self.handle_table.insert(
                 &mut cache,
                 self.current_roots.handle_table_page,
@@ -112,9 +107,9 @@ impl TransactionManager {
         // Install freemap growth into roots (and return the session set) so the
         // NEXT candidate in this allocate (the reverse-map insert) threads the
         // up-to-date tree and treats already-COW'd freemap pages as in-place. The
-        // freemap COW supersedes go to structural_superseded via put_freemap_tree.
+        // freemap COW supersedes go to structural_superseded via put_tree.
         // See membership_insert_candidate for the abort-safety reasoning.
-        self.put_freemap_tree(tree);
+        self.freemap.put_tree(&mut self.current_roots, tree);
         result
     }
 
@@ -171,12 +166,10 @@ impl TransactionManager {
         freed: &mut Vec<u64>,
     ) -> Result<(u64, bool)> {
         let reuse = self.savepoints.is_empty();
-        let mut tree = self.take_freemap_tree();
+        let mut tree = self.freemap.take_tree(&self.current_roots);
         let result = {
-            let hint = &mut self.freemap_hint;
-            let pool = &mut self.structural_reuse;
             let mut cache = self.cache.borrow_mut();
-            let mut alloc = |c: &mut PageCache| cow_alloc(c, &mut tree, hint, pool, reuse);
+            let mut alloc = |c: &mut PageCache| self.freemap.cow_alloc_into(c, &mut tree, reuse);
             self.membership_index.remove(
                 &mut cache,
                 self.current_roots.membership_index_page,
@@ -186,7 +179,7 @@ impl TransactionManager {
                 freed,
             )
         };
-        self.put_freemap_tree(tree);
+        self.freemap.put_tree(&mut self.current_roots, tree);
         result
     }
 

@@ -2,7 +2,6 @@
 //! delete_with_tag / delete_many (+ their `_inner` cores). Split out of
 //! `transaction.rs` verbatim; see the parent module for the type and fields.
 
-use super::freemap::cow_alloc;
 use super::*;
 
 impl TransactionManager {
@@ -193,12 +192,10 @@ impl TransactionManager {
         // InvalidHandle to preserve the public-API behavior.
         let mut ht_freed: Vec<u64> = Vec::new();
         let reuse = self.savepoints.is_empty();
-        let mut tree = self.take_freemap_tree();
+        let mut tree = self.freemap.take_tree(&self.current_roots);
         let delete_result = {
-            let hint = &mut self.freemap_hint;
-            let pool = &mut self.structural_reuse;
             let mut cache = self.cache.borrow_mut();
-            let mut alloc = |c: &mut PageCache| cow_alloc(c, &mut tree, hint, pool, reuse);
+            let mut alloc = |c: &mut PageCache| self.freemap.cow_alloc_into(c, &mut tree, reuse);
             self.handle_table.delete(
                 &mut cache,
                 self.current_roots.handle_table_page,
@@ -210,7 +207,7 @@ impl TransactionManager {
         // Install freemap growth (supersedes go to structural_superseded). Done
         // BEFORE the `?` so a delete that COW'd the freemap leaf yet then errored
         // still records the extended root and returns the session set.
-        self.put_freemap_tree(tree);
+        self.freemap.put_tree(&mut self.current_roots, tree);
         let (ht_new_root, prev_entry) = delete_result?;
         let entry = prev_entry.ok_or(ChiselError::InvalidHandle(handle))?;
 

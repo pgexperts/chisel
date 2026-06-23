@@ -184,66 +184,14 @@ pub struct TransactionManager {
     // their old contents must stay readable via `committed_roots` until
     // commit promotes the new roots.
     txn_freed_pages: Vec<u64>,
-    // Best-effort lower bound on the lowest free page id in the committed
-    // freemap tree, threaded into `FreeMapTree::allocate_first` so a scan
-    // starts near the answer instead of at id 0. Deliberately NOT
-    // transactionally tracked: a too-low hint only costs a wasted left-to-right
-    // scan, never correctness (the scan still returns the true lowest free id),
-    // so it needs no begin/rollback snapshotting. `allocate_first` advances it;
-    // a free at a lower id is invisible to the hint until the next scan walks
-    // back over it, which is acceptable slack. Init 0.
-    freemap_hint: u64,
-    // Dead freemap pages carried BETWEEN commits, the engine's bounded-growth
-    // mechanism for the extend-only freemap (ISSUES.md I18, generalized to the
-    // tree). Lifecycle:
-    //
-    //   * A freemap mutation (data-alloc-side leaf COW, or persist's frees) must
-    //     COW the committed freemap pages it touches — it can never overwrite a
-    //     page the last-durable superblock still references. Each COW supersedes
-    //     an OLD freemap page.
-    //   * That old page cannot be reused IN THE SAME COMMIT (the commit's new
-    //     freemap root may still reference it until the superblock flips), so it
-    //     is DEFERRED one commit: collected in `structural_superseded` this
-    //     transaction, promoted to `pending_structural_frees` at commit.
-    //   * The NEXT transaction reuses them: `begin()` moves them into
-    //     `structural_reuse`, and every structural `extend` (freemap COW target)
-    //     pops from that pool before extending the file. This is what makes the
-    //     freemap leaf ROTATE among a small set of pages instead of marching the
-    //     file upward ~1 page/commit forever. Reusing a DEAD page (vs. a free bit
-    //     in the tree) keeps the extend-only TERMINATION guarantee — no freemap
-    //     mutation ever draws structural space from the freemap's own bits.
-    //
-    // Not data-reusable (never enters `txn_freed_pages`): a freed freemap page
-    // sits at a high id, and the lowest-first data allocator would starve it, so
-    // routing it back as structural reuse (where demand matches supply at steady
-    // state) is what actually reclaims it.
-    pending_structural_frees: Vec<u64>,
-    // The dead-freemap-page pool available to reuse as structural COW targets in
-    // the CURRENT transaction. Seeded from `pending_structural_frees` at
-    // `begin()`; drained by every structural `extend`; the unconsumed remainder
-    // is carried forward (back into `pending_structural_frees`) at commit. On
-    // rollback it is moved back wholesale, restoring the pre-transaction
-    // `pending_structural_frees`.
-    structural_reuse: Vec<u64>,
-    // This transaction's freemap-COW supersedes (old freemap pages this txn
-    // replaced). Accumulated as transient handles drain `tree.pending_superseded`
-    // here via `put_freemap_tree`; promoted to `pending_structural_frees` at
-    // commit (the one-commit defer). Dropped on rollback (those COWs are
-    // truncated above the watermark).
-    structural_superseded: Vec<u64>,
-    // Freemap pages already COW'd/extended by the CURRENT transaction. Because
-    // the manager rebuilds a transient `FreeMapTree` handle at every allocation
-    // site (data-page alloc, each HT/membership COW, persist_freemap), this set
-    // is what lets those handles share the "first touch this txn => COW, later
-    // touches => in-place" discipline: without it every site would re-COW the
-    // same freemap leaf, turning reclamation into unbounded file growth. Swapped
-    // into each transient handle and read back out (see `freemap_tree` helper).
-    // Cleared at begin (fresh per transaction); also cleared on commit/rollback
-    // so the next transaction starts empty. A stale entry pointing at a
-    // now-committed page would be a CORRECTNESS bug (it would suppress a needed
-    // COW and mutate a live committed page in place), which is exactly why it is
-    // transaction-scoped, not cross-transaction.
-    freemap_session_owned: FxHashSet<u64>,
+    // The structural-page recycle cluster and freemap commit/alloc/persist
+    // machinery — the crash-durability backbone — extracted into its own owned
+    // unit. No code outside `freemap.rs` touches the inner fields; the rest of
+    // `TransactionManager` reaches the freemap through `FreemapRecycle`'s narrow
+    // surface (the transient-tree trio, the commit-path persist/reclaim wrappers
+    // on this type, and the begin/commit/rollback lifecycle hooks). See the
+    // `FreemapRecycle` doc in `freemap.rs` for the recycle/rotation model.
+    freemap: freemap::FreemapRecycle,
     // R1 slot-packing state (live-slot counts per data page + the insert
     // cursor), extracted into its own owned unit. No code outside `packing.rs`
     // touches the inner fields; `TransactionManager` reaches packing through
