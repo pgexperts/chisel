@@ -1352,7 +1352,7 @@ fn allocate_membership_failure_leaves_maps_consistent() {
     // The id the about-to-fail allocate will (try to) use.
     let ghost = tm.current_roots.next_handle;
 
-    tm.fail_next_membership_op.set(true);
+    tm.fault.fail_next_membership_op.set(true);
     let err = tm.allocate_tagged(b"payload", 7).unwrap_err();
     assert!(
         matches!(err, ChiselError::CacheFull { .. }),
@@ -1423,7 +1423,7 @@ fn allocate_handle_table_failure_leaves_maps_consistent() {
     assert_eq!(saved_root, PAGE_ID_NONE, "precondition: empty handle table");
     let ghost = tm.current_roots.next_handle;
 
-    tm.fail_next_handle_table_op.set(true);
+    tm.fault.fail_next_handle_table_op.set(true);
     let err = tm.allocate_tagged(b"payload", 7).unwrap_err();
     assert!(
         matches!(err, ChiselError::CacheFull { .. }),
@@ -1468,7 +1468,7 @@ fn delete_membership_failure_leaves_maps_consistent() {
     tm.commit().unwrap();
 
     tm.begin().unwrap();
-    tm.fail_next_membership_op.set(true);
+    tm.fault.fail_next_membership_op.set(true);
     let err = tm.delete(h).unwrap_err();
     assert!(
         matches!(err, ChiselError::CacheFull { .. }),
@@ -1535,7 +1535,7 @@ fn delete_membership_failure_survives_reopen_consistently() {
         tm.commit().unwrap();
 
         tm.begin().unwrap();
-        tm.fail_next_membership_op.set(true);
+        tm.fault.fail_next_membership_op.set(true);
         assert!(matches!(
             tm.delete(h).unwrap_err(),
             ChiselError::CacheFull { .. }
@@ -1581,7 +1581,7 @@ fn delete_with_tag_mid_pass_failure_is_consistent_and_drops_progress() {
 
     tm.begin().unwrap();
     // Let the 1st delete in the pass commit, fail the 2nd's membership op.
-    tm.fail_membership_op_after.set(2);
+    tm.fault.fail_membership_op_after.set(2);
     let err = tm.delete_with_tag(5, 3).unwrap_err();
     assert!(
         matches!(err, ChiselError::CacheFull { .. }),
@@ -1645,7 +1645,7 @@ fn update_value_write_failure_does_not_free_old_value_pages() {
     assert_eq!(tm.read(h).unwrap(), big, "precondition: old value readable");
 
     tm.begin().unwrap();
-    tm.fail_next_update_value_write.set(true);
+    tm.fault.fail_next_update_value_write.set(true);
     let err = tm.update(h, b"replacement").unwrap_err();
     assert!(
         matches!(err, ChiselError::CacheFull { .. }),
@@ -1700,7 +1700,7 @@ fn update_value_write_failure_does_not_free_old_inline_page() {
     tm.commit().unwrap();
 
     tm.begin().unwrap();
-    tm.fail_next_update_value_write.set(true);
+    tm.fault.fail_next_update_value_write.set(true);
     assert!(matches!(
         tm.update(h, b"replacement").unwrap_err(),
         ChiselError::CacheFull { .. }
@@ -1746,7 +1746,7 @@ fn update_handle_table_failure_preserves_old_value_and_releases_new_slot() {
     tm.commit().unwrap();
 
     tm.begin().unwrap();
-    tm.fail_next_handle_table_op.set(true);
+    tm.fault.fail_next_handle_table_op.set(true);
     let err = tm.update(h, b"small-new").unwrap_err();
     assert!(
         matches!(err, ChiselError::CacheFull { .. }),
@@ -1813,7 +1813,7 @@ fn allocate_membership_failure_survives_reopen_consistently() {
 
         tm.begin().unwrap();
         let ghost = tm.current_roots.next_handle;
-        tm.fail_next_membership_op.set(true);
+        tm.fault.fail_next_membership_op.set(true);
         assert!(matches!(
             tm.allocate_tagged(b"payload", 9).unwrap_err(),
             ChiselError::CacheFull { .. }
@@ -1927,7 +1927,7 @@ fn aborted_tagged_allocate_with_freemap_reuse_is_consistent_and_rollback_reclaim
     // Fire the injection: `cow_alloc` inside `handle_table_insert_candidate`
     // or `membership_insert_candidate` will draw from the committed freemap
     // before the prepare fails.
-    tm.fail_next_membership_op.set(true);
+    tm.fault.fail_next_membership_op.set(true);
     let err = tm.allocate_tagged(&big, 5).unwrap_err();
     assert!(
         matches!(err, ChiselError::CacheFull { .. }),

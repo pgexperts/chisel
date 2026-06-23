@@ -287,41 +287,17 @@ pub struct TransactionManager {
     // lib.rs); there is no cross-thread access to synchronize against.
     poisoned: Cell<bool>,
 
-    // Test-only fault injection (BUG#2 atomic-staging regression tests). When
-    // armed, the NEXT reverse-map (membership-index) update in
-    // `allocate_inner`/`delete_inner` returns a non-fatal `CacheFull` BEFORE
-    // touching the index, simulating a mid-operation resource-exhaustion strike
-    // at exactly the forward/reverse divergence window. Gated `#[cfg(test)]` so
-    // it carries no production code (mirrors `force_poison_for_test`). Cell so
-    // the in-crate tests can arm it through `&self`.
+    // Test-only fault injection consolidated off the production type (review
+    // 2026-06-22 SMELL #4): the four BUG#2 atomic-staging arming flags live in
+    // their own `#[cfg(test)]` struct so they carry no production scaffolding
+    // fields here. See `fault.rs` for each Cell's precise divergence window.
     #[cfg(test)]
-    fail_next_membership_op: Cell<bool>,
-
-    // Companion to `fail_next_membership_op` for the FORWARD step: when armed,
-    // the next `allocate_inner` handle-table insert returns a non-fatal
-    // `CacheFull`, so tests can exercise the prepare-abort/unwind path of the
-    // step that carries the eager depth bump (HandleTable::grow). `#[cfg(test)]`.
-    #[cfg(test)]
-    fail_next_handle_table_op: Cell<bool>,
-
-    // For `update_inner`: when armed, the next update returns a non-fatal
-    // `CacheFull` at the NEW-value-write step. With the fix this is the first
-    // fallible step (a clean no-op); pre-fix it lands AFTER the old location was
-    // already freed, so the regression test can prove the old value is not
-    // prematurely freed before the new entry installs. `#[cfg(test)]`.
-    #[cfg(test)]
-    fail_next_update_value_write: Cell<bool>,
-
-    // Countdown variant of `fail_next_membership_op` for multi-delete passes
-    // (e.g. delete_with_tag): when set to K, the Kth subsequent membership-index
-    // op fails with a non-fatal CacheFull (the first K-1 succeed). Lets a test
-    // fail a LATER delete in a loop so earlier deletes commit first. 0 disables.
-    // `#[cfg(test)]`.
-    #[cfg(test)]
-    fail_membership_op_after: Cell<u32>,
+    fault: fault::FaultInjector,
 }
 
 mod config;
+#[cfg(test)]
+mod fault;
 mod freemap;
 mod lifecycle;
 mod mutate;

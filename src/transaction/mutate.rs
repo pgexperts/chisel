@@ -57,7 +57,7 @@ impl TransactionManager {
         // Test-only injection (see `fail_next_update_value_write`): now the FIRST
         // fallible step, so a simulated failure here retires nothing.
         #[cfg(test)]
-        if self.fail_next_update_value_write.replace(false) {
+        if self.fault.fail_next_update_value_write.replace(false) {
             return Err(ChiselError::CacheFull { limit: 0 });
         }
 

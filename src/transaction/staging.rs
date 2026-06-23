@@ -90,7 +90,7 @@ impl TransactionManager {
         // allocate_inner and update_inner exercise the real abort/unwind. No
         // production artifact under `#[cfg(not(test))]`.
         #[cfg(test)]
-        if self.fail_next_handle_table_op.replace(false) {
+        if self.fault.fail_next_handle_table_op.replace(false) {
             return Err(ChiselError::CacheFull { limit: 0 });
         }
         let reuse = self.savepoints.is_empty();
@@ -197,14 +197,14 @@ impl TransactionManager {
     /// here keeps the injection logic in one place.
     #[cfg(test)]
     pub(super) fn inject_membership_failure(&self) -> bool {
-        if self.fail_next_membership_op.replace(false) {
+        if self.fault.fail_next_membership_op.replace(false) {
             return true;
         }
-        let remaining = self.fail_membership_op_after.get();
+        let remaining = self.fault.fail_membership_op_after.get();
         if remaining == 0 {
             return false;
         }
-        self.fail_membership_op_after.set(remaining - 1);
+        self.fault.fail_membership_op_after.set(remaining - 1);
         remaining == 1
     }
 

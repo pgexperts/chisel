@@ -100,13 +100,7 @@ impl TransactionManager {
             insert_cursor: None,
             poisoned: Cell::new(false),
             #[cfg(test)]
-            fail_next_membership_op: Cell::new(false),
-            #[cfg(test)]
-            fail_next_handle_table_op: Cell::new(false),
-            #[cfg(test)]
-            fail_next_update_value_write: Cell::new(false),
-            #[cfg(test)]
-            fail_membership_op_after: Cell::new(0),
+            fault: fault::FaultInjector::default(),
         })
     }
 
@@ -334,13 +328,7 @@ impl TransactionManager {
             insert_cursor: None,
             poisoned: Cell::new(false),
             #[cfg(test)]
-            fail_next_membership_op: Cell::new(false),
-            #[cfg(test)]
-            fail_next_handle_table_op: Cell::new(false),
-            #[cfg(test)]
-            fail_next_update_value_write: Cell::new(false),
-            #[cfg(test)]
-            fail_membership_op_after: Cell::new(0),
+            fault: fault::FaultInjector::default(),
         })
     }
 }
