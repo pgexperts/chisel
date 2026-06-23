@@ -434,7 +434,11 @@ impl PyChisel {
     // class, so a user-defined options-shaped object will also work
     // — the dataclass is just the nice ergonomic default.
     #[pyo3(signature = (options=None))]
-    pub(crate) fn defrag(&self, py: Python<'_>, options: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
+    pub(crate) fn defrag(
+        &self,
+        py: Python<'_>,
+        options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
         let rust_opts = match options {
             None => chisel::DefragOptions::default(),
             Some(obj) => {

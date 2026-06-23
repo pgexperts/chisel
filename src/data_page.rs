@@ -293,10 +293,14 @@ impl DataPage {
         let offset = u16::from_le_bytes(buf[base..base + 2].try_into().unwrap()) as usize;
         let length = u16::from_le_bytes(buf[base + 2..base + 4].try_into().unwrap()) as usize;
         let flags = u16::from_le_bytes(buf[base + 4..base + 6].try_into().unwrap());
-        // Payload must live entirely within the page body, and must not
-        // overlap the fixed header. A dead slot's bytes are still bounded
-        // by these invariants, so we check even when the caller may
-        // eventually discard the entry.
+        // Payload must live entirely within the page body (offset + length <=
+        // CHECKSUM_OFFSET) and must not overlap the fixed common header
+        // (offset >= DATA_PAGE_HEADER_SIZE). Note: this does NOT verify that
+        // the payload lies beyond the slot directory (offset >= free_start) —
+        // a checksum-valid but corrupt page could carry a slot whose offset
+        // aliases the directory area; only the directory boundary (above) is
+        // enforced here. Dead slots are still subject to these bounds, so we
+        // check unconditionally even when the caller may later discard the entry.
         if offset < DATA_PAGE_HEADER_SIZE {
             return None;
         }

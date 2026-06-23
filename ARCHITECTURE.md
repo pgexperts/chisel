@@ -247,10 +247,12 @@ byte:    0       1       2                  8                          16
 (*) byte 1 is page_format_version for Data, Overflow, FreeMap,
     MembershipInterior, MembershipLeaf;
     FLAG_LEAF/INTERIOR for HandleTable (its version sits at byte 2).
-    See `page::page_format_version()` for the read-side dispatch (offset by
-    page type). The cache load path validates only the checksum — per-page
-    version dispatch is per-module decode-only; see
-    docs/specs/2026-06-21-per-page-format-versioning-design.md.
+    The read-side dispatch helper (`page::page_format_version()`, offset
+    by page type) is **dormant today** — no call site exists; the cache
+    load path validates only the XXH3 checksum and nothing reads the
+    version byte yet (see the "dormant today" note in the Format
+    versioning section below and
+    docs/specs/2026-06-21-per-page-format-versioning-design.md).
 ```
 
 The page-format-version byte (I31) lets individual page layouts evolve within a file MAJOR without a file-wide format bump — the foundation for lazy per-page upgrade. Today every page reports version 0; future minor changes to a page-type's layout will bump that page-type's version while leaving others alone.
