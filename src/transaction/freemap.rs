@@ -657,18 +657,6 @@ impl TransactionManager {
         Ok(())
     }
 
-    /// Commit-path wrapper: persist this commit's data frees into a COW of the
-    /// committed freemap tree. `current_roots` (mut), `freemap` (mut),
-    /// `txn_freed_pages` (immutable read), and the cache borrow are disjoint, so
-    /// `txn_freed_pages` passes by `&` with no take/restore dance. `commit_inner`
-    /// calls this BEFORE cache.flush() so the new freemap pages join the same
-    /// durable write set.
-    pub(super) fn persist_freemap(&mut self) -> Result<()> {
-        let mut cache = self.cache.borrow_mut();
-        self.freemap
-            .persist(&mut cache, &mut self.current_roots, &self.txn_freed_pages)
-    }
-
     /// Commit-path wrapper: reclaim crash-orphaned freemap pages. Read the
     /// savepoint-active flag and superblock count into locals BEFORE borrowing the
     /// cache to keep the borrows clean. `pub(crate)` — defrag calls it.
