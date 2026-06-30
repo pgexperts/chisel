@@ -64,6 +64,17 @@ libc = "0.2"
 # (this is only the third runtime dependency). The crates.io package is
 # `rustc-hash` (hyphen); the import path is `rustc_hash` (underscore).
 rustc-hash = "2"
+# On-disk encryption (spec 2026-06-29). All pure-Rust, well-vetted RustCrypto
+# primitives — rolling our own crypto is forbidden. These reach the published
+# crate's dependency tree only when a DB is opened with an encryption key, but
+# they are unconditional deps (the seal/open code is always compiled). Versions
+# pinned to the audited RustCrypto generation current as of 2026-06.
+chacha20poly1305 = "0.10"   # XChaCha20-Poly1305 AEAD (192-bit nonce)
+argon2 = "0.5"              # Argon2id passphrase KDF (memory-hard)
+hkdf = "0.12"               # HKDF-SHA256 raw-key KDF
+sha2 = "0.10"               # SHA-256 for HKDF
+zeroize = { version = "1", features = ["derive"] }  # wipe key material on drop
+getrandom = "0.2"           # OS RNG for DEK / nonce / salt generation
 
 [dev-dependencies]
 tempfile = "3"
