@@ -42,6 +42,17 @@ pub enum Key {
     Passphrase(Zeroizing<String>),
 }
 
+// Debug intentionally omits the key bytes — key material must not appear in
+// logs, panic messages, or error chains. The variant name is enough for diagnostics.
+impl std::fmt::Debug for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Key::Raw(_) => f.write_str("Key::Raw(<redacted>)"),
+            Key::Passphrase(_) => f.write_str("Key::Passphrase(<redacted>)"),
+        }
+    }
+}
+
 /// The Data Encryption Key: seals every page and the superblock body. Generated
 /// once at create time, held for the open session only, wiped on drop. Never
 /// written to disk except KEK-wrapped in a key-slot.
@@ -141,6 +152,11 @@ const KEK_INFO: &[u8] = b"chisel-kek-v1";
 /// won't match the slot that was written with the other KDF, surfacing as an
 /// unwrap Auth failure one layer up. The slot's kdf_id is the single source of
 /// truth, so we never guess from the variant.)
+///
+/// # Errors
+/// Returns `CryptoError::Kdf` if the KDF primitive rejects its parameters
+/// (e.g. Argon2id with zero memory cost). Returns `CryptoError::BadKeyLength`
+/// if `kdf == Hkdf` and the raw key bytes are empty.
 pub fn derive_kek(
     key: &Key,
     kdf: KdfId,
@@ -239,6 +255,10 @@ pub fn wrap_dek(
 /// that the client key (hence KEK) is correct — there is no separate verifier.
 /// Any failure (wrong passphrase, wrong KEK, tampered ciphertext or tag, wrong
 /// AAD) returns CryptoError::Auth without revealing partial plaintext.
+///
+/// # Errors
+/// Returns `CryptoError::Auth` if AEAD authentication fails (wrong key,
+/// tampered ciphertext, wrong AAD, or wrong nonce).
 pub fn unwrap_dek(
     kek: &Kek,
     wrapped: &[u8; DEK_LEN],
@@ -297,6 +317,10 @@ impl PageCipher {
     /// Open an 8232-byte on-disk blob back to the 8192-byte plaintext page.
     /// AAD = page_id LE. Any authentication failure → CryptoError::Auth (the
     /// engine maps this to DecryptionFailed at the page-read site).
+    ///
+    /// # Errors
+    /// Returns `CryptoError::Auth` if the AEAD tag does not verify (wrong DEK,
+    /// tampered ciphertext, or mismatched page_id).
     pub fn open(
         &self,
         page_id: u64,
@@ -329,6 +353,10 @@ impl PageCipher {
 
     /// Open a variable-length body sealed by `seal_body`. AAD must match the
     /// superblock identity used at seal time, else CryptoError::Auth.
+    ///
+    /// # Errors
+    /// Returns `CryptoError::Auth` if the AEAD tag does not verify (wrong DEK
+    /// or AAD, or tampered ciphertext).
     pub fn open_body(
         &self,
         aad: &[u8],

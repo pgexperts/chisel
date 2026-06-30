@@ -23,7 +23,7 @@ fn fresh_manager() -> TransactionManager {
         crate::DrainInsertion::LruTail,
         crate::SpillwayLocation::InMemory,
     );
-    let mut tm = TransactionManager::create_new(cache, 2).unwrap();
+    let mut tm = TransactionManager::create_new(cache, 2, None).unwrap();
     // Commit once so there's a real baseline to read/write against.
     tm.begin().unwrap();
     tm.commit().unwrap();
@@ -261,7 +261,7 @@ fn fatal_error_outside_commit_also_poisons() {
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
         );
-        let mut tm = TransactionManager::create_new(cache, 2).unwrap();
+        let mut tm = TransactionManager::create_new(cache, 2, None).unwrap();
         tm.begin().unwrap();
         h = tm.allocate(b"durable").unwrap();
         tm.commit().unwrap();
@@ -1270,7 +1270,7 @@ fn commit_does_not_poison_when_cache_is_at_strict_cap() {
         crate::DrainInsertion::LruTail,
         crate::SpillwayLocation::InMemory,
     );
-    let mut tm = TransactionManager::create_new(cache, 2).unwrap();
+    let mut tm = TransactionManager::create_new(cache, 2, None).unwrap();
     tm.begin().unwrap();
     tm.commit().unwrap();
 
@@ -1532,7 +1532,7 @@ fn delete_membership_failure_survives_reopen_consistently() {
             crate::SpillwayLocation::InMemory,
         );
         if create {
-            TransactionManager::create_new(cache, 2).unwrap()
+            TransactionManager::create_new(cache, 2, None).unwrap()
         } else {
             TransactionManager::open_existing(cache).unwrap()
         }
@@ -1810,7 +1810,7 @@ fn allocate_membership_failure_survives_reopen_consistently() {
             crate::SpillwayLocation::InMemory,
         );
         if create {
-            TransactionManager::create_new(cache, 2).unwrap()
+            TransactionManager::create_new(cache, 2, None).unwrap()
         } else {
             TransactionManager::open_existing(cache).unwrap()
         }
@@ -2051,7 +2051,7 @@ fn format_version_gate_is_major_only() {
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
         );
-        let _ = TransactionManager::create_new(cache, 2).unwrap();
+        let _ = TransactionManager::create_new(cache, 2, None).unwrap();
         // drop() releases the flock so the test can read+write the
         // file directly below.
     }
@@ -2137,7 +2137,7 @@ fn file_minor_newer_than_binary_is_forced_read_only() {
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
         );
-        let _ = TransactionManager::create_new(cache, 2).unwrap();
+        let _ = TransactionManager::create_new(cache, 2, None).unwrap();
     }
 
     // Patch every slot to (current MAJOR, MINOR + 1) and re-stamp checksums.
@@ -2300,7 +2300,7 @@ fn reopen_preserves_committed_data() {
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
         );
-        let mut txm = TransactionManager::create_new(cache, 2).unwrap();
+        let mut txm = TransactionManager::create_new(cache, 2, None).unwrap();
         txm.begin().unwrap();
         handle = txm.allocate(b"persistent").unwrap();
         txm.commit().unwrap();

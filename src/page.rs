@@ -113,6 +113,16 @@ pub const MAGIC: u32 = 0x4348534C; // "CHSL"
 pub const FORMAT_MAJOR_VERSION: u16 = 1;
 pub const FORMAT_MINOR_VERSION: u16 = 1;
 
+/// MAJOR version stamped into an ENCRYPTED database's superblock. The bump from
+/// 1 → 2 hard-rejects old binaries (which gate on FORMAT_MAJOR_VERSION == 1).
+pub const FORMAT_MAJOR_VERSION_ENCRYPTED: u16 = 2;
+
+/// Pack the encrypted-DB format version: MAJOR=2, MINOR=current. Used by
+/// `create_new` when a key is supplied, and by Task 2.4's open-time gate.
+pub fn format_version_encrypted() -> u32 {
+    pack_format_version(FORMAT_MAJOR_VERSION_ENCRYPTED, FORMAT_MINOR_VERSION)
+}
+
 /// Pack a (major, minor) pair into the on-disk u32 format version.
 pub const fn pack_format_version(major: u16, minor: u16) -> u32 {
     ((major as u32) << 16) | (minor as u32)

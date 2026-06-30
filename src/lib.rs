@@ -74,8 +74,14 @@ pub use handle::{Handle, Tag, TagDropProgress};
 pub use page::PAGE_SIZE;
 pub use stats::{ChiselCounters, Stats};
 pub use superblock::{
-    SlotDefect, SuperblockDefect, DEFAULT_SUPERBLOCK_COUNT, MAX_SUPERBLOCKS, MIN_SUPERBLOCKS,
-    NAMED_ROOT_COUNT, NAMED_ROOT_NAME_LEN,
+    CryptoHeader, KeySlot, SlotDefect, SuperblockDefect, ALGO_XCHACHA20POLY1305,
+    CRYPTO_HEADER_OFFSET, DEFAULT_SUPERBLOCK_COUNT, KEY_SLOT_COUNT, KEY_SLOT_SIZE,
+    MAX_SUPERBLOCKS, MIN_SUPERBLOCKS, NAMED_ROOT_COUNT, NAMED_ROOT_NAME_LEN,
+};
+pub use page::{FORMAT_MAJOR_VERSION_ENCRYPTED, format_major, format_version_encrypted};
+pub use crypto::{
+    derive_kek, unwrap_dek, wrap_dek, Argon2Params, KdfId, Key, PageCipher, CryptoError,
+    NONCE_LEN, SALT_LEN, DEK_LEN,
 };
 
 use std::path::Path;
@@ -138,6 +144,9 @@ pub struct Options {
     pub create_if_missing: bool,
     pub read_only: bool,
     pub superblock_count: u32,
+    /// Encryption key supplied at open/create. `Some` creates (or opens) an
+    /// encrypted database; `None` keeps the existing plaintext format.
+    pub(crate) encryption_key: Option<crate::crypto::Key>,
 }
 
 /// Where commit-drain rehydrated pages are inserted into the LRU.
@@ -188,6 +197,7 @@ impl Default for Options {
             create_if_missing: true,
             read_only: false,
             superblock_count: superblock::DEFAULT_SUPERBLOCK_COUNT,
+            encryption_key: None,
         }
     }
 }
@@ -233,6 +243,15 @@ impl Options {
     /// header.
     pub fn superblock_count(mut self, count: u32) -> Self {
         self.superblock_count = count;
+        self
+    }
+
+    /// Supply an encryption key. On create, a fresh DEK is generated and
+    /// wrapped into key-slot 0 under a KEK derived from this key; the
+    /// superblock is stamped MAJOR=2. On open (Task 2.4), the key is used
+    /// to unwrap the stored DEK from the matching slot.
+    pub fn with_encryption_key(mut self, key: crate::crypto::Key) -> Self {
+        self.encryption_key = Some(key);
         self
     }
 }
@@ -344,7 +363,11 @@ impl Chisel {
             // superblock. options.superblock_count is ignored here.
             TransactionManager::open_existing(cache)?
         } else {
-            TransactionManager::create_new(cache, options.superblock_count)?
+            TransactionManager::create_new(
+                cache,
+                options.superblock_count,
+                options.encryption_key.clone(),
+            )?
         };
 
         Ok(Chisel { txm })
@@ -402,7 +425,8 @@ impl Chisel {
             options.drain_insertion,
             SpillwayLocation::InMemory,
         );
-        let txm = TransactionManager::create_new(cache, options.superblock_count)?;
+        // ponytail: in-memory path never encrypts (no key supplied at this call site)
+        let txm = TransactionManager::create_new(cache, options.superblock_count, None)?;
         Ok(Chisel { txm })
     }
 

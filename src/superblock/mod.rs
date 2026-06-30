@@ -656,6 +656,28 @@ impl Superblock {
             encryption: None,
         }
     }
+
+    /// Like `new_empty`, but stamps MAJOR=2 and embeds the crypto-header so
+    /// `serialize_encrypted` can seal the body. Called exclusively from the
+    /// `create_new` encrypted path; the `CryptoHeader` carries the wrapped DEK
+    /// in slot 0 and is written in cleartext into the superblock's reserved region.
+    pub fn new_empty_encrypted(superblock_count: u32, header: CryptoHeader) -> Superblock {
+        Superblock {
+            magic: MAGIC,
+            format_version: page::format_version_encrypted(),
+            txn_counter: (superblock_count - 1) as u64,
+            root_handle_table_page: page::PAGE_ID_NONE,
+            root_freemap_page: page::PAGE_ID_NONE,
+            total_pages: superblock_count as u64,
+            next_handle: 1,
+            page_size: PAGE_SIZE as u32,
+            named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
+            superblock_count,
+            root_membership_index_page: page::PAGE_ID_NONE,
+            freemap_depth: 0,
+            encryption: Some(header),
+        }
+    }
 }
 
 #[cfg(test)]

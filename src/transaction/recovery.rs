@@ -29,13 +29,25 @@ impl TransactionManager {
     /// filters on XXH3 checksum validity BEFORE comparing counters —
     /// a legitimate counter-0 slot has a valid checksum; a zeroed
     /// region doesn't.
-    pub fn create_new(mut cache: PageCache, superblock_count: u32) -> Result<TransactionManager> {
+    pub fn create_new(
+        mut cache: PageCache,
+        superblock_count: u32,
+        key: Option<crate::crypto::Key>,
+    ) -> Result<TransactionManager> {
         // Caller is expected to have validated bounds via Options in
         // lib.rs, but defend against direct-call misuse too.
         assert!(
             (2..=MAX_SUPERBLOCKS).contains(&superblock_count),
             "superblock_count {superblock_count} out of supported range 2..=16"
         );
+
+        // Build the per-session cipher up front for an encrypted DB: a fresh
+        // random DEK is sealed into slot 0 under a KEK derived from `key`.
+        // For plaintext DBs this is None and the slot-write loop uses serialize().
+        let cipher = match key {
+            None => None,
+            Some(k) => Some(build_create_cipher(&k)?),
+        };
 
         // Write N staggered slots. Slot 0 gets the highest counter
         // (superblock_count - 1), slot N-1 gets 0. First user commit
@@ -48,10 +60,16 @@ impl TransactionManager {
         // `select()` at open time will pick slot 0 (highest counter).
         // After the first user commit, slot 0 holds the newest data
         // and the rest remain as "rollback fallbacks".
-        let mut sb = Superblock::new_empty(superblock_count);
+        let mut sb = match &cipher {
+            None => Superblock::new_empty(superblock_count),
+            Some(cc) => Superblock::new_empty_encrypted(superblock_count, cc.header),
+        };
         for i in 0..superblock_count {
             sb.txn_counter = (superblock_count - 1 - i) as u64;
-            let buf = sb.serialize();
+            let buf = match &cipher {
+                None => sb.serialize(),
+                Some(cc) => sb.serialize_encrypted(&cc.page_cipher),
+            };
             cache.io_mut().write_page(i as u64, &buf)?;
         }
         cache.io_mut().fsync()?;
@@ -93,6 +111,7 @@ impl TransactionManager {
             // A fresh database has no data pages and no live slots yet.
             packer: packing::SlotPacker::new(),
             poisoned: Cell::new(false),
+            cipher: cipher.map(|cc| cc.page_cipher),
             #[cfg(test)]
             fault: fault::FaultInjector::default(),
         })
@@ -313,8 +332,65 @@ impl TransactionManager {
             freemap: freemap::FreemapRecycle::new(),
             packer: packing::SlotPacker::from_committed(committed_live_slots),
             poisoned: Cell::new(false),
+            // Task 2.4 fills this from the supplied key + the on-disk slot.
+            cipher: None,
             #[cfg(test)]
             fault: fault::FaultInjector::default(),
         })
     }
+}
+
+/// Output of the create-time key setup: the live cipher for this session and
+/// the crypto-header to stamp into every superblock slot.
+struct CreateCrypto {
+    page_cipher: crate::crypto::PageCipher,
+    header: crate::superblock::CryptoHeader,
+}
+
+/// Build the session PageCipher for a freshly-created encrypted DB: generate a
+/// random DEK + slot-0 salt, derive the KEK from the client key, wrap the DEK
+/// into slot 0, and assemble the crypto-header. Returns the live PageCipher and
+/// the header to stamp into every superblock slot.
+///
+/// The AAD passed to `wrap_dek` is `slot.aad()` — the same bytes that Task 2.4
+/// reconstructs at unwrap time from the persisted slot fields. Keeping the AAD
+/// construction in one place (`KeySlot::aad`) ensures wrap and unwrap agree.
+fn build_create_cipher(key: &crate::crypto::Key) -> Result<CreateCrypto> {
+    use crate::crypto::{
+        derive_kek, random_array, random_dek, wrap_dek, Argon2Params, KdfId, NONCE_LEN, SALT_LEN,
+    };
+    use crate::superblock::{CryptoHeader, KeySlot, ALGO_XCHACHA20POLY1305, KEY_SLOT_COUNT};
+
+    let dek = random_dek();
+    let salt: [u8; SALT_LEN] = random_array();
+    let wrap_nonce: [u8; NONCE_LEN] = random_array();
+
+    // KDF choice: a Raw key uses HKDF (fast, key-material quality);
+    // a Passphrase uses Argon2id (memory-hard, brute-force resistant).
+    let (kdf, params) = match key {
+        crate::crypto::Key::Raw(_) => (KdfId::Hkdf, Argon2Params::default()),
+        crate::crypto::Key::Passphrase(_) => (KdfId::Argon2id, Argon2Params::default()),
+    };
+    let kek = derive_kek(key, kdf, &salt, &params)?;
+
+    // Populate slot 0: state=active, KDF metadata, the wrapped DEK.
+    // slot.aad() is the canonical AAD bytes; it MUST be the same value
+    // used by Task 2.4 to unwrap — both sides call KeySlot::aad() on
+    // the populated-but-pre-wrap slot so the bytes are identical.
+    let mut slot = KeySlot::EMPTY;
+    slot.state = 1; // active
+    slot.kdf_id = kdf as u8;
+    slot.argon2 = params;
+    slot.salt = salt;
+    slot.wrap_nonce = wrap_nonce;
+    let aad = slot.aad();
+    let (wrapped, tag) = wrap_dek(&kek, &dek, &wrap_nonce, &aad);
+    slot.wrapped_dek = wrapped;
+    slot.wrap_tag = tag;
+
+    let mut slots = [KeySlot::EMPTY; KEY_SLOT_COUNT];
+    slots[0] = slot;
+    let header = CryptoHeader { algorithm: ALGO_XCHACHA20POLY1305, stride: 8232, slots };
+
+    Ok(CreateCrypto { page_cipher: crate::crypto::PageCipher::new(dek), header })
 }

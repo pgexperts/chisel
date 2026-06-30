@@ -385,6 +385,20 @@ impl From<io::Error> for ChiselError {
     }
 }
 
+impl From<crate::crypto::CryptoError> for ChiselError {
+    // A CryptoError reaching the engine through `?` in the create/open/key-management
+    // paths is always a key-or-KDF problem on intact on-disk data, so it maps to the
+    // operational InvalidEncryptionKey. The page-read path (Phase 3) does NOT use this
+    // blanket conversion — it maps decrypt failures explicitly to the fatal
+    // ChiselError::DecryptionFailed { page_id } via `.map_err(...)`. The operational
+    // cases that are NOT CryptoError-derived (no key supplied for an encrypted DB; a
+    // key supplied for a plaintext DB) are returned explicitly as NoEncryptionKey /
+    // EncryptionNotSupported at their decision sites.
+    fn from(_: crate::crypto::CryptoError) -> Self {
+        ChiselError::InvalidEncryptionKey
+    }
+}
+
 /// Crate-wide Result alias. All fallible Chisel APIs return this.
 pub type Result<T> = std::result::Result<T, ChiselError>;
 
