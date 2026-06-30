@@ -15,6 +15,8 @@
 // #[allow] on every item.
 #![allow(dead_code)]
 
+use chacha20poly1305::aead::AeadInPlace;
+use chacha20poly1305::{Key as AeadKey, KeyInit, XChaCha20Poly1305, XNonce};
 use zeroize::Zeroizing;
 
 /// On-disk stride of one encrypted page: 8192 ciphertext + 16 tag + 24 nonce.
@@ -170,9 +172,6 @@ pub fn derive_kek(
     Ok(Kek(okm))
 }
 
-use chacha20poly1305::aead::AeadInPlace;
-use chacha20poly1305::{Key as AeadKey, KeyInit, XChaCha20Poly1305, XNonce};
-
 /// Detached AEAD seal: ciphertext is the same length as plaintext, the 16-byte
 /// Poly1305 tag is returned separately. Detached suits our fixed page layout
 /// (ciphertext occupies a known 32-byte DEK slot, tag a known 16-byte slot;
@@ -194,17 +193,21 @@ fn seal_detached(
 }
 
 /// Detached AEAD open. Any tag mismatch (wrong key, tampered ct/tag, wrong AAD,
-/// wrong nonce) maps to CryptoError::Auth. The AEAD impl scrubs the in-place
-/// buffer on failure so no partial plaintext escapes.
+/// wrong nonce) maps to CryptoError::Auth. XChaCha20-Poly1305 is verify-then-
+/// decrypt: `decrypt_in_place_detached` checks the Poly1305 tag BEFORE applying
+/// the keystream, so on auth failure the buffer still holds the original
+/// ciphertext and no plaintext is ever written. The returned buffer is
+/// Zeroizing so the decrypted plaintext (key material) is wiped on drop rather
+/// than handed back to the allocator un-scrubbed.
 fn open_detached(
     key: &[u8; 32],
     nonce: &[u8; NONCE_LEN],
     aad: &[u8],
     ciphertext: &[u8],
     tag: &[u8; TAG_LEN],
-) -> Result<Vec<u8>, CryptoError> {
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let cipher = XChaCha20Poly1305::new(AeadKey::from_slice(key));
-    let mut buf = ciphertext.to_vec();
+    let mut buf = Zeroizing::new(ciphertext.to_vec());
     cipher
         .decrypt_in_place_detached(
             XNonce::from_slice(nonce),
