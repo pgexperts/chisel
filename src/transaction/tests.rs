@@ -2468,3 +2468,54 @@ fn commit_write_failure_poisons() {
     );
     assert!(tm.is_poisoned(), "write failure during commit must poison");
 }
+
+// --- Session-cipher structural invariants ---
+//
+// Phase 3 will wire `cipher` to page I/O; these tests confirm the DEK is
+// retained for the full session (Some for encrypted DBs, None for plaintext)
+// and that nothing leaks it. Zeroization on drop is automatic: PageCipher
+// owns a Dek(Zeroizing<[u8; 32]>), so the key is wiped when the manager is
+// dropped — no explicit Drop impl needed. In safe Rust, post-drop memory
+// content is not observable, so the tests assert the structural invariant
+// (Some vs None) rather than attempting to read freed memory.
+
+#[test]
+fn encrypted_manager_holds_session_cipher() {
+    // create_new with a key must unwrap a fresh DEK and hold it as
+    // Some(PageCipher) for Phase 3 page I/O wiring.
+    let file = NamedTempFile::new().unwrap();
+    let io = PageIo::open(file.path(), false).unwrap();
+    let cache = PageCache::new(
+        io,
+        1024 * PAGE_SIZE as u64,
+        0,
+        crate::DrainInsertion::LruTail,
+        crate::SpillwayLocation::InMemory,
+    );
+    let key = crate::crypto::Key::Raw(zeroize::Zeroizing::new(vec![0x5Au8; 32]));
+    let txm = TransactionManager::create_new(cache, 2, Some(key)).unwrap();
+    assert!(
+        txm.cipher.is_some(),
+        "encrypted create must retain a session cipher"
+    );
+}
+
+#[test]
+fn plaintext_manager_has_no_cipher() {
+    // create_new without a key must leave cipher as None — no accidental
+    // encryption on plaintext DBs, and no dead PageCipher in memory.
+    let file = NamedTempFile::new().unwrap();
+    let io = PageIo::open(file.path(), false).unwrap();
+    let cache = PageCache::new(
+        io,
+        1024 * PAGE_SIZE as u64,
+        0,
+        crate::DrainInsertion::LruTail,
+        crate::SpillwayLocation::InMemory,
+    );
+    let txm = TransactionManager::create_new(cache, 2, None).unwrap();
+    assert!(
+        txm.cipher.is_none(),
+        "plaintext create must have no session cipher"
+    );
+}
