@@ -277,7 +277,7 @@ fn fatal_error_outside_commit_also_poisons() {
         crate::DrainInsertion::LruTail,
         crate::SpillwayLocation::InMemory,
     );
-    let tm = TransactionManager::open_existing(cache).unwrap();
+    let tm = TransactionManager::open_existing(cache, None).unwrap();
     tm.cache.borrow().io().arm_fault(Fault::FailReadPage(pid));
     let result = tm.read(h);
     assert!(
@@ -1534,7 +1534,7 @@ fn delete_membership_failure_survives_reopen_consistently() {
         if create {
             TransactionManager::create_new(cache, 2, None).unwrap()
         } else {
-            TransactionManager::open_existing(cache).unwrap()
+            TransactionManager::open_existing(cache, None).unwrap()
         }
     };
 
@@ -1812,7 +1812,7 @@ fn allocate_membership_failure_survives_reopen_consistently() {
         if create {
             TransactionManager::create_new(cache, 2, None).unwrap()
         } else {
-            TransactionManager::open_existing(cache).unwrap()
+            TransactionManager::open_existing(cache, None).unwrap()
         }
     };
 
@@ -2089,7 +2089,7 @@ fn format_version_gate_is_major_only() {
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
         );
-        let tm = TransactionManager::open_existing(cache);
+        let tm = TransactionManager::open_existing(cache, None);
         assert!(
             tm.is_ok(),
             "same-major / different-minor file should open cleanly; got {:?}",
@@ -2110,7 +2110,7 @@ fn format_version_gate_is_major_only() {
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
         );
-        match TransactionManager::open_existing(cache) {
+        match TransactionManager::open_existing(cache, None) {
             Err(ChiselError::UnsupportedFormatVersion { .. }) => {}
             Err(e) => panic!("expected UnsupportedFormatVersion, got {e:?}"),
             Ok(_) => panic!("expected UnsupportedFormatVersion, got Ok"),
@@ -2162,7 +2162,7 @@ fn file_minor_newer_than_binary_is_forced_read_only() {
         crate::DrainInsertion::LruTail,
         crate::SpillwayLocation::InMemory,
     );
-    let mut tm = TransactionManager::open_existing(cache)
+    let mut tm = TransactionManager::open_existing(cache, None)
         .expect("a newer-minor file must still OPEN (reads are additive-safe)");
     assert!(
         matches!(tm.begin(), Err(ChiselError::ReadOnlyMode)),
@@ -2314,7 +2314,7 @@ fn reopen_preserves_committed_data() {
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
         );
-        let txm = TransactionManager::open_existing(cache).unwrap();
+        let txm = TransactionManager::open_existing(cache, None).unwrap();
         let data = txm.read(handle).unwrap();
         assert_eq!(data, b"persistent");
     }

@@ -361,7 +361,7 @@ impl Chisel {
         let txm = if file_exists {
             // Existing database: N is discovered from the on-disk
             // superblock. options.superblock_count is ignored here.
-            TransactionManager::open_existing(cache)?
+            TransactionManager::open_existing(cache, options.encryption_key.clone())?
         } else {
             TransactionManager::create_new(
                 cache,

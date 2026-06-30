@@ -5,10 +5,6 @@
 // the reserved region stays zeroed and `deserialize` returns None (algorithm 0).
 //
 // Consumed by superblock/mod.rs (serialize_encrypted, deserialize, decrypt_body).
-// ponytail: items here are called from serialize_encrypted / decrypt_body which
-// themselves are dead-code-warned at the superblock level pending Phase 2.4
-// wiring; suppress until that caller lands.
-#![allow(dead_code)]
 //
 // On-disk layout (all inside the superblock's reserved region, after freemap_depth):
 //   324..325   algorithm (u8; 1 = XChaCha20-Poly1305, 0 = none/plaintext)

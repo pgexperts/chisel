@@ -322,10 +322,6 @@ impl Superblock {
         buf
     }
 
-    // ponytail: methods below are called from serialize_encrypted/decrypt_body
-    // which in turn are called from tests and will be wired to the commit/open
-    // path in Task 2.4. Suppress dead_code until that caller lands.
-    #[allow(dead_code)]
     /// Build the AAD that binds the sealed body and each key-slot's DEK wrap to
     /// this superblock's plaintext identity. The four bootstrap fields that stay
     /// cleartext in both encrypted and plaintext DBs are included; this prevents
@@ -387,7 +383,6 @@ impl Superblock {
     /// leaks (named_roots at 52..308, root/page-id scalars at 16..52, etc.).
     ///
     /// Panics if `self.encryption` is `None` — only call for encrypted DBs.
-    #[allow(dead_code)]
     pub fn serialize_encrypted(&self, cipher: &crate::crypto::PageCipher) -> [u8; PAGE_SIZE] {
         let header = self
             .encryption
@@ -423,7 +418,6 @@ impl Superblock {
     /// already called `deserialize` (which fills bootstrap fields and the
     /// crypto-header from cleartext) and obtained the matching DEK. Returns
     /// `CryptoError::Auth` if the DEK or AAD is wrong, or the blob is tampered.
-    #[allow(dead_code)]
     pub fn decrypt_body(
         &mut self,
         cipher: &crate::crypto::PageCipher,

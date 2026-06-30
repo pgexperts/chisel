@@ -44,7 +44,7 @@ impl TransactionManager {
         // Build the per-session cipher up front for an encrypted DB: a fresh
         // random DEK is sealed into slot 0 under a KEK derived from `key`.
         // For plaintext DBs this is None and the slot-write loop uses serialize().
-        let cipher = match key {
+        let create_crypto = match key {
             None => None,
             Some(k) => Some(build_create_cipher(&k)?),
         };
@@ -60,13 +60,13 @@ impl TransactionManager {
         // `select()` at open time will pick slot 0 (highest counter).
         // After the first user commit, slot 0 holds the newest data
         // and the rest remain as "rollback fallbacks".
-        let mut sb = match &cipher {
+        let mut sb = match &create_crypto {
             None => Superblock::new_empty(superblock_count),
             Some(cc) => Superblock::new_empty_encrypted(superblock_count, cc.header),
         };
         for i in 0..superblock_count {
             sb.txn_counter = (superblock_count - 1 - i) as u64;
-            let buf = match &cipher {
+            let buf = match &create_crypto {
                 None => sb.serialize(),
                 Some(cc) => sb.serialize_encrypted(&cc.page_cipher),
             };
@@ -93,6 +93,12 @@ impl TransactionManager {
             membership_index_page: PAGE_ID_NONE,
         };
 
+        // Split the CreateCrypto struct into its session parts before consuming.
+        let (session_cipher, session_header) = match create_crypto {
+            None => (None, None),
+            Some(cc) => (Some(cc.page_cipher), Some(cc.header)),
+        };
+
         Ok(TransactionManager {
             cache: RefCell::new(cache),
             committed_roots: roots.clone(),
@@ -111,7 +117,8 @@ impl TransactionManager {
             // A fresh database has no data pages and no live slots yet.
             packer: packing::SlotPacker::new(),
             poisoned: Cell::new(false),
-            cipher: cipher.map(|cc| cc.page_cipher),
+            cipher: session_cipher,
+            crypto_header: session_header,
             #[cfg(test)]
             fault: fault::FaultInjector::default(),
         })
@@ -152,7 +159,10 @@ impl TransactionManager {
     /// If no valid superblock is found in the first MAX_SUPERBLOCKS
     /// pages, we return `CorruptSuperblock`. This bounds the probe
     /// cost in the pathological case where every candidate is torn.
-    pub fn open_existing(mut cache: PageCache) -> Result<TransactionManager> {
+    pub fn open_existing(
+        mut cache: PageCache,
+        key: Option<crate::crypto::Key>,
+    ) -> Result<TransactionManager> {
         // Step 1: read up to MAX_SUPERBLOCKS pages as candidates.
         let mut candidates: Vec<[u8; PAGE_SIZE]> = Vec::new();
         for i in 0..MAX_SUPERBLOCKS as u64 {
@@ -169,9 +179,41 @@ impl TransactionManager {
         // Step 2 + 3: pick the winner via select(). select() uses
         // deserialize, which validates checksum and magic — data
         // pages in the candidate list (if any) are filtered out.
-        let sb = Superblock::select(&candidates).ok_or_else(|| ChiselError::CorruptSuperblock {
+        let mut sb = Superblock::select(&candidates).ok_or_else(|| ChiselError::CorruptSuperblock {
             defects: Superblock::diagnose(&candidates),
         })?;
+
+        // Encryption gate: the winning superblock's crypto-header (already
+        // parsed by deserialize into sb.encryption) tells us whether the DB
+        // is encrypted. Mismatches between "DB encrypted?" and "key
+        // supplied?" are operational open errors, not torn-slot signals.
+        //
+        // For an encrypted DB we must decrypt the sealed body (which holds
+        // total_pages, named_roots, etc.) BEFORE the page-size and
+        // total_pages checks that read those fields.
+        let cipher = match (&sb.encryption, &key) {
+            (None, None) => None,
+            (Some(_), None) => return Err(ChiselError::NoEncryptionKey),
+            (None, Some(_)) => return Err(ChiselError::EncryptionNotSupported),
+            (Some(header), Some(k)) => {
+                // The winning slot's raw bytes: slot index is
+                // txn_counter % superblock_count, which is how commit
+                // selects the write slot, so the highest-counter slot is
+                // always at this index in the candidates array.
+                let slot_idx =
+                    (sb.txn_counter % sb.superblock_count as u64) as usize;
+                let raw = &candidates[slot_idx];
+                let dek = unwrap_first_matching_slot(header, k)?;
+                let cipher = crate::crypto::PageCipher::new(dek);
+                // decrypt_body fills total_pages, named_roots, etc.
+                // A tag failure here means corruption, not a wrong key
+                // (the slot already authenticated the DEK), so map to
+                // InvalidEncryptionKey rather than poisoning.
+                sb.decrypt_body(&cipher, raw)
+                    .map_err(|_| ChiselError::InvalidEncryptionKey)?;
+                Some(cipher)
+            }
+        };
 
         // Format-version gate (see ISSUES.md I15 for the original check,
         // I29 for the major/minor split). Compare MAJOR only: the packed
@@ -187,7 +229,17 @@ impl TransactionManager {
         // compatibility — silently falling back to an older-version
         // superblock would hand the user a stale snapshot with
         // mysteriously missing data.
-        if page::format_major(sb.format_version) != page::FORMAT_MAJOR_VERSION {
+        //
+        // Encrypted DBs carry MAJOR=2; plaintext DBs carry MAJOR=1. An old
+        // binary (FORMAT_MAJOR_VERSION=1) rejects MAJOR=2 as unsupported,
+        // which is correct. A new binary accepts either, gated on whether
+        // the encryption header is present.
+        let expected_major = if sb.encryption.is_some() {
+            page::FORMAT_MAJOR_VERSION_ENCRYPTED
+        } else {
+            page::FORMAT_MAJOR_VERSION
+        };
+        if page::format_major(sb.format_version) != expected_major {
             return Err(ChiselError::UnsupportedFormatVersion {
                 found: sb.format_version,
                 expected: page::FORMAT_VERSION,
@@ -332,8 +384,12 @@ impl TransactionManager {
             freemap: freemap::FreemapRecycle::new(),
             packer: packing::SlotPacker::from_committed(committed_live_slots),
             poisoned: Cell::new(false),
-            // Task 2.4 fills this from the supplied key + the on-disk slot.
-            cipher: None,
+            cipher,
+            // The CryptoHeader (key-slot table + algorithm) is preserved from the
+            // winning superblock so commit can write it back verbatim. It never
+            // changes between opens: slots are only mutated by key-rotation (a
+            // future operation). None for plaintext DBs.
+            crypto_header: sb.encryption,
             #[cfg(test)]
             fault: fault::FaultInjector::default(),
         })
@@ -393,4 +449,43 @@ fn build_create_cipher(key: &crate::crypto::Key) -> Result<CreateCrypto> {
     let header = CryptoHeader { algorithm: ALGO_XCHACHA20POLY1305, stride: 8232, slots };
 
     Ok(CreateCrypto { page_cipher: crate::crypto::PageCipher::new(dek), header })
+}
+
+/// Try every ACTIVE key-slot in turn: derive the KEK from `key` + the slot's
+/// salt/params, then attempt to unwrap the DEK. The first slot whose AEAD tag
+/// verifies yields the DEK. If no slot matches, the caller's key is wrong.
+///
+/// Trying every active slot (rather than a slot-index hint) is what makes
+/// multi-key support possible: a DB may have the same DEK wrapped under
+/// several KEKs (one per trusted key), and the caller's key matches exactly
+/// one of them.
+///
+/// The AAD passed to `unwrap_dek` is `slot.aad()` — the identical bytes
+/// that `build_create_cipher` used at wrap time. Both sides call
+/// `KeySlot::aad()` on the fully populated (but pre-wrap) slot, so the
+/// bytes agree even if the slot layout changes in a future format version.
+fn unwrap_first_matching_slot(
+    header: &crate::superblock::CryptoHeader,
+    key: &crate::crypto::Key,
+) -> Result<crate::crypto::Dek> {
+    use crate::crypto::{derive_kek, unwrap_dek, KdfId};
+
+    for slot in header.slots.iter().filter(|s| s.is_active()) {
+        let kdf = match slot.kdf_id {
+            1 => KdfId::Hkdf,
+            2 => KdfId::Argon2id,
+            _ => continue, // unknown KDF id: skip, treat as non-matching
+        };
+        let kek = match derive_kek(key, kdf, &slot.salt, &slot.argon2) {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+        let aad = slot.aad();
+        if let Ok(dek) =
+            unwrap_dek(&kek, &slot.wrapped_dek, &slot.wrap_tag, &slot.wrap_nonce, &aad)
+        {
+            return Ok(dek);
+        }
+    }
+    Err(ChiselError::InvalidEncryptionKey)
 }

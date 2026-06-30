@@ -218,10 +218,15 @@ pub struct TransactionManager {
     /// Per-session page cipher for an encrypted database. `None` for plaintext.
     /// Holds the unwrapped DEK (zeroizing) for the life of the manager; reaches
     /// the PageCache in Phase 3 for per-page seal/open. Set on the create path
-    /// (fresh DEK) and on the open path when Task 2.4 lands (DEK unwrapped from
-    /// a key-slot). The DEK inside PageCipher is zeroizing and is cleared on drop.
-    #[allow(dead_code)] // used by create path; Phase 3 wires it to page I/O
+    /// (fresh DEK) and on the open path (DEK unwrapped from a key-slot). The DEK
+    /// inside PageCipher is zeroizing and is cleared on drop.
+    #[allow(dead_code)] // Phase 3 wires this to page I/O; commit path uses it via CommitCtx
     cipher: Option<crate::crypto::PageCipher>,
+    /// The crypto-header (algorithm id + key-slot table) for an encrypted database.
+    /// Written verbatim into every committed superblock. `None` for plaintext DBs.
+    /// The key-slot contents never change after create or open: the slots hold the
+    /// DEK wrapped under KEKs from each user key and are opaque to the commit path.
+    crypto_header: Option<crate::superblock::CryptoHeader>,
 
     // Test-only fault injection consolidated off the production type (review
     // 2026-06-22 SMELL #4): the four BUG#2 atomic-staging arming flags live in
