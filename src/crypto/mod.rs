@@ -66,7 +66,9 @@ impl Clone for Dek {
 
 /// The Key Encryption Key: derived per-open from the client key + a slot's
 /// salt/params. Only ever wraps/unwraps the DEK; transient, wiped on drop.
-#[derive(Debug)]
+///
+/// No Debug/Display: `Zeroizing`'s derived Debug delegates to the inner array
+/// (it does not redact), so printing a Kek would leak the raw key bytes.
 pub struct Kek(Zeroizing<[u8; 32]>);
 
 impl Kek {
@@ -147,21 +149,25 @@ pub fn derive_kek(
         Key::Raw(bytes) => bytes.as_slice(),
         Key::Passphrase(s) => s.as_bytes(),
     };
-    let mut okm = [0u8; 32];
+    // Zeroizing so the derived key never lingers un-wiped on the stack: on the
+    // success path it is MOVED into Kek (no copy left behind), and on any error
+    // path partial KDF output is wiped on drop.
+    let mut okm = Zeroizing::new([0u8; 32]);
     match kdf {
         KdfId::Hkdf => {
             let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
-            hk.expand(KEK_INFO, &mut okm).map_err(|_| CryptoError::Kdf)?;
+            hk.expand(KEK_INFO, okm.as_mut())
+                .map_err(|_| CryptoError::Kdf)?;
         }
         KdfId::Argon2id => {
             let p = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(32))
                 .map_err(|_| CryptoError::Kdf)?;
             let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, p);
-            a2.hash_password_into(ikm, salt, &mut okm)
+            a2.hash_password_into(ikm, salt, okm.as_mut())
                 .map_err(|_| CryptoError::Kdf)?;
         }
     }
-    Ok(Kek::from_bytes(okm))
+    Ok(Kek(okm))
 }
 
 /// Fill an N-byte array from the OS CSPRNG. Panics if the OS RNG is unavailable,
@@ -283,7 +289,11 @@ mod tests {
     fn derive_kek_argon2_rejects_zero_memory() {
         let bad = Argon2Params { m_cost: 0, t_cost: 1, p_cost: 1 };
         let key = Key::Passphrase(zeroize::Zeroizing::new("x".to_string()));
-        let err = derive_kek(&key, KdfId::Argon2id, &[0u8; SALT_LEN], &bad).unwrap_err();
-        assert_eq!(err, CryptoError::Kdf);
+        // matches! rather than unwrap_err: Kek deliberately has no Debug (it
+        // wraps key bytes), so Result::unwrap_err can't be used here.
+        assert!(matches!(
+            derive_kek(&key, KdfId::Argon2id, &[0u8; SALT_LEN], &bad),
+            Err(CryptoError::Kdf)
+        ));
     }
 }
