@@ -36,9 +36,9 @@
 // them from a downstream crate requires either a path-dep with
 // #[cfg(test)] access (the bench subcrate does this implicitly
 // through the public API) or copying the relevant logic out.
+pub(crate) mod crypto;
 pub(crate) mod data_page;
 pub(crate) mod defrag;
-pub(crate) mod crypto;
 pub(crate) mod error;
 pub(crate) mod freemap;
 pub(crate) mod freemap_tree;

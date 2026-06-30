@@ -638,7 +638,10 @@ mod tests {
 
         // Display carries the page id for the fatal variant.
         let msg = format!("{}", ChiselError::DecryptionFailed { page_id: 7 });
-        assert!(msg.contains('7'), "Display {msg:?} should mention page id 7");
+        assert!(
+            msg.contains('7'),
+            "Display {msg:?} should mention page id 7"
+        );
 
         // source() is None for all four — none wrap an inner cause.
         use std::error::Error;

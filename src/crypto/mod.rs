@@ -297,7 +297,11 @@ impl PageCipher {
     /// Open an 8232-byte on-disk blob back to the 8192-byte plaintext page.
     /// AAD = page_id LE. Any authentication failure → CryptoError::Auth (the
     /// engine maps this to DecryptionFailed at the page-read site).
-    pub fn open(&self, page_id: u64, ondisk: &[u8; ENC_PAGE_SIZE]) -> Result<[u8; 8192], CryptoError> {
+    pub fn open(
+        &self,
+        page_id: u64,
+        ondisk: &[u8; ENC_PAGE_SIZE],
+    ) -> Result<[u8; 8192], CryptoError> {
         let ct = &ondisk[0..8192];
         let mut tag = [0u8; TAG_LEN];
         tag.copy_from_slice(&ondisk[8192..8208]);
@@ -313,7 +317,11 @@ impl PageCipher {
     /// Seal a variable-length body (the superblock sensitive sub-blob). Returns
     /// (nonce, tag, ciphertext); the caller lays these out in the reserved
     /// region. AAD binds the body to the superblock's identity (anti-splicing).
-    pub fn seal_body(&self, aad: &[u8], plaintext: &[u8]) -> ([u8; NONCE_LEN], [u8; TAG_LEN], Vec<u8>) {
+    pub fn seal_body(
+        &self,
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> ([u8; NONCE_LEN], [u8; TAG_LEN], Vec<u8>) {
         let nonce = random_array::<NONCE_LEN>();
         let (ct, tag) = seal_detached(self.dek.as_bytes(), &nonce, aad, plaintext);
         (nonce, tag, ct)
@@ -414,28 +422,44 @@ mod tests {
         let k1 = derive_kek(&key, KdfId::Hkdf, &salt_a, &p).unwrap();
         let k2 = derive_kek(&key, KdfId::Hkdf, &salt_a, &p).unwrap();
         let k3 = derive_kek(&key, KdfId::Hkdf, &salt_b, &p).unwrap();
-        assert_eq!(k1.as_bytes(), k2.as_bytes(), "same input must be deterministic");
+        assert_eq!(
+            k1.as_bytes(),
+            k2.as_bytes(),
+            "same input must be deterministic"
+        );
         assert_ne!(k1.as_bytes(), k3.as_bytes(), "different salt must diverge");
     }
 
     #[test]
     fn derive_kek_argon2_roundtrips_and_is_salt_sensitive() {
         // Cheap params so the test is fast (real defaults are 19 MiB).
-        let fast = Argon2Params { m_cost: 256, t_cost: 1, p_cost: 1 };
+        let fast = Argon2Params {
+            m_cost: 256,
+            t_cost: 1,
+            p_cost: 1,
+        };
         let key = Key::Passphrase(zeroize::Zeroizing::new("correct horse".to_string()));
         let salt_a = [9u8; SALT_LEN];
         let salt_b = [8u8; SALT_LEN];
         let k1 = derive_kek(&key, KdfId::Argon2id, &salt_a, &fast).unwrap();
         let k2 = derive_kek(&key, KdfId::Argon2id, &salt_a, &fast).unwrap();
         let k3 = derive_kek(&key, KdfId::Argon2id, &salt_b, &fast).unwrap();
-        assert_eq!(k1.as_bytes(), k2.as_bytes(), "Argon2id must be deterministic");
+        assert_eq!(
+            k1.as_bytes(),
+            k2.as_bytes(),
+            "Argon2id must be deterministic"
+        );
         assert_ne!(k1.as_bytes(), k3.as_bytes(), "different salt must diverge");
         assert_ne!(k1.as_bytes(), &[0u8; 32]);
     }
 
     #[test]
     fn derive_kek_argon2_rejects_zero_memory() {
-        let bad = Argon2Params { m_cost: 0, t_cost: 1, p_cost: 1 };
+        let bad = Argon2Params {
+            m_cost: 0,
+            t_cost: 1,
+            p_cost: 1,
+        };
         let key = Key::Passphrase(zeroize::Zeroizing::new("x".to_string()));
         // matches! rather than unwrap_err: Kek deliberately has no Debug (it
         // wraps key bytes), so Result::unwrap_err can't be used here.
@@ -452,7 +476,11 @@ mod tests {
         let nonce = [5u8; NONCE_LEN];
         let aad = b"slot-meta";
         let (wrapped, tag) = wrap_dek(&kek, &dek, &nonce, aad);
-        assert_ne!(&wrapped, dek.as_bytes(), "wrapped DEK must not equal plaintext DEK");
+        assert_ne!(
+            &wrapped,
+            dek.as_bytes(),
+            "wrapped DEK must not equal plaintext DEK"
+        );
         let out = unwrap_dek(&kek, &wrapped, &tag, &nonce, aad).unwrap();
         assert_eq!(out.as_bytes(), dek.as_bytes());
     }
@@ -530,7 +558,11 @@ mod tests {
         let page = [0xABu8; 8192];
         let blob = pc.seal(0, &page);
         // ciphertext occupies 0..8192, tag 8192..8208, nonce 8208..8232.
-        assert_ne!(&blob[0..8192], &page[..], "ciphertext must differ from plaintext");
+        assert_ne!(
+            &blob[0..8192],
+            &page[..],
+            "ciphertext must differ from plaintext"
+        );
     }
 
     #[test]
@@ -582,6 +614,34 @@ mod tests {
         let pc = PageCipher::new(Dek::from_bytes([2u8; DEK_LEN]));
         let body = b"secret".to_vec();
         let (nonce, tag, ct) = pc.seal_body(b"sb-A", &body);
-        assert_eq!(pc.open_body(b"sb-B", &nonce, &tag, &ct).unwrap_err(), CryptoError::Auth);
+        assert_eq!(
+            pc.open_body(b"sb-B", &nonce, &tag, &ct).unwrap_err(),
+            CryptoError::Auth
+        );
+    }
+
+    // Zeroization guards: verify that Dek/Key wrap Zeroizing buffers and that
+    // Clone produces independent copies (so dropping one does not corrupt the
+    // other).  We cannot observe freed memory in safe Rust, so the honest check
+    // is independence of cloned buffers — if the inner Zeroizing zeroes-on-drop
+    // the original's view is unaffected because they own separate allocations.
+    #[test]
+    fn dek_clone_is_independent_zeroizing_copy() {
+        let d = Dek::from_bytes([7u8; DEK_LEN]);
+        let c = d.clone();
+        assert_eq!(d.as_bytes(), c.as_bytes());
+        // Dropping the clone must not affect the original (independent buffers).
+        drop(c);
+        assert_eq!(d.as_bytes(), &[7u8; DEK_LEN]);
+    }
+
+    #[test]
+    fn key_variants_construct_from_zeroizing() {
+        // Compile + construct proof that Key wraps Zeroizing for both variants.
+        let raw = Key::Raw(zeroize::Zeroizing::new(vec![1u8, 2, 3]));
+        let pass = Key::Passphrase(zeroize::Zeroizing::new("pw".to_string()));
+        // Clone works (needed by Options/rotation).
+        let _r2 = raw.clone();
+        let _p2 = pass.clone();
     }
 }
