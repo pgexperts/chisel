@@ -92,7 +92,7 @@ pub enum KdfId {
 
 /// Argon2id cost parameters. Stored per-slot so a slot can be re-derived
 /// regardless of the binary's current defaults.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Argon2Params {
     pub m_cost: u32, // KiB of memory
     pub t_cost: u32, // iterations

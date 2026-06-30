@@ -34,6 +34,13 @@
 use crate::page::{self, MAGIC, PAGE_SIZE};
 use std::fmt;
 
+mod crypto_header;
+#[allow(unused_imports)] // Phase 2.2+ wires these into superblock serialize/open
+pub use crypto_header::{
+    CryptoHeader, KeySlot, ALGO_XCHACHA20POLY1305, CRYPTO_HEADER_OFFSET, CRYPTO_HEADER_SIZE,
+    KEY_SLOT_COUNT, KEY_SLOT_SIZE,
+};
+
 // Superblock count bounds (ISSUES.md R4). Hardcoded limits keep the
 // probe-at-open-time cost bounded and prevent obviously-broken configs.
 // N=1 is disqualified because it provides no redundancy — a single torn
