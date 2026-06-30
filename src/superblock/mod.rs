@@ -537,31 +537,20 @@ impl Superblock {
 
     /// Select the active superblock from a list of candidate slot buffers.
     ///
-    /// Correctness of crash recovery rides on this: we deserialize every
-    /// candidate, discard any whose checksum/magic/count-range validation
-    /// fails, and pick the survivor with the highest `txn_counter`.
-    /// Because the commit protocol fsyncs data pages *before* writing the
-    /// new superblock, the highest-counter valid superblock is guaranteed
-    /// to reference a fully-durable page set.
+    /// Deserialize every candidate, discard any whose
+    /// checksum/magic/count-range validation fails, and return the
+    /// survivor with the highest `txn_counter`.
     ///
-    /// The caller (`TransactionManager::open_existing`) passes up to
-    /// MAX_SUPERBLOCKS candidate pages without first trying to determine
-    /// N: non-superblock pages (data / overflow / freemap / handle-table)
-    /// that happen to land in the probed range will fail the MAGIC check
-    /// inside `deserialize` and be filtered out harmlessly. This is why
-    /// the open path reads blindly up to MAX_SUPERBLOCKS rather than
-    /// trying to look up N first.
+    /// Used in tests only. Production code (`open_existing`) inlines the
+    /// same `filter_map` + `max_by_key` so it can keep the winning buffer
+    /// alongside the deserialized superblock for `decrypt_body`.
     ///
-    /// Returns None only when *every* candidate is corrupt — the caller
-    /// should treat that as `CorruptSuperblock` (fatal).
+    /// Returns None only when *every* candidate is corrupt.
     ///
-    /// Tie-break policy: on a `txn_counter` tie, `max_by_key` returns the
-    /// FIRST maximum in iteration order — i.e. the slot with the lowest
-    /// page id. Ties should not arise in normal operation (every
-    /// successful commit bumps the counter), but they can appear during
-    /// the `create_new` seeding window before the first user commit and
-    /// in hand-crafted corruption-repair scenarios. Lowest-slot-wins is
-    /// deterministic and matches the slot-0-is-primary intuition.
+    /// Tie-break: `max_by_key` returns the LAST maximum in iteration order
+    /// (highest page index on a tie). Ties should not arise in normal
+    /// operation; this is a deterministic fallback for tests.
+    #[cfg(test)]
     pub fn select(buffers: &[[u8; PAGE_SIZE]]) -> Option<Superblock> {
         buffers
             .iter()

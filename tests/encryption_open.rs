@@ -157,6 +157,40 @@ fn passphrase_key_round_trip() {
     }
 }
 
+/// Regression: open an encrypted DB immediately after creation, WITHOUT any
+/// user commit. Before the fix, `slot_idx = txn_counter % N = (N-1) % N = N-1`
+/// pointed at the loser slot (counter 0) while the winner (counter N-1) is at
+/// slot 0, causing an AAD mismatch and a spurious InvalidEncryptionKey.
+#[test]
+fn open_encrypted_db_with_no_commits_uses_correct_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fresh.chisel");
+    // Create with a named root set at create time (so there's something to verify
+    // round-trips even without a user commit).
+    {
+        let _db = Chisel::open(
+            &path,
+            Options::default().with_encryption_key(raw_key(0x42)),
+        )
+        .unwrap();
+        // Drop immediately — no begin/commit. This is the exact scenario the
+        // create-seed inversion bug breaks: the winner slot is at page 0
+        // (counter N-1) but txn_counter % N = N-1 != 0 for N=2.
+    }
+    // Reopen with the correct key: must not return InvalidEncryptionKey.
+    let result = Chisel::open(
+        &path,
+        Options::default()
+            .with_encryption_key(raw_key(0x42))
+            .create_if_missing(false),
+    );
+    assert!(
+        result.is_ok(),
+        "correct key must open a never-committed encrypted DB; got: {:?}",
+        result.err()
+    );
+}
+
 /// Named root written under an encrypted DB must round-trip through open.
 #[test]
 fn named_root_round_trips_through_encrypted_open() {

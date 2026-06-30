@@ -176,12 +176,27 @@ impl TransactionManager {
             }
         }
 
-        // Step 2 + 3: pick the winner via select(). select() uses
-        // deserialize, which validates checksum and magic — data
-        // pages in the candidate list (if any) are filtered out.
-        let mut sb = Superblock::select(&candidates).ok_or_else(|| ChiselError::CorruptSuperblock {
-            defects: Superblock::diagnose(&candidates),
-        })?;
+        // Step 2 + 3: pick the winner. We need BOTH the deserialized superblock
+        // AND the raw buffer it came from (for decrypt_body's AAD reconstruction).
+        // select() discards the buffer index, so we re-select here as a
+        // (superblock, &buf) pair. Tie-break is identical to select(): max_by_key
+        // returns the last maximum, matching the plaintext path's behavior.
+        //
+        // IMPORTANT: do NOT reconstruct the buffer index from
+        // `txn_counter % superblock_count`. That formula matches the commit
+        // write-slot rule but is INVERTED for the create-seeding rule (slot i
+        // gets counter N-1-i), so a freshly-created encrypted DB that has never
+        // been committed would yield slot_idx pointing at the LOSER buffer —
+        // decrypt_body builds its AAD from the winner's txn_counter but reads
+        // the sealed body from the wrong buffer, causing an AAD mismatch →
+        // CryptoError::Auth → the correct key wrongly fails to open.
+        let (mut sb, raw) = candidates
+            .iter()
+            .filter_map(|b| Superblock::deserialize(b).map(|sb| (sb, b)))
+            .max_by_key(|(sb, _)| sb.txn_counter)
+            .ok_or_else(|| ChiselError::CorruptSuperblock {
+                defects: Superblock::diagnose(&candidates),
+            })?;
 
         // Encryption gate: the winning superblock's crypto-header (already
         // parsed by deserialize into sb.encryption) tells us whether the DB
@@ -196,13 +211,8 @@ impl TransactionManager {
             (Some(_), None) => return Err(ChiselError::NoEncryptionKey),
             (None, Some(_)) => return Err(ChiselError::EncryptionNotSupported),
             (Some(header), Some(k)) => {
-                // The winning slot's raw bytes: slot index is
-                // txn_counter % superblock_count, which is how commit
-                // selects the write slot, so the highest-counter slot is
-                // always at this index in the candidates array.
-                let slot_idx =
-                    (sb.txn_counter % sb.superblock_count as u64) as usize;
-                let raw = &candidates[slot_idx];
+                // `raw` is provably the buffer the winner was deserialized from —
+                // correct regardless of create-seed vs commit write-slot ordering.
                 let dek = unwrap_first_matching_slot(header, k)?;
                 let cipher = crate::crypto::PageCipher::new(dek);
                 // decrypt_body fills total_pages, named_roots, etc.
@@ -240,9 +250,17 @@ impl TransactionManager {
             page::FORMAT_MAJOR_VERSION
         };
         if page::format_major(sb.format_version) != expected_major {
+            // Report the version the caller should expect for THIS kind of DB
+            // (encrypted = MAJOR 2, plaintext = MAJOR 1). Using the plaintext
+            // FORMAT_VERSION for an encrypted file would be misleading.
+            let expected_version = if sb.encryption.is_some() {
+                page::format_version_encrypted()
+            } else {
+                page::FORMAT_VERSION
+            };
             return Err(ChiselError::UnsupportedFormatVersion {
                 found: sb.format_version,
-                expected: page::FORMAT_VERSION,
+                expected: expected_version,
             });
         }
 
