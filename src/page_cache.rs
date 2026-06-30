@@ -470,17 +470,20 @@ impl PageCache {
                 // effectively rolled back. If commit is ever made retryable,
                 // reorder to write_page-then-forget so a failed drain leaves the
                 // page recoverable from the spillway (review 2026-06-22).
-                let buf = {
+                let buf: Box<[u8; page::PAGE_SIZE]> = {
                     let spw = self.spillway.as_mut().unwrap();
                     let b = spw.rehydrate(page_id)?;
                     spw.forget(page_id);
-                    b
+                    // rehydrate returns Vec<u8>; for a plaintext spillway it is
+                    // always PAGE_SIZE bytes. Task 3.3/3.4 replaces this with
+                    // the sealed-blob path; unwrap is safe until then.
+                    Box::new(b.try_into().expect("spillway rehydrate returned wrong length"))
                 };
                 self.io.write_page(page_id, &buf)?;
                 // Re-insert as clean: the bytes are now on the main file,
                 // so the cache entry is a valid read-through cache.
                 let entry = CacheEntry {
-                    buf: Box::new(buf),
+                    buf,
                     dirty: false,
                 };
                 // Use the Entry API to avoid the clippy::map_entry pattern:
@@ -871,12 +874,17 @@ impl PageCache {
         // pre-transaction bytes.
         if let Some(spw) = self.spillway.as_mut() {
             if spw.is_resident(page_id) {
-                let buf = spw.rehydrate(page_id)?;
-                spw.forget(page_id);
+                let buf: Box<[u8; page::PAGE_SIZE]> = {
+                    let b = spw.rehydrate(page_id)?;
+                    spw.forget(page_id);
+                    // rehydrate returns Vec<u8>; for plaintext always PAGE_SIZE.
+                    // Task 3.3/3.4 replaces with the sealed-blob path.
+                    Box::new(b.try_into().expect("spillway rehydrate returned wrong length"))
+                };
                 self.entries.insert(
                     page_id,
                     CacheEntry {
-                        buf: Box::new(buf),
+                        buf,
                         dirty: true, // re-loaded spilled page is dirty
                     },
                 );
@@ -1044,7 +1052,7 @@ impl PageCache {
             // is restored the same way.
             let spill_result = self
                 .ensure_spillway()
-                .and_then(|spw| spw.spill(victim_id, &entry.buf));
+                .and_then(|spw| spw.spill(victim_id, entry.buf.as_ref()));
             if let Err(e) = spill_result {
                 if entry.dirty {
                     self.dirty_count += 1;
@@ -1084,10 +1092,10 @@ impl PageCache {
         if self.spillway.is_none() {
             let spw = match &self.spillway_location {
                 crate::SpillwayLocation::Path(p) => {
-                    crate::spillway::Spillway::open_file(p, self.spillway_max_bytes)?
+                    crate::spillway::Spillway::open_file(p, self.spillway_max_bytes, page::PAGE_SIZE)?
                 }
                 crate::SpillwayLocation::InMemory => {
-                    crate::spillway::Spillway::open_memory(self.spillway_max_bytes)
+                    crate::spillway::Spillway::open_memory(self.spillway_max_bytes, page::PAGE_SIZE)
                 }
             };
             self.spillway = Some(spw);
