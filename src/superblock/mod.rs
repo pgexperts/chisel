@@ -1067,6 +1067,66 @@ mod tests {
         assert!(back.decrypt_body(&cipher, &buf).is_err());
     }
 
+    /// Security property: a recognizable named-root name must NOT appear in
+    /// cleartext anywhere in the serialized page for an encrypted superblock.
+    ///
+    /// This is the core anti-leak assertion for Task 2.3. The name bytes are
+    /// stored only inside the DEK-sealed body (ciphertext), so they must be
+    /// invisible in the raw page. The test also verifies the sentinel IS
+    /// recovered after `decrypt_body`, proving it was sealed rather than dropped.
+    #[test]
+    fn encrypted_named_root_name_absent_from_cleartext() {
+        use crate::crypto::{random_dek, PageCipher};
+
+        // Sentinel: exactly NAMED_ROOT_NAME_LEN (24) bytes, recognizable prefix.
+        // "secret-LEAKCHECK" = 16 ASCII bytes, padded with zeros to fill the slot.
+        let mut sentinel = [0u8; NAMED_ROOT_NAME_LEN];
+        sentinel[..16].copy_from_slice(b"secret-LEAKCHECK");
+
+        let cipher = PageCipher::new(random_dek());
+        let mut header_slots = [KeySlot::EMPTY; KEY_SLOT_COUNT];
+        header_slots[0].state = 1;
+        let header = CryptoHeader {
+            algorithm: ALGO_XCHACHA20POLY1305,
+            stride: 8232,
+            slots: header_slots,
+        };
+
+        let mut sb = Superblock::new_empty(DEFAULT_SUPERBLOCK_COUNT);
+        sb.named_roots[0].name = sentinel;
+        sb.named_roots[0].handle = 0xDEAD_BEEF_CAFE_0001;
+        sb.encryption = Some(header);
+
+        let buf = sb.serialize_encrypted(&cipher);
+
+        // 1. The named_roots region (52..308) must be zero in cleartext.
+        assert_eq!(
+            &buf[52..308],
+            &[0u8; 256][..],
+            "named_roots region (52..308) is not zeroed in encrypted superblock"
+        );
+
+        // 2. The sentinel bytes must NOT appear as a contiguous subsequence
+        //    anywhere in the full page (including the sealed-body region).
+        //    The 16-byte scan window is long enough to be collision-resistant
+        //    against random ciphertext (prob ≈ 2^-128).
+        let needle = &sentinel[..16];
+        assert!(
+            !buf.windows(needle.len()).any(|w| w == needle),
+            "sentinel name appears in cleartext page — named_root name leaked"
+        );
+
+        // 3. Round-trip: decrypt_body must recover the sentinel, proving it was
+        //    sealed (not silently dropped).
+        let mut back = Superblock::deserialize(&buf).expect("encrypted sb must deserialize");
+        back.decrypt_body(&cipher, &buf).expect("correct DEK must open body");
+        assert_eq!(
+            back.named_roots[0].name, sentinel,
+            "named_root name not recovered after decrypt_body"
+        );
+        assert_eq!(back.named_roots[0].handle, 0xDEAD_BEEF_CAFE_0001);
+    }
+
     /// Plaintext DBs must serialize byte-identically to the pre-encryption
     /// implementation (regression guard: `encryption: None` path is unchanged).
     #[test]
