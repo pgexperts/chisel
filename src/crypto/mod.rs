@@ -170,6 +170,85 @@ pub fn derive_kek(
     Ok(Kek(okm))
 }
 
+use chacha20poly1305::aead::AeadInPlace;
+use chacha20poly1305::{Key as AeadKey, KeyInit, XChaCha20Poly1305, XNonce};
+
+/// Detached AEAD seal: ciphertext is the same length as plaintext, the 16-byte
+/// Poly1305 tag is returned separately. Detached suits our fixed page layout
+/// (ciphertext occupies a known 32-byte DEK slot, tag a known 16-byte slot;
+/// for pages the same pattern applies with 8192-byte slots).
+fn seal_detached(
+    key: &[u8; 32],
+    nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> (Vec<u8>, [u8; TAG_LEN]) {
+    let cipher = XChaCha20Poly1305::new(AeadKey::from_slice(key));
+    let mut buf = plaintext.to_vec();
+    let tag = cipher
+        .encrypt_in_place_detached(XNonce::from_slice(nonce), aad, &mut buf)
+        .expect("XChaCha20-Poly1305 encrypt cannot fail for in-range lengths");
+    let mut tag_arr = [0u8; TAG_LEN];
+    tag_arr.copy_from_slice(&tag);
+    (buf, tag_arr)
+}
+
+/// Detached AEAD open. Any tag mismatch (wrong key, tampered ct/tag, wrong AAD,
+/// wrong nonce) maps to CryptoError::Auth. The AEAD impl scrubs the in-place
+/// buffer on failure so no partial plaintext escapes.
+fn open_detached(
+    key: &[u8; 32],
+    nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8; TAG_LEN],
+) -> Result<Vec<u8>, CryptoError> {
+    let cipher = XChaCha20Poly1305::new(AeadKey::from_slice(key));
+    let mut buf = ciphertext.to_vec();
+    cipher
+        .decrypt_in_place_detached(
+            XNonce::from_slice(nonce),
+            aad,
+            &mut buf,
+            tag.as_slice().into(),
+        )
+        .map_err(|_| CryptoError::Auth)?;
+    Ok(buf)
+}
+
+/// Wrap (encrypt) the DEK under a KEK using detached XChaCha20-Poly1305.
+/// `aad` binds the slot's metadata (kdf_id, salt, Argon2 params) so an
+/// attacker cannot tamper a slot's parameters to force a mis-derivation.
+/// Returns (wrapped_dek, wrap_tag); both are written to the key-slot on disk.
+pub fn wrap_dek(
+    kek: &Kek,
+    dek: &Dek,
+    wrap_nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+) -> ([u8; DEK_LEN], [u8; TAG_LEN]) {
+    let (ct, tag) = seal_detached(kek.as_bytes(), wrap_nonce, aad, dek.as_bytes());
+    let mut wrapped = [0u8; DEK_LEN];
+    wrapped.copy_from_slice(&ct);
+    (wrapped, tag)
+}
+
+/// Unwrap (decrypt + authenticate) the DEK. A successful unwrap IS the proof
+/// that the client key (hence KEK) is correct — there is no separate verifier.
+/// Any failure (wrong passphrase, wrong KEK, tampered ciphertext or tag, wrong
+/// AAD) returns CryptoError::Auth without revealing partial plaintext.
+pub fn unwrap_dek(
+    kek: &Kek,
+    wrapped: &[u8; DEK_LEN],
+    tag: &[u8; TAG_LEN],
+    wrap_nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+) -> Result<Dek, CryptoError> {
+    let pt = open_detached(kek.as_bytes(), wrap_nonce, aad, wrapped, tag)?;
+    let mut dek_bytes = Zeroizing::new([0u8; DEK_LEN]);
+    dek_bytes.copy_from_slice(&pt);
+    Ok(Dek::from_bytes(*dek_bytes))
+}
+
 /// Fill an N-byte array from the OS CSPRNG. Panics if the OS RNG is unavailable,
 /// which on a supported platform indicates a broken system — there is no safe
 /// fallback for key material, so failing loud is correct.
@@ -294,6 +373,72 @@ mod tests {
         assert!(matches!(
             derive_kek(&key, KdfId::Argon2id, &[0u8; SALT_LEN], &bad),
             Err(CryptoError::Kdf)
+        ));
+    }
+
+    #[test]
+    fn wrap_unwrap_roundtrip() {
+        let kek = Kek::from_bytes([3u8; 32]);
+        let dek = Dek::from_bytes([42u8; DEK_LEN]);
+        let nonce = [5u8; NONCE_LEN];
+        let aad = b"slot-meta";
+        let (wrapped, tag) = wrap_dek(&kek, &dek, &nonce, aad);
+        assert_ne!(&wrapped, dek.as_bytes(), "wrapped DEK must not equal plaintext DEK");
+        let out = unwrap_dek(&kek, &wrapped, &tag, &nonce, aad).unwrap();
+        assert_eq!(out.as_bytes(), dek.as_bytes());
+    }
+
+    #[test]
+    fn unwrap_wrong_kek_is_auth() {
+        let dek = Dek::from_bytes([42u8; DEK_LEN]);
+        let nonce = [5u8; NONCE_LEN];
+        let aad = b"slot-meta";
+        let (wrapped, tag) = wrap_dek(&Kek::from_bytes([3u8; 32]), &dek, &nonce, aad);
+        // unwrap_err() requires Dek: Debug, which we deliberately omit (it wraps key
+        // bytes). Use matches! to test the error variant without printing anything.
+        assert!(matches!(
+            unwrap_dek(&Kek::from_bytes([4u8; 32]), &wrapped, &tag, &nonce, aad),
+            Err(CryptoError::Auth)
+        ));
+    }
+
+    #[test]
+    fn unwrap_tampered_tag_is_auth() {
+        let kek = Kek::from_bytes([3u8; 32]);
+        let dek = Dek::from_bytes([42u8; DEK_LEN]);
+        let nonce = [5u8; NONCE_LEN];
+        let aad = b"slot-meta";
+        let (wrapped, mut tag) = wrap_dek(&kek, &dek, &nonce, aad);
+        tag[0] ^= 0x01;
+        assert!(matches!(
+            unwrap_dek(&kek, &wrapped, &tag, &nonce, aad),
+            Err(CryptoError::Auth)
+        ));
+    }
+
+    #[test]
+    fn unwrap_tampered_ciphertext_is_auth() {
+        let kek = Kek::from_bytes([3u8; 32]);
+        let dek = Dek::from_bytes([42u8; DEK_LEN]);
+        let nonce = [5u8; NONCE_LEN];
+        let aad = b"slot-meta";
+        let (mut wrapped, tag) = wrap_dek(&kek, &dek, &nonce, aad);
+        wrapped[0] ^= 0x01;
+        assert!(matches!(
+            unwrap_dek(&kek, &wrapped, &tag, &nonce, aad),
+            Err(CryptoError::Auth)
+        ));
+    }
+
+    #[test]
+    fn unwrap_wrong_aad_is_auth() {
+        let kek = Kek::from_bytes([3u8; 32]);
+        let dek = Dek::from_bytes([42u8; DEK_LEN]);
+        let nonce = [5u8; NONCE_LEN];
+        let (wrapped, tag) = wrap_dek(&kek, &dek, &nonce, b"slot-meta-A");
+        assert!(matches!(
+            unwrap_dek(&kek, &wrapped, &tag, &nonce, b"slot-meta-B"),
+            Err(CryptoError::Auth)
         ));
     }
 }
