@@ -360,6 +360,9 @@ impl Superblock {
     /// Unpack a decrypted body blob into `self`'s sensitive fields. The body
     /// layout must match `body_plaintext`'s encoding.
     fn load_body(&mut self, body: &[u8]) {
+        // open_body returns exactly the plaintext that was sealed, which is
+        // always BODY_LEN bytes (see body_plaintext); document the invariant.
+        debug_assert_eq!(body.len(), BODY_LEN);
         self.root_handle_table_page = u64::from_le_bytes(body[0..8].try_into().unwrap());
         self.root_freemap_page = u64::from_le_bytes(body[8..16].try_into().unwrap());
         self.root_membership_index_page = u64::from_le_bytes(body[16..24].try_into().unwrap());
@@ -437,6 +440,14 @@ impl Superblock {
                 .unwrap(),
         ) as usize;
         let coff = base + NONCE_LEN + TAG_LEN + 2;
+        // Bounds-check ct_len before slicing. The page checksum is XXH3 (non-
+        // cryptographic): an attacker who edits the page can recompute it, so a
+        // forged ct_len must NOT reach the slice and panic. Treat an out-of-
+        // range length as an undecryptable body — same Err as a failed AEAD
+        // auth, since open_body would never accept it anyway.
+        if coff + ct_len > page::CHECKSUM_OFFSET {
+            return Err(CryptoError::Auth);
+        }
         let ct = &raw[coff..coff + ct_len];
         let aad = self.sb_identity_aad();
         let body = cipher.open_body(&aad, &nonce, &tag, ct)?;
@@ -954,6 +965,10 @@ mod tests {
         assert_eq!(&buf[52..308], &[0u8; 256][..], "named_roots leaked in cleartext");
         // Scalar sensitive fields at 16..48 must be zero.
         assert_eq!(&buf[16..48], &[0u8; 32][..], "sensitive scalars leaked");
+        // root_membership_index_page (312..320) and freemap_depth (320..324)
+        // are also sealed-only, so their plaintext slots must be zero. Bytes
+        // 308..312 (superblock_count) are legitimately cleartext and skipped.
+        assert_eq!(&buf[312..324], &[0u8; 12][..], "membership/freemap_depth leaked");
         // Bootstrap fields stay plaintext.
         assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), MAGIC);
         assert_eq!(
@@ -997,6 +1012,37 @@ mod tests {
         let wrong = PageCipher::new(random_dek());
         let mut back = Superblock::deserialize(&buf).unwrap();
         assert!(back.decrypt_body(&wrong, &buf).is_err());
+    }
+
+    /// A forged ct_len (the XXH3 page checksum is non-cryptographic, so it
+    /// cannot protect it) must surface as a recoverable Err, never a panic on
+    /// the slice. Regression guard for the out-of-bounds slice fixed in review.
+    #[test]
+    fn forged_ct_len_returns_err_not_panic() {
+        use crate::crypto::{random_dek, PageCipher};
+
+        let cipher = PageCipher::new(random_dek());
+        let mut header_slots = [KeySlot::EMPTY; KEY_SLOT_COUNT];
+        header_slots[0].state = 1;
+        let header = CryptoHeader {
+            algorithm: ALGO_XCHACHA20POLY1305,
+            stride: 8232,
+            slots: header_slots,
+        };
+        let mut sb = Superblock::new_empty(DEFAULT_SUPERBLOCK_COUNT);
+        sb.encryption = Some(header);
+        let mut buf = sb.serialize_encrypted(&cipher);
+
+        // Overwrite the 2-byte ct_len field with 0xFFFF (65535), which would
+        // slice far past CHECKSUM_OFFSET, then re-stamp the checksum so the
+        // page validates (simulating an attacker who recomputed XXH3).
+        let len_off = SEALED_BODY_OFFSET + NONCE_LEN + TAG_LEN;
+        buf[len_off..len_off + 2].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        page::stamp_checksum(&mut buf);
+
+        let mut back = Superblock::deserialize(&buf).unwrap();
+        // Must return Err, not panic.
+        assert!(back.decrypt_body(&cipher, &buf).is_err());
     }
 
     /// Plaintext DBs must serialize byte-identically to the pre-encryption
