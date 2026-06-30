@@ -66,6 +66,7 @@ impl Clone for Dek {
 
 /// The Key Encryption Key: derived per-open from the client key + a slot's
 /// salt/params. Only ever wraps/unwraps the DEK; transient, wiped on drop.
+#[derive(Debug)]
 pub struct Kek(Zeroizing<[u8; 32]>);
 
 impl Kek {
@@ -116,6 +117,51 @@ pub enum CryptoError {
     Kdf,
     /// A raw key was not the length the KDF requires.
     BadKeyLength,
+}
+
+use argon2::{Algorithm, Argon2, Params, Version};
+use hkdf::Hkdf;
+use sha2::Sha256;
+
+/// HKDF info string binding derived KEKs to this construction/version. Changing
+/// it is a format break (existing slots would stop unwrapping); versioned so a
+/// future KDF revision can coexist.
+const KEK_INFO: &[u8] = b"chisel-kek-v1";
+
+/// Derive a 256-bit KEK from the client key and a slot's salt/params.
+///
+/// Dispatch is on `kdf`, NOT on the `Key` variant: the slot records which KDF
+/// produced it, and that is the authority. A `Raw` key is the IKM for HKDF; a
+/// `Passphrase` is the password for Argon2id. (A mismatched pairing — e.g. a
+/// passphrase with KdfId::Hkdf — still derives a deterministic KEK; it simply
+/// won't match the slot that was written with the other KDF, surfacing as an
+/// unwrap Auth failure one layer up. The slot's kdf_id is the single source of
+/// truth, so we never guess from the variant.)
+pub fn derive_kek(
+    key: &Key,
+    kdf: KdfId,
+    salt: &[u8; SALT_LEN],
+    params: &Argon2Params,
+) -> Result<Kek, CryptoError> {
+    let ikm: &[u8] = match key {
+        Key::Raw(bytes) => bytes.as_slice(),
+        Key::Passphrase(s) => s.as_bytes(),
+    };
+    let mut okm = [0u8; 32];
+    match kdf {
+        KdfId::Hkdf => {
+            let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
+            hk.expand(KEK_INFO, &mut okm).map_err(|_| CryptoError::Kdf)?;
+        }
+        KdfId::Argon2id => {
+            let p = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(32))
+                .map_err(|_| CryptoError::Kdf)?;
+            let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, p);
+            a2.hash_password_into(ikm, salt, &mut okm)
+                .map_err(|_| CryptoError::Kdf)?;
+        }
+    }
+    Ok(Kek::from_bytes(okm))
 }
 
 /// Fill an N-byte array from the OS CSPRNG. Panics if the OS RNG is unavailable,
@@ -183,5 +229,61 @@ mod tests {
     fn crypto_error_is_comparable() {
         assert_eq!(CryptoError::Auth, CryptoError::Auth);
         assert_ne!(CryptoError::Auth, CryptoError::Kdf);
+    }
+
+    #[test]
+    fn derive_kek_hkdf_matches_reference_construction() {
+        // RFC 5869 Test Case 1 inputs (IKM/salt), our pinned info string.
+        let ikm = [0x0bu8; 22];
+        let salt: [u8; SALT_LEN] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let key = Key::Raw(zeroize::Zeroizing::new(ikm.to_vec()));
+        let kek = derive_kek(&key, KdfId::Hkdf, &salt, &Argon2Params::default()).unwrap();
+
+        // Independent reference: run hkdf directly with our exact salt+info.
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+        let hk = Hkdf::<Sha256>::new(Some(&salt), &ikm);
+        let mut expect = [0u8; 32];
+        hk.expand(b"chisel-kek-v1", &mut expect).unwrap();
+        assert_eq!(kek.as_bytes(), &expect);
+    }
+
+    #[test]
+    fn derive_kek_hkdf_is_deterministic_and_salt_sensitive() {
+        let key = Key::Raw(zeroize::Zeroizing::new(vec![7u8; 32]));
+        let salt_a = [1u8; SALT_LEN];
+        let salt_b = [2u8; SALT_LEN];
+        let p = Argon2Params::default();
+        let k1 = derive_kek(&key, KdfId::Hkdf, &salt_a, &p).unwrap();
+        let k2 = derive_kek(&key, KdfId::Hkdf, &salt_a, &p).unwrap();
+        let k3 = derive_kek(&key, KdfId::Hkdf, &salt_b, &p).unwrap();
+        assert_eq!(k1.as_bytes(), k2.as_bytes(), "same input must be deterministic");
+        assert_ne!(k1.as_bytes(), k3.as_bytes(), "different salt must diverge");
+    }
+
+    #[test]
+    fn derive_kek_argon2_roundtrips_and_is_salt_sensitive() {
+        // Cheap params so the test is fast (real defaults are 19 MiB).
+        let fast = Argon2Params { m_cost: 256, t_cost: 1, p_cost: 1 };
+        let key = Key::Passphrase(zeroize::Zeroizing::new("correct horse".to_string()));
+        let salt_a = [9u8; SALT_LEN];
+        let salt_b = [8u8; SALT_LEN];
+        let k1 = derive_kek(&key, KdfId::Argon2id, &salt_a, &fast).unwrap();
+        let k2 = derive_kek(&key, KdfId::Argon2id, &salt_a, &fast).unwrap();
+        let k3 = derive_kek(&key, KdfId::Argon2id, &salt_b, &fast).unwrap();
+        assert_eq!(k1.as_bytes(), k2.as_bytes(), "Argon2id must be deterministic");
+        assert_ne!(k1.as_bytes(), k3.as_bytes(), "different salt must diverge");
+        assert_ne!(k1.as_bytes(), &[0u8; 32]);
+    }
+
+    #[test]
+    fn derive_kek_argon2_rejects_zero_memory() {
+        let bad = Argon2Params { m_cost: 0, t_cost: 1, p_cost: 1 };
+        let key = Key::Passphrase(zeroize::Zeroizing::new("x".to_string()));
+        let err = derive_kek(&key, KdfId::Argon2id, &[0u8; SALT_LEN], &bad).unwrap_err();
+        assert_eq!(err, CryptoError::Kdf);
     }
 }
