@@ -159,7 +159,21 @@ pub(super) fn run_commit(ctx: &mut CommitCtx<'_>) -> Result<()> {
     // here can only damage the new superblock, never the N-1
     // last-known-good ones.
     let inactive = *ctx.txn_counter % ctx.superblock_count as u64;
-    cache.io_mut().write_page(inactive, &buf)?;
+    // Superblock-at-8232: for an encrypted DB, stride is ENC_PAGE_SIZE=8232 so
+    // write_page (which asserts stride==PAGE_SIZE) would panic. The superblock
+    // image is 8192 bytes (plaintext header + Phase-2 encrypted body) and is NOT
+    // PageCipher-sealed; Phase 2 already encrypts its body. We write it into a
+    // zero-padded ENC_PAGE_SIZE unit so the slot occupies the same 8232-byte
+    // region on disk that data pages use, then write via write_page_unit.
+    // For plaintext DBs (stride==PAGE_SIZE), write_page still works fine.
+    if ctx.cipher.is_some() {
+        use crate::crypto::ENC_PAGE_SIZE;
+        let mut unit = [0u8; ENC_PAGE_SIZE];
+        unit[..buf.len()].copy_from_slice(&buf);
+        cache.io_mut().write_page_unit(inactive, &unit)?;
+    } else {
+        cache.io_mut().write_page(inactive, &buf)?;
+    }
     // Step 4: Durability linearization point. Until this fsync returns the
     // transaction is not crash-safe; after it returns the new state is
     // observable on recovery.

@@ -10,11 +10,6 @@
 // All randomness is OS-sourced (getrandom). Rolling our own crypto is
 // forbidden; only the vetted RustCrypto primitives are used.
 
-// ponytail: staged build — later tasks (PageCipher, KDF, wrap/unwrap) consume
-// these types; suppress dead_code until the callers land rather than scattering
-// #[allow] on every item.
-#![allow(dead_code)]
-
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{Key as AeadKey, KeyInit, XChaCha20Poly1305, XNonce};
 use zeroize::Zeroizing;
@@ -290,6 +285,11 @@ pub fn random_dek() -> Dek {
 /// whole-page (fixed 8192→8232) and variable-length body (superblock sub-blob).
 /// Lives in the page-cache layer in later phases; here it is fully standalone.
 /// Constructs the AEAD cipher once and reuses it across calls.
+///
+/// `Clone` produces an independent copy with its own `Zeroizing` DEK (both
+/// copies wipe on drop independently). Used when the cache and the session
+/// manager each need their own cipher instance from the same DEK.
+#[derive(Clone)]
 pub struct PageCipher {
     dek: Dek,
 }

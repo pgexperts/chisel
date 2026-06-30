@@ -49,6 +49,23 @@ impl TransactionManager {
             Some(k) => Some(build_create_cipher(&k)?),
         };
 
+        // Uniform-stride layout (encryption spec): an encrypted DB uses the
+        // ENC_PAGE_SIZE (8232) stride for EVERY page — superblock slots
+        // included — FROM BIRTH. Set the stride BEFORE writing the initial
+        // slots so the file is a clean multiple of 8232 (= total_pages *
+        // stride). Without this, fresh slots would be written at PAGE_SIZE and
+        // a never-committed encrypted DB's file length (N*8192) would not
+        // divide evenly by the open-time stride (8232), breaking the
+        // page_count == total_pages invariant that open_existing relies on.
+        // A superblock slot still holds the 8192-byte superblock image; the
+        // trailing 40 bytes of its 8232-byte unit stay zero. The cipher is
+        // installed on the cache AFTER this loop so data-page writes seal
+        // through PageCache::write_sealed (superblock images are NOT
+        // PageCipher-sealed — their body is sealed by serialize_encrypted).
+        if create_crypto.is_some() {
+            cache.io_mut().set_stride(crate::crypto::ENC_PAGE_SIZE);
+        }
+
         // Write N staggered slots. Slot 0 gets the highest counter
         // (superblock_count - 1), slot N-1 gets 0. First user commit
         // bumps to N, which modulo N is 0, so slot 0 is the first to
@@ -66,11 +83,22 @@ impl TransactionManager {
         };
         for i in 0..superblock_count {
             sb.txn_counter = (superblock_count - 1 - i) as u64;
-            let buf = match &create_crypto {
-                None => sb.serialize(),
-                Some(cc) => sb.serialize_encrypted(&cc.page_cipher),
-            };
-            cache.io_mut().write_page(i as u64, &buf)?;
+            match &create_crypto {
+                None => {
+                    // Plaintext: stride == PAGE_SIZE, write_page is correct.
+                    let buf = sb.serialize();
+                    cache.io_mut().write_page(i as u64, &buf)?;
+                }
+                Some(cc) => {
+                    // Encrypted: zero-pad the 8192-byte image into an 8232-byte
+                    // unit (trailing 40 bytes stay zero) and write at the now-set
+                    // ENC_PAGE_SIZE stride. write_page would panic (stride assert).
+                    let buf = sb.serialize_encrypted(&cc.page_cipher);
+                    let mut unit = [0u8; crate::crypto::ENC_PAGE_SIZE];
+                    unit[..buf.len()].copy_from_slice(&buf);
+                    cache.io_mut().write_page_unit(i as u64, &unit)?;
+                }
+            }
         }
         cache.io_mut().fsync()?;
         cache.set_next_page_id(superblock_count as u64);
@@ -94,9 +122,21 @@ impl TransactionManager {
         };
 
         // Split the CreateCrypto struct into its session parts before consuming.
+        // The stride was already set to ENC_PAGE_SIZE above (before the slot
+        // loop) for the uniform-stride layout. Here we only install the cipher
+        // on the cache so subsequent DATA-page writes seal through
+        // PageCache::write_sealed. Superblock images are NOT PageCipher-sealed
+        // (their body is sealed by serialize_encrypted), which is why the slot
+        // loop above wrote them directly rather than through the cache.
         let (session_cipher, session_header) = match create_crypto {
             None => (None, None),
-            Some(cc) => (Some(cc.page_cipher), Some(cc.header)),
+            Some(cc) => {
+                // Clone: both the session manager and the page cache need their
+                // own PageCipher instance. Both hold independent Zeroizing DEK
+                // copies and wipe independently on drop.
+                cache.set_cipher(cc.page_cipher.clone());
+                (Some(cc.page_cipher), Some(cc.header))
+            }
         };
 
         Ok(TransactionManager {
@@ -163,16 +203,91 @@ impl TransactionManager {
         mut cache: PageCache,
         key: Option<crate::crypto::Key>,
     ) -> Result<TransactionManager> {
-        // Step 1: read up to MAX_SUPERBLOCKS pages as candidates.
-        let mut candidates: Vec<[u8; PAGE_SIZE]> = Vec::new();
-        for i in 0..MAX_SUPERBLOCKS as u64 {
-            // If the file is shorter than MAX_SUPERBLOCKS (fresh DB
-            // with small N), read_page returns InvalidPageId (I16).
-            // Stop probing at EOF.
-            match cache.io_mut().read_page(i) {
-                Ok(buf) => candidates.push(buf),
-                Err(ChiselError::InvalidPageId { .. }) => break,
-                Err(e) => return Err(e),
+        // Step 1: read up to MAX_SUPERBLOCKS slots as candidates.
+        //
+        // Bootstrap stride (encryption spec): an encrypted DB uses a uniform
+        // ENC_PAGE_SIZE (8232) stride for EVERY page, superblock slots
+        // included, but we do not yet know whether THIS file is encrypted, and
+        // we must NOT assume page 0 is intact — the commit protocol overwrites
+        // slot `txn_counter % N`, so slot 0 IS a torn-write target, and R4
+        // crash recovery must still find a valid sibling. Each candidate slot
+        // image must therefore be read at the file's true stride; reading an
+        // encrypted slot at the wrong (8192) stride lands mid-unit and yields
+        // garbage that would defeat sibling fallback.
+        //
+        // Probe the stride by scanning slots at the default PAGE_SIZE stride
+        // first: a plaintext DB (all slots at 8192) deserializes immediately,
+        // and an encrypted DB's page 0 lives at offset 0 so it deserializes at
+        // 8192 too (its 40-byte trailing padding is ignored by deserialize). If
+        // ANY slot deserializes with an encryption header, switch the IO stride
+        // to header.stride and RE-READ all candidate slots at that stride so
+        // siblings 1..N land on their true 8232-byte boundaries. The re-read is
+        // what preserves torn-slot-0 recovery for encrypted DBs: even if page 0
+        // is torn, a sibling read at 8232 supplies the header that unlocks the
+        // correct stride. This switch also happens BEFORE the total_pages /
+        // file-size validation below, so page_count = file_len/stride == N.
+        let read_candidates = |cache: &mut PageCache| -> Result<Vec<[u8; PAGE_SIZE]>> {
+            let mut out: Vec<[u8; PAGE_SIZE]> = Vec::new();
+            for i in 0..MAX_SUPERBLOCKS as u64 {
+                // read_page_unit honors the current stride and returns a
+                // `stride`-byte unit; take the first PAGE_SIZE bytes as the
+                // slot's superblock image (trailing encrypted padding ignored).
+                // A file shorter than MAX_SUPERBLOCKS stops the probe at EOF.
+                match cache.io_mut().read_page_unit(i) {
+                    Ok(unit) => {
+                        let mut buf = [0u8; PAGE_SIZE];
+                        buf.copy_from_slice(&unit[..PAGE_SIZE]);
+                        out.push(buf);
+                    }
+                    Err(ChiselError::InvalidPageId { .. }) => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(out)
+        };
+        // Anchor on page 0: it always lives at byte offset 0 regardless of
+        // stride, so read it at the default PAGE_SIZE stride (read_page reads
+        // bytes 0..8192 = the page-0 image; an encrypted slot's 40-byte padding
+        // is ignored by deserialize). An intact, encrypted page 0 tells us the
+        // stride directly via its cleartext crypto-header — the common case.
+        let page0 = cache.io_mut().read_page(0)?;
+        if let Some(stride) = Superblock::deserialize(&page0)
+            .and_then(|sb| sb.encryption.map(|h| h.stride as usize))
+        {
+            cache.io_mut().set_stride(stride);
+        }
+        // With an intact page 0 the stride is already correct here, so this
+        // first read picks up every slot at its true boundary. The fallback
+        // below only fires when page 0 is torn (see its comment).
+        let mut candidates = read_candidates(&mut cache)?;
+        // Helper: the encrypted stride advertised by the first candidate that
+        // deserializes with an encryption header (None for plaintext/torn).
+        let encrypted_stride = |cands: &[[u8; PAGE_SIZE]]| -> Option<usize> {
+            cands
+                .iter()
+                .filter_map(Superblock::deserialize)
+                .find_map(|sb| sb.encryption.map(|h| h.stride as usize))
+        };
+        if encrypted_stride(&candidates).is_none()
+            && Superblock::deserialize(&page0).is_none()
+        {
+            // Torn-slot-0 recovery for encrypted DBs: when slot 0 is a torn
+            // write, page 0 fails to deserialize so the anchor above could not
+            // learn the stride, and the default-stride candidate scan finds
+            // nothing (siblings 1..N sit at 8232 offsets — misaligned garbage
+            // when read at 8192). Speculatively retry at the encrypted stride:
+            // every slot carries the cleartext crypto-header, so an intact
+            // sibling read at its true boundary supplies the stride and lets
+            // select() fall back to it. If this read ALSO yields no encryption
+            // header (a genuinely plaintext-but-torn file), restore the
+            // default-stride candidates so the CorruptSuperblock diagnosis
+            // below reflects the real bytes.
+            cache.io_mut().set_stride(crate::crypto::ENC_PAGE_SIZE);
+            let enc_candidates = read_candidates(&mut cache)?;
+            if encrypted_stride(&enc_candidates).is_some() {
+                candidates = enc_candidates;
+            } else {
+                cache.io_mut().set_stride(PAGE_SIZE);
             }
         }
 
@@ -221,6 +336,12 @@ impl TransactionManager {
                 // InvalidEncryptionKey rather than poisoning.
                 sb.decrypt_body(&cipher, raw)
                     .map_err(|_| ChiselError::InvalidEncryptionKey)?;
+                // The IO stride was already switched to header.stride during the
+                // bootstrap read above (so slots 1..N and the file-size checks
+                // use the 8232-byte unit). Here we only install the cipher on
+                // the cache so subsequent data-page reads go through
+                // PageCipher::open.
+                cache.set_cipher(cipher.clone());
                 Some(cipher)
             }
         };
@@ -292,20 +413,27 @@ impl TransactionManager {
 
         let page_count = cache.io_mut().page_count()?;
         if page_count < sb.total_pages {
+            // Stride-correct byte counts: encrypted DBs use ENC_PAGE_SIZE
+            // (8232) for every page including superblock slots, so multiply by
+            // the CURRENT stride, not the hardcoded PAGE_SIZE. Both page_count
+            // and total_pages are logical page counts under that uniform
+            // stride; reporting them as PAGE_SIZE bytes would understate an
+            // encrypted file's true size.
+            let stride = cache.io_mut().stride() as u64;
             return Err(ChiselError::FileSizeMismatch {
                 // saturating_mul: `sb.total_pages` comes from a checksum-valid but
                 // otherwise untrusted superblock — `Superblock::deserialize` bounds
                 // only the checksum, MAGIC, and superblock_count, NOT total_pages.
                 // A crafted/edited file with total_pages near u64::MAX would
-                // overflow `* PAGE_SIZE` here: a panic in debug builds (how CI
+                // overflow `* stride` here: a panic in debug builds (how CI
                 // runs) and a silent wrap in release. Saturating keeps the public
                 // `Chisel::open` a typed-error path; "as many bytes as a u64 can
                 // represent" is the right report for an absurd page count (mirrors
                 // the I47 saturation in `Chisel::stats`/`file_size_bytes`).
                 // `page_count` is file-length-bounded and cannot realistically
                 // overflow, but it is saturated too for symmetry.
-                expected: sb.total_pages.saturating_mul(PAGE_SIZE as u64),
-                actual: page_count.saturating_mul(PAGE_SIZE as u64),
+                expected: sb.total_pages.saturating_mul(stride),
+                actual: page_count.saturating_mul(stride),
             });
         }
         // Reset next_page_id from the authoritative superblock, NOT from

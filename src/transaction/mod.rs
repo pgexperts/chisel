@@ -216,11 +216,11 @@ pub struct TransactionManager {
     // lib.rs); there is no cross-thread access to synchronize against.
     poisoned: Cell<bool>,
     /// Per-session page cipher for an encrypted database. `None` for plaintext.
-    /// Holds the unwrapped DEK (zeroizing) for the life of the manager; reaches
-    /// the PageCache in Phase 3 for per-page seal/open. Set on the create path
-    /// (fresh DEK) and on the open path (DEK unwrapped from a key-slot). The DEK
-    /// inside PageCipher is zeroizing and is cleared on drop.
-    #[allow(dead_code)] // Phase 3 wires this to page I/O; commit path uses it via CommitCtx
+    /// Holds the unwrapped DEK (zeroizing) for the life of the manager; the
+    /// PageCache gets its own clone at open time (recovery.rs) for per-page
+    /// seal/open. The manager's copy is also threaded through CommitCtx for the
+    /// superblock body seal on every commit. The DEK inside PageCipher is
+    /// zeroizing and is cleared on drop.
     cipher: Option<crate::crypto::PageCipher>,
     /// The crypto-header (algorithm id + key-slot table) for an encrypted database.
     /// Written verbatim into every committed superblock. `None` for plaintext DBs.

@@ -4,6 +4,7 @@
 // error, spurious-key-on-plaintext error, and plaintext-DB regression.
 
 use chisel::{Chisel, Key, Options};
+use std::io::{Seek, SeekFrom, Write};
 use zeroize::Zeroizing;
 
 fn raw_key(b: u8) -> Key {
@@ -220,4 +221,140 @@ fn named_root_round_trips_through_encrypted_open() {
         assert!(h.is_some(), "named root must survive close+reopen");
         assert_eq!(db.read(h.unwrap()).unwrap(), b"payload");
     }
+}
+
+/// Uniform-stride regression (N>2, never committed): with the encryption spec's
+/// uniform 8232 stride, a 4-superblock encrypted DB's file must be exactly
+/// 4 * 8232 bytes from birth so page_count == total_pages == 4 on reopen. Under
+/// the old PAGE_SIZE-stride-then-switch layout the file was 4 * 8192, which is
+/// not a multiple of 8232, so the open-time page_count (file_len/8232 = 3 < 4)
+/// would spuriously raise FileSizeMismatch. N=4 (not the default N=2) is chosen
+/// because integer-division masked the N=2 case at exactly one boundary.
+#[test]
+fn never_committed_encrypted_db_with_extra_superblocks_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("n4.chisel");
+    {
+        let _db = Chisel::open(
+            &path,
+            Options::default()
+                .with_encryption_key(raw_key(0x55))
+                .superblock_count(4),
+        )
+        .unwrap();
+        // Drop with no begin/commit — exercise the create-only file layout.
+    }
+    let reopened = Chisel::open(
+        &path,
+        Options::default()
+            .with_encryption_key(raw_key(0x55))
+            .create_if_missing(false),
+    );
+    assert!(
+        reopened.is_ok(),
+        "never-committed N=4 encrypted DB must reopen; got: {:?}",
+        reopened.err()
+    );
+}
+
+/// Uniform-stride regression (multi-page, committed): allocate a value large
+/// enough to force overflow data pages, commit, reopen, and read it back. This
+/// drives the cold-load seal/open path across several data pages AND confirms
+/// the committed file (superblock slots + data pages, all at 8232 stride) stays
+/// a clean multiple of the stride so reopen's total_pages check passes.
+#[test]
+fn multi_page_encrypted_value_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.chisel");
+    // 32 KiB payload spans multiple 8 KiB pages via the overflow chain.
+    let payload: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
+    let handle;
+    {
+        let mut db = Chisel::open(
+            &path,
+            Options::default().with_encryption_key(raw_key(0x77)),
+        )
+        .unwrap();
+        db.begin().unwrap();
+        handle = db.allocate(&payload).unwrap();
+        db.commit().unwrap();
+    }
+    {
+        let db = Chisel::open(
+            &path,
+            Options::default()
+                .with_encryption_key(raw_key(0x77))
+                .create_if_missing(false),
+        )
+        .unwrap();
+        assert_eq!(
+            db.read(handle).unwrap(),
+            payload,
+            "multi-page encrypted value must survive close+reopen byte-for-byte"
+        );
+    }
+}
+
+/// R4 crash-recovery for encrypted DBs: a torn write to slot 0 must still open
+/// via a valid sibling slot. This exercises the uniform-stride bootstrap's
+/// torn-slot-0 fallback: page 0 fails to deserialize, so open_existing cannot
+/// learn the stride from it and must speculatively retry at the encrypted
+/// stride to read sibling slots (which sit at their true 8232-byte offsets) and
+/// recover the correct DEK + state. Without that fallback the correct key would
+/// spuriously fail to open a recoverable file.
+#[test]
+fn torn_slot_0_encrypted_db_recovers_via_sibling() {
+    // ENC_PAGE_SIZE is not part of the public API; encode the on-disk slot
+    // stride locally. A mismatch would make the seek miss slot 0 and the test
+    // would (correctly) fail loudly rather than silently pass.
+    const ENC_STRIDE: u64 = 8232;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("torn.chisel");
+    let h1;
+    {
+        let mut db = Chisel::open(
+            &path,
+            Options::default().with_encryption_key(raw_key(0x99)),
+        )
+        .unwrap();
+        // Two commits so BOTH slots (N=2) hold valid post-commit superblocks:
+        // commit 1 → slot 0, commit 2 → slot 1. After corrupting slot 0,
+        // recovery must fall back to slot 1.
+        db.begin().unwrap();
+        h1 = db.allocate(b"survives the tear").unwrap();
+        db.commit().unwrap();
+        db.begin().unwrap();
+        let _h2 = db.allocate(b"second commit").unwrap();
+        db.commit().unwrap();
+    }
+    // Simulate a torn write to slot 0: zero its first PAGE_SIZE bytes so the
+    // page-0 image fails to deserialize (anchor cannot learn the stride).
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&[0u8; 8192]).unwrap();
+        f.sync_all().unwrap();
+    }
+    // The file must still be a clean multiple of the encrypted stride (the
+    // corruption only overwrote bytes, did not change the length).
+    let len = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(
+        len % ENC_STRIDE,
+        0,
+        "encrypted file length {len} must stay a multiple of {ENC_STRIDE}"
+    );
+    // Recovery must open via the intact sibling slot 1 and expose commit-2
+    // state, which still resolves the commit-1 handle h1.
+    let db = Chisel::open(
+        &path,
+        Options::default()
+            .with_encryption_key(raw_key(0x99))
+            .create_if_missing(false),
+    )
+    .expect("correct key must recover a torn-slot-0 encrypted DB via its sibling");
+    assert_eq!(db.read(h1).unwrap(), b"survives the tear");
 }

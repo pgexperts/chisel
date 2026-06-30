@@ -203,19 +203,15 @@ impl PageIo {
     }
 
     /// On-disk unit size in bytes (PAGE_SIZE plaintext, ENC_PAGE_SIZE encrypted).
-    // Dead until Task 3.3 wires the encrypted open path through set_stride.
-    #[allow(dead_code)]
     pub fn stride(&self) -> usize {
         self.stride
     }
 
     /// Set the on-disk stride and re-seed the page-count cache against the new
     /// unit size. Must be called BEFORE the first unit read on an encrypted DB.
-    /// The engine does this immediately after reading page 0's plaintext
-    /// bootstrap header. Re-seeds from the true file length so page_count()
-    /// is reported in the new stride-units.
-    // Dead until Task 3.3 wires the encrypted open path through set_stride.
-    #[allow(dead_code)]
+    /// The engine does this immediately after the superblock initialization so
+    /// data-page I/O uses the 8232-byte encrypted stride. Re-seeds from the
+    /// true file length so page_count() is reported in the new stride-units.
     pub fn set_stride(&mut self, stride: usize) {
         self.stride = stride;
         let len = match &mut self.backing {
@@ -310,6 +306,47 @@ impl PageIo {
                 Ok(bytes[off..off + stride].to_vec())
             }
         }
+    }
+
+    /// Read the raw on-disk unit into a caller-provided buffer.
+    ///
+    /// `buf` must be exactly `stride` bytes. Avoids the heap allocation of
+    /// `read_page_unit`; used by PageCache::load_page with a stack-allocated
+    /// `[u8; ENC_PAGE_SIZE]` buffer so the cold-load hot path allocates nothing.
+    ///
+    /// Shares all validation (bounds check, fault injection) with `read_page_unit`.
+    pub fn read_page_unit_into(&mut self, page_id: u64, buf: &mut [u8]) -> Result<()> {
+        let page_count = self.page_count()?;
+        if page_id >= page_count {
+            return Err(ChiselError::InvalidPageId { page_id });
+        }
+        #[cfg(test)]
+        if self.fault.get() == Fault::FailReadPage(page_id) {
+            self.fault.set(Fault::None);
+            return Err(ChiselError::IoError(std::io::Error::other(
+                "fault-injected read failure",
+            )));
+        }
+        let stride = self.stride;
+        debug_assert_eq!(
+            buf.len(),
+            stride,
+            "read_page_unit_into: buf.len() {} != stride {}",
+            buf.len(),
+            stride
+        );
+        match &mut self.backing {
+            Backing::File { file } => {
+                let offset = page_id * stride as u64;
+                file.seek(SeekFrom::Start(offset))?;
+                file.read_exact(buf)?;
+            }
+            Backing::Memory { bytes } => {
+                let off = (page_id * stride as u64) as usize;
+                buf.copy_from_slice(&bytes[off..off + stride]);
+            }
+        }
+        Ok(())
     }
 
     /// Write a raw on-disk unit (must be exactly `stride` bytes) for `page_id`.
