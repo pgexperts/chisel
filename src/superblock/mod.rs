@@ -31,11 +31,15 @@
 // writes. N is stored inside each superblock so open-time recovery can
 // discover it from the first valid slot.
 
+use crate::crypto::{CryptoError, NONCE_LEN, TAG_LEN};
 use crate::page::{self, MAGIC, PAGE_SIZE};
 use std::fmt;
 
 mod crypto_header;
-#[allow(unused_imports)] // Phase 2.2+ wires these into superblock serialize/open
+// Re-export the crypto-header API for consumers (open/create code in later
+// phases, key-management tools, tests). Items not yet referenced in non-test
+// module code are still public API surface — the allow is intentional.
+#[allow(unused_imports)]
 pub use crypto_header::{
     CryptoHeader, KeySlot, ALGO_XCHACHA20POLY1305, CRYPTO_HEADER_OFFSET, CRYPTO_HEADER_SIZE,
     KEY_SLOT_COUNT, KEY_SLOT_SIZE,
@@ -219,6 +223,12 @@ pub struct Superblock {
     // is a COW radix tree of FreeMap bitmap leaves with FreeMapInterior inner
     // nodes; root_freemap_page points to the root at that depth.
     pub freemap_depth: u32,
+    /// Crypto-header for an encrypted database. `None` for plaintext DBs, in
+    /// which case serialize/deserialize use the existing all-plaintext layout.
+    /// `Some` means the sensitive fields are sealed in a DEK-encrypted body
+    /// sub-blob; those fields are zero until the caller supplies the DEK and
+    /// calls `decrypt_body`.
+    pub encryption: Option<CryptoHeader>,
 }
 
 /// The three torn-slot rules, shared by the hot path (`deserialize`) and the
@@ -243,6 +253,34 @@ fn validate(buf: &[u8; PAGE_SIZE]) -> Result<(), SuperblockDefect> {
     }
     Ok(())
 }
+
+// Offset where the DEK-sealed body sub-blob starts, immediately after the
+// crypto-header's key-slot table. Layout of the sealed region:
+//   SEALED_BODY_OFFSET .. +24    nonce (XChaCha20 192-bit)
+//   +24 .. +40                   Poly1305 authentication tag
+//   +40 .. +42                   ciphertext length (u16 LE)
+//   +42 .. +42+ct_len            ciphertext
+// The sealed region must fit before CHECKSUM_OFFSET (8184); at the maximum
+// body length (see BODY_LEN) the region ends well inside that bound.
+pub const SEALED_BODY_OFFSET: usize =
+    crypto_header::CRYPTO_HEADER_OFFSET + crypto_header::CRYPTO_HEADER_SIZE; // 1356
+
+// Plaintext body layout (the bytes fed to seal_body): the sensitive fields in
+// a fixed order.
+//   0..8   root_handle_table_page (u64 LE)
+//   8..16  root_freemap_page (u64 LE)
+//   16..24 root_membership_index_page (u64 LE)
+//   24..32 total_pages (u64 LE)
+//   32..40 next_handle (u64 LE)
+//   40..44 freemap_depth (u32 LE)
+//   44..44+NAMED_ROOT_COUNT*NAMED_ROOT_ENTRY_SIZE  named_roots
+const BODY_LEN: usize = 8 * 5 + 4 + (NAMED_ROOT_COUNT * NAMED_ROOT_ENTRY_SIZE);
+
+// Compile-time check: the sealed blob fits before the checksum.
+// SEALED_BODY_OFFSET(1356) + NONCE_LEN(24) + TAG_LEN(16) + 2(len) + BODY_LEN.
+const _: () = assert!(
+    SEALED_BODY_OFFSET + NONCE_LEN + TAG_LEN + 2 + BODY_LEN <= page::CHECKSUM_OFFSET
+);
 
 impl Superblock {
     /// Serialize the superblock into a full page buffer with a trailing checksum.
@@ -284,6 +322,128 @@ impl Superblock {
         buf
     }
 
+    // ponytail: methods below are called from serialize_encrypted/decrypt_body
+    // which in turn are called from tests and will be wired to the commit/open
+    // path in Task 2.4. Suppress dead_code until that caller lands.
+    #[allow(dead_code)]
+    /// Build the AAD that binds the sealed body and each key-slot's DEK wrap to
+    /// this superblock's plaintext identity. The four bootstrap fields that stay
+    /// cleartext in both encrypted and plaintext DBs are included; this prevents
+    /// transplanting a sealed body from a different DB or a different txn_counter.
+    pub fn sb_identity_aad(&self) -> [u8; 24] {
+        let mut a = [0u8; 24];
+        a[0..4].copy_from_slice(&self.magic.to_le_bytes());
+        a[4..8].copy_from_slice(&self.format_version.to_le_bytes());
+        a[8..16].copy_from_slice(&self.txn_counter.to_le_bytes());
+        a[16..20].copy_from_slice(&self.superblock_count.to_le_bytes());
+        // bytes 20..24 are reserved (zero) for future AAD fields.
+        a
+    }
+
+    /// Assemble the plaintext body for sealing: all sensitive fields in the
+    /// canonical order defined by BODY_LEN. Called only for encrypted DBs.
+    fn body_plaintext(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(BODY_LEN);
+        b.extend_from_slice(&self.root_handle_table_page.to_le_bytes());
+        b.extend_from_slice(&self.root_freemap_page.to_le_bytes());
+        b.extend_from_slice(&self.root_membership_index_page.to_le_bytes());
+        b.extend_from_slice(&self.total_pages.to_le_bytes());
+        b.extend_from_slice(&self.next_handle.to_le_bytes());
+        b.extend_from_slice(&self.freemap_depth.to_le_bytes());
+        for entry in &self.named_roots {
+            b.extend_from_slice(&entry.name);
+            b.extend_from_slice(&entry.handle.to_le_bytes());
+        }
+        b
+    }
+
+    /// Unpack a decrypted body blob into `self`'s sensitive fields. The body
+    /// layout must match `body_plaintext`'s encoding.
+    fn load_body(&mut self, body: &[u8]) {
+        self.root_handle_table_page = u64::from_le_bytes(body[0..8].try_into().unwrap());
+        self.root_freemap_page = u64::from_le_bytes(body[8..16].try_into().unwrap());
+        self.root_membership_index_page = u64::from_le_bytes(body[16..24].try_into().unwrap());
+        self.total_pages = u64::from_le_bytes(body[24..32].try_into().unwrap());
+        self.next_handle = u64::from_le_bytes(body[32..40].try_into().unwrap());
+        self.freemap_depth = u32::from_le_bytes(body[40..44].try_into().unwrap());
+        let mut off = 44;
+        for entry in self.named_roots.iter_mut() {
+            entry.name.copy_from_slice(&body[off..off + NAMED_ROOT_NAME_LEN]);
+            entry.handle = u64::from_le_bytes(
+                body[off + NAMED_ROOT_NAME_LEN..off + NAMED_ROOT_NAME_LEN + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            off += NAMED_ROOT_ENTRY_SIZE;
+        }
+    }
+
+    /// Serialize an encrypted superblock: bootstrap fields + crypto-header in
+    /// cleartext; sensitive fields sealed under the DEK. The byte ranges that
+    /// would hold sensitive data in a plaintext page are left ZERO so nothing
+    /// leaks (named_roots at 52..308, root/page-id scalars at 16..52, etc.).
+    ///
+    /// Panics if `self.encryption` is `None` — only call for encrypted DBs.
+    #[allow(dead_code)]
+    pub fn serialize_encrypted(&self, cipher: &crate::crypto::PageCipher) -> [u8; PAGE_SIZE] {
+        let header = self
+            .encryption
+            .as_ref()
+            .expect("serialize_encrypted requires Superblock.encryption = Some");
+        let mut buf = [0u8; PAGE_SIZE];
+        // Plaintext bootstrap fields only. Sensitive scalar fields (16..52)
+        // and named_roots (52..308) are intentionally left zero.
+        buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.format_version.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.txn_counter.to_le_bytes());
+        buf[48..52].copy_from_slice(&self.page_size.to_le_bytes());
+        buf[SUPERBLOCK_COUNT_OFFSET..SUPERBLOCK_COUNT_OFFSET + 4]
+            .copy_from_slice(&self.superblock_count.to_le_bytes());
+        // Crypto-header written into reserved region (plaintext).
+        header.serialize_into(&mut buf);
+        // Seal the sensitive body into the region immediately after the
+        // key-slot table: nonce || tag || ct_len(u16 LE) || ciphertext.
+        let aad = self.sb_identity_aad();
+        let (nonce, tag, ct) = cipher.seal_body(&aad, &self.body_plaintext());
+        let base = SEALED_BODY_OFFSET;
+        buf[base..base + NONCE_LEN].copy_from_slice(&nonce);
+        buf[base + NONCE_LEN..base + NONCE_LEN + TAG_LEN].copy_from_slice(&tag);
+        buf[base + NONCE_LEN + TAG_LEN..base + NONCE_LEN + TAG_LEN + 2]
+            .copy_from_slice(&(ct.len() as u16).to_le_bytes());
+        let coff = base + NONCE_LEN + TAG_LEN + 2;
+        buf[coff..coff + ct.len()].copy_from_slice(&ct);
+        page::stamp_checksum(&mut buf);
+        buf
+    }
+
+    /// Decrypt the sealed body into `self`'s sensitive fields. Caller must have
+    /// already called `deserialize` (which fills bootstrap fields and the
+    /// crypto-header from cleartext) and obtained the matching DEK. Returns
+    /// `CryptoError::Auth` if the DEK or AAD is wrong, or the blob is tampered.
+    #[allow(dead_code)]
+    pub fn decrypt_body(
+        &mut self,
+        cipher: &crate::crypto::PageCipher,
+        raw: &[u8; PAGE_SIZE],
+    ) -> Result<(), CryptoError> {
+        let base = SEALED_BODY_OFFSET;
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(&raw[base..base + NONCE_LEN]);
+        let mut tag = [0u8; TAG_LEN];
+        tag.copy_from_slice(&raw[base + NONCE_LEN..base + NONCE_LEN + TAG_LEN]);
+        let ct_len = u16::from_le_bytes(
+            raw[base + NONCE_LEN + TAG_LEN..base + NONCE_LEN + TAG_LEN + 2]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let coff = base + NONCE_LEN + TAG_LEN + 2;
+        let ct = &raw[coff..coff + ct_len];
+        let aad = self.sb_identity_aad();
+        let body = cipher.open_body(&aad, &nonce, &tag, ct)?;
+        self.load_body(&body);
+        Ok(())
+    }
+
     /// Deserialize from a page buffer. Returns None if the checksum is invalid
     /// or the magic number doesn't match.
     ///
@@ -301,6 +461,33 @@ impl Superblock {
         // the compiled PAGE_SIZE is a fatal open-time error the caller raises,
         // not a torn-slot signal that should make select() fall back.
         validate(buf).ok()?;
+        // Check for an encryption header first. For encrypted DBs only the
+        // bootstrap fields are in cleartext; the sensitive fields stay zero
+        // until the caller supplies the DEK and calls `decrypt_body`.
+        let encryption = crypto_header::CryptoHeader::deserialize(buf);
+        if encryption.is_some() {
+            let superblock_count = u32::from_le_bytes(
+                buf[SUPERBLOCK_COUNT_OFFSET..SUPERBLOCK_COUNT_OFFSET + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            return Some(Superblock {
+                magic: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+                format_version: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+                txn_counter: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+                root_handle_table_page: 0,
+                root_freemap_page: 0,
+                total_pages: 0,
+                next_handle: 0,
+                page_size: u32::from_le_bytes(buf[48..52].try_into().unwrap()),
+                named_roots: [NamedRoot::EMPTY; NAMED_ROOT_COUNT],
+                superblock_count,
+                root_membership_index_page: 0,
+                freemap_depth: 0,
+                encryption,
+            });
+        }
+        // Plaintext path: all fields are directly readable.
         let mut named_roots = [NamedRoot::EMPTY; NAMED_ROOT_COUNT];
         for (i, entry) in named_roots.iter_mut().enumerate() {
             let base = NAMED_ROOTS_OFFSET + i * NAMED_ROOT_ENTRY_SIZE;
@@ -339,6 +526,7 @@ impl Superblock {
                     .try_into()
                     .unwrap(),
             ),
+            encryption: None,
         })
     }
 
@@ -454,6 +642,7 @@ impl Superblock {
             superblock_count,
             root_membership_index_page: page::PAGE_ID_NONE,
             freemap_depth: 0,
+            encryption: None,
         }
     }
 }
@@ -587,6 +776,7 @@ mod tests {
             superblock_count: DEFAULT_SUPERBLOCK_COUNT,
             root_membership_index_page: crate::page::PAGE_ID_NONE,
             freemap_depth: 0,
+            encryption: None,
         };
         let buf = sb.serialize();
         let sb2 = Superblock::deserialize(&buf).unwrap();
@@ -608,6 +798,7 @@ mod tests {
             superblock_count: DEFAULT_SUPERBLOCK_COUNT,
             root_membership_index_page: crate::page::PAGE_ID_NONE,
             freemap_depth: 0,
+            encryption: None,
         };
         let mut buf = sb.serialize();
         buf[10] ^= 0xFF;
@@ -629,6 +820,7 @@ mod tests {
             superblock_count: DEFAULT_SUPERBLOCK_COUNT,
             root_membership_index_page: crate::page::PAGE_ID_NONE,
             freemap_depth: 0,
+            encryption: None,
         };
         let sb2 = Superblock {
             magic: MAGIC,
@@ -643,6 +835,7 @@ mod tests {
             superblock_count: DEFAULT_SUPERBLOCK_COUNT,
             root_membership_index_page: crate::page::PAGE_ID_NONE,
             freemap_depth: 0,
+            encryption: None,
         };
         let buf1 = sb1.serialize();
         let buf2 = sb2.serialize();
@@ -665,6 +858,7 @@ mod tests {
             superblock_count: DEFAULT_SUPERBLOCK_COUNT,
             root_membership_index_page: crate::page::PAGE_ID_NONE,
             freemap_depth: 0,
+            encryption: None,
         };
         let sb2_buf = [0u8; PAGE_SIZE];
         let buf1 = sb1.serialize();
@@ -728,6 +922,103 @@ mod tests {
     // page_size). NamedRoot.name uses a byte-array strategy so the
     // empty-slot convention (name[0] == 0) gets exercised alongside
     // populated names.
+    // ── Encrypted-superblock tests (Task 2.2) ──
+
+    /// Full encrypt→serialize→deserialize→decrypt round-trip: sensitive fields
+    /// must survive the seal/open cycle and must not appear in the raw bytes.
+    #[test]
+    fn encrypted_superblock_hides_sensitive_fields_and_round_trips() {
+        use crate::crypto::{random_dek, PageCipher};
+
+        let cipher = PageCipher::new(random_dek());
+        let mut header_slots = [KeySlot::EMPTY; KEY_SLOT_COUNT];
+        header_slots[0].state = 1; // mark one slot active (simulates a real key-slot)
+        let header = CryptoHeader {
+            algorithm: ALGO_XCHACHA20POLY1305,
+            stride: 8232,
+            slots: header_slots,
+        };
+
+        let mut sb = Superblock::new_empty(DEFAULT_SUPERBLOCK_COUNT);
+        sb.root_handle_table_page = 7;
+        sb.next_handle = 99;
+        sb.total_pages = 41;
+        sb.named_roots[0].name[..5].copy_from_slice(b"users");
+        sb.named_roots[0].handle = 12345;
+        sb.encryption = Some(header);
+
+        let buf = sb.serialize_encrypted(&cipher);
+
+        // Sensitive bytes must be absent from cleartext.
+        // named_roots occupy 52..308; all must be zero in the encrypted page.
+        assert_eq!(&buf[52..308], &[0u8; 256][..], "named_roots leaked in cleartext");
+        // Scalar sensitive fields at 16..48 must be zero.
+        assert_eq!(&buf[16..48], &[0u8; 32][..], "sensitive scalars leaked");
+        // Bootstrap fields stay plaintext.
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), MAGIC);
+        assert_eq!(
+            u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            sb.txn_counter
+        );
+
+        // Two-phase deserialize: sensitive fields are zero after deserialize.
+        let mut back = Superblock::deserialize(&buf).expect("encrypted sb deserializes");
+        assert!(back.encryption.is_some(), "encryption field must be populated");
+        assert_eq!(back.root_handle_table_page, 0, "not yet decrypted");
+        assert_eq!(back.next_handle, 0, "not yet decrypted");
+
+        // After decrypt_body the sensitive fields are restored.
+        back.decrypt_body(&cipher, &buf).expect("DEK opens body");
+        assert_eq!(back.root_handle_table_page, 7);
+        assert_eq!(back.next_handle, 99);
+        assert_eq!(back.total_pages, 41);
+        assert_eq!(&back.named_roots[0].name[..5], b"users");
+        assert_eq!(back.named_roots[0].handle, 12345);
+    }
+
+    /// Wrong DEK must produce a CryptoError (authentication failure), not
+    /// silently corrupt the sensitive fields.
+    #[test]
+    fn wrong_dek_fails_body_authentication() {
+        use crate::crypto::{random_dek, PageCipher};
+
+        let cipher = PageCipher::new(random_dek());
+        let mut header_slots = [KeySlot::EMPTY; KEY_SLOT_COUNT];
+        header_slots[0].state = 1;
+        let header = CryptoHeader {
+            algorithm: ALGO_XCHACHA20POLY1305,
+            stride: 8232,
+            slots: header_slots,
+        };
+        let mut sb = Superblock::new_empty(DEFAULT_SUPERBLOCK_COUNT);
+        sb.encryption = Some(header);
+        let buf = sb.serialize_encrypted(&cipher);
+
+        let wrong = PageCipher::new(random_dek());
+        let mut back = Superblock::deserialize(&buf).unwrap();
+        assert!(back.decrypt_body(&wrong, &buf).is_err());
+    }
+
+    /// Plaintext DBs must serialize byte-identically to the pre-encryption
+    /// implementation (regression guard: `encryption: None` path is unchanged).
+    #[test]
+    fn plaintext_superblock_round_trips_unchanged() {
+        let mut sb = Superblock::new_empty(DEFAULT_SUPERBLOCK_COUNT);
+        sb.root_handle_table_page = 5;
+        sb.root_freemap_page = 6;
+        sb.total_pages = 20;
+        sb.next_handle = 3;
+        sb.named_roots[0].name[..4].copy_from_slice(b"test");
+        sb.named_roots[0].handle = 42;
+
+        let buf = sb.serialize();
+        let back = Superblock::deserialize(&buf).expect("plaintext must deserialize");
+        assert!(back.encryption.is_none());
+        assert_eq!(back.root_handle_table_page, 5);
+        assert_eq!(back.named_roots[0].handle, 42);
+        assert_eq!(&back.named_roots[0].name[..4], b"test");
+    }
+
     proptest::proptest! {
         #[test]
         fn prop_serialize_deserialize_roundtrip(
@@ -768,6 +1059,7 @@ mod tests {
                 superblock_count,
                 root_membership_index_page,
                 freemap_depth: 0,
+                encryption: None,
             };
             let buf = sb.serialize();
             let parsed = Superblock::deserialize(&buf)
@@ -786,6 +1078,7 @@ mod tests {
             prop_assert_eq!(parsed.superblock_count, sb.superblock_count);
             prop_assert_eq!(parsed.root_membership_index_page, sb.root_membership_index_page);
             prop_assert_eq!(parsed.freemap_depth, sb.freemap_depth);
+            prop_assert_eq!(parsed.encryption, sb.encryption);
             for i in 0..NAMED_ROOT_COUNT {
                 prop_assert_eq!(parsed.named_roots[i].name, sb.named_roots[i].name);
                 prop_assert_eq!(parsed.named_roots[i].handle, sb.named_roots[i].handle);

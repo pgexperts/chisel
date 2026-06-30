@@ -4,8 +4,10 @@
 // per-DB DEK under a KEK derived from one client key). For PLAINTEXT databases
 // the reserved region stays zeroed and `deserialize` returns None (algorithm 0).
 //
-// No callers yet outside this file's own tests; will be wired into superblock
-// open/create in Phase 2.2.
+// Consumed by superblock/mod.rs (serialize_encrypted, deserialize, decrypt_body).
+// ponytail: items here are called from serialize_encrypted / decrypt_body which
+// themselves are dead-code-warned at the superblock level pending Phase 2.4
+// wiring; suppress until that caller lands.
 #![allow(dead_code)]
 //
 // On-disk layout (all inside the superblock's reserved region, after freemap_depth):
@@ -160,7 +162,7 @@ impl CryptoHeader {
 mod tests {
     use super::*;
     use crate::crypto::Argon2Params;
-    use crate::page::{self, PAGE_SIZE};
+    use crate::page::PAGE_SIZE;
 
     fn sample_slot(state: u8) -> KeySlot {
         KeySlot {

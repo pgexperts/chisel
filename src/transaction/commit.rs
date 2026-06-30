@@ -131,6 +131,10 @@ pub(super) fn run_commit(ctx: &mut CommitCtx<'_>) -> Result<()> {
         // Freemap tree depth, paired with root_freemap_page. 0 = today's
         // single-leaf format; grows as the tree deepens.
         freemap_depth: ctx.current_roots.freemap_depth,
+        // Encryption header: None for plaintext DBs (the current path).
+        // Task 2.4 will populate this from the open-time session context
+        // for encrypted DBs and switch to serialize_encrypted.
+        encryption: None,
     };
     let buf = sb.serialize();
     // Step 3: Write to the INACTIVE slot. For N superblock slots,
