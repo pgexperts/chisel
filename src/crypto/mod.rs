@@ -266,6 +266,72 @@ pub fn random_dek() -> Dek {
     Dek::from_bytes(random_array::<DEK_LEN>())
 }
 
+/// Holds the DEK and performs the two seal/open transforms the engine needs:
+/// whole-page (fixed 8192→8232) and variable-length body (superblock sub-blob).
+/// Lives in the page-cache layer in later phases; here it is fully standalone.
+/// Constructs the AEAD cipher once and reuses it across calls.
+pub struct PageCipher {
+    dek: Dek,
+}
+
+impl PageCipher {
+    pub fn new(dek: Dek) -> Self {
+        PageCipher { dek }
+    }
+
+    /// Seal a full 8192-byte plaintext page image into the 8232-byte on-disk
+    /// blob: `ciphertext(8192) ‖ tag(16) ‖ nonce(24)`. AAD = page_id LE bytes
+    /// (anti-relocation). A fresh random 192-bit nonce per call (spec §2.1) —
+    /// safe under shadow-paging page reuse, and stored in the clear.
+    pub fn seal(&self, page_id: u64, plaintext: &[u8; 8192]) -> [u8; ENC_PAGE_SIZE] {
+        let nonce = random_array::<NONCE_LEN>();
+        let aad = page_id.to_le_bytes();
+        let (ct, tag) = seal_detached(self.dek.as_bytes(), &nonce, &aad, plaintext);
+        let mut out = [0u8; ENC_PAGE_SIZE];
+        out[0..8192].copy_from_slice(&ct);
+        out[8192..8208].copy_from_slice(&tag);
+        out[8208..8232].copy_from_slice(&nonce);
+        out
+    }
+
+    /// Open an 8232-byte on-disk blob back to the 8192-byte plaintext page.
+    /// AAD = page_id LE. Any authentication failure → CryptoError::Auth (the
+    /// engine maps this to DecryptionFailed at the page-read site).
+    pub fn open(&self, page_id: u64, ondisk: &[u8; ENC_PAGE_SIZE]) -> Result<[u8; 8192], CryptoError> {
+        let ct = &ondisk[0..8192];
+        let mut tag = [0u8; TAG_LEN];
+        tag.copy_from_slice(&ondisk[8192..8208]);
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(&ondisk[8208..8232]);
+        let aad = page_id.to_le_bytes();
+        let pt = open_detached(self.dek.as_bytes(), &nonce, &aad, ct, &tag)?;
+        let mut page = [0u8; 8192];
+        page.copy_from_slice(&pt);
+        Ok(page)
+    }
+
+    /// Seal a variable-length body (the superblock sensitive sub-blob). Returns
+    /// (nonce, tag, ciphertext); the caller lays these out in the reserved
+    /// region. AAD binds the body to the superblock's identity (anti-splicing).
+    pub fn seal_body(&self, aad: &[u8], plaintext: &[u8]) -> ([u8; NONCE_LEN], [u8; TAG_LEN], Vec<u8>) {
+        let nonce = random_array::<NONCE_LEN>();
+        let (ct, tag) = seal_detached(self.dek.as_bytes(), &nonce, aad, plaintext);
+        (nonce, tag, ct)
+    }
+
+    /// Open a variable-length body sealed by `seal_body`. AAD must match the
+    /// superblock identity used at seal time, else CryptoError::Auth.
+    pub fn open_body(
+        &self,
+        aad: &[u8],
+        nonce: &[u8; NONCE_LEN],
+        tag: &[u8; TAG_LEN],
+        ct: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        open_detached(self.dek.as_bytes(), nonce, aad, ct, tag).map(|z| z.to_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,5 +509,79 @@ mod tests {
             unwrap_dek(&kek, &wrapped, &tag, &nonce, b"slot-meta-B"),
             Err(CryptoError::Auth)
         ));
+    }
+
+    #[test]
+    fn page_seal_open_roundtrip() {
+        let pc = PageCipher::new(Dek::from_bytes([1u8; DEK_LEN]));
+        let mut page = [0u8; 8192];
+        for (i, b) in page.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let blob = pc.seal(7, &page);
+        assert_eq!(blob.len(), ENC_PAGE_SIZE);
+        let out = pc.open(7, &blob).unwrap();
+        assert_eq!(out, page);
+    }
+
+    #[test]
+    fn page_seal_layout_is_ct_tag_nonce() {
+        let pc = PageCipher::new(Dek::from_bytes([1u8; DEK_LEN]));
+        let page = [0xABu8; 8192];
+        let blob = pc.seal(0, &page);
+        // ciphertext occupies 0..8192, tag 8192..8208, nonce 8208..8232.
+        assert_ne!(&blob[0..8192], &page[..], "ciphertext must differ from plaintext");
+    }
+
+    #[test]
+    fn page_open_wrong_page_id_is_auth() {
+        // AAD = page_id gives anti-relocation: a page sealed at id 7 must not
+        // authenticate at id 8.
+        let pc = PageCipher::new(Dek::from_bytes([1u8; DEK_LEN]));
+        let page = [9u8; 8192];
+        let blob = pc.seal(7, &page);
+        assert_eq!(pc.open(8, &blob).unwrap_err(), CryptoError::Auth);
+    }
+
+    #[test]
+    fn page_open_byte_flip_is_auth() {
+        let pc = PageCipher::new(Dek::from_bytes([1u8; DEK_LEN]));
+        let page = [9u8; 8192];
+        let mut blob = pc.seal(7, &page);
+        blob[100] ^= 0x01; // flip a ciphertext byte
+        assert_eq!(pc.open(7, &blob).unwrap_err(), CryptoError::Auth);
+    }
+
+    #[test]
+    fn page_two_seals_use_different_nonces() {
+        // Random per-write nonce (spec §2.1): two seals of the same page must
+        // produce different on-disk blobs (different nonce ⇒ different ct+tag).
+        let pc = PageCipher::new(Dek::from_bytes([1u8; DEK_LEN]));
+        let page = [9u8; 8192];
+        let a = pc.seal(7, &page);
+        let b = pc.seal(7, &page);
+        assert_ne!(&a[..], &b[..], "nonce reuse: identical blobs for same page");
+        // Both still open correctly.
+        assert_eq!(pc.open(7, &a).unwrap(), page);
+        assert_eq!(pc.open(7, &b).unwrap(), page);
+    }
+
+    #[test]
+    fn body_seal_open_roundtrip() {
+        let pc = PageCipher::new(Dek::from_bytes([2u8; DEK_LEN]));
+        let body = b"root pointers + named_roots".to_vec();
+        let aad = b"sb-identity";
+        let (nonce, tag, ct) = pc.seal_body(aad, &body);
+        assert_eq!(ct.len(), body.len(), "body cipher is length-preserving");
+        let out = pc.open_body(aad, &nonce, &tag, &ct).unwrap();
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn body_open_wrong_aad_is_auth() {
+        let pc = PageCipher::new(Dek::from_bytes([2u8; DEK_LEN]));
+        let body = b"secret".to_vec();
+        let (nonce, tag, ct) = pc.seal_body(b"sb-A", &body);
+        assert_eq!(pc.open_body(b"sb-B", &nonce, &tag, &ct).unwrap_err(), CryptoError::Auth);
     }
 }
