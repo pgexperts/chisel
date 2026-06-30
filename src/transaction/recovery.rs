@@ -33,6 +33,7 @@ impl TransactionManager {
         mut cache: PageCache,
         superblock_count: u32,
         key: Option<crate::crypto::Key>,
+        argon2_params: Option<crate::crypto::Argon2Params>,
     ) -> Result<TransactionManager> {
         // Caller is expected to have validated bounds via Options in
         // lib.rs, but defend against direct-call misuse too.
@@ -46,7 +47,7 @@ impl TransactionManager {
         // For plaintext DBs this is None and the slot-write loop uses serialize().
         let create_crypto = match key {
             None => None,
-            Some(k) => Some(build_create_cipher(&k)?),
+            Some(k) => Some(build_create_cipher(&k, argon2_params)?),
         };
 
         // Uniform-stride layout (encryption spec): an encrypted DB uses the
@@ -557,7 +558,10 @@ struct CreateCrypto {
 /// The AAD passed to `wrap_dek` is `slot.aad()` — the same bytes that Task 2.4
 /// reconstructs at unwrap time from the persisted slot fields. Keeping the AAD
 /// construction in one place (`KeySlot::aad`) ensures wrap and unwrap agree.
-fn build_create_cipher(key: &crate::crypto::Key) -> Result<CreateCrypto> {
+fn build_create_cipher(
+    key: &crate::crypto::Key,
+    argon2_override: Option<crate::crypto::Argon2Params>,
+) -> Result<CreateCrypto> {
     use crate::crypto::{
         derive_kek, random_array, random_dek, wrap_dek, Argon2Params, KdfId, NONCE_LEN, SALT_LEN,
     };
@@ -567,11 +571,16 @@ fn build_create_cipher(key: &crate::crypto::Key) -> Result<CreateCrypto> {
     let salt: [u8; SALT_LEN] = random_array();
     let wrap_nonce: [u8; NONCE_LEN] = random_array();
 
-    // KDF choice: a Raw key uses HKDF (fast, key-material quality);
-    // a Passphrase uses Argon2id (memory-hard, brute-force resistant).
+    // KDF choice: Raw → HKDF (fast, key-material quality); Passphrase → Argon2id
+    // (memory-hard, brute-force resistant). The argon2_override is the
+    // caller-supplied cost params from Options::argon2_params; falls back to the
+    // OWASP baseline default. Raw keys use HKDF regardless, so the override only
+    // has effect for Passphrase.
     let (kdf, params) = match key {
         crate::crypto::Key::Raw(_) => (KdfId::Hkdf, Argon2Params::default()),
-        crate::crypto::Key::Passphrase(_) => (KdfId::Argon2id, Argon2Params::default()),
+        crate::crypto::Key::Passphrase(_) => {
+            (KdfId::Argon2id, argon2_override.unwrap_or_default())
+        }
     };
     let kek = derive_kek(key, kdf, &salt, &params)?;
 

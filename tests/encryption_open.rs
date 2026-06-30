@@ -21,7 +21,7 @@ fn round_trip_open_with_correct_key() {
     {
         let mut db = Chisel::open(
             &path,
-            Options::default().with_encryption_key(raw_key(0x11)),
+            Options::default().encryption_key(raw_key(0x11)),
         )
         .unwrap();
         db.begin().unwrap();
@@ -33,7 +33,7 @@ fn round_trip_open_with_correct_key() {
         let db = Chisel::open(
             &path,
             Options::default()
-                .with_encryption_key(raw_key(0x11))
+                .encryption_key(raw_key(0x11))
                 .create_if_missing(false),
         )
         .unwrap();
@@ -50,7 +50,7 @@ fn wrong_key_is_operational_error_not_panic() {
     {
         let mut db = Chisel::open(
             &path,
-            Options::default().with_encryption_key(raw_key(0x11)),
+            Options::default().encryption_key(raw_key(0x11)),
         )
         .unwrap();
         db.begin().unwrap();
@@ -60,7 +60,7 @@ fn wrong_key_is_operational_error_not_panic() {
     let err = Chisel::open(
         &path,
         Options::default()
-            .with_encryption_key(raw_key(0x22))
+            .encryption_key(raw_key(0x22))
             .create_if_missing(false),
     );
     assert!(err.is_err(), "wrong key must fail to open");
@@ -69,7 +69,7 @@ fn wrong_key_is_operational_error_not_panic() {
     let ok = Chisel::open(
         &path,
         Options::default()
-            .with_encryption_key(raw_key(0x11))
+            .encryption_key(raw_key(0x11))
             .create_if_missing(false),
     );
     assert!(ok.is_ok(), "correct key must succeed after a wrong-key attempt");
@@ -83,7 +83,7 @@ fn missing_key_on_encrypted_db_errors() {
     {
         let mut db = Chisel::open(
             &path,
-            Options::default().with_encryption_key(raw_key(0x11)),
+            Options::default().encryption_key(raw_key(0x11)),
         )
         .unwrap();
         db.begin().unwrap();
@@ -106,7 +106,7 @@ fn key_supplied_for_plaintext_db_errors() {
     let err = Chisel::open(
         &path,
         Options::default()
-            .with_encryption_key(raw_key(0x11))
+            .encryption_key(raw_key(0x11))
             .create_if_missing(false),
     );
     assert!(err.is_err(), "supplying a key to a plaintext DB must fail");
@@ -141,7 +141,7 @@ fn passphrase_key_round_trip() {
     let handle;
     {
         let mut db =
-            Chisel::open(&path, Options::default().with_encryption_key(pass())).unwrap();
+            Chisel::open(&path, Options::default().encryption_key(pass())).unwrap();
         db.begin().unwrap();
         handle = db.allocate(b"secret").unwrap();
         db.commit().unwrap();
@@ -150,7 +150,7 @@ fn passphrase_key_round_trip() {
         let db = Chisel::open(
             &path,
             Options::default()
-                .with_encryption_key(pass())
+                .encryption_key(pass())
                 .create_if_missing(false),
         )
         .unwrap();
@@ -171,7 +171,7 @@ fn open_encrypted_db_with_no_commits_uses_correct_key() {
     {
         let _db = Chisel::open(
             &path,
-            Options::default().with_encryption_key(raw_key(0x42)),
+            Options::default().encryption_key(raw_key(0x42)),
         )
         .unwrap();
         // Drop immediately — no begin/commit. This is the exact scenario the
@@ -182,7 +182,7 @@ fn open_encrypted_db_with_no_commits_uses_correct_key() {
     let result = Chisel::open(
         &path,
         Options::default()
-            .with_encryption_key(raw_key(0x42))
+            .encryption_key(raw_key(0x42))
             .create_if_missing(false),
     );
     assert!(
@@ -201,7 +201,7 @@ fn named_root_round_trips_through_encrypted_open() {
     {
         let mut db = Chisel::open(
             &path,
-            Options::default().with_encryption_key(raw_key(0xAB)),
+            Options::default().encryption_key(raw_key(0xAB)),
         )
         .unwrap();
         db.begin().unwrap();
@@ -213,7 +213,7 @@ fn named_root_round_trips_through_encrypted_open() {
         let db = Chisel::open(
             &path,
             Options::default()
-                .with_encryption_key(raw_key(0xAB))
+                .encryption_key(raw_key(0xAB))
                 .create_if_missing(false),
         )
         .unwrap();
@@ -238,7 +238,7 @@ fn never_committed_encrypted_db_with_extra_superblocks_reopens() {
         let _db = Chisel::open(
             &path,
             Options::default()
-                .with_encryption_key(raw_key(0x55))
+                .encryption_key(raw_key(0x55))
                 .superblock_count(4),
         )
         .unwrap();
@@ -247,7 +247,7 @@ fn never_committed_encrypted_db_with_extra_superblocks_reopens() {
     let reopened = Chisel::open(
         &path,
         Options::default()
-            .with_encryption_key(raw_key(0x55))
+            .encryption_key(raw_key(0x55))
             .create_if_missing(false),
     );
     assert!(
@@ -272,7 +272,7 @@ fn multi_page_encrypted_value_round_trips() {
     {
         let mut db = Chisel::open(
             &path,
-            Options::default().with_encryption_key(raw_key(0x77)),
+            Options::default().encryption_key(raw_key(0x77)),
         )
         .unwrap();
         db.begin().unwrap();
@@ -283,7 +283,7 @@ fn multi_page_encrypted_value_round_trips() {
         let db = Chisel::open(
             &path,
             Options::default()
-                .with_encryption_key(raw_key(0x77))
+                .encryption_key(raw_key(0x77))
                 .create_if_missing(false),
         )
         .unwrap();
@@ -315,7 +315,7 @@ fn torn_slot_0_encrypted_db_recovers_via_sibling() {
     {
         let mut db = Chisel::open(
             &path,
-            Options::default().with_encryption_key(raw_key(0x99)),
+            Options::default().encryption_key(raw_key(0x99)),
         )
         .unwrap();
         // Two commits so BOTH slots (N=2) hold valid post-commit superblocks:
@@ -352,7 +352,7 @@ fn torn_slot_0_encrypted_db_recovers_via_sibling() {
     let db = Chisel::open(
         &path,
         Options::default()
-            .with_encryption_key(raw_key(0x99))
+            .encryption_key(raw_key(0x99))
             .create_if_missing(false),
     )
     .expect("correct key must recover a torn-slot-0 encrypted DB via its sibling");

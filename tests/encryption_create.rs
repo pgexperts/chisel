@@ -62,7 +62,7 @@ fn create_encrypted_db_stamps_major_2() {
     let key = Key::Raw(Zeroizing::new(vec![0xAB_u8; 32]));
     let db = chisel::Chisel::open(
         tmp.path(),
-        Options::default().with_encryption_key(key),
+        Options::default().encryption_key(key),
     )
     .expect("create encrypted db");
     drop(db);
@@ -83,7 +83,7 @@ fn create_encrypted_db_passphrase_stamps_major_2() {
     let key = Key::Passphrase(Zeroizing::new("hunter2".to_string()));
     let db = chisel::Chisel::open(
         tmp.path(),
-        Options::default().with_encryption_key(key),
+        Options::default().encryption_key(key),
     )
     .expect("create encrypted db passphrase");
     drop(db);
@@ -101,7 +101,7 @@ fn create_encrypted_db_populates_slot_0_only() {
     let key = Key::Raw(Zeroizing::new(vec![0x77_u8; 32]));
     let db = chisel::Chisel::open(
         tmp.path(),
-        Options::default().with_encryption_key(key),
+        Options::default().encryption_key(key),
     )
     .expect("create");
     drop(db);
@@ -150,7 +150,7 @@ fn create_encrypted_db_sealed_body_is_present() {
     let key = Key::Raw(Zeroizing::new(vec![0xCC_u8; 32]));
     let db = chisel::Chisel::open(
         tmp.path(),
-        Options::default().with_encryption_key(key),
+        Options::default().encryption_key(key),
     )
     .expect("create");
     drop(db);
@@ -179,7 +179,7 @@ fn slot0_dek_unwraps_with_correct_key() {
     let key = Key::Raw(Zeroizing::new(vec![0x5A_u8; 32]));
     let db = chisel::Chisel::open(
         tmp.path(),
-        Options::default().with_encryption_key(key.clone()),
+        Options::default().encryption_key(key.clone()),
     )
     .expect("create");
     drop(db);
@@ -225,7 +225,7 @@ fn slot0_dek_unwrap_fails_with_wrong_key() {
     let key = Key::Raw(Zeroizing::new(vec![0x5A_u8; 32]));
     let db = chisel::Chisel::open(
         tmp.path(),
-        Options::default().with_encryption_key(key),
+        Options::default().encryption_key(key),
     )
     .expect("create");
     drop(db);

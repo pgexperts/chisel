@@ -144,9 +144,19 @@ pub struct Options {
     pub create_if_missing: bool,
     pub read_only: bool,
     pub superblock_count: u32,
-    /// Encryption key supplied at open/create. `Some` creates (or opens) an
-    /// encrypted database; `None` keeps the existing plaintext format.
-    pub(crate) encryption_key: Option<crate::crypto::Key>,
+    /// Encryption key for an encrypted database. `None` (default) opens or
+    /// creates a plaintext DB. On create, `Some(key)` makes a new encrypted
+    /// DB sealed under a random DEK wrapped by this key. On reopen, the key
+    /// must unwrap one of the on-disk key slots or `open` returns
+    /// `InvalidEncryptionKey`. Supplying a key to open a plaintext DB returns
+    /// `EncryptionNotSupported`; omitting it on an encrypted DB returns
+    /// `NoEncryptionKey`.
+    pub encryption_key: Option<Key>,
+    /// Argon2id cost parameters used to derive the KEK from a `Key::Passphrase`
+    /// on *create*. `None` uses `Argon2Params::default()` (OWASP: 19 MiB / t=2 /
+    /// p=1). Ignored for `Key::Raw` (HKDF, no cost params) and on reopen (the
+    /// params are read from the key slot the file was written with).
+    pub argon2_params: Option<Argon2Params>,
 }
 
 /// Where commit-drain rehydrated pages are inserted into the LRU.
@@ -198,6 +208,7 @@ impl Default for Options {
             read_only: false,
             superblock_count: superblock::DEFAULT_SUPERBLOCK_COUNT,
             encryption_key: None,
+            argon2_params: None,
         }
     }
 }
@@ -246,12 +257,20 @@ impl Options {
         self
     }
 
-    /// Supply an encryption key. On create, a fresh DEK is generated and
+    /// Set the encryption key. On create, a fresh DEK is generated and
     /// wrapped into key-slot 0 under a KEK derived from this key; the
-    /// superblock is stamped MAJOR=2. On open (Task 2.4), the key is used
-    /// to unwrap the stored DEK from the matching slot.
-    pub fn with_encryption_key(mut self, key: crate::crypto::Key) -> Self {
+    /// superblock is stamped MAJOR=2. On open, the key is used to unwrap
+    /// the stored DEK from the matching slot. See [`Options::encryption_key`]
+    /// for the full create-vs-reopen semantics.
+    pub fn encryption_key(mut self, key: Key) -> Self {
         self.encryption_key = Some(key);
+        self
+    }
+    /// Set the Argon2id cost parameters used when deriving a KEK from a
+    /// passphrase on database creation. No effect for raw keys or on reopen
+    /// (the stored slot carries its own params). See [`Options::argon2_params`].
+    pub fn argon2_params(mut self, params: Argon2Params) -> Self {
+        self.argon2_params = Some(params);
         self
     }
 }
@@ -367,6 +386,7 @@ impl Chisel {
                 cache,
                 options.superblock_count,
                 options.encryption_key.clone(),
+                options.argon2_params,
             )?
         };
 
@@ -425,8 +445,8 @@ impl Chisel {
             options.drain_insertion,
             SpillwayLocation::InMemory,
         );
-        // ponytail: in-memory path never encrypts (no key supplied at this call site)
-        let txm = TransactionManager::create_new(cache, options.superblock_count, None)?;
+        // ponytail: in-memory databases never use encryption; key and argon2_params are ignored here
+        let txm = TransactionManager::create_new(cache, options.superblock_count, None, None)?;
         Ok(Chisel { txm })
     }
 
@@ -914,5 +934,32 @@ impl Chisel {
     /// `TransactionInProgress` if a transaction is active.
     pub fn set_drain_insertion(&mut self, policy: DrainInsertion) -> Result<()> {
         self.txm.set_drain_insertion(policy)
+    }
+}
+
+#[cfg(test)]
+mod options_encryption_tests {
+    use super::*;
+
+    // The two encryption fields default to None (a plaintext DB) and round-trip
+    // through the chained-setter builder, preserving #[non_exhaustive] (callers
+    // can't struct-literal, so the setters are the only construction path).
+    #[test]
+    fn encryption_options_default_none_and_set() {
+        let o = Options::default();
+        assert!(o.encryption_key.is_none());
+        assert!(o.argon2_params.is_none());
+
+        let raw = Key::Raw(zeroize::Zeroizing::new(vec![0u8; 32]));
+        let o = Options::default()
+            .encryption_key(raw)
+            .argon2_params(Argon2Params {
+                m_cost: 19456,
+                t_cost: 2,
+                p_cost: 1,
+            });
+        assert!(matches!(o.encryption_key, Some(Key::Raw(_))));
+        let p = o.argon2_params.expect("set above");
+        assert_eq!((p.m_cost, p.t_cost, p.p_cost), (19456, 2, 1));
     }
 }
