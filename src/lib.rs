@@ -73,16 +73,17 @@ pub use defrag::{DefragOptions, DefragStats};
 pub use handle::{Handle, Tag, TagDropProgress};
 pub use page::PAGE_SIZE;
 pub use stats::{ChiselCounters, Stats};
+// SlotDefect and SuperblockDefect were public before this branch (pre-existing API).
 pub use superblock::{
-    CryptoHeader, KeySlot, SlotDefect, SuperblockDefect, ALGO_XCHACHA20POLY1305,
-    CRYPTO_HEADER_OFFSET, DEFAULT_SUPERBLOCK_COUNT, KEY_SLOT_COUNT, KEY_SLOT_SIZE,
-    MAX_SUPERBLOCKS, MIN_SUPERBLOCKS, NAMED_ROOT_COUNT, NAMED_ROOT_NAME_LEN,
+    SlotDefect, SuperblockDefect, DEFAULT_SUPERBLOCK_COUNT, MAX_SUPERBLOCKS, MIN_SUPERBLOCKS,
+    NAMED_ROOT_COUNT, NAMED_ROOT_NAME_LEN,
 };
-pub use page::{FORMAT_MAJOR_VERSION_ENCRYPTED, format_major, format_version_encrypted};
-pub use crypto::{
-    derive_kek, unwrap_dek, wrap_dek, Argon2Params, KdfId, Key, PageCipher, CryptoError,
-    NONCE_LEN, SALT_LEN, DEK_LEN,
-};
+// format_major was public before this branch (I29 read-dispatch).
+pub use page::format_major;
+// Key and Argon2Params are public API (callers need them to open encrypted DBs).
+// Crypto internals (PageCipher, CryptoError, raw constants) are pub(crate) in
+// their source modules and not re-exported here.
+pub use crypto::{Argon2Params, Key};
 
 use std::path::Path;
 
