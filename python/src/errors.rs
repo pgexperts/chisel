@@ -47,6 +47,7 @@
 //                                   not match the handle's stored tag)
 //       FatalError                       (drop-and-reopen recovery only)
 //         IoError                  (ALSO subclasses builtin OSError — see register)
+//         DecryptionFailedError    (encrypted page/superblock failed AEAD auth)
 //         ChecksumMismatchError
 //         CorruptSuperblockError
 //         FileSizeMismatchError

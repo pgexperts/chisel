@@ -373,8 +373,8 @@ mod tests {
     #[test]
     fn rewrite_alternates_superblock_slots() {
         let mut db = fresh_encrypted();
-        // After fresh_encrypted: one create + one data commit = txn_counter=3
-        // (create writes N=2 initial slots + one commit). The next write targets
+        // After fresh_encrypted: create leaves txn_counter = superblock_count-1
+        // = 1 (N=2), then one data commit bumps it to 2. The next write targets
         // txn_counter % 2.
         // CryptoHeader is Copy so we can just use the value twice.
         let hdr: CryptoHeader = db.crypto_header.unwrap();

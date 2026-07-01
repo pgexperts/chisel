@@ -146,7 +146,7 @@ impl TransactionManager {
             current_roots: roots,
             handle_table: HandleTable::new(),
             membership_index: MembershipIndex::new(),
-            // Slot 0 was written last in the loop above, at counter
+            // Slot 0 was written first in the loop above (i=0), at counter
             // (superblock_count - 1 - 0) = superblock_count - 1. That's
             // the highest counter and therefore the winner on select().
             txn_counter: (superblock_count - 1) as u64,

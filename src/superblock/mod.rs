@@ -381,7 +381,8 @@ impl Superblock {
     /// Serialize an encrypted superblock: bootstrap fields + crypto-header in
     /// cleartext; sensitive fields sealed under the DEK. The byte ranges that
     /// would hold sensitive data in a plaintext page are left ZERO so nothing
-    /// leaks (named_roots at 52..308, root/page-id scalars at 16..52, etc.).
+    /// leaks (named_roots at 52..308, root/page-id scalars at 16..48, etc.;
+    /// page_size at 48..52 stays cleartext).
     ///
     /// Panics if `self.encryption` is `None` — only call for encrypted DBs.
     pub fn serialize_encrypted(&self, cipher: &crate::crypto::PageCipher) -> [u8; PAGE_SIZE] {
@@ -390,8 +391,9 @@ impl Superblock {
             .as_ref()
             .expect("serialize_encrypted requires Superblock.encryption = Some");
         let mut buf = [0u8; PAGE_SIZE];
-        // Plaintext bootstrap fields only. Sensitive scalar fields (16..52)
-        // and named_roots (52..308) are intentionally left zero.
+        // Plaintext bootstrap fields only. Sensitive scalar fields (16..48)
+        // and named_roots (52..308) are intentionally left zero (page_size at
+        // 48..52 is a cleartext bootstrap field, written just below).
         buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
         buf[4..8].copy_from_slice(&self.format_version.to_le_bytes());
         buf[8..16].copy_from_slice(&self.txn_counter.to_le_bytes());

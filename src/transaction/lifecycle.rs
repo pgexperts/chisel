@@ -200,7 +200,7 @@ impl TransactionManager {
 
     fn commit_inner(&mut self) -> Result<()> {
         // The 3-fsync commit protocol lives in `commit::run_commit`, operating
-        // over the ten pieces of manager state it touches via `CommitCtx`. The
+        // over the twelve pieces of manager state it touches via `CommitCtx`. The
         // ordering there is load-bearing (see the step-by-step rationale on
         // `commit()` above and in `commit.rs`); this stays a thin caller. All
         // `&mut self.<field>` borrows are distinct fields and `&self.cache` is a
