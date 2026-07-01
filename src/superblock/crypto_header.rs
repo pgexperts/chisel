@@ -24,6 +24,7 @@
 //   102..128 reserved
 
 use crate::crypto::{Argon2Params, DEK_LEN, NONCE_LEN, SALT_LEN, TAG_LEN};
+use crate::error::ChiselError;
 use crate::page::{self, PAGE_SIZE};
 
 pub const KEY_SLOT_COUNT: usize = 8;
@@ -151,6 +152,204 @@ impl CryptoHeader {
             *slot = KeySlot::read_from(&buf[base..base + KEY_SLOT_SIZE]);
         }
         Some(CryptoHeader { algorithm, stride, slots })
+    }
+
+    /// Count how many slots currently hold a wrapped DEK (state == active).
+    /// Used by `remove_key` (Task 5.4) to guard against removing the last
+    /// credential and locking the caller out of their own database.
+    pub fn active_count(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_active()).count()
+    }
+
+    /// Index of the first non-active slot, or `None` if all 8 are occupied.
+    /// Maps to `ChiselError::NoFreeKeySlot` in the caller (Task 5.2).
+    pub fn free_slot(&self) -> Option<usize> {
+        self.slots.iter().position(|s| !s.is_active())
+    }
+
+    /// Try each active slot in turn: derive the KEK from `key` + the slot's
+    /// KDF identity, then attempt to unwrap the DEK. Returns `(slot_index,
+    /// dek)` for the first slot whose AEAD tag verifies. If no slot matches,
+    /// returns `Err(InvalidEncryptionKey)`.
+    ///
+    /// This is byte-identical to the inline trial in `recovery.rs`
+    /// (`unwrap_first_matching_slot`) — both call `slot.aad()` on the
+    /// fully-populated slot before passing it to `unwrap_dek`.
+    ///
+    /// # Errors
+    /// Returns `ChiselError::InvalidEncryptionKey` if no active slot's tag
+    /// verifies under the supplied key.
+    pub fn unlock(
+        &self,
+        key: &crate::crypto::Key,
+    ) -> Result<(usize, crate::crypto::Dek), ChiselError> {
+        use crate::crypto::{self, KdfId};
+        for (i, slot) in self.slots.iter().enumerate() {
+            if !slot.is_active() {
+                continue;
+            }
+            // Map the on-disk kdf_id byte to the typed enum. An unrecognized
+            // id means a slot from a newer format — skip it rather than
+            // failing the whole open, so forward-compatible keys still work.
+            let kdf = match slot.kdf_id {
+                x if x == KdfId::Hkdf as u8 => KdfId::Hkdf,
+                x if x == KdfId::Argon2id as u8 => KdfId::Argon2id,
+                _ => continue,
+            };
+            let kek = match crypto::derive_kek(key, kdf, &slot.salt, &slot.argon2) {
+                Ok(k) => k,
+                Err(_) => continue,
+            };
+            if let Ok(dek) = crypto::unwrap_dek(
+                &kek,
+                &slot.wrapped_dek,
+                &slot.wrap_tag,
+                &slot.wrap_nonce,
+                &slot.aad(),
+            ) {
+                return Ok((i, dek));
+            }
+        }
+        Err(ChiselError::InvalidEncryptionKey)
+    }
+
+    /// Populate `slots[slot]` with a fresh random salt and nonce, wrapping
+    /// `dek` under the KEK derived from `key`. The KDF follows the key
+    /// variant: `Key::Raw` → HKDF (fast, key-material quality);
+    /// `Key::Passphrase` → Argon2id (memory-hard). The caller is responsible
+    /// for ensuring the slot index is free (use `free_slot()`) before calling.
+    ///
+    /// AAD is computed over the slot metadata BEFORE the wrapped bytes are
+    /// written (the `aad()` method does not read `wrapped_dek`/`wrap_tag`),
+    /// so the same `slot.aad()` call on the on-disk slot at open time
+    /// produces the exact same bytes `unlock` needs.
+    pub fn wrap_into(
+        &mut self,
+        slot: usize,
+        key: &crate::crypto::Key,
+        dek: &crate::crypto::Dek,
+    ) {
+        use crate::crypto::{self, KdfId};
+        let (kdf_id, argon2) = match key {
+            crate::crypto::Key::Raw(_) => {
+                (KdfId::Hkdf, Argon2Params { m_cost: 0, t_cost: 0, p_cost: 0 })
+            }
+            crate::crypto::Key::Passphrase(_) => (KdfId::Argon2id, Argon2Params::default()),
+        };
+        let salt: [u8; SALT_LEN] = crypto::random_array();
+        let wrap_nonce: [u8; NONCE_LEN] = crypto::random_array();
+        let mut s = KeySlot {
+            state: 1, // active
+            kdf_id: kdf_id as u8,
+            argon2,
+            salt,
+            wrap_nonce,
+            wrapped_dek: [0u8; DEK_LEN],
+            wrap_tag: [0u8; TAG_LEN],
+        };
+        // AAD is computed before the wrapped bytes are filled in: aad() reads
+        // state/kdf_id/argon2/salt/wrap_nonce, none of which are
+        // wrapped_dek/wrap_tag. This ordering matches unlock() and the
+        // existing recovery.rs path — all three call slot.aad() on the
+        // populated-but-pre-wrap slot.
+        let kek = crypto::derive_kek(key, kdf_id, &s.salt, &s.argon2)
+            .expect("fresh random salt cannot trigger a KDF parameter error");
+        let (wrapped, tag) = crypto::wrap_dek(&kek, dek, &s.wrap_nonce, &s.aad());
+        s.wrapped_dek = wrapped;
+        s.wrap_tag = tag;
+        self.slots[slot] = s;
+    }
+}
+
+#[cfg(test)]
+mod crypto_header_tests {
+    use super::*;
+    use crate::crypto::{self, Key};
+    use zeroize::Zeroizing;
+
+    fn raw(b: u8) -> Key {
+        Key::Raw(Zeroizing::new(vec![b; 32]))
+    }
+
+    // A header with exactly one active slot holding `dek` under `key`.
+    fn header_with_one(key: &Key, dek: &crypto::Dek) -> CryptoHeader {
+        let mut h = CryptoHeader {
+            algorithm: 1,
+            stride: crypto::ENC_PAGE_SIZE as u32,
+            slots: [KeySlot::EMPTY; KEY_SLOT_COUNT],
+        };
+        h.wrap_into(0, key, dek);
+        h
+    }
+
+    #[test]
+    fn unlock_finds_the_right_slot_and_recovers_dek() {
+        let dek = crypto::random_dek();
+        let k0 = raw(0xA1);
+        let mut h = header_with_one(&k0, &dek);
+
+        // Add a second credential into slot 3 wrapping the SAME dek.
+        let k1 = raw(0xB2);
+        h.wrap_into(3, &k1, &dek);
+
+        let (idx0, d0) = h.unlock(&k0).expect("k0 must unlock");
+        let (idx1, d1) = h.unlock(&k1).expect("k1 must unlock");
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 3);
+        // Both recover the identical DEK bytes.
+        assert_eq!(d0.as_bytes(), dek.as_bytes());
+        assert_eq!(d1.as_bytes(), dek.as_bytes());
+    }
+
+    #[test]
+    fn unlock_wrong_key_returns_invalid_encryption_key() {
+        let dek = crypto::random_dek();
+        let h = header_with_one(&raw(0xAA), &dek);
+        // Dek has no Debug, so we can't use expect_err(); use matches! instead.
+        let result = h.unlock(&raw(0xBB));
+        assert!(matches!(result, Err(crate::error::ChiselError::InvalidEncryptionKey)));
+    }
+
+    #[test]
+    fn unlock_empty_header_returns_error() {
+        let h = CryptoHeader {
+            algorithm: 1,
+            stride: crypto::ENC_PAGE_SIZE as u32,
+            slots: [KeySlot::EMPTY; KEY_SLOT_COUNT],
+        };
+        assert!(h.unlock(&raw(0x01)).is_err());
+    }
+
+    #[test]
+    fn free_slot_and_active_count_track_occupancy() {
+        let dek = crypto::random_dek();
+        let mut h = header_with_one(&raw(0x01), &dek);
+        assert_eq!(h.active_count(), 1);
+        assert_eq!(h.free_slot(), Some(1));
+
+        // Fill every remaining slot.
+        for i in 1..KEY_SLOT_COUNT {
+            h.wrap_into(i, &raw(i as u8 + 1), &dek);
+        }
+        assert_eq!(h.active_count(), KEY_SLOT_COUNT);
+        assert_eq!(h.free_slot(), None);
+    }
+
+    #[test]
+    fn wrap_into_then_unlock_round_trips_dek() {
+        // Verify that a freshly wrapped slot's AAD bytes at wrap time match
+        // those recomputed at unlock time (the crux of Task 5.1).
+        let dek = crypto::random_dek();
+        let key = raw(0x77);
+        let mut h = CryptoHeader {
+            algorithm: 1,
+            stride: crypto::ENC_PAGE_SIZE as u32,
+            slots: [KeySlot::EMPTY; KEY_SLOT_COUNT],
+        };
+        h.wrap_into(5, &key, &dek);
+        let (idx, recovered) = h.unlock(&key).expect("wrap_into then unlock must succeed");
+        assert_eq!(idx, 5);
+        assert_eq!(recovered.as_bytes(), dek.as_bytes());
     }
 }
 
