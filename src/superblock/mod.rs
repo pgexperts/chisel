@@ -325,6 +325,12 @@ impl Superblock {
     /// this superblock's plaintext identity. The four bootstrap fields that stay
     /// cleartext in both encrypted and plaintext DBs are included; this prevents
     /// transplanting a sealed body from a different DB or a different txn_counter.
+    ///
+    /// These four MUST stay cleartext even in an encrypted DB precisely because
+    /// they are the AAD: slot selection (`max_by_key` on `txn_counter`) and this
+    /// AAD derivation both run BEFORE any DEK is available, so the fields cannot
+    /// live in the DEK-sealed body — the engine must read them to pick the live
+    /// slot and rebuild the AAD before it can open that body.
     pub fn sb_identity_aad(&self) -> [u8; 24] {
         let mut a = [0u8; 24];
         a[0..4].copy_from_slice(&self.magic.to_le_bytes());
