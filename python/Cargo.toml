@@ -34,5 +34,6 @@ chisel = { path = ".." }
 # the stable ABI — that floor is preserved here.
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py311"] }
 # Needed to construct Key::Raw(Zeroizing::new(...)) and Key::Passphrase(Zeroizing::new(...))
-# in open(). Versions must match the root crate to share the same Zeroizing type.
-zeroize = { version = "1", features = ["derive"] }
+# in open(). Only Zeroizing::new() is used — no derive macro — so the default
+# feature set suffices. Version must match the root crate to share the Zeroizing type.
+zeroize = "1"

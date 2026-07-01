@@ -30,6 +30,8 @@ def test_wrong_key_raises_invalid_encryption_key(tmp_path: pathlib.Path):
         db.allocate(b"x")
         db.commit()
 
+    # Bare open() (no `with`) is intentional: InvalidEncryptionKey is raised at
+    # open time before any Chisel object exists, so there is nothing to close.
     with pytest.raises(chisel.InvalidEncryptionKeyError):
         chisel.open(path, create_if_missing=False, encryption_key=b"\x00" * 32)
 
