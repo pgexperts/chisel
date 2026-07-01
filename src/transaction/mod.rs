@@ -241,6 +241,7 @@ mod config;
 #[cfg(test)]
 mod fault;
 mod freemap;
+mod keys;
 mod lifecycle;
 mod mutate;
 mod named_roots;
