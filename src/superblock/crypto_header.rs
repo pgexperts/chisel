@@ -29,6 +29,8 @@ use crate::page::{self, PAGE_SIZE};
 
 pub const KEY_SLOT_COUNT: usize = 8;
 pub const KEY_SLOT_SIZE: usize = 128;
+/// State byte value for an occupied, usable slot.
+const KEY_SLOT_ACTIVE: u8 = 1;
 // Immediately after freemap_depth (bytes 320..324). Keep in lockstep with
 // superblock/mod.rs's FREEMAP_DEPTH_OFFSET (320) + 4.
 pub const CRYPTO_HEADER_OFFSET: usize = 324;
@@ -64,9 +66,9 @@ impl KeySlot {
         wrap_tag: [0u8; TAG_LEN],
     };
 
-    /// True if this slot holds a usable wrapped DEK (state byte == 1).
+    /// True if this slot holds a usable wrapped DEK (state byte == `KEY_SLOT_ACTIVE`).
     pub fn is_active(&self) -> bool {
-        self.state == 1
+        self.state == KEY_SLOT_ACTIVE
     }
 
     /// The bytes an unwrap operation must authenticate as AAD: the slot's own
@@ -228,7 +230,7 @@ impl CryptoHeader {
         slot: usize,
         key: &crate::crypto::Key,
         dek: &crate::crypto::Dek,
-    ) {
+    ) -> Result<(), crate::crypto::CryptoError> {
         use crate::crypto::{self, KdfId};
         let (kdf_id, argon2) = match key {
             crate::crypto::Key::Raw(_) => {
@@ -239,7 +241,7 @@ impl CryptoHeader {
         let salt: [u8; SALT_LEN] = crypto::random_array();
         let wrap_nonce: [u8; NONCE_LEN] = crypto::random_array();
         let mut s = KeySlot {
-            state: 1, // active
+            state: KEY_SLOT_ACTIVE,
             kdf_id: kdf_id as u8,
             argon2,
             salt,
@@ -252,12 +254,12 @@ impl CryptoHeader {
         // wrapped_dek/wrap_tag. This ordering matches unlock() and the
         // existing recovery.rs path — all three call slot.aad() on the
         // populated-but-pre-wrap slot.
-        let kek = crypto::derive_kek(key, kdf_id, &s.salt, &s.argon2)
-            .expect("fresh random salt cannot trigger a KDF parameter error");
+        let kek = crypto::derive_kek(key, kdf_id, &s.salt, &s.argon2)?;
         let (wrapped, tag) = crypto::wrap_dek(&kek, dek, &s.wrap_nonce, &s.aad());
         s.wrapped_dek = wrapped;
         s.wrap_tag = tag;
         self.slots[slot] = s;
+        Ok(())
     }
 }
 
@@ -278,7 +280,7 @@ mod crypto_header_tests {
             stride: crypto::ENC_PAGE_SIZE as u32,
             slots: [KeySlot::EMPTY; KEY_SLOT_COUNT],
         };
-        h.wrap_into(0, key, dek);
+        h.wrap_into(0, key, dek).expect("wrap_into with valid key must succeed");
         h
     }
 
@@ -290,7 +292,7 @@ mod crypto_header_tests {
 
         // Add a second credential into slot 3 wrapping the SAME dek.
         let k1 = raw(0xB2);
-        h.wrap_into(3, &k1, &dek);
+        h.wrap_into(3, &k1, &dek).expect("wrap_into with valid key must succeed");
 
         let (idx0, d0) = h.unlock(&k0).expect("k0 must unlock");
         let (idx1, d1) = h.unlock(&k1).expect("k1 must unlock");
@@ -329,7 +331,8 @@ mod crypto_header_tests {
 
         // Fill every remaining slot.
         for i in 1..KEY_SLOT_COUNT {
-            h.wrap_into(i, &raw(i as u8 + 1), &dek);
+            h.wrap_into(i, &raw(i as u8 + 1), &dek)
+                .expect("wrap_into with valid key must succeed");
         }
         assert_eq!(h.active_count(), KEY_SLOT_COUNT);
         assert_eq!(h.free_slot(), None);
@@ -346,7 +349,7 @@ mod crypto_header_tests {
             stride: crypto::ENC_PAGE_SIZE as u32,
             slots: [KeySlot::EMPTY; KEY_SLOT_COUNT],
         };
-        h.wrap_into(5, &key, &dek);
+        h.wrap_into(5, &key, &dek).expect("wrap_into with valid key must succeed");
         let (idx, recovered) = h.unlock(&key).expect("wrap_into then unlock must succeed");
         assert_eq!(idx, 5);
         assert_eq!(recovered.as_bytes(), dek.as_bytes());

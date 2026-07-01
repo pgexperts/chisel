@@ -139,7 +139,7 @@ impl TransactionManager {
         let (_idx, dek) = header.unlock(existing)?; // → InvalidEncryptionKey if none
         let free = header.free_slot().ok_or(ChiselError::NoFreeKeySlot)?;
         let mut new_header = *header;
-        new_header.wrap_into(free, new, &dek);
+        new_header.wrap_into(free, new, &dek).map_err(|_| ChiselError::InvalidEncryptionKey)?;
         self.rewrite_crypto_header(new_header)
     }
 
@@ -160,7 +160,7 @@ impl TransactionManager {
         let (old_idx, dek) = header.unlock(old)?; // → InvalidEncryptionKey if none
         let free = header.free_slot().ok_or(ChiselError::NoFreeKeySlot)?;
         let mut new_header = *header;
-        new_header.wrap_into(free, new, &dek);
+        new_header.wrap_into(free, new, &dek).map_err(|_| ChiselError::InvalidEncryptionKey)?;
         // Clear the old slot in the same header snapshot — single atomic rewrite.
         new_header.slots[old_idx] = crate::superblock::KeySlot::EMPTY;
         self.rewrite_crypto_header(new_header)
@@ -302,7 +302,7 @@ mod tests {
         // Unlock slot 0 to get the DEK, then wrap it into a second slot.
         let mut new_hdr = db.crypto_header.expect("encrypted DB must have crypto_header");
         let (_, dek) = new_hdr.unlock(&raw(0x11)).expect("slot 0 unlocks with key 0x11");
-        new_hdr.wrap_into(1, &raw(0x22), &dek);
+        new_hdr.wrap_into(1, &raw(0x22), &dek).expect("wrap_into with valid key must succeed");
 
         db.rewrite_crypto_header(new_hdr).unwrap();
 
@@ -396,7 +396,7 @@ mod tests {
         // Add key 0x22 by rewriting the header with a second slot.
         let mut new_hdr = db.crypto_header.unwrap();
         let (_, dek) = new_hdr.unlock(&raw(0x11)).unwrap();
-        new_hdr.wrap_into(1, &raw(0x22), &dek);
+        new_hdr.wrap_into(1, &raw(0x22), &dek).expect("wrap_into with valid key must succeed");
         db.rewrite_crypto_header(new_hdr).unwrap();
         // Drop to flush OS buffers (fsync already called).
         drop(db);

@@ -509,7 +509,7 @@ impl PageCache {
                             let unit: [u8; ENC_PAGE_SIZE] = blob
                                 .as_slice()
                                 .try_into()
-                                .expect("spillway rehydrate returned wrong length for encrypted blob");
+                                .map_err(|_| ChiselError::DecryptionFailed { page_id })?;
                             self.io.write_page_unit(page_id, &unit)?;
                             let pt = c
                                 .open(page_id, &unit)
@@ -520,7 +520,7 @@ impl PageCache {
                             // blob is PAGE_SIZE bytes; write directly.
                             let pt: [u8; page::PAGE_SIZE] = blob
                                 .try_into()
-                                .expect("spillway rehydrate returned wrong length for plaintext blob");
+                                .map_err(|_| ChiselError::DecryptionFailed { page_id })?;
                             self.io.write_page_unit(page_id, &pt)?;
                             Box::new(pt)
                         }
@@ -959,7 +959,7 @@ impl PageCache {
                         let unit: [u8; ENC_PAGE_SIZE] = blob
                             .as_slice()
                             .try_into()
-                            .expect("spillway rehydrate returned wrong length for encrypted blob");
+                            .map_err(|_| ChiselError::DecryptionFailed { page_id })?;
                         let pt = c
                             .open(page_id, &unit)
                             .map_err(|_| ChiselError::DecryptionFailed { page_id })?;
@@ -967,7 +967,7 @@ impl PageCache {
                     }
                     None => Box::new(
                         blob.try_into()
-                            .expect("spillway rehydrate returned wrong length for plaintext blob"),
+                            .map_err(|_| ChiselError::DecryptionFailed { page_id })?,
                     ),
                 };
                 self.entries.insert(
