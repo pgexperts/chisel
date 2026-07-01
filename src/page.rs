@@ -113,6 +113,34 @@ pub const MAGIC: u32 = 0x4348534C; // "CHSL"
 pub const FORMAT_MAJOR_VERSION: u16 = 1;
 pub const FORMAT_MINOR_VERSION: u16 = 1;
 
+/// MAJOR version stamped into an ENCRYPTED database's superblock. The bump from
+/// 1 → 2 hard-rejects old binaries (which gate on FORMAT_MAJOR_VERSION == 1).
+pub const FORMAT_MAJOR_VERSION_ENCRYPTED: u16 = 2;
+
+/// MINOR version for the encrypted-DB format series. A new MAJOR series starts
+/// its MINOR count at 0, so encrypted DBs stamp (2, 0) — NOT (2, FORMAT_MINOR_VERSION).
+/// The encrypted format carries its own minor series, independent of plaintext.
+pub(crate) const FORMAT_MINOR_VERSION_ENCRYPTED: u16 = 0;
+
+/// The SINGLE canonical packed format_version for an ENCRYPTED database's
+/// superblock: `pack(2, 0)`. `format_version_encrypted()` returns this constant;
+/// create, open, and the superblock-body AAD (`sb_identity_aad`) all route
+/// through that function, so there is exactly ONE on-disk value — no two
+/// constants that can drift. An encryption-unaware binary (FORMAT_MAJOR_VERSION
+/// == 1) rejects it as `UnsupportedFormatVersion`, the intended hard-reject.
+pub(crate) const ENCRYPTED_FORMAT_VERSION: u32 = pack_format_version(
+    FORMAT_MAJOR_VERSION_ENCRYPTED,
+    FORMAT_MINOR_VERSION_ENCRYPTED,
+);
+
+/// The encrypted-DB packed format version (MAJOR=2, MINOR=0). Single source of
+/// truth: returns `ENCRYPTED_FORMAT_VERSION`. Called by the create path
+/// (keys.rs, superblock::new_empty_encrypted), the commit stamp, and the
+/// open-time gate — they all agree because they all call this one function.
+pub fn format_version_encrypted() -> u32 {
+    ENCRYPTED_FORMAT_VERSION
+}
+
 /// Pack a (major, minor) pair into the on-disk u32 format version.
 pub const fn pack_format_version(major: u16, minor: u16) -> u32 {
     ((major as u32) << 16) | (minor as u32)

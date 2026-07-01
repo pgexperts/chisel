@@ -215,6 +215,18 @@ pub struct TransactionManager {
     // AtomicBool because TransactionManager is !Sync by design (see
     // lib.rs); there is no cross-thread access to synchronize against.
     poisoned: Cell<bool>,
+    /// Per-session page cipher for an encrypted database. `None` for plaintext.
+    /// Holds the unwrapped DEK (zeroizing) for the life of the manager; the
+    /// PageCache gets its own clone at open time (recovery.rs) for per-page
+    /// seal/open. The manager's copy is also threaded through CommitCtx for the
+    /// superblock body seal on every commit. The DEK inside PageCipher is
+    /// zeroizing and is cleared on drop.
+    cipher: Option<crate::crypto::PageCipher>,
+    /// The crypto-header (algorithm id + key-slot table) for an encrypted database.
+    /// Written verbatim into every committed superblock. `None` for plaintext DBs.
+    /// The key-slot contents never change after create or open: the slots hold the
+    /// DEK wrapped under KEKs from each user key and are opaque to the commit path.
+    crypto_header: Option<crate::superblock::CryptoHeader>,
 
     // Test-only fault injection consolidated off the production type (review
     // 2026-06-22 SMELL #4): the four BUG#2 atomic-staging arming flags live in
@@ -227,8 +239,11 @@ pub struct TransactionManager {
 mod commit;
 mod config;
 #[cfg(test)]
+mod create_tests;
+#[cfg(test)]
 mod fault;
 mod freemap;
+mod keys;
 mod lifecycle;
 mod mutate;
 mod named_roots;

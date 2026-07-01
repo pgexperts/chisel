@@ -216,6 +216,8 @@ impl TransactionManager {
             txn_counter: &mut self.txn_counter,
             active_txn: &mut self.active_txn,
             superblock_count: self.superblock_count,
+            cipher: self.cipher.as_ref(),
+            crypto_header: self.crypto_header.as_ref(),
         })
     }
 

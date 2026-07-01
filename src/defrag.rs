@@ -289,7 +289,7 @@ mod tests {
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
         );
-        let mut tm = TransactionManager::create_new(cache, 2).unwrap();
+        let mut tm = TransactionManager::create_new(cache, 2, None, None).unwrap();
         tm.begin().unwrap();
         tm.commit().unwrap();
         tm

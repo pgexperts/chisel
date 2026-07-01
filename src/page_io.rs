@@ -11,13 +11,24 @@
 // - `Backing::File` — the durable path. Owns a `File` handle for its entire
 //   lifetime; the advisory flock is tied to that fd and released on drop.
 //   Two fsyncs per commit; shadow paging guarantees crash consistency.
-// - `Backing::Memory` — the ephemeral path. Pages live in a `Vec`; fsync is
-//   a no-op; no flock is taken. Used for benchmark parity with SQLite
-//   `:memory:` — see the in-memory-mode spec for the design rationale.
+// - `Backing::Memory` — the ephemeral path. Pages live in a flat `Vec<u8>`
+//   addressed by `page_id * stride`; fsync is a no-op; no flock is taken.
+//   Used for benchmark parity with SQLite `:memory:` — see the in-memory-mode
+//   spec for the design rationale.
+//
+// Stride: the on-disk unit size. For plaintext DBs stride == PAGE_SIZE (8192).
+// For encrypted DBs stride == ENC_PAGE_SIZE (8232 = 8192 ct + 16 tag + 24 nonce).
+// This module is crypto-agnostic: it only moves `stride`-byte blobs; the seal/
+// open transform happens one layer up in PageCache (Task 3.3). Offset math is
+// always `page_id * stride`. The engine calls `set_stride(ENC_PAGE_SIZE)` right
+// after reading page 0's plaintext bootstrap header on an encrypted open, before
+// any other page is read. The default at open is PAGE_SIZE, which is always
+// correct for the initial page-0 read regardless of encryption.
 //
 // Invariants common to both backings:
-// - All reads and writes are page-aligned: offset = page_id * PAGE_SIZE.
-//   Callers pass logical page IDs; this module never sees byte offsets.
+// - All reads and writes are unit-aligned: offset = page_id * stride. The
+//   stride defaults to PAGE_SIZE and is set to ENC_PAGE_SIZE for encrypted
+//   DBs after page 0 is read. Callers pass logical page IDs only.
 // - Platform: macOS and Linux only. `libc::flock` is a BSD/Linux syscall;
 //   Windows is not supported.
 // - On-disk format is little-endian (see page.rs); this module is
@@ -38,10 +49,10 @@ use crate::page::PAGE_SIZE;
 enum Backing {
     File { file: File },
     // Memory-backed database for benchmarking against SQLite :memory:.
-    // `pages.len() * PAGE_SIZE` is the on-disk "file size" equivalent;
-    // allocating a new page is a `Vec::push` of a zero-filled array.
+    // Flat byte vec addressed by `page_id * stride`; stride-variable so
+    // encrypted (8232-byte) and plaintext (8192-byte) units both work.
     // No fsync, no flock, no recovery — see the in-memory-mode spec.
-    Memory { pages: Vec<[u8; PAGE_SIZE]> },
+    Memory { bytes: Vec<u8> },
 }
 
 /// Test-only fault plan armed via `PageIo::arm_fault` (I112). `Copy` so it
@@ -72,22 +83,30 @@ pub struct PageIo {
     // matters: a ReadOnlyMode error is operational — the caller just used
     // the wrong open mode — while a fatal IoError poisons the manager.
     read_only: bool,
+    // On-disk unit size in bytes. PAGE_SIZE for a plaintext DB;
+    // ENC_PAGE_SIZE (8232 = 8192 ct + 16 tag + 24 nonce) for an encrypted
+    // DB. This module is crypto-agnostic: it only moves `stride`-byte blobs
+    // and computes offset = page_id * stride. The engine calls set_stride to
+    // ENC_PAGE_SIZE immediately after reading page 0's plaintext bootstrap
+    // header on an encrypted open, before any other page is read.
+    // page_count() is always reported in stride-units.
+    stride: usize,
     // Cumulative fsync count. Cell<u64> because `fsync(&self)` takes &self
     // (single-writer + same-thread reads — see project memory note
     // `project_chisel_single_client_design`). Read-only opens never fsync,
     // so this stays at 0 for the read-only lifetime — a useful invariant
     // when interpreting the counter.
     fsync_calls: Cell<u64>,
-    // I51 (ISSUES.md, 2026-05-22): cached file length in pages. Eliminates
-    // the `lseek(End(0))` syscall that every read_page() used to issue
-    // through `page_count()`. Maintained by:
+    // I51 (ISSUES.md, 2026-05-22): cached file length in stride-units.
+    // Eliminates the `lseek(End(0))` syscall that every read_page() used to
+    // issue through `page_count()`. Maintained by:
     //   - `open()` / `open_in_memory()` — seed from initial file length
-    //   - `write_page()` — extend if page_id+1 > cached value
+    //   - `write_page_unit()` — extend if page_id+1 > cached value
     //   - `set_page_count(n)` — overwrite to n (both grow and shrink)
+    //   - `set_stride(s)` — re-seeds from true file length in new units
     // Safe under the single-writer flock contract: no other process can
     // mutate the file behind our back, so the cached value never goes
-    // stale. Used by both File and Memory backings — for Memory the
-    // cache mirrors `pages.len()` and the maintenance cost is negligible.
+    // stale.
     cached_page_count: Cell<u64>,
     // I112: test-only fault injector. Checked at the top of read_page/
     // write_page/fsync; cfg(test) so it is compiled out of production builds
@@ -128,10 +147,14 @@ impl PageIo {
         // without a syscall; the cache is kept in sync by write_page()
         // and set_page_count().
         let initial_len = file.seek(SeekFrom::End(0))?;
+        // Seed with PAGE_SIZE (the default stride). set_stride() is called
+        // by the engine immediately after reading the encrypted superblock on
+        // page 0, at which point it re-seeds the count in ENC_PAGE_SIZE units.
         let initial_page_count = initial_len / PAGE_SIZE as u64;
         Ok(PageIo {
             backing: Backing::File { file },
             read_only,
+            stride: PAGE_SIZE,
             fsync_calls: Cell::new(0),
             cached_page_count: Cell::new(initial_page_count),
             #[cfg(test)]
@@ -149,11 +172,12 @@ impl PageIo {
     /// symmetric with `open` and leaves room for future fallible init.
     pub fn open_in_memory() -> Result<PageIo> {
         Ok(PageIo {
-            backing: Backing::Memory { pages: Vec::new() },
+            backing: Backing::Memory { bytes: Vec::new() },
             read_only: false,
+            stride: PAGE_SIZE,
             fsync_calls: Cell::new(0),
-            // I51: seeded to 0; write_page() and set_page_count() keep
-            // it in sync with pages.len() as the Vec grows or shrinks.
+            // I51: seeded to 0; write_page_unit() and set_page_count() keep
+            // it in sync with bytes.len() / stride as the Vec grows or shrinks.
             cached_page_count: Cell::new(0),
             #[cfg(test)]
             fault: Cell::new(Fault::None),
@@ -176,6 +200,25 @@ impl PageIo {
     /// that `write_page` / `fsync` / `set_page_count` already honor. See I29.
     pub fn force_read_only(&mut self) {
         self.read_only = true;
+    }
+
+    /// On-disk unit size in bytes (PAGE_SIZE plaintext, ENC_PAGE_SIZE encrypted).
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// Set the on-disk stride and re-seed the page-count cache against the new
+    /// unit size. Must be called BEFORE the first unit read on an encrypted DB.
+    /// The engine does this immediately after the superblock initialization so
+    /// data-page I/O uses the 8232-byte encrypted stride. Re-seeds from the
+    /// true file length so page_count() is reported in the new stride-units.
+    pub fn set_stride(&mut self, stride: usize) {
+        self.stride = stride;
+        let len = match &mut self.backing {
+            Backing::File { file } => file.seek(SeekFrom::End(0)).unwrap_or(0),
+            Backing::Memory { bytes } => bytes.len() as u64,
+        };
+        self.cached_page_count.set(len / stride as u64);
     }
 
     /// Acquire an exclusive advisory lock (flock). Returns LockFailed if
@@ -219,27 +262,21 @@ impl PageIo {
         Ok(())
     }
 
-    /// Read a single page by page ID. Returns the page contents by value.
+    /// Read the raw on-disk unit (`stride` bytes) for `page_id`.
     ///
-    /// Returning `[u8; PAGE_SIZE]` by value (not a borrowed slice) is
-    /// deliberate: `PageCache` will copy the bytes into its own `Box` and
-    /// run checksum verification there. Keeping this layer buffer-free means
-    /// callers never accidentally alias the underlying File.
+    /// Crypto-agnostic: for a plaintext DB the returned blob IS the page
+    /// image (stride == PAGE_SIZE). For an encrypted DB the blob is the
+    /// sealed ciphertext‖tag‖nonce, which PageCache hands to PageCipher::open.
     ///
-    /// Reading an unallocated page is a bug in the caller, not a
-    /// recoverable condition. ISSUES.md I16: we surface it as the typed
-    /// `InvalidPageId` variant rather than the old generic
-    /// `UnexpectedEof` wrapped as `IoError`, so upstream debugging can
-    /// distinguish "caller asked for a page that doesn't exist" from
-    /// "genuine disk I/O failure".
+    /// Reading an unallocated page is a caller bug. I16: surfaced as the
+    /// typed `InvalidPageId` rather than a generic `IoError` so that
+    /// upstream debugging can distinguish "wrong page id" from "disk I/O
+    /// failure".
     ///
-    /// Cost note: post-I51 (2026-05-22) `page_count()` returns a cached
-    /// value with no syscall, so the bounds check below is effectively
-    /// free. The cache is seeded at `open()` and maintained by
-    /// `write_page()` and `set_page_count()`. `&mut self` is still
-    /// required because the actual page read does `file.seek` +
-    /// `read_exact` — both side-effectful operations on the File handle.
-    pub fn read_page(&mut self, page_id: u64) -> Result<[u8; PAGE_SIZE]> {
+    /// `&mut self` is required because the File branch does `file.seek` +
+    /// `read_exact` — side-effectful operations on the File handle. The
+    /// bounds check is effectively free post-I51 (cached page count).
+    pub fn read_page_unit(&mut self, page_id: u64) -> Result<Vec<u8>> {
         let page_count = self.page_count()?;
         if page_id >= page_count {
             return Err(ChiselError::InvalidPageId { page_id });
@@ -251,38 +288,86 @@ impl PageIo {
                 "fault-injected read failure",
             )));
         }
+        let stride = self.stride;
         match &mut self.backing {
             Backing::File { file } => {
-                let offset = page_id * PAGE_SIZE as u64;
+                let offset = page_id * stride as u64;
                 file.seek(SeekFrom::Start(offset))?;
-                let mut buf = [0u8; PAGE_SIZE];
+                let mut buf = vec![0u8; stride];
                 file.read_exact(&mut buf)?;
                 Ok(buf)
             }
-            // Unchecked index is sound: the `page_id >= page_count` guard
-            // above already rejected out-of-range ids, and for Memory the
-            // cached page count is kept identical to `pages.len()` (seeded 0,
-            // grown by write_page, resized by set_page_count). So a passing
-            // bounds check guarantees `page_id < pages.len()` here.
-            Backing::Memory { pages } => Ok(pages[page_id as usize]),
+            // Sound: the `page_id >= page_count` guard above already rejected
+            // out-of-range ids, and the cached page count equals
+            // bytes.len() / stride (maintained by write_page_unit and
+            // set_page_count). A passing check guarantees the slice exists.
+            Backing::Memory { bytes } => {
+                let off = (page_id * stride as u64) as usize;
+                Ok(bytes[off..off + stride].to_vec())
+            }
         }
     }
 
-    /// Write a single page by page ID.
+    /// Read the raw on-disk unit into a caller-provided buffer.
     ///
-    /// If `page_id` is beyond the current end of file, the kernel extends
-    /// the file to cover the write (standard POSIX behavior). This is how
-    /// new pages allocated by `PageCache::new_page()` physically reach
-    /// disk — we never explicitly `set_page_count()` when growing during
-    /// normal operation.
+    /// `buf` must be exactly `stride` bytes. Avoids the heap allocation of
+    /// `read_page_unit`; used by PageCache::load_page with a stack-allocated
+    /// `[u8; ENC_PAGE_SIZE]` buffer so the cold-load hot path allocates nothing.
     ///
-    /// Note: this write is NOT durable until `fsync()` is called. The
-    /// shadow-paging commit protocol relies on callers flushing all data
-    /// pages with fsync BEFORE writing the superblock, and fsyncing AGAIN
-    /// after the superblock. See transaction.rs::commit.
-    pub fn write_page(&mut self, page_id: u64, buf: &[u8; PAGE_SIZE]) -> Result<()> {
+    /// Shares all validation (bounds check, fault injection) with `read_page_unit`.
+    pub fn read_page_unit_into(&mut self, page_id: u64, buf: &mut [u8]) -> Result<()> {
+        let page_count = self.page_count()?;
+        if page_id >= page_count {
+            return Err(ChiselError::InvalidPageId { page_id });
+        }
+        #[cfg(test)]
+        if self.fault.get() == Fault::FailReadPage(page_id) {
+            self.fault.set(Fault::None);
+            return Err(ChiselError::IoError(std::io::Error::other(
+                "fault-injected read failure",
+            )));
+        }
+        let stride = self.stride;
+        debug_assert_eq!(
+            buf.len(),
+            stride,
+            "read_page_unit_into: buf.len() {} != stride {}",
+            buf.len(),
+            stride
+        );
+        match &mut self.backing {
+            Backing::File { file } => {
+                let offset = page_id * stride as u64;
+                file.seek(SeekFrom::Start(offset))?;
+                file.read_exact(buf)?;
+            }
+            Backing::Memory { bytes } => {
+                let off = (page_id * stride as u64) as usize;
+                buf.copy_from_slice(&bytes[off..off + stride]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Write a raw on-disk unit (must be exactly `stride` bytes) for `page_id`.
+    ///
+    /// Past-EOF writes extend the file; intermediate units are zero-filled
+    /// (POSIX behavior, matching how new pages reach disk via new_page()).
+    /// The blob length must equal `stride` — a mismatch is a caller bug
+    /// returned as an `IoError` rather than silently truncating/padding.
+    ///
+    /// Note: not durable until `fsync()` is called. See the shadow-paging
+    /// commit protocol in transaction.rs.
+    pub fn write_page_unit(&mut self, page_id: u64, blob: &[u8]) -> Result<()> {
         if self.read_only {
             return Err(ChiselError::ReadOnlyMode);
+        }
+        if blob.len() != self.stride {
+            return Err(ChiselError::IoError(std::io::Error::other(format!(
+                "page unit length {} != stride {}",
+                blob.len(),
+                self.stride
+            ))));
         }
         #[cfg(test)]
         if self.fault.get() == Fault::FailWritePage(page_id) {
@@ -291,32 +376,63 @@ impl PageIo {
                 "fault-injected write failure",
             )));
         }
+        let stride = self.stride;
         match &mut self.backing {
             Backing::File { file } => {
-                let offset = page_id * PAGE_SIZE as u64;
+                let offset = page_id * stride as u64;
                 file.seek(SeekFrom::Start(offset))?;
-                file.write_all(buf)?;
+                file.write_all(blob)?;
             }
-            Backing::Memory { pages } => {
-                // Match POSIX: writing past end extends, intermediate pages
+            Backing::Memory { bytes } => {
+                // Match POSIX: writing past end extends, intermediate units
                 // are zero-filled. Shadow paging and PageCache::new_page
                 // rely on this growth shape.
-                let idx = page_id as usize;
-                if idx >= pages.len() {
-                    pages.resize(idx + 1, [0u8; PAGE_SIZE]);
+                let off = (page_id * stride as u64) as usize;
+                let needed = off + stride;
+                if bytes.len() < needed {
+                    bytes.resize(needed, 0);
                 }
-                pages[idx] = *buf;
+                bytes[off..off + stride].copy_from_slice(blob);
             }
         }
         // I51: maintain the page-count cache. Writing past the current
         // end extends the file (POSIX behavior); intra-cache writes
-        // don't change it. Use max() so an idempotent write to an
-        // existing page doesn't decrement the count.
+        // don't change it.
         let needed = page_id + 1;
         if needed > self.cached_page_count.get() {
             self.cached_page_count.set(needed);
         }
         Ok(())
+    }
+
+    /// Read a single plaintext page by page ID. Returns the page contents
+    /// by value.
+    ///
+    /// Only valid when `stride == PAGE_SIZE` (the plaintext path). Encrypted
+    /// DBs go through `read_page_unit` directly from PageCache. Returning
+    /// `[u8; PAGE_SIZE]` by value keeps the layer buffer-free so callers
+    /// never accidentally alias the underlying File.
+    pub fn read_page(&mut self, page_id: u64) -> Result<[u8; PAGE_SIZE]> {
+        debug_assert_eq!(
+            self.stride, PAGE_SIZE,
+            "read_page called on an encrypted stride; use read_page_unit"
+        );
+        let blob = self.read_page_unit(page_id)?;
+        let mut buf = [0u8; PAGE_SIZE];
+        buf.copy_from_slice(&blob);
+        Ok(buf)
+    }
+
+    /// Write a single plaintext page by page ID.
+    ///
+    /// Only valid when `stride == PAGE_SIZE` (the plaintext path). See
+    /// `write_page_unit` for the encrypted path. Not durable until `fsync()`.
+    pub fn write_page(&mut self, page_id: u64, buf: &[u8; PAGE_SIZE]) -> Result<()> {
+        debug_assert_eq!(
+            self.stride, PAGE_SIZE,
+            "write_page called on an encrypted stride; use write_page_unit"
+        );
+        self.write_page_unit(page_id, buf)
     }
 
     /// Flush all writes to durable storage.
@@ -386,43 +502,42 @@ impl PageIo {
         self.fault.set(f);
     }
 
-    /// Return the number of whole pages in the file.
+    /// Return the number of whole stride-units (pages) in the file.
     ///
-    /// I51 (2026-05-22): returns the cached value. The cache is
-    /// seeded at `open()` from the initial file length and maintained
-    /// by `write_page()` (extend on writes past EOF) and
-    /// `set_page_count()` (resync on truncate/grow). Single-writer
-    /// flock + private-process ownership of the file makes the cache
-    /// always coherent — no external mutator can desync it.
+    /// I51 (2026-05-22): returns the cached value in stride-units. The cache
+    /// is seeded at `open()` from the initial file length divided by PAGE_SIZE
+    /// (the default stride), and re-seeded by `set_stride()` when the stride
+    /// changes. Maintained by `write_page_unit()` (extend on writes past EOF)
+    /// and `set_page_count()` (resync on truncate/grow). Single-writer flock +
+    /// private-process ownership of the file makes the cache always coherent.
     ///
-    /// I123 (ISSUES.md, 2026-06-21): takes `&self` — the body is a pure `Cell`
-    /// read (the I51 cached page count), so it never needed `&mut`. Dropping it
-    /// removes the latent double-borrow risk of forcing a `borrow_mut()` /
-    /// `io_mut()` on a semantically-read path. Callers holding `&mut` still work
-    /// (coercion); read-only paths can now use a shared borrow.
+    /// I123 (ISSUES.md, 2026-06-21): takes `&self` — pure Cell read, no
+    /// syscall. Dropping `&mut` removes the latent double-borrow risk.
     pub fn page_count(&self) -> Result<u64> {
         Ok(self.cached_page_count.get())
     }
 
-    /// Truncate (or extend) the file to exactly `n` pages.
+    /// Truncate (or extend) the file to exactly `n` stride-units (pages).
     ///
-    /// Used by defrag/truncate paths. Shrinking is destructive: pages at
-    /// id >= n become unreadable immediately. Callers must ensure those
-    /// pages are not referenced from any committed root before calling.
+    /// File length is `n * stride` bytes. Used by defrag/truncate paths.
+    /// Shrinking is destructive: pages at id >= n become unreadable
+    /// immediately. Callers must ensure those pages are not referenced
+    /// from any committed root before calling.
     pub fn set_page_count(&mut self, n: u64) -> Result<()> {
         if self.read_only {
             return Err(ChiselError::ReadOnlyMode);
         }
+        let stride = self.stride;
         match &mut self.backing {
             Backing::File { file } => {
-                file.set_len(n * PAGE_SIZE as u64)?;
+                file.set_len(n * stride as u64)?;
             }
-            Backing::Memory { pages } => {
-                pages.resize(n as usize, [0u8; PAGE_SIZE]);
+            Backing::Memory { bytes } => {
+                bytes.resize((n * stride as u64) as usize, 0);
             }
         }
         // I51: resync the page-count cache to the authoritative new
-        // length. Unlike write_page (which only grows), set_page_count
+        // length. Unlike write_page_unit (which only grows), set_page_count
         // can shrink too — overwrite the cache rather than max(cache, n).
         self.cached_page_count.set(n);
         Ok(())
@@ -835,5 +950,109 @@ mod tests {
         io.arm_fault(Fault::FailReadPage(0));
         assert!(matches!(io.read_page(0), Err(ChiselError::IoError(_))));
         assert!(io.read_page(0).is_ok(), "one-shot cleared");
+    }
+}
+
+#[cfg(test)]
+mod stride_tests {
+    use super::*;
+    use crate::crypto::ENC_PAGE_SIZE;
+
+    // Offset math must use the on-disk stride, not PAGE_SIZE. With an
+    // 8232-byte stride, page 2's blob lives at byte 16464, and page_count
+    // is reported in stride-units. In-memory backing so the test is
+    // filesystem-free.
+    #[test]
+    fn stride_8232_offsets_and_unit_roundtrip() {
+        let mut io = PageIo::open_in_memory().unwrap();
+        io.set_stride(ENC_PAGE_SIZE);
+        assert_eq!(io.stride(), ENC_PAGE_SIZE);
+
+        // Distinct 8232-byte blobs per page id.
+        let mut blob0 = vec![0u8; ENC_PAGE_SIZE];
+        blob0[0] = 0xA0;
+        blob0[ENC_PAGE_SIZE - 1] = 0x0A;
+        let mut blob2 = vec![0u8; ENC_PAGE_SIZE];
+        blob2[0] = 0xC2;
+        blob2[ENC_PAGE_SIZE - 1] = 0x2C;
+
+        io.write_page_unit(0, &blob0).unwrap();
+        io.write_page_unit(2, &blob2).unwrap(); // page 1 zero-filled by growth
+
+        // page_count is in stride-units: writing page 2 extends to 3.
+        assert_eq!(io.page_count().unwrap(), 3);
+
+        assert_eq!(io.read_page_unit(0).unwrap(), blob0);
+        assert_eq!(io.read_page_unit(2).unwrap(), blob2);
+        // The zero-filled gap page reads back as all zeros.
+        assert_eq!(io.read_page_unit(1).unwrap(), vec![0u8; ENC_PAGE_SIZE]);
+    }
+
+    // The plaintext stride (default) keeps PAGE_SIZE offset math intact.
+    #[test]
+    fn default_stride_is_page_size() {
+        let io = PageIo::open_in_memory().unwrap();
+        assert_eq!(io.stride(), PAGE_SIZE);
+    }
+
+    // A blob whose length != stride is a caller bug, not silent truncation.
+    #[test]
+    fn write_unit_wrong_length_is_invalid() {
+        let mut io = PageIo::open_in_memory().unwrap();
+        io.set_stride(ENC_PAGE_SIZE);
+        let short = vec![0u8; PAGE_SIZE]; // wrong: 8192 != 8232
+        assert!(io.write_page_unit(0, &short).is_err());
+    }
+
+    // set_stride re-seeds page_count in the new unit size.
+    #[test]
+    fn set_stride_reseeds_page_count_in_memory() {
+        let mut io = PageIo::open_in_memory().unwrap();
+        // Write 2 plaintext pages (stride == PAGE_SIZE by default).
+        io.write_page(0, &[0u8; PAGE_SIZE]).unwrap();
+        io.write_page(1, &[0u8; PAGE_SIZE]).unwrap();
+        assert_eq!(io.page_count().unwrap(), 2);
+
+        // After switching to ENC_PAGE_SIZE stride: 2 * 8192 = 16384 bytes.
+        // 16384 / 8232 = 1 full unit (remainder discarded by integer div).
+        io.set_stride(ENC_PAGE_SIZE);
+        assert_eq!(io.stride(), ENC_PAGE_SIZE);
+        assert_eq!(io.page_count().unwrap(), 1);
+    }
+
+    // set_page_count uses stride so the file length is n * stride bytes.
+    #[test]
+    fn set_page_count_uses_stride() {
+        let mut io = PageIo::open_in_memory().unwrap();
+        io.set_stride(ENC_PAGE_SIZE);
+        io.set_page_count(3).unwrap();
+        assert_eq!(io.page_count().unwrap(), 3);
+        // The flat byte vec must be exactly 3 * 8232 bytes.
+        // Verify indirectly: reading page 2 (zero-filled) must succeed.
+        assert_eq!(io.read_page_unit(2).unwrap(), vec![0u8; ENC_PAGE_SIZE]);
+        // And page 3 must be out-of-range.
+        assert!(matches!(
+            io.read_page_unit(3),
+            Err(ChiselError::InvalidPageId { page_id: 3 })
+        ));
+    }
+
+    // Plaintext read_page/write_page still work unchanged with the default stride.
+    #[test]
+    fn plaintext_wrappers_unchanged_at_default_stride() {
+        use tempfile::NamedTempFile;
+        let f = NamedTempFile::new().unwrap();
+        let mut io = PageIo::open(f.path(), false).unwrap();
+        assert_eq!(io.stride(), PAGE_SIZE);
+
+        let mut buf = [0u8; PAGE_SIZE];
+        buf[0] = 0x77;
+        buf[PAGE_SIZE - 1] = 0x99;
+        io.write_page(0, &buf).unwrap();
+        io.write_page(1, &[0xAB; PAGE_SIZE]).unwrap();
+
+        assert_eq!(io.page_count().unwrap(), 2);
+        assert_eq!(io.read_page(0).unwrap(), buf);
+        assert_eq!(io.read_page(1).unwrap(), [0xAB; PAGE_SIZE]);
     }
 }

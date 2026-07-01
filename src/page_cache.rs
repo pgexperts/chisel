@@ -41,6 +41,7 @@ use std::cell::Cell;
 
 use rustc_hash::FxHashMap;
 
+use crate::crypto::ENC_PAGE_SIZE;
 use crate::error::{ChiselError, Result};
 use crate::lru::LruIndex;
 use crate::page::{self, PAGE_SIZE};
@@ -132,6 +133,13 @@ pub struct PageCache {
     // Monotonically increasing allocator for shadow-paged new pages. Never
     // reused within a process lifetime except via `truncate()`.
     next_page_id: u64,
+    /// Page sealer/opener for encrypted DBs; `None` for plaintext. When `Some`,
+    /// `entries` always holds PLAINTEXT while the main file and spillway hold
+    /// CIPHERTEXT. Seal happens once at flush (Phase 1a) and at evict-to-spillway
+    /// (Task 3.4); open happens at cold load before `verify_checksum`. The caller
+    /// MUST have already called `io.set_stride(ENC_PAGE_SIZE)` before installing
+    /// the cipher so that on-disk offsets use the 8232-byte encrypted stride.
+    cipher: Option<crate::crypto::PageCipher>,
     // Cumulative-from-open counters. Cell<u64> so reads can go through
     // `&self` accessors (forward-compatible with a possible future where
     // get/new_page also become &self via interior mutability — today they
@@ -189,6 +197,7 @@ impl PageCache {
             spillway_location,
             spillway: None,
             next_page_id,
+            cipher: None,
             cache_hits: Cell::new(0),
             cache_misses: Cell::new(0),
             pages_allocated: Cell::new(0),
@@ -426,9 +435,16 @@ impl PageCache {
             // self.entries (filtered by dirty=true). Nothing between
             // the extend and this loop touches self.entries, so each
             // id is still present and still dirty.
-            let entry = self.entries.get_mut(&page_id).unwrap();
-            self.io.write_page(page_id, &entry.buf)?;
-            entry.dirty = false;
+            //
+            // Copy the plaintext out before calling write_sealed: write_sealed
+            // needs `&mut self` (to call self.io) while `entry` borrows
+            // self.entries. The 8 KB stack copy is the same cost as the COW
+            // paths elsewhere in the cache that already pay it.
+            let plaintext: [u8; PAGE_SIZE] = *self.entries.get(&page_id).unwrap().buf;
+            self.write_sealed(page_id, &plaintext)?;
+            // Mark clean only AFTER the write succeeds. On error the page
+            // stays dirty and the I1 poison model discards it.
+            self.entries.get_mut(&page_id).unwrap().dirty = false;
         }
         dirty_scratch.clear();
         self.dirty_scratch = dirty_scratch;
@@ -485,17 +501,50 @@ impl PageCache {
                 // effectively rolled back. If commit is ever made retryable,
                 // reorder to write_page-then-forget so a failed drain leaves the
                 // page recoverable from the spillway (review 2026-06-22).
-                let buf = {
+                // Drain: the spillway slot holds either a sealed 8232-byte
+                // ciphertext blob (encrypted DB) or a plaintext 8192-byte
+                // page image (plaintext DB). In both cases we copy it VERBATIM
+                // to the main file via write_page_unit — never re-seal.
+                //
+                // For the cache re-insertion we need the plaintext page, so:
+                //   - Encrypted: open the sealed blob → plaintext.
+                //   - Plaintext: the blob IS the plaintext.
+                //
+                // Seal-once invariant: the page was sealed exactly once, at
+                // eviction in maybe_evict Phase B. A second seal here would
+                // produce a new nonce and corrupt the on-disk unit.
+                let plaintext: Box<[u8; page::PAGE_SIZE]> = {
                     let spw = self.spillway.as_mut().unwrap();
-                    let b = spw.rehydrate(page_id)?;
+                    let blob = spw.rehydrate(page_id)?;
                     spw.forget(page_id);
-                    b
+                    match &self.cipher {
+                        Some(c) => {
+                            // blob is ENC_PAGE_SIZE bytes (sealed at eviction).
+                            // Copy verbatim to the main file, then open for cache.
+                            let unit: [u8; ENC_PAGE_SIZE] = blob
+                                .as_slice()
+                                .try_into()
+                                .map_err(|_| ChiselError::DecryptionFailed { page_id })?;
+                            self.io.write_page_unit(page_id, &unit)?;
+                            let pt = c
+                                .open(page_id, &unit)
+                                .map_err(|_| ChiselError::DecryptionFailed { page_id })?;
+                            Box::new(pt)
+                        }
+                        None => {
+                            // blob is PAGE_SIZE bytes; write directly.
+                            let pt: [u8; page::PAGE_SIZE] = blob
+                                .try_into()
+                                .map_err(|_| ChiselError::DecryptionFailed { page_id })?;
+                            self.io.write_page_unit(page_id, &pt)?;
+                            Box::new(pt)
+                        }
+                    }
                 };
-                self.io.write_page(page_id, &buf)?;
                 // Re-insert as clean: the bytes are now on the main file,
                 // so the cache entry is a valid read-through cache.
                 let entry = CacheEntry {
-                    buf: Box::new(buf),
+                    buf: plaintext,
                     dirty: false,
                 };
                 // Use the Entry API to avoid the clippy::map_entry pattern:
@@ -846,6 +895,34 @@ impl PageCache {
         self.drain_insertion = policy;
     }
 
+    /// Install the page cipher for an encrypted DB. The caller MUST have
+    /// already called `self.io_mut().set_stride(ENC_PAGE_SIZE)` so that
+    /// on-disk offset arithmetic uses the 8232-byte encrypted stride.
+    /// Set once at open time after the DEK is unwrapped (or generated).
+    pub fn set_cipher(&mut self, cipher: crate::crypto::PageCipher) {
+        self.cipher = Some(cipher);
+    }
+
+    /// Seal a plaintext page and write its on-disk unit.
+    ///
+    /// For an encrypted DB (cipher present): seals the 8192-byte plaintext
+    /// into the 8232-byte `ct‖tag‖nonce` blob then calls `write_page_unit`.
+    /// For a plaintext DB: calls `write_page_unit` directly with the 8192-byte
+    /// image (stride == PAGE_SIZE, so the unit is the page image itself).
+    ///
+    /// This is the seal point for flush Phase 1a (in-cache dirty pages →
+    /// main file). Evict-to-spillway seals independently in maybe_evict
+    /// Phase B (seal-once invariant: each page is sealed exactly once).
+    fn write_sealed(&mut self, page_id: u64, plaintext: &[u8; PAGE_SIZE]) -> Result<()> {
+        match &self.cipher {
+            Some(c) => {
+                let blob = c.seal(page_id, plaintext);
+                self.io.write_page_unit(page_id, &blob)
+            }
+            None => self.io.write_page_unit(page_id, plaintext),
+        }
+    }
+
     /// Check if a page is dirty in the cache.
     ///
     /// Used by the transaction layer to reason about whether a page is
@@ -886,12 +963,32 @@ impl PageCache {
         // pre-transaction bytes.
         if let Some(spw) = self.spillway.as_mut() {
             if spw.is_resident(page_id) {
-                let buf = spw.rehydrate(page_id)?;
+                // Rehydrate: the spillway holds either a sealed blob (encrypted DB)
+                // or raw plaintext (plaintext DB). Open ciphertext → plaintext
+                // before re-inserting into the cache. The page is still dirty
+                // (it was dirty when it was evicted to the spillway).
+                let blob = spw.rehydrate(page_id)?;
                 spw.forget(page_id);
+                let buf: Box<[u8; page::PAGE_SIZE]> = match &self.cipher {
+                    Some(c) => {
+                        let unit: [u8; ENC_PAGE_SIZE] = blob
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| ChiselError::DecryptionFailed { page_id })?;
+                        let pt = c
+                            .open(page_id, &unit)
+                            .map_err(|_| ChiselError::DecryptionFailed { page_id })?;
+                        Box::new(pt)
+                    }
+                    None => Box::new(
+                        blob.try_into()
+                            .map_err(|_| ChiselError::DecryptionFailed { page_id })?,
+                    ),
+                };
                 self.entries.insert(
                     page_id,
                     CacheEntry {
-                        buf: Box::new(buf),
+                        buf,
                         dirty: true, // re-loaded spilled page is dirty
                     },
                 );
@@ -904,14 +1001,41 @@ impl PageCache {
         // Fall through to disk: the page is not spilled, so its
         // last-committed bytes live in the main file (or the page id
         // is bogus, in which case PageIo will surface it).
-        let buf = self.io.read_page(page_id)?;
-        if !page::verify_checksum(&buf) {
+        //
+        // Use a stack-allocated ENC_PAGE_SIZE buffer (the maximum on-disk unit)
+        // and read only the first `stride` bytes — no heap allocation on this
+        // hot path regardless of whether the DB is encrypted. The cipher branch
+        // verifies the AEAD tag (anti-tamper) before the plaintext is cached;
+        // the plaintext branch runs verify_checksum on the raw page bytes as before.
+        let mut on_disk = [0u8; ENC_PAGE_SIZE];
+        let stride = self.io.stride();
+        self.io
+            .read_page_unit_into(page_id, &mut on_disk[..stride])?;
+
+        let plaintext: [u8; PAGE_SIZE] = match &self.cipher {
+            Some(c) => {
+                // The on-disk unit is exactly ENC_PAGE_SIZE at this stride;
+                // the try_into is infallible (ENC_PAGE_SIZE == 8232 == stride).
+                let unit: [u8; ENC_PAGE_SIZE] = on_disk;
+                c.open(page_id, &unit)
+                    .map_err(|_| ChiselError::DecryptionFailed { page_id })?
+            }
+            // Plaintext: the first PAGE_SIZE bytes of the on_disk buffer ARE the
+            // page image (stride == PAGE_SIZE here, so the copy takes exactly 8192 bytes).
+            None => {
+                let mut buf = [0u8; PAGE_SIZE];
+                buf.copy_from_slice(&on_disk[..PAGE_SIZE]);
+                buf
+            }
+        };
+
+        if !page::verify_checksum(&plaintext) {
             return Err(ChiselError::ChecksumMismatch { page_id });
         }
         self.entries.insert(
             page_id,
             CacheEntry {
-                buf: Box::new(buf),
+                buf: Box::new(plaintext),
                 dirty: false,
             },
         );
@@ -1057,9 +1181,19 @@ impl PageCache {
             // so `&entry.buf` does not conflict with the `&mut self` borrow that
             // `ensure_spillway` takes. An `ensure_spillway()` open error (I/O)
             // is restored the same way.
+            // Seal-once invariant (Task 3.4): for an encrypted DB, seal the
+            // plaintext page here before handing the bytes to the spillway.
+            // The spillway then holds ciphertext for the lifetime of the txn.
+            // Drain will copy that ciphertext verbatim to the main file (no
+            // second seal). Rehydrate (load_page spillway branch) will open it.
+            // For plaintext DBs the page bytes are stored as-is (no cipher).
+            let spill_blob: Vec<u8> = match &self.cipher {
+                Some(c) => c.seal(victim_id, entry.buf.as_ref()).to_vec(),
+                None => entry.buf.as_ref().to_vec(),
+            };
             let spill_result = self
                 .ensure_spillway()
-                .and_then(|spw| spw.spill(victim_id, &entry.buf));
+                .and_then(|spw| spw.spill(victim_id, &spill_blob));
             if let Err(e) = spill_result {
                 if entry.dirty {
                     self.dirty_count += 1;
@@ -1097,12 +1231,21 @@ impl PageCache {
         // otherwise create a sidecar file for what is supposed to be a
         // read-only open.
         if self.spillway.is_none() {
+            // Encrypted DBs store the sealed 8232-byte unit in each slot so the
+            // spillway NEVER holds plaintext (seal-once invariant, Task 3.4).
+            // Plaintext DBs use the historical 8192-byte payload; slot layout is
+            // SLOT_HEADER_SIZE + payload_size in both cases.
+            let payload_size = if self.cipher.is_some() {
+                ENC_PAGE_SIZE
+            } else {
+                page::PAGE_SIZE
+            };
             let spw = match &self.spillway_location {
                 crate::SpillwayLocation::Path(p) => {
-                    crate::spillway::Spillway::open_file(p, self.spillway_max_bytes)?
+                    crate::spillway::Spillway::open_file(p, self.spillway_max_bytes, payload_size)?
                 }
                 crate::SpillwayLocation::InMemory => {
-                    crate::spillway::Spillway::open_memory(self.spillway_max_bytes)
+                    crate::spillway::Spillway::open_memory(self.spillway_max_bytes, payload_size)
                 }
             };
             self.spillway = Some(spw);
@@ -1751,6 +1894,318 @@ mod tests {
             cache.entries.values().filter(|e| e.dirty).count(),
             0,
             "phase-1a cleared the real dirty flags, not just the counter"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Encrypted page-cache tests (Task 3.3)
+    // -----------------------------------------------------------------------
+
+    use crate::crypto::{random_dek, PageCipher, ENC_PAGE_SIZE};
+
+    /// Build a file-backed cache with stride=ENC_PAGE_SIZE and a PageCipher
+    /// installed. The stride must be set on the PageIo BEFORE construction so
+    /// page_count() is seeded correctly; the cipher is installed via set_cipher.
+    fn fresh_encrypted_cache(max_pages: usize) -> (TempDir, PageCache) {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.chisel");
+        let mut io = PageIo::open(&db_path, false).unwrap();
+        io.set_stride(ENC_PAGE_SIZE);
+        let cache_max_bytes = max_pages as u64 * PAGE_SIZE as u64;
+        let mut cache = PageCache::new(
+            io,
+            cache_max_bytes,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
+        cache.set_cipher(PageCipher::new(random_dek()));
+        (dir, cache)
+    }
+
+    /// A plaintext data page written, flushed, evicted, and cold-loaded must
+    /// round-trip its exact bytes through the plaintext path (no cipher branch).
+    ///
+    /// NOTE: use offsets < CHECKSUM_OFFSET (8184) — stamp_checksum overwrites
+    /// bytes 8184..8192 with the XXH3 hash, which is what cold-load verifies.
+    #[test]
+    fn plaintext_page_roundtrip_unaffected() {
+        let (_dir, mut cache) = fresh_cache(8);
+        let pid = cache.new_page().unwrap();
+        {
+            let buf = cache.get_mut(pid).unwrap();
+            buf[0] = 0x11;
+            buf[4096] = 0xFF; // mid-page, before checksum region (8184..8192)
+            page::stamp_checksum(buf);
+        }
+        cache.flush().unwrap();
+        cache.test_drop_from_cache(pid);
+        let read = cache.get(pid).unwrap();
+        assert_eq!(read[0], 0x11);
+        assert_eq!(read[4096], 0xFF);
+    }
+
+    /// Encrypted data-page round-trip: write → flush (seals to disk) → evict
+    /// → cold load (opens from disk) → plaintext bytes match original.
+    ///
+    /// NOTE: use offsets < CHECKSUM_OFFSET (8184) — stamp_checksum overwrites
+    /// bytes 8184..8192 with the XXH3 hash, which is what cold-load verifies.
+    #[test]
+    fn encrypted_page_round_trips_through_seal_open() {
+        let (_dir, mut cache) = fresh_encrypted_cache(8);
+        let pid = cache.new_page().unwrap();
+        {
+            let buf = cache.get_mut(pid).unwrap();
+            buf[0] = 0x9C;
+            buf[4096] = 0xC9; // middle of the page body, before the checksum region
+            page::stamp_checksum(buf);
+        }
+        cache.flush().unwrap();
+        // Force a cold read: drop from cache so load_page hits the disk unit.
+        cache.test_drop_from_cache(pid);
+        let read = cache.get(pid).unwrap();
+        assert_eq!(read[0], 0x9C, "first byte must survive seal/open");
+        assert_eq!(read[4096], 0xC9, "mid-page byte must survive seal/open");
+    }
+
+    // -----------------------------------------------------------------------
+    // Encrypted spillway tests (Task 3.4)
+    // -----------------------------------------------------------------------
+
+    /// Encrypted cache + spillway helper: stride=ENC_PAGE_SIZE, cipher installed,
+    /// spillway enabled (InMemory for filesystem independence). `max_pages` is
+    /// the strict cache cap; `spillway_pages` is the spillway capacity in pages
+    /// (each spilled slot is ENC_PAGE_SIZE bytes, so spillway_max_bytes reflects that).
+    fn fresh_encrypted_cache_with_spillway(
+        max_pages: usize,
+        spillway_pages: usize,
+    ) -> (TempDir, PageCache) {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.chisel");
+        let mut io = PageIo::open(&db_path, false).unwrap();
+        io.set_stride(ENC_PAGE_SIZE);
+        let cache_max_bytes = max_pages as u64 * PAGE_SIZE as u64;
+        // Spillway slots hold ENC_PAGE_SIZE bytes each for encrypted DBs.
+        let spillway_max_bytes =
+            (spillway_pages as u64) * (crate::spillway::SLOT_HEADER_SIZE + ENC_PAGE_SIZE) as u64;
+        let mut cache = PageCache::new(
+            io,
+            cache_max_bytes,
+            spillway_max_bytes,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
+        cache.set_cipher(PageCipher::new(random_dek()));
+        (dir, cache)
+    }
+
+    /// Spilling an encrypted page must store ciphertext in the spillway slot,
+    /// not plaintext. We write a known sentinel byte to page A, force it to
+    /// spill by allocating enough pages to overflow the cache, then read the
+    /// raw spillway slot bytes and assert the sentinel is NOT present verbatim.
+    #[test]
+    fn encrypted_spill_stores_ciphertext_not_plaintext() {
+        // 2-page cache; spillway fits 4 encrypted pages.
+        let (_dir, mut cache) = fresh_encrypted_cache_with_spillway(2, 4);
+
+        let id_a = cache.new_page().unwrap();
+        {
+            let buf = cache.get_mut(id_a).unwrap();
+            // Distinctive 8-byte sentinel at offset 0 (before checksum region).
+            buf[..8].copy_from_slice(b"SENTINEL");
+            page::stamp_checksum(buf);
+        }
+
+        // Force id_a to spill: two more allocations overflow the 2-page cache.
+        cache.new_page().unwrap();
+        cache.new_page().unwrap();
+
+        // id_a is now in the spillway, not the cache.
+        assert!(
+            !cache.entries.contains_key(&id_a),
+            "page A should have spilled out of the cache"
+        );
+        {
+            let spw = cache.spillway.as_ref().unwrap();
+            assert!(spw.is_resident(id_a), "page A must be in the spillway");
+        }
+        // Read the spillway slot bytes and confirm the plaintext sentinel is absent.
+        // `rehydrate` returns the stored blob (verifying the slot checksum); for an
+        // encrypted DB that blob is XChaCha20-Poly1305 ciphertext — the sentinel
+        // must NOT appear verbatim anywhere in it.
+        let blob = cache.spillway.as_mut().unwrap().rehydrate(id_a).unwrap();
+        let sentinel_pos = blob.windows(8).position(|w| w == b"SENTINEL");
+        assert!(
+            sentinel_pos.is_none(),
+            "plaintext sentinel found verbatim in spillway slot — spill did not encrypt"
+        );
+    }
+
+    /// After spilling encrypted pages and flushing (drain → main file), a cold
+    /// read of each spilled page must return the correct plaintext.
+    #[test]
+    fn encrypted_spill_drain_and_cold_read_round_trips() {
+        // 2-page cache; spillway for 4 encrypted pages. Allocate 4 total: 2 in
+        // cache, 2 spilled. Flush drains to the main file; then evict all and
+        // cold-read all four back.
+        let (_dir, mut cache) = fresh_encrypted_cache_with_spillway(2, 4);
+
+        let mut ids = Vec::new();
+        for n in 0..4u8 {
+            let pid = cache.new_page().unwrap();
+            {
+                let buf = cache.get_mut(pid).unwrap();
+                buf[0] = 0x40 | n; // distinct sentinel per page
+                page::stamp_checksum(buf);
+            }
+            ids.push(pid);
+        }
+        // Drain spilled pages to main file and write remaining in-cache dirty pages.
+        cache.flush().unwrap();
+
+        // Evict all entries so every subsequent get() is a cold disk read.
+        for &pid in &ids {
+            cache.test_drop_from_cache(pid);
+        }
+
+        // Cold read: each page must return its plaintext sentinel.
+        for (n, &pid) in ids.iter().enumerate() {
+            let buf = cache.get(pid).unwrap();
+            assert_eq!(
+                buf[0],
+                0x40 | n as u8,
+                "page {pid} cold-read returned wrong byte after encrypted spill+drain"
+            );
+        }
+    }
+
+    /// Rehydrate path: reading a page that is STILL resident in the spillway
+    /// (not yet drained) must return the correct plaintext, NOT disk content.
+    #[test]
+    fn encrypted_rehydrate_returns_correct_plaintext() {
+        let (_dir, mut cache) = fresh_encrypted_cache_with_spillway(2, 4);
+
+        let id_a = cache.new_page().unwrap();
+        {
+            let buf = cache.get_mut(id_a).unwrap();
+            buf[0] = 0xEE;
+            page::stamp_checksum(buf);
+        }
+
+        // Force id_a to spill.
+        cache.new_page().unwrap();
+        cache.new_page().unwrap();
+
+        assert!(
+            !cache.entries.contains_key(&id_a),
+            "precondition: id_a must be spilled, not cached"
+        );
+        assert!(cache.spillway.as_ref().unwrap().is_resident(id_a));
+
+        // Reading id_a rehydrates from the spillway — must not see disk zeros.
+        let buf = cache.get(id_a).unwrap();
+        assert_eq!(
+            buf[0], 0xEE,
+            "rehydrated encrypted page must return in-flight plaintext"
+        );
+    }
+
+    /// Full end-to-end: encrypted DB, several pages force spill, commit
+    /// (flush drains), DB is reopened (simulated by cold-evicting all entries),
+    /// all pages cold-read back correctly.
+    #[test]
+    fn encrypted_spill_full_round_trip_multiple_pages() {
+        let (_dir, mut cache) = fresh_encrypted_cache_with_spillway(2, 8);
+
+        let mut ids = Vec::new();
+        for n in 0..6u8 {
+            let pid = cache.new_page().unwrap();
+            {
+                let buf = cache.get_mut(pid).unwrap();
+                buf[0] = n;
+                buf[100] = n.wrapping_mul(7);
+                page::stamp_checksum(buf);
+            }
+            ids.push(pid);
+        }
+
+        cache.flush().unwrap();
+
+        for &pid in &ids {
+            cache.test_drop_from_cache(pid);
+        }
+
+        for (n, &pid) in ids.iter().enumerate() {
+            let buf = cache.get(pid).unwrap();
+            assert_eq!(
+                buf[0], n as u8,
+                "page {pid} byte[0] mismatch after full round trip"
+            );
+            assert_eq!(
+                buf[100],
+                (n as u8).wrapping_mul(7),
+                "page {pid} byte[100] mismatch after full round trip"
+            );
+        }
+    }
+
+    /// Plaintext spill/drain must be byte-identical to before Task 3.4 —
+    /// no cipher, slot is PAGE_SIZE, drain goes through write_page_unit.
+    #[test]
+    fn plaintext_spill_drain_unchanged() {
+        let max_pages = 2;
+        let spillway_bytes = 4 * PAGE_SIZE as u64;
+        let (_dir, mut cache) = fresh_cache_with_spillway(max_pages, spillway_bytes);
+
+        let mut ids = Vec::new();
+        for n in 0..4u8 {
+            let pid = cache.new_page().unwrap();
+            {
+                let buf = cache.get_mut(pid).unwrap();
+                buf[0] = 0xB0 | n;
+                page::stamp_checksum(buf);
+            }
+            ids.push(pid);
+        }
+        cache.flush().unwrap();
+
+        for &pid in &ids {
+            cache.test_drop_from_cache(pid);
+        }
+        for (n, &pid) in ids.iter().enumerate() {
+            let buf = cache.get(pid).unwrap();
+            assert_eq!(
+                buf[0],
+                0xB0 | n as u8,
+                "plaintext spill/drain page {pid} byte mismatch"
+            );
+        }
+    }
+
+    /// Tampering with a ciphertext byte must surface DecryptionFailed (AEAD
+    /// authentication failure). This proves the AEAD tag is verified on open.
+    #[test]
+    fn tampered_ciphertext_surfaces_decryption_failed() {
+        let (_dir, mut cache) = fresh_encrypted_cache(8);
+        let pid = cache.new_page().unwrap();
+        {
+            let buf = cache.get_mut(pid).unwrap();
+            buf[10] = 0x42;
+            page::stamp_checksum(buf);
+        }
+        cache.flush().unwrap();
+        cache.test_drop_from_cache(pid);
+        // Flip one byte inside the 8192-byte ciphertext region (byte 42 of the
+        // 8232-byte on-disk unit, well before the 16-byte tag at bytes 8192..8208).
+        {
+            let mut blob = cache.io_mut().read_page_unit(pid).unwrap();
+            blob[42] ^= 0x01;
+            cache.io_mut().write_page_unit(pid, &blob).unwrap();
+        }
+        let err = cache.get(pid).unwrap_err();
+        assert!(
+            matches!(err, ChiselError::DecryptionFailed { page_id } if page_id == pid),
+            "expected DecryptionFailed, got {err:?}"
         );
     }
 }

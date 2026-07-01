@@ -64,6 +64,31 @@ libc = "0.2"
 # (this is only the third runtime dependency). The crates.io package is
 # `rustc-hash` (hyphen); the import path is `rustc_hash` (underscore).
 rustc-hash = "2"
+# On-disk encryption (spec 2026-06-29). All pure-Rust, well-vetted RustCrypto
+# primitives — rolling our own crypto is forbidden. These reach the published
+# crate's dependency tree only when a DB is opened with an encryption key, but
+# they are unconditional deps (the seal/open code is always compiled). Versions
+# pinned to the audited RustCrypto generation current as of 2026-06.
+chacha20poly1305 = "0.10"   # XChaCha20-Poly1305 AEAD (192-bit nonce)
+argon2 = "0.5"              # Argon2id passphrase KDF (memory-hard)
+hkdf = "0.12"               # HKDF-SHA256 raw-key KDF
+sha2 = "0.10"               # SHA-256 for HKDF
+# I61-style tilde pin: zeroize 1.9.0 AND its `zeroize_derive` macro both
+# bumped to `edition2024` (Rust 1.85+), which would push chisel's library
+# MSRV above the 1.82 floor enforced by the msrv CI job. `~1.8` (>=1.8.0,
+# <1.9.0) holds the last edition-2021 line of the core crate. We use only
+# `Zeroizing<T>` — no #[derive(Zeroize)] anywhere — so the `derive` feature
+# is dropped entirely, keeping the edition2024 `zeroize_derive` out of the
+# tree. Lift when the floor moves past 1.85; mirrors clap `~4.5` in bench.
+zeroize = "~1.8"  # wipe key material on drop (Zeroizing<T>)
+getrandom = "0.2"           # OS RNG for DEK / nonce / salt generation
+# I61-style floor pin on a TRANSITIVE dep (not used directly). argon2 0.5.3
+# hard-depends on base64ct; base64ct 1.7+ went edition2024 (Rust 1.85+), which
+# would break the 1.82 MSRV floor (msrv CI job). `~1.6` (>=1.6.0, <1.7.0) holds
+# the last edition-2021 line. base64ct only encodes PHC hash strings, which we
+# never emit (we call argon2's raw hash_password_into), so the pinned version's
+# code path is never exercised. Lift when the MSRV floor moves past 1.85.
+base64ct = "~1.6"
 
 [dev-dependencies]
 tempfile = "3"

@@ -36,6 +36,7 @@
 // them from a downstream crate requires either a path-dep with
 // #[cfg(test)] access (the bench subcrate does this implicitly
 // through the public API) or copying the relevant logic out.
+pub(crate) mod crypto;
 pub(crate) mod data_page;
 pub(crate) mod defrag;
 pub(crate) mod error;
@@ -72,10 +73,17 @@ pub use defrag::{DefragOptions, DefragStats};
 pub use handle::{Handle, Tag, TagDropProgress};
 pub use page::PAGE_SIZE;
 pub use stats::{ChiselCounters, Stats};
+// SlotDefect and SuperblockDefect were public before this branch (pre-existing API).
 pub use superblock::{
     SlotDefect, SuperblockDefect, DEFAULT_SUPERBLOCK_COUNT, MAX_SUPERBLOCKS, MIN_SUPERBLOCKS,
     NAMED_ROOT_COUNT, NAMED_ROOT_NAME_LEN,
 };
+// format_major was public before this branch (I29 read-dispatch).
+pub use page::format_major;
+// Key and Argon2Params are public API (callers need them to open encrypted DBs).
+// Crypto internals (PageCipher, CryptoError, raw constants) are pub(crate) in
+// their source modules and not re-exported here.
+pub use crypto::{Argon2Params, Key};
 
 use std::path::Path;
 
@@ -137,6 +145,19 @@ pub struct Options {
     pub create_if_missing: bool,
     pub read_only: bool,
     pub superblock_count: u32,
+    /// Encryption key for an encrypted database. `None` (default) opens or
+    /// creates a plaintext DB. On create, `Some(key)` makes a new encrypted
+    /// DB sealed under a random DEK wrapped by this key. On reopen, the key
+    /// must unwrap one of the on-disk key slots or `open` returns
+    /// `InvalidEncryptionKey`. Supplying a key to open a plaintext DB returns
+    /// `EncryptionNotSupported`; omitting it on an encrypted DB returns
+    /// `NoEncryptionKey`.
+    pub encryption_key: Option<Key>,
+    /// Argon2id cost parameters used to derive the KEK from a `Key::Passphrase`
+    /// on *create*. `None` uses `Argon2Params::default()` (OWASP: 19 MiB / t=2 /
+    /// p=1). Ignored for `Key::Raw` (HKDF, no cost params) and on reopen (the
+    /// params are read from the key slot the file was written with).
+    pub argon2_params: Option<Argon2Params>,
 }
 
 /// Where commit-drain rehydrated pages are inserted into the LRU.
@@ -187,6 +208,8 @@ impl Default for Options {
             create_if_missing: true,
             read_only: false,
             superblock_count: superblock::DEFAULT_SUPERBLOCK_COUNT,
+            encryption_key: None,
+            argon2_params: None,
         }
     }
 }
@@ -232,6 +255,23 @@ impl Options {
     /// header.
     pub fn superblock_count(mut self, count: u32) -> Self {
         self.superblock_count = count;
+        self
+    }
+
+    /// Set the encryption key. On create, a fresh DEK is generated and
+    /// wrapped into key-slot 0 under a KEK derived from this key; the
+    /// superblock is stamped MAJOR=2. On open, the key is used to unwrap
+    /// the stored DEK from the matching slot. See [`Options::encryption_key`]
+    /// for the full create-vs-reopen semantics.
+    pub fn encryption_key(mut self, key: Key) -> Self {
+        self.encryption_key = Some(key);
+        self
+    }
+    /// Set the Argon2id cost parameters used when deriving a KEK from a
+    /// passphrase on database creation. No effect for raw keys or on reopen
+    /// (the stored slot carries its own params). See [`Options::argon2_params`].
+    pub fn argon2_params(mut self, params: Argon2Params) -> Self {
+        self.argon2_params = Some(params);
         self
     }
 }
@@ -303,9 +343,12 @@ impl Chisel {
     /// # Errors
     /// `InvalidSuperblockCount` (the `superblock_count` option is out of
     /// range), `FileNotFound` (no file at `path` and `create_if_missing` is
-    /// false), or `LockFailed` (another handle holds the exclusive flock). When
-    /// reopening an existing file, parsing the superblock can also yield
-    /// `UnsupportedFormatVersion`, `CorruptSuperblock`,
+    /// false), or `LockFailed` (another handle holds the exclusive flock).
+    /// For an encrypted database: `NoEncryptionKey` (file is encrypted but
+    /// no `encryption_key` given), `InvalidEncryptionKey` (key unwraps no
+    /// key slot), or `EncryptionNotSupported` (key given for a plaintext
+    /// file). When reopening an existing file, parsing the superblock can
+    /// also yield `UnsupportedFormatVersion`, `CorruptSuperblock`,
     /// `ChecksumMismatch`, `FileSizeMismatch`, or `IoError`.
     pub fn open(path: &Path, options: Options) -> Result<Chisel> {
         // R4: validate superblock_count before touching the file.
@@ -341,9 +384,14 @@ impl Chisel {
         let txm = if file_exists {
             // Existing database: N is discovered from the on-disk
             // superblock. options.superblock_count is ignored here.
-            TransactionManager::open_existing(cache)?
+            TransactionManager::open_existing(cache, options.encryption_key.clone())?
         } else {
-            TransactionManager::create_new(cache, options.superblock_count)?
+            TransactionManager::create_new(
+                cache,
+                options.superblock_count,
+                options.encryption_key.clone(),
+                options.argon2_params,
+            )?
         };
 
         Ok(Chisel { txm })
@@ -401,7 +449,12 @@ impl Chisel {
             options.drain_insertion,
             SpillwayLocation::InMemory,
         );
-        let txm = TransactionManager::create_new(cache, options.superblock_count)?;
+        let txm = TransactionManager::create_new(
+            cache,
+            options.superblock_count,
+            options.encryption_key.clone(),
+            options.argon2_params,
+        )?;
         Ok(Chisel { txm })
     }
 
@@ -889,5 +942,75 @@ impl Chisel {
     /// `TransactionInProgress` if a transaction is active.
     pub fn set_drain_insertion(&mut self, policy: DrainInsertion) -> Result<()> {
         self.txm.set_drain_insertion(policy)
+    }
+
+    /// Add a second credential that unlocks this database. `existing` must
+    /// already unlock it; `new` is wrapped over the same data key into a free
+    /// key slot. After this returns, either credential opens the database. O(1)
+    /// superblock commit — no page is re-encrypted.
+    ///
+    /// # Errors
+    /// `EncryptionNotSupported` if the database has no encryption;
+    /// `InvalidEncryptionKey` if `existing` unlocks no slot; `NoFreeKeySlot` if
+    /// all 8 key slots are full. An fsync/superblock failure is fatal and poisons
+    /// the handle.
+    pub fn add_key(&mut self, existing: &crypto::Key, new: &crypto::Key) -> Result<()> {
+        self.txm.add_key(existing, new)
+    }
+
+    /// Replace `old` with `new`: `new` is added and `old` is revoked in one
+    /// atomic superblock commit. After this returns, `old` no longer opens the
+    /// database and `new` does. O(1) — the data key is unchanged, no page is
+    /// re-encrypted.
+    ///
+    /// # Errors
+    /// `EncryptionNotSupported` if the database has no encryption;
+    /// `InvalidEncryptionKey` if `old` unlocks no slot; `NoFreeKeySlot` if all 8
+    /// key slots are full (no room to stage `new` before revoking `old`). An
+    /// fsync/superblock failure is fatal and poisons the handle.
+    pub fn rotate_key(&mut self, old: &crypto::Key, new: &crypto::Key) -> Result<()> {
+        self.txm.rotate_key(old, new)
+    }
+
+    /// Revoke the credential `key`. After this returns, `key` no longer opens
+    /// the database; any other credentials are unaffected. Refuses to remove
+    /// the only remaining credential. O(1) — the data key is unchanged, no
+    /// page is re-encrypted.
+    ///
+    /// # Errors
+    /// `EncryptionNotSupported` if the database has no encryption;
+    /// `InvalidEncryptionKey` if `key` unlocks no slot; `LastKeySlot` if
+    /// `key` is the only active credential (removing it would make the database
+    /// permanently unopenable — nothing is changed). An fsync/superblock
+    /// failure is fatal and poisons the handle.
+    pub fn remove_key(&mut self, key: &crypto::Key) -> Result<()> {
+        self.txm.remove_key(key)
+    }
+}
+
+#[cfg(test)]
+mod options_encryption_tests {
+    use super::*;
+
+    // The two encryption fields default to None (a plaintext DB) and round-trip
+    // through the chained-setter builder, preserving #[non_exhaustive] (callers
+    // can't struct-literal, so the setters are the only construction path).
+    #[test]
+    fn encryption_options_default_none_and_set() {
+        let o = Options::default();
+        assert!(o.encryption_key.is_none());
+        assert!(o.argon2_params.is_none());
+
+        let raw = Key::Raw(zeroize::Zeroizing::new(vec![0u8; 32]));
+        let o = Options::default()
+            .encryption_key(raw)
+            .argon2_params(Argon2Params {
+                m_cost: 19456,
+                t_cost: 2,
+                p_cost: 1,
+            });
+        assert!(matches!(o.encryption_key, Some(Key::Raw(_))));
+        let p = o.argon2_params.expect("set above");
+        assert_eq!((p.m_cost, p.t_cost, p.p_cost), (19456, 2, 1));
     }
 }

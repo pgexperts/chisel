@@ -600,6 +600,7 @@ fn test_recovery_superblock_pointing_past_eof_is_rejected() {
         superblock_count: crate::superblock::DEFAULT_SUPERBLOCK_COUNT,
         root_membership_index_page: page::PAGE_ID_NONE,
         freemap_depth: 0,
+        encryption: None,
     };
     let buf = sb.serialize();
     {
@@ -654,6 +655,7 @@ fn test_recovery_superblock_total_pages_max_is_rejected_not_panic() {
         superblock_count: crate::superblock::DEFAULT_SUPERBLOCK_COUNT,
         root_membership_index_page: page::PAGE_ID_NONE,
         freemap_depth: 0,
+        encryption: None,
     };
     let buf = sb.serialize();
     {
@@ -770,6 +772,7 @@ fn test_reject_unsupported_format_version() {
         superblock_count: crate::superblock::DEFAULT_SUPERBLOCK_COUNT,
         root_membership_index_page: page::PAGE_ID_NONE,
         freemap_depth: 0,
+        encryption: None,
     };
     let buf_a = sb.serialize();
     sb.txn_counter = 4;

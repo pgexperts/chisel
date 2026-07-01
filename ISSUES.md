@@ -1705,3 +1705,23 @@ Suggested order for this cluster: **I108** (CI lint hole) and **I111** (radix pr
 **Disposition (decomposed, then deliberately stopped):** Worked incrementally — a directory-module split by concern plus four extracted units: `SlotPacker` (R1 packing, #77), `FreemapRecycle` (structural recycle + persist/reclaim, #78), `CommitProtocol` (the 3-fsync sequence, #79), and a `#[cfg(test)] FaultInjector` (#76). All behavior-preserving (the existing suite is the oracle; FreemapRecycle additionally passed a 4-lens adversarial review). The planned final unit — `StagingTxn` (the BUG#2 atomic `allocate_inner` prepare/install) — was **deliberately NOT extracted**: the candidate-prepare/install vocabulary (`handle_table_insert_candidate`, `membership_insert_candidate`, `membership_remove_candidate`, `abort_allocate_prepare`, `inject_membership_failure`, `insert_into_data_page`) is **shared across `allocate_inner` (staging.rs) AND `update_inner`/`delete_inner` (mutate.rs)**, so a context-based extraction cannot be contained to staging.rs — it would force the most delicate mutation paths + packing.rs through a mechanical wrapper change for little cohesion gain. `staging.rs` is already a focused, holdable-in-context concern file.
 
 **Future work (incremental only):** if/when the staging paths are touched for a real reason, fold the shared vocabulary into a `StagingTxn` unit at that point. Do NOT re-trigger a standalone extraction from the SMELL alone — the engine passes every test; on a green, pre-production engine a below-bug structural finding is the lowest-value, highest-risk change (this whole decomposition was a large undertaking driven by one SMELL). The remaining `transaction.rs` SMELL items below the extraction (the test-only flags) are already addressed by the `FaultInjector` split.
+
+---
+
+## On-disk encryption
+
+Source: **[encryption 2026-06-29]** — deferred work captured while implementing the on-disk encryption feature (design at `docs/specs/2026-06-29-on-disk-encryption-design.md`).
+
+#### I142. Bulk DEK rotation (full re-encryption under a new DEK) is not implemented — **P3** ⏸ DEFERRED 2026-06-29
+
+**Where:** `src/lib.rs`, `src/transaction/keys.rs`, `src/crypto/mod.rs`
+
+**Problem:** There are two distinct "key rotation" operations with very different costs:
+
+1. **Credential rotation** (KEK re-wrap): derives a new KEK from a new passphrase or raw key and re-wraps the existing DEK into a key slot. This is O(1) — it touches only the superblock — and is fully implemented via `add_key` / `rotate_key` / `remove_key`.
+
+2. **Bulk DEK rotation** (full re-encryption): generates a fresh DEK, re-encrypts every data page under the new DEK, and replaces the wrapped DEK in all active key slots. This is O(total\_pages) — it must rewrite the entire database file — and is **not yet implemented**.
+
+Bulk DEK rotation is only needed when the DEK itself is believed compromised (e.g., a process memory dump exposed the in-session DEK). Credential rotation — the far more common operational need (password change, key rollover, adding a second credential) — is already available and O(1). Because no production databases exist today and the DEK is not separately distributed, the risk of DEK compromise is low; the heavy whole-file cost makes this a poor default rotation path.
+
+**Direction of fix (when needed):** Implement a `rekey(old_key, new_key)` or `rekey_dek(key)` API that (1) generates a fresh DEK, (2) reads, decrypts, re-encrypts, and writes back every non-superblock page in a single pass using the existing stride-aware `PageIo`, (3) re-wraps the new DEK into all currently-active key slots, and (4) commits an updated superblock. The operation must be crash-safe: either complete or leave the original file intact. A copy-then-atomic-rename strategy (write the new file alongside, then rename) is the simplest crash-safe approach for an embedded store; an in-place two-pass strategy is also possible but more complex. Reuse `PageCipher::seal` / `PageCipher::open` and `CryptoHeader` from the existing crypto layer.

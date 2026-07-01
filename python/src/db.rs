@@ -49,6 +49,32 @@ use chisel::Chisel;
 
 use crate::errors::to_py_err;
 
+/// Map a Python key argument to a `chisel::Key`. `bytes` → `Key::Raw` (any
+/// length; the engine validates the length and raises BadKeyLength via
+/// to_py_err if it is wrong). `str` → `Key::Passphrase`. Anything else raises
+/// a Python `TypeError`. Key material is wrapped in `Zeroizing` immediately so
+/// it is scrubbed when the `Key` is dropped; we never log or repr the value.
+///
+/// Mirrors the `encryption_key` kwarg coercion in `open()` so the binding
+/// has one key vocabulary. Factor is shared because add_key / rotate_key each
+/// need two independent key values, and duplicating the coercion inline would
+/// be both verbose and a maintenance hazard.
+fn py_key(obj: &Bound<'_, PyAny>) -> PyResult<chisel::Key> {
+    if let Ok(b) = obj.cast::<pyo3::types::PyBytes>() {
+        Ok(chisel::Key::Raw(zeroize::Zeroizing::new(
+            b.as_bytes().to_vec(),
+        )))
+    } else if let Ok(s) = obj.cast::<PyString>() {
+        Ok(chisel::Key::Passphrase(zeroize::Zeroizing::new(
+            s.to_str()?.to_owned(),
+        )))
+    } else {
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "key must be bytes (raw) or str (passphrase)",
+        ))
+    }
+}
+
 /// Convert a Python-supplied `u32` tag into a non-zero `chisel::Tag`, raising
 /// Python `ValueError` on `0`. Tag `0` is no longer a valid value — "untagged"
 /// is expressed by calling `allocate` (not `allocate_tagged`), and `tag()`
@@ -145,7 +171,8 @@ impl From<PyDrainInsertion> for chisel::DrainInsertion {
     drain_insertion = PyDrainInsertion::LruTail,
     create_if_missing = true,
     read_only = false,
-    superblock_count = 2
+    superblock_count = 2,
+    encryption_key = None
 ))]
 // open() has 8 args; clippy warns at 7. All but `path` are keyword-only
 // (note the `*` in the pyo3(signature) above), so the user can never
@@ -163,6 +190,7 @@ pub fn open(
     create_if_missing: bool,
     read_only: bool,
     superblock_count: u32,
+    encryption_key: Option<Py<PyAny>>,
 ) -> PyResult<PyChisel> {
     // Coerce path to PathBuf under the GIL first. Accept str fast-path
     // and fall back to os.fspath() for any os.PathLike (pathlib.Path, etc).
@@ -182,6 +210,31 @@ pub fn open(
                 os.call_method1("fspath", (obj,))?.extract()?
             };
             Some(PathBuf::from(s))
+        }
+    };
+
+    // Coerce encryption_key under the GIL (before py.detach): `bytes` →
+    // Key::Raw, `str` → Key::Passphrase. Done here so a bad type raises a
+    // synchronous Python TypeError, matching the path coercion above.
+    // Key material is wrapped in Zeroizing immediately; the bytes/str borrow
+    // is released before the GIL drop so no key material escapes the GIL window.
+    let key: Option<chisel::Key> = match encryption_key {
+        None => None,
+        Some(obj) => {
+            let bound = obj.bind(py);
+            if let Ok(b) = bound.cast::<pyo3::types::PyBytes>() {
+                Some(chisel::Key::Raw(zeroize::Zeroizing::new(
+                    b.as_bytes().to_vec(),
+                )))
+            } else if let Ok(s) = bound.cast::<PyString>() {
+                Some(chisel::Key::Passphrase(zeroize::Zeroizing::new(
+                    s.to_str()?.to_owned(),
+                )))
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "encryption_key must be bytes (raw key) or str (passphrase)",
+                ));
+            }
         }
     };
 
@@ -205,13 +258,16 @@ pub fn open(
     // builder. Every field is set explicitly because Python kwargs
     // already encode the caller's intent — there are no
     // "leave at default" cases at this boundary.
-    let options = chisel::Options::default()
+    let mut options = chisel::Options::default()
         .cache_max_bytes(cache_max_bytes)
         .spillway_max_bytes(resolved_spillway_max_bytes)
         .drain_insertion(drain_insertion.into())
         .create_if_missing(create_if_missing)
         .read_only(read_only)
         .superblock_count(superblock_count);
+    if let Some(k) = key {
+        options = options.encryption_key(k);
+    }
 
     // Engine calls can block on I/O (flock, fsync, file creation), so
     // release the GIL while they run. Chisel is Send (single-threaded
@@ -477,6 +533,47 @@ impl PyChisel {
         kwargs.set_item("pages_freed", stats.pages_freed)?;
         kwargs.set_item("values_moved", stats.values_moved)?;
         Ok(cls.call((), Some(&kwargs))?.unbind())
+    }
+
+    // ── Key-rotation methods ─────────────────────────────────────────
+    //
+    // These three methods mirror `Chisel::{add_key, rotate_key, remove_key}`
+    // and use `py_key` (the module-level helper) to coerce each Python key
+    // argument. Key material is scrubbed (Zeroizing) immediately on coercion,
+    // before any Rust engine call, so keys never appear in error messages,
+    // tracebacks, or repr output.
+    //
+    // Errors are routed through the standard `to_py_err` path:
+    //   InvalidEncryptionKey  → InvalidEncryptionKeyError  (wrong/unknown key)
+    //   NoFreeKeySlot         → NoFreeKeySlotError         (8-slot table full)
+    //   LastKeySlot           → LastKeySlotError           (would leave DB keyless)
+    //
+    // All three are between-transaction operations at the engine level;
+    // the engine enforces this and raises TransactionInProgress if violated.
+
+    pub(crate) fn add_key(
+        &self,
+        existing: &Bound<'_, PyAny>,
+        new: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let existing = py_key(existing)?;
+        let new = py_key(new)?;
+        self.with_inner_mut_io(|c| c.add_key(&existing, &new))
+    }
+
+    pub(crate) fn rotate_key(
+        &self,
+        old: &Bound<'_, PyAny>,
+        new: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let old = py_key(old)?;
+        let new = py_key(new)?;
+        self.with_inner_mut_io(|c| c.rotate_key(&old, &new))
+    }
+
+    pub(crate) fn remove_key(&self, key: &Bound<'_, PyAny>) -> PyResult<()> {
+        let key = py_key(key)?;
+        self.with_inner_mut_io(|c| c.remove_key(&key))
     }
 
     // ── Between-transaction configuration mutators ──────────────────

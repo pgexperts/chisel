@@ -159,6 +159,39 @@ pub enum ChiselError {
         stored: u32,
         compiled: u32,
     },
+
+    // Operational — the caller supplied the wrong key material or none, or
+    // asked an unencrypted-only build to open an encrypted DB. The on-disk
+    // file is untouched; the caller fixes their `Options` and retries.
+    //
+    // Raised at open time when the superblock declares encryption but
+    // `Options::encryption_key` was None.
+    NoEncryptionKey,
+    // Raised at open time when a key was supplied but no key-slot's wrapped
+    // DEK could be unwrapped under the derived KEK (wrong passphrase / raw
+    // key). Operational: the DB is intact; supply the right key and reopen.
+    InvalidEncryptionKey,
+    // Raised when a key was supplied to open a *plaintext* DB, or an
+    // encrypted DB is opened by a build that the on-disk crypto-header
+    // algorithm id is unknown to. Operational: the request is a mismatch,
+    // not corruption.
+    EncryptionNotSupported,
+    // Operational — key-management (add/rotate/remove) ran out of room: all
+    // KEY_SLOT_COUNT (8) wrapped-DEK slots are occupied, so there is nowhere
+    // to stage a new credential. The DB is intact; remove an unused key first.
+    NoFreeKeySlot,
+    // Operational — refusing to remove the last active key slot, which would
+    // leave the database with zero usable credentials (permanently unopenable).
+    LastKeySlot,
+    // Fatal — an AEAD authentication failure while decrypting a page that
+    // was already located and read off disk. The ciphertext, tag, nonce, or
+    // session DEK disagree, so the last-committed snapshot cannot be trusted;
+    // poisons the manager (I1) exactly like ChecksumMismatch. Distinct from
+    // InvalidEncryptionKey (a *key-slot* unwrap failure at open, before any
+    // page is served) — this fires mid-session on a real data/handle page.
+    DecryptionFailed {
+        page_id: u64,
+    },
 }
 
 impl ChiselError {
@@ -190,6 +223,7 @@ impl ChiselError {
                 | ChiselError::CorruptPage { .. }
                 | ChiselError::InvalidPageId { .. }
                 | ChiselError::UnsupportedPageSize { .. }
+                | ChiselError::DecryptionFailed { .. }
         )
     }
 }
@@ -279,6 +313,29 @@ impl fmt::Display for ChiselError {
                 f,
                 "page size mismatch: file was written with {stored}-byte pages, this build uses {compiled}-byte pages"
             ),
+            ChiselError::NoEncryptionKey => write!(
+                f,
+                "database is encrypted but no encryption_key was supplied"
+            ),
+            ChiselError::InvalidEncryptionKey => write!(
+                f,
+                "encryption key does not match any key slot (wrong passphrase or raw key)"
+            ),
+            ChiselError::EncryptionNotSupported => write!(
+                f,
+                "encryption not supported for this open (key supplied for a plaintext database, or unknown crypto algorithm)"
+            ),
+            ChiselError::NoFreeKeySlot => write!(
+                f,
+                "no free key slot: all 8 key slots are occupied (remove an unused key first)"
+            ),
+            ChiselError::LastKeySlot => write!(
+                f,
+                "refusing to remove the last active key slot (the database would become permanently unopenable)"
+            ),
+            ChiselError::DecryptionFailed { page_id } => {
+                write!(f, "decryption/authentication failed for page {page_id}")
+            }
         }
     }
 }
@@ -325,6 +382,20 @@ impl From<io::Error> for ChiselError {
             io::ErrorKind::NotFound => ChiselError::FileNotFound,
             _ => ChiselError::IoError(e),
         }
+    }
+}
+
+impl From<crate::crypto::CryptoError> for ChiselError {
+    // A CryptoError reaching the engine through `?` in the create/open/key-management
+    // paths is always a key-or-KDF problem on intact on-disk data, so it maps to the
+    // operational InvalidEncryptionKey. The page-read path (Phase 3) does NOT use this
+    // blanket conversion — it maps decrypt failures explicitly to the fatal
+    // ChiselError::DecryptionFailed { page_id } via `.map_err(...)`. The operational
+    // cases that are NOT CryptoError-derived (no key supplied for an encrypted DB; a
+    // key supplied for a plaintext DB) are returned explicitly as NoEncryptionKey /
+    // EncryptionNotSupported at their decision sites.
+    fn from(_: crate::crypto::CryptoError) -> Self {
+        ChiselError::InvalidEncryptionKey
     }
 }
 
@@ -482,7 +553,14 @@ mod tests {
                 | ChiselError::TagMismatch { .. }
                 // Poisoned is operational by is_fatal()'s definition: the manager
                 // is already dead, so re-seeing it must not re-poison.
-                | ChiselError::Poisoned => false,
+                | ChiselError::Poisoned
+                // Encryption credential errors: the DB is intact; supply the
+                // right key and retry, or manage key slots before retrying.
+                | ChiselError::NoEncryptionKey
+                | ChiselError::InvalidEncryptionKey
+                | ChiselError::EncryptionNotSupported
+                | ChiselError::NoFreeKeySlot
+                | ChiselError::LastKeySlot => false,
                 // Fatal — integrity in question; close and reopen.
                 ChiselError::IoError(_)
                 | ChiselError::ChecksumMismatch { .. }
@@ -492,7 +570,8 @@ mod tests {
                 | ChiselError::UnsupportedFormatVersion { .. }
                 | ChiselError::CorruptPage { .. }
                 | ChiselError::InvalidPageId { .. }
-                | ChiselError::UnsupportedPageSize { .. } => true,
+                | ChiselError::UnsupportedPageSize { .. }
+                | ChiselError::DecryptionFailed { .. } => true,
             }
         }
 
@@ -537,6 +616,12 @@ mod tests {
                 stored: 0,
                 compiled: 0,
             },
+            ChiselError::NoEncryptionKey,
+            ChiselError::InvalidEncryptionKey,
+            ChiselError::EncryptionNotSupported,
+            ChiselError::NoFreeKeySlot,
+            ChiselError::LastKeySlot,
+            ChiselError::DecryptionFailed { page_id: 0 },
         ];
         for e in &all {
             assert_eq!(
@@ -545,9 +630,44 @@ mod tests {
                 "is_fatal() disagrees with the documented Fatal/Operational block for {e:?}"
             );
         }
-        // Tripwire: exactly 9 variants are fatal today. If this count moves, the
+        // Tripwire: exactly 10 variants are fatal today. If this count moves, the
         // Fatal/Operational split changed — confirm that was intentional (it is a
         // breaking change for callers doing error-class matching, per the header).
-        assert_eq!(all.iter().filter(|e| e.is_fatal()).count(), 9);
+        assert_eq!(all.iter().filter(|e| e.is_fatal()).count(), 10);
+    }
+
+    // Phase 4: the three operational encryption errors are recoverable (the
+    // on-disk DB is intact — the caller supplied the wrong/no key, or asked an
+    // old binary to read a v2 file), so is_fatal() is false. DecryptionFailed
+    // is fatal: an AEAD tag failure on a page read means the ciphertext or DEK
+    // is wrong and the snapshot can't be trusted, so it must poison (I1).
+    #[test]
+    fn encryption_error_classification() {
+        assert!(!ChiselError::NoEncryptionKey.is_fatal());
+        assert!(!ChiselError::InvalidEncryptionKey.is_fatal());
+        assert!(!ChiselError::EncryptionNotSupported.is_fatal());
+        assert!(!ChiselError::NoFreeKeySlot.is_fatal());
+        assert!(!ChiselError::LastKeySlot.is_fatal());
+        assert!(ChiselError::DecryptionFailed { page_id: 7 }.is_fatal());
+
+        // Display carries the page id for the fatal variant.
+        let msg = format!("{}", ChiselError::DecryptionFailed { page_id: 7 });
+        assert!(
+            msg.contains('7'),
+            "Display {msg:?} should mention page id 7"
+        );
+
+        // source() is None for all six — none wrap an inner cause.
+        use std::error::Error;
+        for e in [
+            ChiselError::NoEncryptionKey,
+            ChiselError::InvalidEncryptionKey,
+            ChiselError::EncryptionNotSupported,
+            ChiselError::NoFreeKeySlot,
+            ChiselError::LastKeySlot,
+            ChiselError::DecryptionFailed { page_id: 0 },
+        ] {
+            assert!(e.source().is_none());
+        }
     }
 }

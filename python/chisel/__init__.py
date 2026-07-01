@@ -46,6 +46,12 @@ from chisel._chisel import (
     CorruptPageError,
     InvalidPageIdError,
     PoisonedError,
+    NoEncryptionKeyError,
+    InvalidEncryptionKeyError,
+    EncryptionNotSupportedError,
+    DecryptionFailedError,
+    NoFreeKeySlotError,
+    LastKeySlotError,
 )
 
 
@@ -138,4 +144,7 @@ __all__ = [
     "FileSizeMismatchError", "LockFailedError",
     "UnsupportedFormatVersionError", "UnsupportedPageSizeError", "CorruptPageError", "InvalidPageIdError",
     "PoisonedError",
+    "NoEncryptionKeyError", "InvalidEncryptionKeyError",
+    "EncryptionNotSupportedError", "DecryptionFailedError",
+    "NoFreeKeySlotError", "LastKeySlotError",
 ]

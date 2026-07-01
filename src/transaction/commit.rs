@@ -23,6 +23,12 @@ pub(super) struct CommitCtx<'a> {
     pub txn_counter: &'a mut u64,
     pub active_txn: &'a mut bool,
     pub superblock_count: u32,
+    /// Cipher for an encrypted database; `None` for plaintext. Needed here so the
+    /// superblock body (sensitive fields) is sealed before being written to disk.
+    pub cipher: Option<&'a crate::crypto::PageCipher>,
+    /// The key-slot table stamped into the on-disk superblock. Carried through
+    /// the session unchanged; None for plaintext DBs.
+    pub crypto_header: Option<&'a crate::superblock::CryptoHeader>,
 }
 
 pub(super) fn run_commit(ctx: &mut CommitCtx<'_>) -> Result<()> {
@@ -115,7 +121,12 @@ pub(super) fn run_commit(ctx: &mut CommitCtx<'_>) -> Result<()> {
     let total_pages = cache.file_page_count()?;
     let sb = Superblock {
         magic: page::MAGIC,
-        format_version: page::FORMAT_VERSION,
+        // Encrypted DBs use MAJOR=2 so an old binary rejects them.
+        format_version: if ctx.crypto_header.is_some() {
+            page::format_version_encrypted()
+        } else {
+            page::FORMAT_VERSION
+        },
         txn_counter: *ctx.txn_counter,
         root_handle_table_page: ctx.current_roots.handle_table_page,
         root_freemap_page: ctx.current_roots.freemap_page,
@@ -131,8 +142,14 @@ pub(super) fn run_commit(ctx: &mut CommitCtx<'_>) -> Result<()> {
         // Freemap tree depth, paired with root_freemap_page. 0 = today's
         // single-leaf format; grows as the tree deepens.
         freemap_depth: ctx.current_roots.freemap_depth,
+        encryption: ctx.crypto_header.copied(),
     };
-    let buf = sb.serialize();
+    // For encrypted DBs, seal the body (sensitive fields) under the session DEK.
+    // The crypto-header (key-slot table) is written verbatim in cleartext.
+    let buf = match (ctx.cipher, ctx.crypto_header) {
+        (Some(cipher), Some(_)) => sb.serialize_encrypted(cipher),
+        _ => sb.serialize(),
+    };
     // Step 3: Write to the INACTIVE slot. For N superblock slots,
     // the slot is `txn_counter % N` — a round-robin that always
     // targets the stalest slot. With N=2 this is the parity
@@ -142,7 +159,21 @@ pub(super) fn run_commit(ctx: &mut CommitCtx<'_>) -> Result<()> {
     // here can only damage the new superblock, never the N-1
     // last-known-good ones.
     let inactive = *ctx.txn_counter % ctx.superblock_count as u64;
-    cache.io_mut().write_page(inactive, &buf)?;
+    // Superblock-at-8232: for an encrypted DB, stride is ENC_PAGE_SIZE=8232 so
+    // write_page (which asserts stride==PAGE_SIZE) would panic. The superblock
+    // image is 8192 bytes (plaintext header + Phase-2 encrypted body) and is NOT
+    // PageCipher-sealed; Phase 2 already encrypts its body. We write it into a
+    // zero-padded ENC_PAGE_SIZE unit so the slot occupies the same 8232-byte
+    // region on disk that data pages use, then write via write_page_unit.
+    // For plaintext DBs (stride==PAGE_SIZE), write_page still works fine.
+    if ctx.cipher.is_some() {
+        use crate::crypto::ENC_PAGE_SIZE;
+        let mut unit = [0u8; ENC_PAGE_SIZE];
+        unit[..buf.len()].copy_from_slice(&buf);
+        cache.io_mut().write_page_unit(inactive, &unit)?;
+    } else {
+        cache.io_mut().write_page(inactive, &buf)?;
+    }
     // Step 4: Durability linearization point. Until this fsync returns the
     // transaction is not crash-safe; after it returns the new state is
     // observable on recovery.

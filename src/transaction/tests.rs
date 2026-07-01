@@ -23,7 +23,7 @@ fn fresh_manager() -> TransactionManager {
         crate::DrainInsertion::LruTail,
         crate::SpillwayLocation::InMemory,
     );
-    let mut tm = TransactionManager::create_new(cache, 2).unwrap();
+    let mut tm = TransactionManager::create_new(cache, 2, None, None).unwrap();
     // Commit once so there's a real baseline to read/write against.
     tm.begin().unwrap();
     tm.commit().unwrap();
@@ -261,7 +261,7 @@ fn fatal_error_outside_commit_also_poisons() {
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
         );
-        let mut tm = TransactionManager::create_new(cache, 2).unwrap();
+        let mut tm = TransactionManager::create_new(cache, 2, None, None).unwrap();
         tm.begin().unwrap();
         h = tm.allocate(b"durable").unwrap();
         tm.commit().unwrap();
@@ -277,7 +277,7 @@ fn fatal_error_outside_commit_also_poisons() {
         crate::DrainInsertion::LruTail,
         crate::SpillwayLocation::InMemory,
     );
-    let tm = TransactionManager::open_existing(cache).unwrap();
+    let tm = TransactionManager::open_existing(cache, None).unwrap();
     tm.cache.borrow().io().arm_fault(Fault::FailReadPage(pid));
     let result = tm.read(h);
     assert!(
@@ -1270,7 +1270,7 @@ fn commit_does_not_poison_when_cache_is_at_strict_cap() {
         crate::DrainInsertion::LruTail,
         crate::SpillwayLocation::InMemory,
     );
-    let mut tm = TransactionManager::create_new(cache, 2).unwrap();
+    let mut tm = TransactionManager::create_new(cache, 2, None, None).unwrap();
     tm.begin().unwrap();
     tm.commit().unwrap();
 
@@ -1532,9 +1532,9 @@ fn delete_membership_failure_survives_reopen_consistently() {
             crate::SpillwayLocation::InMemory,
         );
         if create {
-            TransactionManager::create_new(cache, 2).unwrap()
+            TransactionManager::create_new(cache, 2, None, None).unwrap()
         } else {
-            TransactionManager::open_existing(cache).unwrap()
+            TransactionManager::open_existing(cache, None).unwrap()
         }
     };
 
@@ -1810,9 +1810,9 @@ fn allocate_membership_failure_survives_reopen_consistently() {
             crate::SpillwayLocation::InMemory,
         );
         if create {
-            TransactionManager::create_new(cache, 2).unwrap()
+            TransactionManager::create_new(cache, 2, None, None).unwrap()
         } else {
-            TransactionManager::open_existing(cache).unwrap()
+            TransactionManager::open_existing(cache, None).unwrap()
         }
     };
 
@@ -2051,7 +2051,7 @@ fn format_version_gate_is_major_only() {
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
         );
-        let _ = TransactionManager::create_new(cache, 2).unwrap();
+        let _ = TransactionManager::create_new(cache, 2, None, None).unwrap();
         // drop() releases the flock so the test can read+write the
         // file directly below.
     }
@@ -2089,7 +2089,7 @@ fn format_version_gate_is_major_only() {
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
         );
-        let tm = TransactionManager::open_existing(cache);
+        let tm = TransactionManager::open_existing(cache, None);
         assert!(
             tm.is_ok(),
             "same-major / different-minor file should open cleanly; got {:?}",
@@ -2110,7 +2110,7 @@ fn format_version_gate_is_major_only() {
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
         );
-        match TransactionManager::open_existing(cache) {
+        match TransactionManager::open_existing(cache, None) {
             Err(ChiselError::UnsupportedFormatVersion { .. }) => {}
             Err(e) => panic!("expected UnsupportedFormatVersion, got {e:?}"),
             Ok(_) => panic!("expected UnsupportedFormatVersion, got Ok"),
@@ -2137,7 +2137,7 @@ fn file_minor_newer_than_binary_is_forced_read_only() {
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
         );
-        let _ = TransactionManager::create_new(cache, 2).unwrap();
+        let _ = TransactionManager::create_new(cache, 2, None, None).unwrap();
     }
 
     // Patch every slot to (current MAJOR, MINOR + 1) and re-stamp checksums.
@@ -2162,7 +2162,7 @@ fn file_minor_newer_than_binary_is_forced_read_only() {
         crate::DrainInsertion::LruTail,
         crate::SpillwayLocation::InMemory,
     );
-    let mut tm = TransactionManager::open_existing(cache)
+    let mut tm = TransactionManager::open_existing(cache, None)
         .expect("a newer-minor file must still OPEN (reads are additive-safe)");
     assert!(
         matches!(tm.begin(), Err(ChiselError::ReadOnlyMode)),
@@ -2300,7 +2300,7 @@ fn reopen_preserves_committed_data() {
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
         );
-        let mut txm = TransactionManager::create_new(cache, 2).unwrap();
+        let mut txm = TransactionManager::create_new(cache, 2, None, None).unwrap();
         txm.begin().unwrap();
         handle = txm.allocate(b"persistent").unwrap();
         txm.commit().unwrap();
@@ -2314,7 +2314,7 @@ fn reopen_preserves_committed_data() {
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
         );
-        let txm = TransactionManager::open_existing(cache).unwrap();
+        let txm = TransactionManager::open_existing(cache, None).unwrap();
         let data = txm.read(handle).unwrap();
         assert_eq!(data, b"persistent");
     }
@@ -2467,4 +2467,55 @@ fn commit_write_failure_poisons() {
         "commit write failure must surface IoError, got {result:?}"
     );
     assert!(tm.is_poisoned(), "write failure during commit must poison");
+}
+
+// --- Session-cipher structural invariants ---
+//
+// Phase 3 will wire `cipher` to page I/O; these tests confirm the DEK is
+// retained for the full session (Some for encrypted DBs, None for plaintext)
+// and that nothing leaks it. Zeroization on drop is automatic: PageCipher
+// owns a Dek(Zeroizing<[u8; 32]>), so the key is wiped when the manager is
+// dropped — no explicit Drop impl needed. In safe Rust, post-drop memory
+// content is not observable, so the tests assert the structural invariant
+// (Some vs None) rather than attempting to read freed memory.
+
+#[test]
+fn encrypted_manager_holds_session_cipher() {
+    // create_new with a key must unwrap a fresh DEK and hold it as
+    // Some(PageCipher) for Phase 3 page I/O wiring.
+    let file = NamedTempFile::new().unwrap();
+    let io = PageIo::open(file.path(), false).unwrap();
+    let cache = PageCache::new(
+        io,
+        1024 * PAGE_SIZE as u64,
+        0,
+        crate::DrainInsertion::LruTail,
+        crate::SpillwayLocation::InMemory,
+    );
+    let key = crate::crypto::Key::Raw(zeroize::Zeroizing::new(vec![0x5Au8; 32]));
+    let txm = TransactionManager::create_new(cache, 2, Some(key), None).unwrap();
+    assert!(
+        txm.cipher.is_some(),
+        "encrypted create must retain a session cipher"
+    );
+}
+
+#[test]
+fn plaintext_manager_has_no_cipher() {
+    // create_new without a key must leave cipher as None — no accidental
+    // encryption on plaintext DBs, and no dead PageCipher in memory.
+    let file = NamedTempFile::new().unwrap();
+    let io = PageIo::open(file.path(), false).unwrap();
+    let cache = PageCache::new(
+        io,
+        1024 * PAGE_SIZE as u64,
+        0,
+        crate::DrainInsertion::LruTail,
+        crate::SpillwayLocation::InMemory,
+    );
+    let txm = TransactionManager::create_new(cache, 2, None, None).unwrap();
+    assert!(
+        txm.cipher.is_none(),
+        "plaintext create must have no session cipher"
+    );
 }
