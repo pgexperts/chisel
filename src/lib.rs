@@ -342,9 +342,12 @@ impl Chisel {
     /// # Errors
     /// `InvalidSuperblockCount` (the `superblock_count` option is out of
     /// range), `FileNotFound` (no file at `path` and `create_if_missing` is
-    /// false), or `LockFailed` (another handle holds the exclusive flock). When
-    /// reopening an existing file, parsing the superblock can also yield
-    /// `UnsupportedFormatVersion`, `CorruptSuperblock`,
+    /// false), or `LockFailed` (another handle holds the exclusive flock).
+    /// For an encrypted database: `NoEncryptionKey` (file is encrypted but
+    /// no `encryption_key` given), `InvalidEncryptionKey` (key unwraps no
+    /// key slot), or `EncryptionNotSupported` (key given for a plaintext
+    /// file). When reopening an existing file, parsing the superblock can
+    /// also yield `UnsupportedFormatVersion`, `CorruptSuperblock`,
     /// `ChecksumMismatch`, `FileSizeMismatch`, or `IoError`.
     pub fn open(path: &Path, options: Options) -> Result<Chisel> {
         // R4: validate superblock_count before touching the file.
@@ -445,8 +448,12 @@ impl Chisel {
             options.drain_insertion,
             SpillwayLocation::InMemory,
         );
-        // ponytail: in-memory databases never use encryption; key and argon2_params are ignored here
-        let txm = TransactionManager::create_new(cache, options.superblock_count, None, None)?;
+        let txm = TransactionManager::create_new(
+            cache,
+            options.superblock_count,
+            options.encryption_key.clone(),
+            options.argon2_params,
+        )?;
         Ok(Chisel { txm })
     }
 
