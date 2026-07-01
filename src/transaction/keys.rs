@@ -201,7 +201,7 @@ impl TransactionManager {
 mod tests {
     use super::*;
     use crate::crypto::Key;
-    use crate::page_io::PageIo;
+    use crate::page_io::{Fault, PageIo};
     use tempfile::NamedTempFile;
     use zeroize::Zeroizing;
 
@@ -414,5 +414,64 @@ mod tests {
         assert!(!db2.is_poisoned());
         let stored = db2.crypto_header.unwrap();
         assert_eq!(stored.active_count(), 2, "both slots must survive reopen");
+    }
+
+    /// An fsync failure inside rewrite_crypto_header (called by add_key / rotate_key)
+    /// must poison the manager — the I1 poison-on-fatal invariant covers the key-
+    /// rotation path, not just data commits.
+    ///
+    /// rewrite_crypto_header_inner writes one superblock and then fsyncs; that fsync
+    /// is the only fsync in the call (no data pages are touched). Arming
+    /// `Fault::FailFsync(0)` catches it on the first call.
+    #[test]
+    fn rewrite_crypto_header_fsync_failure_poisons() {
+        let file = NamedTempFile::new().unwrap();
+        let io = PageIo::open(file.path(), false).unwrap();
+        let cache = PageCache::new(
+            io,
+            1024 * PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
+        let mut db = TransactionManager::create_new(cache, 2, Some(raw(0x11)), None).unwrap();
+        db.begin().unwrap();
+        db.commit().unwrap();
+
+        // Arm a fault on the first fsync so rewrite_crypto_header's superblock
+        // write succeeds but its fsync fails — this is the I1 trigger point.
+        db.cache.borrow().io().arm_fault(Fault::FailFsync(0));
+
+        // add_key calls rewrite_crypto_header; the fsync fault must surface as
+        // IoError and leave the manager poisoned.
+        let result = db.add_key(&raw(0x11), &raw(0x22));
+        assert!(
+            matches!(result, Err(ChiselError::IoError(_))),
+            "fsync failure in rewrite_crypto_header must surface IoError, got {result:?}"
+        );
+        assert!(
+            db.is_poisoned(),
+            "fsync failure in rewrite_crypto_header must poison the manager"
+        );
+        // Subsequent operations must be rejected with Poisoned.
+        assert!(
+            matches!(db.begin(), Err(ChiselError::Poisoned)),
+            "poisoned manager must reject further ops"
+        );
+    }
+
+    /// add_key with a zero-length raw key must return an error, not panic.
+    /// derive_kek rejects empty key material with BadKeyLength; wrap_into
+    /// propagates it and add_key maps it to InvalidEncryptionKey.
+    #[test]
+    fn add_key_with_invalid_raw_key_returns_error_not_panic() {
+        let mut db = fresh_encrypted();
+        let bad_new = Key::Raw(Zeroizing::new(vec![])); // zero-length key material
+        // This must NOT panic; it must return an Err.
+        let result = db.add_key(&raw(0x11), &bad_new);
+        assert!(
+            matches!(result, Err(ChiselError::InvalidEncryptionKey)),
+            "empty raw key must return InvalidEncryptionKey, not panic; got {result:?}"
+        );
     }
 }

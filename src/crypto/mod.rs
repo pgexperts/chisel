@@ -681,4 +681,35 @@ mod tests {
         let _r2 = raw.clone();
         let _p2 = pass.clone();
     }
+
+    #[test]
+    fn argon2id_known_answer_test() {
+        // Golden regression pin for our Argon2id KDF path. Input: password=b"password",
+        // salt=b"somesalt12345678" (16 bytes), m_cost=8, t_cost=1, p_cost=1, tag=32,
+        // algorithm=Argon2id, version=0x13. These are deliberately cheap params so the
+        // test is instant; they differ from production defaults (OWASP: m=19456).
+        //
+        // This is a golden (regression) pin computed from the argon2 crate, not an
+        // independently-published first-principles vector — the RFC 9106 reference
+        // vectors use secret+AD parameters our derive_kek API does not expose.
+        // The pin's value: if this test fails, the KDF configuration silently changed
+        // (algorithm, version, output length, info string) and existing key slots would
+        // fail to unwrap. That is a data-loss event; the test must be updated
+        // deliberately and the format version bumped.
+        let key = Key::Passphrase(zeroize::Zeroizing::new("password".to_string()));
+        let salt = *b"somesalt12345678";
+        let params = Argon2Params { m_cost: 8, t_cost: 1, p_cost: 1 };
+        let kek = derive_kek(&key, KdfId::Argon2id, &salt, &params).unwrap();
+        let expected: [u8; 32] = [
+            0xd8, 0x38, 0x04, 0x14, 0x00, 0x12, 0xc3, 0xe6,
+            0xd3, 0x50, 0x2a, 0x3e, 0xb5, 0x9f, 0xc2, 0x4a,
+            0x89, 0xa9, 0xec, 0x08, 0xb6, 0xac, 0x97, 0xbe,
+            0x1f, 0xec, 0xa1, 0x70, 0x0a, 0xbe, 0x0a, 0xfb,
+        ];
+        assert_eq!(
+            kek.as_bytes(),
+            &expected,
+            "Argon2id output changed — KDF config or format break; update golden and bump FORMAT_VERSION"
+        );
+    }
 }
