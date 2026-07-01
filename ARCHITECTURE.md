@@ -13,6 +13,7 @@ This is a living document; update it when the architecture changes. Decisions do
 5. [Recovery on open](#recovery-on-open)
 6. [On-disk format](#on-disk-format)
 7. [Cross-cutting concepts](#cross-cutting-concepts)
+   - [On-disk encryption](#on-disk-encryption)
 8. [Benchmark infrastructure](#benchmark-infrastructure)
 9. [Implementation history](#implementation-history)
 10. [Glossary](#glossary)
@@ -614,6 +615,37 @@ Chisel versions its on-disk format at two levels.
 - **Page level** (I31): each non-superblock page carries a one-byte `page_format_version` in its header (byte 1 for Data/Overflow/FreeMap; byte 2 for HandleTable, where byte 1 holds the FLAG byte). This lets individual page layouts evolve within a major without a file-wide bump. The current value is `0` everywhere. The post-1.0 upgrade plan is lazy migration: reads *will* dispatch on the version byte (the per-module decode helpers and `page::page_format_version()` exist but are **dormant today** — `PageCache::load_page` validates only the XXH3 checksum and nothing reads the version byte yet), writes always stamp the current version, and an opt-in eager upgrader (deferred) sweeps remaining old pages.
 
 Both schemes leave reserved space for forward compatibility — the superblock has bytes 324..8184 reserved (after the `freemap_depth` field at 320..324), and every non-superblock page has bytes 8..16 reserved (8 bytes / 64 bits) for future common-header fields.
+
+### On-disk encryption
+
+Chisel supports optional authenticated encryption of database files. An encrypted database is indistinguishable from random bytes to a reader without the key; each page is individually authenticated, so corruption (accidental or deliberate) is detected before any plaintext is returned.
+
+**Cipher.** XChaCha20-Poly1305 (IETF extended-nonce variant). Each page write generates a fresh random 192-bit nonce; the extended nonce space (2¹⁹²) makes nonce reuse under shadow-paging page reassignment negligible in practice (spec §2.1). The on-disk layout per encrypted page is `ciphertext(8192) ‖ tag(16) ‖ nonce(24)` = 8232 bytes (`ENC_PAGE_SIZE`). The additional data (AAD) for each page is the 8-byte little-endian `page_id`, which binds ciphertext to its slot and prevents a valid block from being relocated to another page position without detection.
+
+**On-disk stride.** Encrypted databases use a uniform 8232-byte stride for every page including the superblock slots. Plaintext databases continue to use the 8192-byte stride; the two are mutually exclusive and the stride is recorded in the superblock's plaintext crypto-header so the engine reads the correct number of bytes before attempting any operation. The `page_io` layer is stride-agnostic: callers set the stride once (via `PageIo::set_stride`) and all subsequent raw reads and writes use it.
+
+**Envelope (key hierarchy).** A random 256-bit per-database encryption key (DEK) encrypts all page content. The DEK itself is never stored in plaintext: it is wrapped under a key-encryption key (KEK) and the wrapped form is held in a plaintext key-slot table inside the superblock's reserved region (bytes 324..1356; 8 slots × 128 bytes each, preceded by a 1-byte algorithm id and 4-byte stride field at byte 324). Each slot stores the KDF identity, KDF parameters, salt, wrap nonce, wrapped DEK, and wrap tag. There are two KEK derivation paths:
+
+- **Raw key** (`Key::Raw`): KEK = HKDF-SHA256(ikm=key material, salt=slot salt, info=`"chisel-kek"`).
+- **Passphrase** (`Key::Passphrase`): KEK = Argon2id(password, salt, m/t/p from the slot's stored parameters).
+
+The DEK wrapping uses detached XChaCha20-Poly1305 with AAD bound to the slot's KDF metadata, so an attacker cannot swap a slot's KDF parameters to force mis-derivation without breaking the tag.
+
+**Superblock body protection.** The superblock's sensitive body — root pointers (`root_handle_table`, `root_freemap_page`, `root_tag_map_page`), `total_pages`, `next_handle`, `freemap_depth`, and the `named_roots` name table — is sealed under the DEK as a `nonce ‖ tag ‖ ciphertext` sub-blob whose AAD binds it to the superblock's identity. The plaintext portion of the superblock (magic, format version, txn counter, page size, superblock count, crypto-header) retains its XXH3 checksum so the A/B torn-write selector (`select()`) still works before any decryption.
+
+**Format version.** Encrypted databases stamp file-level **MAJOR = 2, MINOR = 0**. Plaintext databases remain at MAJOR = 1. The existing open-time gate (which rejects any file whose MAJOR differs from the compiled-in `FORMAT_MAJOR_VERSION`) therefore hard-rejects an encrypted database on an encryption-unaware binary with `UnsupportedFormatVersion`, preventing ciphertext from being silently misread as page data. No per-page (I31) format change is needed — the logical page image is unchanged.
+
+**Key management.** Credential rotation is O(1) and crash-safe — it never re-encrypts any page:
+
+- `add_key(old_key, new_key)`: derives a new KEK, wraps the same DEK into a free slot, then commits.
+- `rotate_key(old_key, new_key)`: `add_key` followed by clearing the old slot in the same commit.
+- `remove_key(key)`: clears the matching slot, refusing to clear the last active slot (which would make the database permanently unreadable).
+
+Each operation is a normal superblock commit through the A/B + fsync protocol. Bulk DEK rotation (re-encrypting every page under a fresh DEK — relevant only when the DEK itself is believed compromised) is deferred; see I142.
+
+**Spillway.** For encrypted databases the in-memory spillway carries sealed blobs: pages are encrypted exactly once on eviction from the page cache (`seal` on evict-to-spillway) and copied verbatim — without decryption or re-encryption — on drain to the main file. Rehydration from the spillway decrypts the blob back into the cache. This means no plaintext page content is ever written to disk by an encrypted database, even during spill.
+
+**Threat-model boundary.** Provided: confidentiality of all user data and sensitive metadata at rest; AEAD tamper-detection per page and per superblock body (any modification surfaces as the fatal `DecryptionFailed` error, which poisons the engine); anti-relocation (AAD = `page_id` prevents transplanting a ciphertext block to a different slot). Not provided: rollback/replay resistance (an attacker who substitutes a wholly older, validly-signed database image cannot be detected without an external monotonic trust anchor such as a TPM); in-memory protection beyond `zeroize`-on-drop for the DEK and page plaintext; traffic-analysis resistance (file size, page count, and access patterns are visible).
 
 ---
 
