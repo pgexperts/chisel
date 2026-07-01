@@ -35,8 +35,6 @@ impl TransactionManager {
     /// - `ChiselError::TransactionInProgress` — an active user transaction exists.
     /// - `ChiselError::EncryptionNotSupported` — this is a plaintext database.
     /// - I/O errors from the cache flush, write, or fsync — all fatal (poison).
-    // ponytail: callers added in Tasks 5.3/5.4 (add_key, rotate_key, remove_key)
-    #[allow(dead_code)]
     pub(crate) fn rewrite_crypto_header(&mut self, new_header: CryptoHeader) -> Result<()> {
         self.check_alive()?;
         if self.active_txn {
@@ -122,6 +120,50 @@ impl TransactionManager {
         self.committed_roots.total_pages = total_pages;
 
         Ok(())
+    }
+
+    /// Prove possession of `existing` (it must unlock some active slot), recover
+    /// the DEK, then wrap that SAME DEK under `new` in a free slot and commit the
+    /// new header. The DEK is unchanged, so existing pages stay readable under
+    /// both credentials after this returns.
+    ///
+    /// # Errors
+    /// `EncryptionNotSupported` — plaintext DB; `InvalidEncryptionKey` — `existing`
+    /// unlocks no slot; `NoFreeKeySlot` — all 8 slots occupied; I/O failures are
+    /// fatal and poison the manager.
+    pub(crate) fn add_key(&mut self, existing: &crate::crypto::Key, new: &crate::crypto::Key) -> Result<()> {
+        if self.poisoned.get() {
+            return Err(ChiselError::Poisoned);
+        }
+        let header = self.crypto_header.as_ref().ok_or(ChiselError::EncryptionNotSupported)?;
+        let (_idx, dek) = header.unlock(existing)?; // → InvalidEncryptionKey if none
+        let free = header.free_slot().ok_or(ChiselError::NoFreeKeySlot)?;
+        let mut new_header = *header;
+        new_header.wrap_into(free, new, &dek);
+        self.rewrite_crypto_header(new_header)
+    }
+
+    /// Replace `old` with `new` in a single atomic superblock write. `new` is
+    /// staged into a free slot BEFORE the old slot is cleared, so there is never
+    /// a window with zero working credentials — a crash leaves either the
+    /// pre-rotation header (old works) or the post-rotation header (new works).
+    ///
+    /// # Errors
+    /// `EncryptionNotSupported` — plaintext DB; `InvalidEncryptionKey` — `old`
+    /// unlocks no slot; `NoFreeKeySlot` — all 8 slots full (no room to stage
+    /// `new` before revoking `old`); I/O failures are fatal and poison the manager.
+    pub(crate) fn rotate_key(&mut self, old: &crate::crypto::Key, new: &crate::crypto::Key) -> Result<()> {
+        if self.poisoned.get() {
+            return Err(ChiselError::Poisoned);
+        }
+        let header = self.crypto_header.as_ref().ok_or(ChiselError::EncryptionNotSupported)?;
+        let (old_idx, dek) = header.unlock(old)?; // → InvalidEncryptionKey if none
+        let free = header.free_slot().ok_or(ChiselError::NoFreeKeySlot)?;
+        let mut new_header = *header;
+        new_header.wrap_into(free, new, &dek);
+        // Clear the old slot in the same header snapshot — single atomic rewrite.
+        new_header.slots[old_idx] = crate::superblock::KeySlot::EMPTY;
+        self.rewrite_crypto_header(new_header)
     }
 }
 

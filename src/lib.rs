@@ -942,6 +942,34 @@ impl Chisel {
     pub fn set_drain_insertion(&mut self, policy: DrainInsertion) -> Result<()> {
         self.txm.set_drain_insertion(policy)
     }
+
+    /// Add a second credential that unlocks this database. `existing` must
+    /// already unlock it; `new` is wrapped over the same data key into a free
+    /// key slot. After this returns, either credential opens the database. O(1)
+    /// superblock commit — no page is re-encrypted.
+    ///
+    /// # Errors
+    /// `EncryptionNotSupported` if the database has no encryption;
+    /// `InvalidEncryptionKey` if `existing` unlocks no slot; `NoFreeKeySlot` if
+    /// all 8 key slots are full. An fsync/superblock failure is fatal and poisons
+    /// the handle.
+    pub fn add_key(&mut self, existing: &crypto::Key, new: &crypto::Key) -> Result<()> {
+        self.txm.add_key(existing, new)
+    }
+
+    /// Replace `old` with `new`: `new` is added and `old` is revoked in one
+    /// atomic superblock commit. After this returns, `old` no longer opens the
+    /// database and `new` does. O(1) — the data key is unchanged, no page is
+    /// re-encrypted.
+    ///
+    /// # Errors
+    /// `EncryptionNotSupported` if the database has no encryption;
+    /// `InvalidEncryptionKey` if `old` unlocks no slot; `NoFreeKeySlot` if all 8
+    /// key slots are full (no room to stage `new` before revoking `old`). An
+    /// fsync/superblock failure is fatal and poisons the handle.
+    pub fn rotate_key(&mut self, old: &crypto::Key, new: &crypto::Key) -> Result<()> {
+        self.txm.rotate_key(old, new)
+    }
 }
 
 #[cfg(test)]
