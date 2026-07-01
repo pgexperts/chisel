@@ -415,3 +415,45 @@ def test_decryption_failed_is_fatal_hierarchy():
     assert issubclass(chisel.DecryptionFailedError, chisel.FatalError)
     assert issubclass(chisel.DecryptionFailedError, chisel.ChiselError)
     assert not issubclass(chisel.DecryptionFailedError, chisel.OperationalError)
+
+
+# ---------------------------------------------------------------------------
+# 13. Key-rotation exception contract (Phase 5, Task 5.5)
+# ---------------------------------------------------------------------------
+# Two ChiselError key-rotation variants map to typed Python classes:
+#
+#   NoFreeKeySlot  -> NoFreeKeySlotError  (OperationalError)
+#   LastKeySlot    -> LastKeySlotError    (OperationalError)
+#
+# NoFreeKeySlotError is triggered end-to-end: fill all 8 key slots (add_key
+# 7 times after the initial open) then attempt an 8th add_key. The engine
+# has a fixed 8-slot key envelope table; the 9th call must raise exactly
+# NoFreeKeySlotError.
+#
+# LastKeySlotError is triggered end-to-end: open with one key, call
+# remove_key — the engine refuses because removing the last slot would
+# leave the database permanently inaccessible.
+
+_KS = [bytes([i]) * 32 for i in range(10)]  # 10 distinct 32-byte raw keys
+
+
+def test_no_free_key_slot_exact_class(tmp_db):
+    # The key envelope table holds 8 slots. Create a DB with key 0 (1 slot
+    # used). Add keys 1–7 (slots 2–8 used, table full). Then add key 8 — the
+    # table is full and NoFreeKeySlotError must be raised.
+    with chisel.open(str(tmp_db), encryption_key=_KS[0]) as db:
+        for i in range(1, 8):                # add keys 1..7 → 8 slots occupied
+            db.add_key(_KS[i - 1], _KS[i])
+        with pytest.raises(chisel.NoFreeKeySlotError) as exc_info:
+            db.add_key(_KS[7], _KS[8])       # 9th key — no slot available
+    assert isinstance(exc_info.value, chisel.OperationalError)
+
+
+def test_last_key_slot_exact_class(tmp_db):
+    # A DB opened with a single key has exactly one occupied slot. Removing
+    # that key would leave no way to unlock the database; LastKeySlotError
+    # must fire.
+    with chisel.open(str(tmp_db), encryption_key=_KS[0]) as db:
+        with pytest.raises(chisel.LastKeySlotError) as exc_info:
+            db.remove_key(_KS[0])
+    assert isinstance(exc_info.value, chisel.OperationalError)

@@ -50,6 +50,8 @@ from chisel._chisel import (
     InvalidEncryptionKeyError,
     EncryptionNotSupportedError,
     DecryptionFailedError,
+    NoFreeKeySlotError,
+    LastKeySlotError,
 )
 
 
@@ -144,4 +146,5 @@ __all__ = [
     "PoisonedError",
     "NoEncryptionKeyError", "InvalidEncryptionKeyError",
     "EncryptionNotSupportedError", "DecryptionFailedError",
+    "NoFreeKeySlotError", "LastKeySlotError",
 ]

@@ -35,6 +35,11 @@
 //         CacheFullError
 //         SpillwayFullError
 //         TransactionInProgressError
+//         NoEncryptionKeyError
+//         InvalidEncryptionKeyError
+//         EncryptionNotSupportedError
+//         NoFreeKeySlotError
+//         LastKeySlotError
 //         ClosedError              (I25: db.close() raced a live txn/sp)
 //         AlreadyFinishedError     (I22/I24: double-drive a finished txn/sp)
 //       FatalError                       (drop-and-reopen recovery only)
@@ -123,6 +128,10 @@ create_exception!(_chisel, NoEncryptionKeyError, OperationalError);
 create_exception!(_chisel, InvalidEncryptionKeyError, OperationalError);
 // EncryptionNotSupported: encryption_key was supplied but the DB is plaintext.
 create_exception!(_chisel, EncryptionNotSupportedError, OperationalError);
+// NoFreeKeySlot: add_key/rotate_key attempted but the 8-slot key table is full.
+create_exception!(_chisel, NoFreeKeySlotError, OperationalError);
+// LastKeySlot: remove_key would leave the DB with no active key — rejected.
+create_exception!(_chisel, LastKeySlotError, OperationalError);
 // ISSUES.md I25: raised by PyChisel's with_inner_io/with_inner_mut_io
 // helpers when `inner` has been cleared by a prior close(). Distinct
 // from PoisonedError because close() is a user action — the DB file
@@ -220,6 +229,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "EncryptionNotSupportedError",
         py.get_type::<EncryptionNotSupportedError>(),
     )?;
+    m.add("NoFreeKeySlotError", py.get_type::<NoFreeKeySlotError>())?;
+    m.add("LastKeySlotError", py.get_type::<LastKeySlotError>())?;
 
     // IoError multiply-inherits (FatalError, OSError); register that class and
     // cache it so `to_py_err` constructs instances of it (not a single-base
@@ -307,6 +318,10 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
         RustChiselError::NoEncryptionKey => NoEncryptionKeyError::new_err(msg),
         RustChiselError::InvalidEncryptionKey => InvalidEncryptionKeyError::new_err(msg),
         RustChiselError::EncryptionNotSupported => EncryptionNotSupportedError::new_err(msg),
+        // Key-rotation operational errors: the DB is intact; caller hit a
+        // capacity limit (table full) or a safety guard (last slot).
+        RustChiselError::NoFreeKeySlot => NoFreeKeySlotError::new_err(msg),
+        RustChiselError::LastKeySlot => LastKeySlotError::new_err(msg),
         // Fatal encryption: MAC verification failed on a page read after open.
         RustChiselError::DecryptionFailed { .. } => DecryptionFailedError::new_err(msg),
         // Fatal
