@@ -414,8 +414,7 @@ impl PageIo {
     /// never accidentally alias the underlying File.
     pub fn read_page(&mut self, page_id: u64) -> Result<[u8; PAGE_SIZE]> {
         debug_assert_eq!(
-            self.stride,
-            PAGE_SIZE,
+            self.stride, PAGE_SIZE,
             "read_page called on an encrypted stride; use read_page_unit"
         );
         let blob = self.read_page_unit(page_id)?;
@@ -430,8 +429,7 @@ impl PageIo {
     /// `write_page_unit` for the encrypted path. Not durable until `fsync()`.
     pub fn write_page(&mut self, page_id: u64, buf: &[u8; PAGE_SIZE]) -> Result<()> {
         debug_assert_eq!(
-            self.stride,
-            PAGE_SIZE,
+            self.stride, PAGE_SIZE,
             "write_page called on an encrypted stride; use write_page_unit"
         );
         self.write_page_unit(page_id, buf)

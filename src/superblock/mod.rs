@@ -278,9 +278,8 @@ const BODY_LEN: usize = 8 * 5 + 4 + (NAMED_ROOT_COUNT * NAMED_ROOT_ENTRY_SIZE);
 
 // Compile-time check: the sealed blob fits before the checksum.
 // SEALED_BODY_OFFSET(1356) + NONCE_LEN(24) + TAG_LEN(16) + 2(len) + BODY_LEN.
-const _: () = assert!(
-    SEALED_BODY_OFFSET + NONCE_LEN + TAG_LEN + 2 + BODY_LEN <= page::CHECKSUM_OFFSET
-);
+const _: () =
+    assert!(SEALED_BODY_OFFSET + NONCE_LEN + TAG_LEN + 2 + BODY_LEN <= page::CHECKSUM_OFFSET);
 
 impl Superblock {
     /// Serialize the superblock into a full page buffer with a trailing checksum.
@@ -367,7 +366,9 @@ impl Superblock {
         self.freemap_depth = u32::from_le_bytes(body[40..44].try_into().unwrap());
         let mut off = 44;
         for entry in self.named_roots.iter_mut() {
-            entry.name.copy_from_slice(&body[off..off + NAMED_ROOT_NAME_LEN]);
+            entry
+                .name
+                .copy_from_slice(&body[off..off + NAMED_ROOT_NAME_LEN]);
             entry.handle = u64::from_le_bytes(
                 body[off + NAMED_ROOT_NAME_LEN..off + NAMED_ROOT_NAME_LEN + 8]
                     .try_into()
@@ -967,13 +968,21 @@ mod tests {
 
         // Sensitive bytes must be absent from cleartext.
         // named_roots occupy 52..308; all must be zero in the encrypted page.
-        assert_eq!(&buf[52..308], &[0u8; 256][..], "named_roots leaked in cleartext");
+        assert_eq!(
+            &buf[52..308],
+            &[0u8; 256][..],
+            "named_roots leaked in cleartext"
+        );
         // Scalar sensitive fields at 16..48 must be zero.
         assert_eq!(&buf[16..48], &[0u8; 32][..], "sensitive scalars leaked");
         // root_membership_index_page (312..320) and freemap_depth (320..324)
         // are also sealed-only, so their plaintext slots must be zero. Bytes
         // 308..312 (superblock_count) are legitimately cleartext and skipped.
-        assert_eq!(&buf[312..324], &[0u8; 12][..], "membership/freemap_depth leaked");
+        assert_eq!(
+            &buf[312..324],
+            &[0u8; 12][..],
+            "membership/freemap_depth leaked"
+        );
         // Bootstrap fields stay plaintext.
         assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), MAGIC);
         assert_eq!(
@@ -983,7 +992,10 @@ mod tests {
 
         // Two-phase deserialize: sensitive fields are zero after deserialize.
         let mut back = Superblock::deserialize(&buf).expect("encrypted sb deserializes");
-        assert!(back.encryption.is_some(), "encryption field must be populated");
+        assert!(
+            back.encryption.is_some(),
+            "encryption field must be populated"
+        );
         assert_eq!(back.root_handle_table_page, 0, "not yet decrypted");
         assert_eq!(back.next_handle, 0, "not yet decrypted");
 
@@ -1102,7 +1114,8 @@ mod tests {
         // 3. Round-trip: decrypt_body must recover the sentinel, proving it was
         //    sealed (not silently dropped).
         let mut back = Superblock::deserialize(&buf).expect("encrypted sb must deserialize");
-        back.decrypt_body(&cipher, &buf).expect("correct DEK must open body");
+        back.decrypt_body(&cipher, &buf)
+            .expect("correct DEK must open body");
         assert_eq!(
             back.named_roots[0].name, sentinel,
             "named_root name not recovered after decrypt_body"

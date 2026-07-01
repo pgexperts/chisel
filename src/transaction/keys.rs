@@ -131,15 +131,24 @@ impl TransactionManager {
     /// `EncryptionNotSupported` — plaintext DB; `InvalidEncryptionKey` — `existing`
     /// unlocks no slot; `NoFreeKeySlot` — all 8 slots occupied; I/O failures are
     /// fatal and poison the manager.
-    pub(crate) fn add_key(&mut self, existing: &crate::crypto::Key, new: &crate::crypto::Key) -> Result<()> {
+    pub(crate) fn add_key(
+        &mut self,
+        existing: &crate::crypto::Key,
+        new: &crate::crypto::Key,
+    ) -> Result<()> {
         if self.poisoned.get() {
             return Err(ChiselError::Poisoned);
         }
-        let header = self.crypto_header.as_ref().ok_or(ChiselError::EncryptionNotSupported)?;
+        let header = self
+            .crypto_header
+            .as_ref()
+            .ok_or(ChiselError::EncryptionNotSupported)?;
         let (_idx, dek) = header.unlock(existing)?; // → InvalidEncryptionKey if none
         let free = header.free_slot().ok_or(ChiselError::NoFreeKeySlot)?;
         let mut new_header = *header;
-        new_header.wrap_into(free, new, &dek).map_err(|_| ChiselError::InvalidEncryptionKey)?;
+        new_header
+            .wrap_into(free, new, &dek)
+            .map_err(|_| ChiselError::InvalidEncryptionKey)?;
         self.rewrite_crypto_header(new_header)
     }
 
@@ -152,15 +161,24 @@ impl TransactionManager {
     /// `EncryptionNotSupported` — plaintext DB; `InvalidEncryptionKey` — `old`
     /// unlocks no slot; `NoFreeKeySlot` — all 8 slots full (no room to stage
     /// `new` before revoking `old`); I/O failures are fatal and poison the manager.
-    pub(crate) fn rotate_key(&mut self, old: &crate::crypto::Key, new: &crate::crypto::Key) -> Result<()> {
+    pub(crate) fn rotate_key(
+        &mut self,
+        old: &crate::crypto::Key,
+        new: &crate::crypto::Key,
+    ) -> Result<()> {
         if self.poisoned.get() {
             return Err(ChiselError::Poisoned);
         }
-        let header = self.crypto_header.as_ref().ok_or(ChiselError::EncryptionNotSupported)?;
+        let header = self
+            .crypto_header
+            .as_ref()
+            .ok_or(ChiselError::EncryptionNotSupported)?;
         let (old_idx, dek) = header.unlock(old)?; // → InvalidEncryptionKey if none
         let free = header.free_slot().ok_or(ChiselError::NoFreeKeySlot)?;
         let mut new_header = *header;
-        new_header.wrap_into(free, new, &dek).map_err(|_| ChiselError::InvalidEncryptionKey)?;
+        new_header
+            .wrap_into(free, new, &dek)
+            .map_err(|_| ChiselError::InvalidEncryptionKey)?;
         // Clear the old slot in the same header snapshot — single atomic rewrite.
         new_header.slots[old_idx] = crate::superblock::KeySlot::EMPTY;
         self.rewrite_crypto_header(new_header)
@@ -184,10 +202,13 @@ impl TransactionManager {
         if self.poisoned.get() {
             return Err(ChiselError::Poisoned);
         }
-        let header = self.crypto_header.as_ref().ok_or(ChiselError::EncryptionNotSupported)?;
+        let header = self
+            .crypto_header
+            .as_ref()
+            .ok_or(ChiselError::EncryptionNotSupported)?;
         let (idx, _dek) = header.unlock(key)?; // → InvalidEncryptionKey if none
-        // Check AFTER confirming the key is valid: an unknown key on a
-        // single-slot DB should report InvalidEncryptionKey, not LastKeySlot.
+                                               // Check AFTER confirming the key is valid: an unknown key on a
+                                               // single-slot DB should report InvalidEncryptionKey, not LastKeySlot.
         if header.active_count() <= 1 {
             return Err(ChiselError::LastKeySlot);
         }
@@ -220,8 +241,7 @@ mod tests {
             crate::DrainInsertion::LruTail,
             crate::SpillwayLocation::InMemory,
         );
-        let mut tm =
-            TransactionManager::create_new(cache, 2, Some(raw(0x11)), None).unwrap();
+        let mut tm = TransactionManager::create_new(cache, 2, Some(raw(0x11)), None).unwrap();
         // Commit once so there is a real baseline superblock to read/write.
         tm.begin().unwrap();
         tm.commit().unwrap();
@@ -300,16 +320,28 @@ mod tests {
         let counter_before = db.txn_counter;
 
         // Unlock slot 0 to get the DEK, then wrap it into a second slot.
-        let mut new_hdr = db.crypto_header.expect("encrypted DB must have crypto_header");
-        let (_, dek) = new_hdr.unlock(&raw(0x11)).expect("slot 0 unlocks with key 0x11");
-        new_hdr.wrap_into(1, &raw(0x22), &dek).expect("wrap_into with valid key must succeed");
+        let mut new_hdr = db
+            .crypto_header
+            .expect("encrypted DB must have crypto_header");
+        let (_, dek) = new_hdr
+            .unlock(&raw(0x11))
+            .expect("slot 0 unlocks with key 0x11");
+        new_hdr
+            .wrap_into(1, &raw(0x22), &dek)
+            .expect("wrap_into with valid key must succeed");
 
         db.rewrite_crypto_header(new_hdr).unwrap();
 
         // txn_counter must have bumped exactly once.
-        assert_eq!(db.txn_counter, counter_before + 1, "txn_counter must advance");
+        assert_eq!(
+            db.txn_counter,
+            counter_before + 1,
+            "txn_counter must advance"
+        );
         // In-memory header must reflect both active slots.
-        let stored = db.crypto_header.expect("crypto_header must be Some after rewrite");
+        let stored = db
+            .crypto_header
+            .expect("crypto_header must be Some after rewrite");
         assert_eq!(stored.active_count(), 2, "both slots must be active");
         assert!(!db.is_poisoned());
     }
@@ -396,7 +428,9 @@ mod tests {
         // Add key 0x22 by rewriting the header with a second slot.
         let mut new_hdr = db.crypto_header.unwrap();
         let (_, dek) = new_hdr.unlock(&raw(0x11)).unwrap();
-        new_hdr.wrap_into(1, &raw(0x22), &dek).expect("wrap_into with valid key must succeed");
+        new_hdr
+            .wrap_into(1, &raw(0x22), &dek)
+            .expect("wrap_into with valid key must succeed");
         db.rewrite_crypto_header(new_hdr).unwrap();
         // Drop to flush OS buffers (fsync already called).
         drop(db);
@@ -467,7 +501,7 @@ mod tests {
     fn add_key_with_invalid_raw_key_returns_error_not_panic() {
         let mut db = fresh_encrypted();
         let bad_new = Key::Raw(Zeroizing::new(vec![])); // zero-length key material
-        // This must NOT panic; it must return an Err.
+                                                        // This must NOT panic; it must return an Err.
         let result = db.add_key(&raw(0x11), &bad_new);
         assert!(
             matches!(result, Err(ChiselError::InvalidEncryptionKey)),

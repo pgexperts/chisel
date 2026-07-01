@@ -23,7 +23,9 @@ fn passphrase_key_and_argon2_params_public_api() {
         t_cost: 3,
         p_cost: 1,
     };
-    let o = Options::default().encryption_key(pass).argon2_params(params);
+    let o = Options::default()
+        .encryption_key(pass)
+        .argon2_params(params);
     assert!(matches!(o.encryption_key, Some(Key::Passphrase(_))));
     let p = o.argon2_params.unwrap();
     assert_eq!(p.m_cost, 32768);

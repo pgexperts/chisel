@@ -59,7 +59,11 @@ impl KeySlot {
     pub const EMPTY: KeySlot = KeySlot {
         state: 0,
         kdf_id: 0,
-        argon2: Argon2Params { m_cost: 0, t_cost: 0, p_cost: 0 },
+        argon2: Argon2Params {
+            m_cost: 0,
+            t_cost: 0,
+            p_cost: 0,
+        },
         salt: [0u8; SALT_LEN],
         wrap_nonce: [0u8; NONCE_LEN],
         wrapped_dek: [0u8; DEK_LEN],
@@ -153,7 +157,11 @@ impl CryptoHeader {
             let base = SLOT_TABLE_OFFSET + i * KEY_SLOT_SIZE;
             *slot = KeySlot::read_from(&buf[base..base + KEY_SLOT_SIZE]);
         }
-        Some(CryptoHeader { algorithm, stride, slots })
+        Some(CryptoHeader {
+            algorithm,
+            stride,
+            slots,
+        })
     }
 
     /// Count how many slots currently hold a wrapped DEK (state == active).
@@ -233,9 +241,14 @@ impl CryptoHeader {
     ) -> Result<(), crate::crypto::CryptoError> {
         use crate::crypto::{self, KdfId};
         let (kdf_id, argon2) = match key {
-            crate::crypto::Key::Raw(_) => {
-                (KdfId::Hkdf, Argon2Params { m_cost: 0, t_cost: 0, p_cost: 0 })
-            }
+            crate::crypto::Key::Raw(_) => (
+                KdfId::Hkdf,
+                Argon2Params {
+                    m_cost: 0,
+                    t_cost: 0,
+                    p_cost: 0,
+                },
+            ),
             crate::crypto::Key::Passphrase(_) => (KdfId::Argon2id, Argon2Params::default()),
         };
         let salt: [u8; SALT_LEN] = crypto::random_array();
@@ -280,7 +293,8 @@ mod crypto_header_tests {
             stride: crypto::ENC_PAGE_SIZE as u32,
             slots: [KeySlot::EMPTY; KEY_SLOT_COUNT],
         };
-        h.wrap_into(0, key, dek).expect("wrap_into with valid key must succeed");
+        h.wrap_into(0, key, dek)
+            .expect("wrap_into with valid key must succeed");
         h
     }
 
@@ -292,7 +306,8 @@ mod crypto_header_tests {
 
         // Add a second credential into slot 3 wrapping the SAME dek.
         let k1 = raw(0xB2);
-        h.wrap_into(3, &k1, &dek).expect("wrap_into with valid key must succeed");
+        h.wrap_into(3, &k1, &dek)
+            .expect("wrap_into with valid key must succeed");
 
         let (idx0, d0) = h.unlock(&k0).expect("k0 must unlock");
         let (idx1, d1) = h.unlock(&k1).expect("k1 must unlock");
@@ -309,7 +324,10 @@ mod crypto_header_tests {
         let h = header_with_one(&raw(0xAA), &dek);
         // Dek has no Debug, so we can't use expect_err(); use matches! instead.
         let result = h.unlock(&raw(0xBB));
-        assert!(matches!(result, Err(crate::error::ChiselError::InvalidEncryptionKey)));
+        assert!(matches!(
+            result,
+            Err(crate::error::ChiselError::InvalidEncryptionKey)
+        ));
     }
 
     #[test]
@@ -349,7 +367,8 @@ mod crypto_header_tests {
             stride: crypto::ENC_PAGE_SIZE as u32,
             slots: [KeySlot::EMPTY; KEY_SLOT_COUNT],
         };
-        h.wrap_into(5, &key, &dek).expect("wrap_into with valid key must succeed");
+        h.wrap_into(5, &key, &dek)
+            .expect("wrap_into with valid key must succeed");
         let (idx, recovered) = h.unlock(&key).expect("wrap_into then unlock must succeed");
         assert_eq!(idx, 5);
         assert_eq!(recovered.as_bytes(), dek.as_bytes());
@@ -366,7 +385,11 @@ mod tests {
         KeySlot {
             state,
             kdf_id: 1,
-            argon2: Argon2Params { m_cost: 19456, t_cost: 2, p_cost: 1 },
+            argon2: Argon2Params {
+                m_cost: 19456,
+                t_cost: 2,
+                p_cost: 1,
+            },
             salt: [7u8; 16],
             wrap_nonce: [9u8; 24],
             wrapped_dek: [3u8; 32],
@@ -379,7 +402,11 @@ mod tests {
         let mut slots = [KeySlot::EMPTY; KEY_SLOT_COUNT];
         slots[0] = sample_slot(1); // active
         slots[3] = sample_slot(1); // active
-        let header = CryptoHeader { algorithm: 1, stride: 8232, slots };
+        let header = CryptoHeader {
+            algorithm: 1,
+            stride: 8232,
+            slots,
+        };
 
         let mut buf = [0u8; PAGE_SIZE];
         header.serialize_into(&mut buf);

@@ -239,7 +239,13 @@ impl Spillway {
             new_index
         };
 
-        write_slot(&mut self.backing, slot_index, page_id, blob, self.payload_size)?;
+        write_slot(
+            &mut self.backing,
+            slot_index,
+            page_id,
+            blob,
+            self.payload_size,
+        )?;
         Ok(())
     }
 

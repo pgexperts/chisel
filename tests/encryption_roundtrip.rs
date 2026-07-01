@@ -12,7 +12,7 @@
 // derivation is exercised in the crypto unit tests. Uses only the public API
 // (chisel::{Chisel, ChiselError, Key, Options}); no crate-internal paths.
 
-use chisel::{ChiselError, Chisel, Key, Options};
+use chisel::{Chisel, ChiselError, Key, Options};
 use zeroize::Zeroizing;
 
 fn raw_key(b: u8) -> Key {
@@ -26,9 +26,8 @@ fn encrypted_roundtrip_and_wrong_key() {
 
     // Create encrypted, write a value, capture the raw handle id, close.
     let raw_handle = {
-        let mut db =
-            Chisel::open(&path, Options::default().encryption_key(raw_key(0xAB)))
-                .expect("create encrypted");
+        let mut db = Chisel::open(&path, Options::default().encryption_key(raw_key(0xAB)))
+            .expect("create encrypted");
         db.begin().expect("begin");
         let h = db.allocate(b"secret-payload").expect("allocate");
         db.commit().expect("commit");
@@ -83,10 +82,9 @@ fn in_memory_encrypted_roundtrip() {
     // An in-memory encrypted DB must write and read back within the same session.
     // There is no reopen for in-memory DBs, so the test covers the allocate →
     // commit → read path under encryption without touching disk.
-    let mut db = Chisel::open_in_memory_with_options(
-        Options::default().encryption_key(raw_key(0x7F)),
-    )
-    .expect("open in-memory encrypted");
+    let mut db =
+        Chisel::open_in_memory_with_options(Options::default().encryption_key(raw_key(0x7F)))
+            .expect("open in-memory encrypted");
 
     db.begin().expect("begin");
     let h1 = db.allocate(b"in-memory-value-alpha").expect("allocate h1");
@@ -102,7 +100,10 @@ fn in_memory_encrypted_roundtrip() {
     db.commit().expect("commit 2");
 
     assert_eq!(db.read(h1).expect("read h1 after update"), b"updated-alpha");
-    assert_eq!(db.read(h2).expect("read h2 unchanged"), b"in-memory-value-beta");
+    assert_eq!(
+        db.read(h2).expect("read h2 unchanged"),
+        b"in-memory-value-beta"
+    );
 }
 
 #[test]

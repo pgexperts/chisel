@@ -252,8 +252,8 @@ impl TransactionManager {
         // is ignored by deserialize). An intact, encrypted page 0 tells us the
         // stride directly via its cleartext crypto-header — the common case.
         let page0 = cache.io_mut().read_page(0)?;
-        if let Some(stride) = Superblock::deserialize(&page0)
-            .and_then(|sb| sb.encryption.map(|h| h.stride as usize))
+        if let Some(stride) =
+            Superblock::deserialize(&page0).and_then(|sb| sb.encryption.map(|h| h.stride as usize))
         {
             cache.io_mut().set_stride(stride);
         }
@@ -269,9 +269,7 @@ impl TransactionManager {
                 .filter_map(Superblock::deserialize)
                 .find_map(|sb| sb.encryption.map(|h| h.stride as usize))
         };
-        if encrypted_stride(&candidates).is_none()
-            && Superblock::deserialize(&page0).is_none()
-        {
+        if encrypted_stride(&candidates).is_none() && Superblock::deserialize(&page0).is_none() {
             // Torn-slot-0 recovery for encrypted DBs: when slot 0 is a torn
             // write, page 0 fails to deserialize so the anchor above could not
             // learn the stride, and the default-stride candidate scan finds
@@ -578,9 +576,7 @@ fn build_create_cipher(
     // has effect for Passphrase.
     let (kdf, params) = match key {
         crate::crypto::Key::Raw(_) => (KdfId::Hkdf, Argon2Params::default()),
-        crate::crypto::Key::Passphrase(_) => {
-            (KdfId::Argon2id, argon2_override.unwrap_or_default())
-        }
+        crate::crypto::Key::Passphrase(_) => (KdfId::Argon2id, argon2_override.unwrap_or_default()),
     };
     let kek = derive_kek(key, kdf, &salt, &params)?;
 
@@ -601,9 +597,16 @@ fn build_create_cipher(
 
     let mut slots = [KeySlot::EMPTY; KEY_SLOT_COUNT];
     slots[0] = slot;
-    let header = CryptoHeader { algorithm: ALGO_XCHACHA20POLY1305, stride: 8232, slots };
+    let header = CryptoHeader {
+        algorithm: ALGO_XCHACHA20POLY1305,
+        stride: 8232,
+        slots,
+    };
 
-    Ok(CreateCrypto { page_cipher: crate::crypto::PageCipher::new(dek), header })
+    Ok(CreateCrypto {
+        page_cipher: crate::crypto::PageCipher::new(dek),
+        header,
+    })
 }
 
 /// Try every ACTIVE key-slot in turn: derive the KEK from `key` + the slot's
@@ -636,9 +639,13 @@ fn unwrap_first_matching_slot(
             Err(_) => continue,
         };
         let aad = slot.aad();
-        if let Ok(dek) =
-            unwrap_dek(&kek, &slot.wrapped_dek, &slot.wrap_tag, &slot.wrap_nonce, &aad)
-        {
+        if let Ok(dek) = unwrap_dek(
+            &kek,
+            &slot.wrapped_dek,
+            &slot.wrap_tag,
+            &slot.wrap_nonce,
+            &aad,
+        ) {
             return Ok(dek);
         }
     }

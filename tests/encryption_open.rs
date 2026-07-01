@@ -19,11 +19,7 @@ fn round_trip_open_with_correct_key() {
     let path = dir.path().join("e.chisel");
     let handle;
     {
-        let mut db = Chisel::open(
-            &path,
-            Options::default().encryption_key(raw_key(0x11)),
-        )
-        .unwrap();
+        let mut db = Chisel::open(&path, Options::default().encryption_key(raw_key(0x11))).unwrap();
         db.begin().unwrap();
         handle = db.allocate(b"hello world").unwrap();
         db.commit().unwrap();
@@ -48,11 +44,7 @@ fn wrong_key_is_operational_error_not_panic() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("e.chisel");
     {
-        let mut db = Chisel::open(
-            &path,
-            Options::default().encryption_key(raw_key(0x11)),
-        )
-        .unwrap();
+        let mut db = Chisel::open(&path, Options::default().encryption_key(raw_key(0x11))).unwrap();
         db.begin().unwrap();
         db.commit().unwrap();
     }
@@ -72,7 +64,10 @@ fn wrong_key_is_operational_error_not_panic() {
             .encryption_key(raw_key(0x11))
             .create_if_missing(false),
     );
-    assert!(ok.is_ok(), "correct key must succeed after a wrong-key attempt");
+    assert!(
+        ok.is_ok(),
+        "correct key must succeed after a wrong-key attempt"
+    );
 }
 
 /// Opening an encrypted DB without supplying a key must error.
@@ -81,16 +76,15 @@ fn missing_key_on_encrypted_db_errors() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("e.chisel");
     {
-        let mut db = Chisel::open(
-            &path,
-            Options::default().encryption_key(raw_key(0x11)),
-        )
-        .unwrap();
+        let mut db = Chisel::open(&path, Options::default().encryption_key(raw_key(0x11))).unwrap();
         db.begin().unwrap();
         db.commit().unwrap();
     }
     let err = Chisel::open(&path, Options::default().create_if_missing(false));
-    assert!(err.is_err(), "opening an encrypted DB without a key must fail");
+    assert!(
+        err.is_err(),
+        "opening an encrypted DB without a key must fail"
+    );
 }
 
 /// Supplying a key to a plaintext DB must error.
@@ -140,8 +134,7 @@ fn passphrase_key_round_trip() {
     let pass = || Key::Passphrase(Zeroizing::new("correct horse battery staple".to_string()));
     let handle;
     {
-        let mut db =
-            Chisel::open(&path, Options::default().encryption_key(pass())).unwrap();
+        let mut db = Chisel::open(&path, Options::default().encryption_key(pass())).unwrap();
         db.begin().unwrap();
         handle = db.allocate(b"secret").unwrap();
         db.commit().unwrap();
@@ -169,11 +162,7 @@ fn open_encrypted_db_with_no_commits_uses_correct_key() {
     // Create with a named root set at create time (so there's something to verify
     // round-trips even without a user commit).
     {
-        let _db = Chisel::open(
-            &path,
-            Options::default().encryption_key(raw_key(0x42)),
-        )
-        .unwrap();
+        let _db = Chisel::open(&path, Options::default().encryption_key(raw_key(0x42))).unwrap();
         // Drop immediately — no begin/commit. This is the exact scenario the
         // create-seed inversion bug breaks: the winner slot is at page 0
         // (counter N-1) but txn_counter % N = N-1 != 0 for N=2.
@@ -199,11 +188,7 @@ fn named_root_round_trips_through_encrypted_open() {
     let path = dir.path().join("named.chisel");
     let handle;
     {
-        let mut db = Chisel::open(
-            &path,
-            Options::default().encryption_key(raw_key(0xAB)),
-        )
-        .unwrap();
+        let mut db = Chisel::open(&path, Options::default().encryption_key(raw_key(0xAB))).unwrap();
         db.begin().unwrap();
         handle = db.allocate(b"payload").unwrap();
         db.set_root_name("myroot", handle).unwrap();
@@ -270,11 +255,7 @@ fn multi_page_encrypted_value_round_trips() {
     let payload: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
     let handle;
     {
-        let mut db = Chisel::open(
-            &path,
-            Options::default().encryption_key(raw_key(0x77)),
-        )
-        .unwrap();
+        let mut db = Chisel::open(&path, Options::default().encryption_key(raw_key(0x77))).unwrap();
         db.begin().unwrap();
         handle = db.allocate(&payload).unwrap();
         db.commit().unwrap();
@@ -313,11 +294,7 @@ fn torn_slot_0_encrypted_db_recovers_via_sibling() {
     let path = dir.path().join("torn.chisel");
     let h1;
     {
-        let mut db = Chisel::open(
-            &path,
-            Options::default().encryption_key(raw_key(0x99)),
-        )
-        .unwrap();
+        let mut db = Chisel::open(&path, Options::default().encryption_key(raw_key(0x99))).unwrap();
         // Two commits so BOTH slots (N=2) hold valid post-commit superblocks:
         // commit 1 → slot 0, commit 2 → slot 1. After corrupting slot 0,
         // recovery must fall back to slot 1.
@@ -331,10 +308,7 @@ fn torn_slot_0_encrypted_db_recovers_via_sibling() {
     // Simulate a torn write to slot 0: zero its first PAGE_SIZE bytes so the
     // page-0 image fails to deserialize (anchor cannot learn the stride).
     {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         f.seek(SeekFrom::Start(0)).unwrap();
         f.write_all(&[0u8; 8192]).unwrap();
         f.sync_all().unwrap();

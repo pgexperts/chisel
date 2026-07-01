@@ -30,8 +30,11 @@ struct TempDb(std::path::PathBuf);
 
 impl TempDb {
     fn new(stem: &str) -> Self {
-        let p = std::env::temp_dir()
-            .join(format!("chisel_enc_test_{}_{}.db", stem, std::process::id()));
+        let p = std::env::temp_dir().join(format!(
+            "chisel_enc_test_{}_{}.db",
+            stem,
+            std::process::id()
+        ));
         let _ = fs::remove_file(&p);
         TempDb(p)
     }
@@ -97,16 +100,15 @@ fn create_encrypted_db_passphrase_stamps_major_2() {
 fn create_encrypted_db_populates_slot_0_only() {
     let tmp = TempDb::new("slot0");
     let key = Key::Raw(Zeroizing::new(vec![0x77_u8; 32]));
-    let db = crate::Chisel::open(tmp.path(), Options::default().encryption_key(key))
-        .expect("create");
+    let db =
+        crate::Chisel::open(tmp.path(), Options::default().encryption_key(key)).expect("create");
     drop(db);
 
     let page0 = tmp.read_page0();
 
     // Algorithm byte is the first byte of the crypto-header region.
     assert_eq!(
-        page0[CRYPTO_HEADER_OFFSET],
-        ALGO_XCHACHA20POLY1305,
+        page0[CRYPTO_HEADER_OFFSET], ALGO_XCHACHA20POLY1305,
         "algorithm byte must be 1 (XChaCha20-Poly1305)"
     );
 
@@ -115,7 +117,10 @@ fn create_encrypted_db_populates_slot_0_only() {
     let slot_table_offset = CRYPTO_HEADER_OFFSET + 8;
 
     // Slot 0 state byte must be 1 (active).
-    assert_eq!(page0[slot_table_offset], 1, "slot 0 state must be active (1)");
+    assert_eq!(
+        page0[slot_table_offset], 1,
+        "slot 0 state must be active (1)"
+    );
 
     // Slots 1..KEY_SLOT_COUNT must all be empty (state = 0).
     for i in 1..KEY_SLOT_COUNT {
@@ -143,8 +148,8 @@ fn create_encrypted_db_sealed_body_is_present() {
 
     let tmp = TempDb::new("cleartext_check");
     let key = Key::Raw(Zeroizing::new(vec![0xCC_u8; 32]));
-    let db = crate::Chisel::open(tmp.path(), Options::default().encryption_key(key))
-        .expect("create");
+    let db =
+        crate::Chisel::open(tmp.path(), Options::default().encryption_key(key)).expect("create");
     drop(db);
 
     let page0 = tmp.read_page0();
@@ -200,11 +205,21 @@ fn slot0_dek_unwraps_with_correct_key() {
     let aad = aad_slot.aad();
 
     // Unwrap must succeed.
-    let dek = unwrap_dek(&kek, &slot.wrapped_dek, &slot.wrap_tag, &slot.wrap_nonce, &aad)
-        .expect("unwrap_dek must succeed with the correct key and AAD");
+    let dek = unwrap_dek(
+        &kek,
+        &slot.wrapped_dek,
+        &slot.wrap_tag,
+        &slot.wrap_nonce,
+        &aad,
+    )
+    .expect("unwrap_dek must succeed with the correct key and AAD");
 
     // The DEK must be non-trivial (not all zeros).
-    assert_ne!(dek.as_bytes(), &[0u8; 32], "unwrapped DEK must not be all zeros");
+    assert_ne!(
+        dek.as_bytes(),
+        &[0u8; 32],
+        "unwrapped DEK must not be all zeros"
+    );
 }
 
 /// Wrong key must fail unwrap (AEAD authentication failure).
@@ -212,8 +227,8 @@ fn slot0_dek_unwraps_with_correct_key() {
 fn slot0_dek_unwrap_fails_with_wrong_key() {
     let tmp = TempDb::new("wrong_key");
     let key = Key::Raw(Zeroizing::new(vec![0x5A_u8; 32]));
-    let db = crate::Chisel::open(tmp.path(), Options::default().encryption_key(key))
-        .expect("create");
+    let db =
+        crate::Chisel::open(tmp.path(), Options::default().encryption_key(key)).expect("create");
     drop(db);
 
     let page0 = tmp.read_page0();
@@ -221,8 +236,7 @@ fn slot0_dek_unwrap_fails_with_wrong_key() {
     let slot = &header.slots[0];
 
     let wrong_key = Key::Raw(Zeroizing::new(vec![0xFF_u8; 32]));
-    let kek =
-        derive_kek(&wrong_key, KdfId::Hkdf, &slot.salt, &slot.argon2).expect("derive_kek");
+    let kek = derive_kek(&wrong_key, KdfId::Hkdf, &slot.salt, &slot.argon2).expect("derive_kek");
 
     let mut aad_slot = KeySlot::EMPTY;
     aad_slot.state = slot.state;
@@ -233,7 +247,14 @@ fn slot0_dek_unwrap_fails_with_wrong_key() {
     let aad = aad_slot.aad();
 
     assert!(
-        unwrap_dek(&kek, &slot.wrapped_dek, &slot.wrap_tag, &slot.wrap_nonce, &aad).is_err(),
+        unwrap_dek(
+            &kek,
+            &slot.wrapped_dek,
+            &slot.wrap_tag,
+            &slot.wrap_nonce,
+            &aad
+        )
+        .is_err(),
         "wrong key must fail DEK unwrap"
     );
 }

@@ -226,7 +226,10 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         py.get_type::<AlreadyFinishedError>(),
     )?;
     m.add("TagMismatchError", py.get_type::<TagMismatchError>())?;
-    m.add("NoEncryptionKeyError", py.get_type::<NoEncryptionKeyError>())?;
+    m.add(
+        "NoEncryptionKeyError",
+        py.get_type::<NoEncryptionKeyError>(),
+    )?;
     m.add(
         "InvalidEncryptionKeyError",
         py.get_type::<InvalidEncryptionKeyError>(),

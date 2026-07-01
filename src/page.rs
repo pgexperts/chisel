@@ -128,8 +128,10 @@ pub(crate) const FORMAT_MINOR_VERSION_ENCRYPTED: u16 = 0;
 /// through that function, so there is exactly ONE on-disk value — no two
 /// constants that can drift. An encryption-unaware binary (FORMAT_MAJOR_VERSION
 /// == 1) rejects it as `UnsupportedFormatVersion`, the intended hard-reject.
-pub(crate) const ENCRYPTED_FORMAT_VERSION: u32 =
-    pack_format_version(FORMAT_MAJOR_VERSION_ENCRYPTED, FORMAT_MINOR_VERSION_ENCRYPTED);
+pub(crate) const ENCRYPTED_FORMAT_VERSION: u32 = pack_format_version(
+    FORMAT_MAJOR_VERSION_ENCRYPTED,
+    FORMAT_MINOR_VERSION_ENCRYPTED,
+);
 
 /// The encrypted-DB packed format version (MAJOR=2, MINOR=0). Single source of
 /// truth: returns `ENCRYPTED_FORMAT_VERSION`. Called by the create path

@@ -4,8 +4,8 @@
 //! The underlying DEK is never re-generated, so add_key / rotate_key are pure
 //! superblock operations: no page is touched, data survives every credential change.
 
-use chisel::{ChiselError, Chisel, Options};
 use chisel::Key;
+use chisel::{Chisel, ChiselError, Options};
 use tempfile::TempDir;
 use zeroize::Zeroizing;
 

@@ -1009,7 +1009,8 @@ impl PageCache {
         // the plaintext branch runs verify_checksum on the raw page bytes as before.
         let mut on_disk = [0u8; ENC_PAGE_SIZE];
         let stride = self.io.stride();
-        self.io.read_page_unit_into(page_id, &mut on_disk[..stride])?;
+        self.io
+            .read_page_unit_into(page_id, &mut on_disk[..stride])?;
 
         let plaintext: [u8; PAGE_SIZE] = match &self.cipher {
             Some(c) => {
@@ -1900,7 +1901,7 @@ mod tests {
     // Encrypted page-cache tests (Task 3.3)
     // -----------------------------------------------------------------------
 
-    use crate::crypto::{random_dek, ENC_PAGE_SIZE, PageCipher};
+    use crate::crypto::{random_dek, PageCipher, ENC_PAGE_SIZE};
 
     /// Build a file-backed cache with stride=ENC_PAGE_SIZE and a PageCipher
     /// installed. The stride must be set on the PageIo BEFORE construction so
@@ -2033,9 +2034,7 @@ mod tests {
         // encrypted DB that blob is XChaCha20-Poly1305 ciphertext — the sentinel
         // must NOT appear verbatim anywhere in it.
         let blob = cache.spillway.as_mut().unwrap().rehydrate(id_a).unwrap();
-        let sentinel_pos = blob
-            .windows(8)
-            .position(|w| w == b"SENTINEL");
+        let sentinel_pos = blob.windows(8).position(|w| w == b"SENTINEL");
         assert!(
             sentinel_pos.is_none(),
             "plaintext sentinel found verbatim in spillway slot — spill did not encrypt"
@@ -2138,7 +2137,10 @@ mod tests {
 
         for (n, &pid) in ids.iter().enumerate() {
             let buf = cache.get(pid).unwrap();
-            assert_eq!(buf[0], n as u8, "page {pid} byte[0] mismatch after full round trip");
+            assert_eq!(
+                buf[0], n as u8,
+                "page {pid} byte[0] mismatch after full round trip"
+            );
             assert_eq!(
                 buf[100],
                 (n as u8).wrapping_mul(7),
