@@ -693,11 +693,13 @@ mod tests {
             .expect("MAJOR=2 file opened without a key must fail");
         match err {
             ChiselError::UnsupportedFormatVersion { found, expected } => {
+                // The exact stamped value is pack(2, 0) = 0x0002_0000 — the
+                // single canonical encrypted format version. MAJOR byte is 2.
                 assert_eq!(
-                    page::format_major(found),
-                    2,
-                    "error must report the MAJOR=2 version found on disk"
+                    found, ENCRYPTED_FORMAT_VERSION,
+                    "error must report the exact MAJOR=2 MINOR=0 version found on disk"
                 );
+                assert_eq!(page::format_major(found), 2);
                 assert_eq!(
                     expected,
                     FORMAT_VERSION, // pack(1, 1) — what a plaintext binary expects

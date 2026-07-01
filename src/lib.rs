@@ -78,10 +78,7 @@ pub use superblock::{
     CRYPTO_HEADER_OFFSET, DEFAULT_SUPERBLOCK_COUNT, KEY_SLOT_COUNT, KEY_SLOT_SIZE,
     MAX_SUPERBLOCKS, MIN_SUPERBLOCKS, NAMED_ROOT_COUNT, NAMED_ROOT_NAME_LEN,
 };
-pub use page::{
-    ENCRYPTED_FORMAT_VERSION, FORMAT_MAJOR_VERSION_ENCRYPTED, FORMAT_MINOR_VERSION_ENCRYPTED,
-    format_major, format_version_encrypted,
-};
+pub use page::{FORMAT_MAJOR_VERSION_ENCRYPTED, format_major, format_version_encrypted};
 pub use crypto::{
     derive_kek, unwrap_dek, wrap_dek, Argon2Params, KdfId, Key, PageCipher, CryptoError,
     NONCE_LEN, SALT_LEN, DEK_LEN,

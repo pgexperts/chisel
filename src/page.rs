@@ -117,23 +117,26 @@ pub const FORMAT_MINOR_VERSION: u16 = 1;
 /// 1 → 2 hard-rejects old binaries (which gate on FORMAT_MAJOR_VERSION == 1).
 pub const FORMAT_MAJOR_VERSION_ENCRYPTED: u16 = 2;
 
-/// MINOR version for the encrypted-DB format series. Starts at 0 (first
-/// encrypted release). Encrypted DBs carry their own minor series: a minor bump
-/// here signals an additive change inside an encrypted DB's superblock fields,
-/// just as `FORMAT_MINOR_VERSION` does for plaintext DBs.
-pub const FORMAT_MINOR_VERSION_ENCRYPTED: u16 = 0;
+/// MINOR version for the encrypted-DB format series. A new MAJOR series starts
+/// its MINOR count at 0, so encrypted DBs stamp (2, 0) — NOT (2, FORMAT_MINOR_VERSION).
+/// The encrypted format carries its own minor series, independent of plaintext.
+pub(crate) const FORMAT_MINOR_VERSION_ENCRYPTED: u16 = 0;
 
-/// Packed format_version stamped into every ENCRYPTED database's superblock:
-/// `pack_format_version(FORMAT_MAJOR_VERSION_ENCRYPTED, FORMAT_MINOR_VERSION_ENCRYPTED)`.
-/// An encryption-unaware binary (FORMAT_MAJOR_VERSION == 1) rejects this as
-/// `UnsupportedFormatVersion`, which is the intended hard-reject behaviour.
-pub const ENCRYPTED_FORMAT_VERSION: u32 =
+/// The SINGLE canonical packed format_version for an ENCRYPTED database's
+/// superblock: `pack(2, 0)`. `format_version_encrypted()` returns this constant;
+/// create, open, and the superblock-body AAD (`sb_identity_aad`) all route
+/// through that function, so there is exactly ONE on-disk value — no two
+/// constants that can drift. An encryption-unaware binary (FORMAT_MAJOR_VERSION
+/// == 1) rejects it as `UnsupportedFormatVersion`, the intended hard-reject.
+pub(crate) const ENCRYPTED_FORMAT_VERSION: u32 =
     pack_format_version(FORMAT_MAJOR_VERSION_ENCRYPTED, FORMAT_MINOR_VERSION_ENCRYPTED);
 
-/// Pack the encrypted-DB format version: MAJOR=2, MINOR=current. Used by
-/// `create_new` when a key is supplied, and by Task 2.4's open-time gate.
+/// The encrypted-DB packed format version (MAJOR=2, MINOR=0). Single source of
+/// truth: returns `ENCRYPTED_FORMAT_VERSION`. Called by the create path
+/// (keys.rs, superblock::new_empty_encrypted), the commit stamp, and the
+/// open-time gate — they all agree because they all call this one function.
 pub fn format_version_encrypted() -> u32 {
-    pack_format_version(FORMAT_MAJOR_VERSION_ENCRYPTED, FORMAT_MINOR_VERSION)
+    ENCRYPTED_FORMAT_VERSION
 }
 
 /// Pack a (major, minor) pair into the on-disk u32 format version.
