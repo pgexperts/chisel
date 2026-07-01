@@ -39,6 +39,12 @@ What follows is the spine of the document: the eighteen design decisions that, i
 
 **Why.** Shadow paging trades disk space (you hold the live and previous version of every mutated page until commit) for code simplicity. There is no log to replay; the "is this database openable?" check *is* the crash-recovery path; crash safety is provable by inspection. The known cost is accepted with eyes open: write amplification (a one-byte change costs a full 8 KB page) and the eventual need for `defrag.rs` to reclaim sparse pages over time. See [ARCHITECTURE.md#commit-protocol](ARCHITECTURE.md#commit-protocol) for the mechanism.
 
+### Page size: 8 KB, aligned to the storage block
+
+**Chosen.** `PAGE_SIZE = 8192`, fixed for the life of a database and pervasive in every geometry calculation (slot directories, radix fan-out, freemap coverage).
+
+**Why.** 8 KB was chosen to align with the underlying storage block size, so that a page maps cleanly onto the device's own block granularity rather than straddling it. *(Recorded directly from the engine author; there is no written ADR for the page-size choice.)*
+
 ### Single-writer, enforced by the type system (ADR-2)
 
 **Chosen.** One process, one writer. The invariant is enforced at three levels at once: an OS exclusive `flock` in `page_io.rs`, `&mut self` on every mutating API, and an explicit statement that this is philosophical, not a v1 shortcut. Reads take `&self` because the cache lives behind a `RefCell`, not a `Mutex`.
@@ -62,6 +68,8 @@ What follows is the spine of the document: the eighteen design decisions that, i
 **Rejected.** A single superblock overwritten each commit, protected by a PostgreSQL-style double-write buffer. Rejected because shadow paging *already* double-protects the data pages, so only the superblock itself needs torn-write protection, and N rotating slots are simpler than standing up a separate buffer area. A write-side mini-WAL just for the superblock fell to the same complexity argument as ADR-1.
 
 **Why.** A single superblock overwritten in place is vulnerable to a torn write leaving the file unrecoverable. Rotating slots give trivial torn-write recovery — a torn slot fails its checksum and is ignored — need no separate journal (the slots *are* the journal), and offer a configurable space/durability tradeoff: higher N survives more *consecutive* torn writes. The cost is N pages of overhead at the file head and the fact that changing N for an existing file needs migration. The commit always writes the *stalest* slot, so a torn write can only damage a slot you were about to discard anyway; see the round-robin reasoning in [ARCHITECTURE.md#commit-protocol](ARCHITECTURE.md#commit-protocol).
+
+**Why the default is 2.** The default `superblock_count` of 2 is a deliberate integrity/performance balance: two slots already give clean torn-write recovery, and 3 is defensible, but larger N carries considerable performance cost for little additional safety — each extra slot only buys survival of one more *consecutive* torn write, already a vanishingly rare event. The `2..=16` range leaves headroom for a deployment that wants more redundancy without imposing it by default. *(The specific default was recorded from the engine author; ADR-4 covered the rotating-slot mechanism but not the chosen value.)*
 
 ### Poison model on fatal errors (ADR-6, I1)
 
@@ -227,21 +235,13 @@ The measurement design is worth a section of its own because its choices are pri
 
 ## Rationale not recovered
 
-The following choices are real and load-bearing, but the project's ADRs, specs, and issue log do **not** record *why* the specific value or option was picked over its neighbors. They are listed here honestly rather than back-filled with a plausible-sounding invention — a fabricated rationale in a "why" document is worse than an acknowledged gap, because a future reader would trust it.
+The following choices are real and load-bearing, but the project's ADRs, specs, and issue log do **not** record *why* the specific value or option was picked over its neighbors. They are listed here honestly rather than back-filled with a plausible-sounding invention — a fabricated rationale in a "why" document is worse than an acknowledged gap, because a future reader would trust it. As gaps are answered by the people who made the calls, they move up into the decision sections above: the **8 KB page size** (aligned to the storage block) and the **`superblock_count` default of 2** (an integrity/performance balance) were recorded from the engine author and now live with their decisions.
 
 - **Why XXH3 specifically** (over CRC32C, BLAKE3, or another non-cryptographic checksum) for the page and spillway checksum. XXH3 is used everywhere, but no source records the comparison; only the I77 FxHash-over-SipHash swap for *internal maps* has recorded rationale.
 
   > Rationale not recovered from project sources.
 
-- **Why 8192-byte pages** (over 4096 or 16384). `PAGE_SIZE = 8192` is pervasive in the geometry and treated as a given; no ADR, spec, or issue captures the size choice.
-
-  > Rationale not recovered from project sources.
-
 - **Why 8 key-slots** (over 4 or 16). Spec §3.2 shows that 8 × 128 bytes fits comfortably in the reserved region, but nothing explains why 8 is the right *operational* number of credentials.
-
-  > Rationale not recovered from project sources.
-
-- **Why `superblock_count` default = 2** (rather than 3), and why the upper bound is 16. ADR-4 explains N rotating slots and that N is configurable, but not the specific default or ceiling.
 
   > Rationale not recovered from project sources.
 
