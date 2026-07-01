@@ -1,12 +1,14 @@
 # Chisel — Architecture and On-Disk Format
 
-This document is for someone (human or AI) reading the Chisel codebase for the first time. It explains *how* Chisel is laid out, *why* the layers stack the way they do, and what every byte on disk means. For *what Chisel does* and how to use it, see [`README.md`](README.md). For the running decision log — open issues, closed issues, every design tradeoff with date-stamped rationale — see [`ISSUES.md`](ISSUES.md).
+This document is the cold-start reference for someone (human or AI) picking up the Chisel codebase in a context-free session. It is a compressed map of the layers, the exact on-disk byte format, the load-bearing invariants, and the landmines. Read it whole at the start of a session. For *what Chisel does* and how to use it, see [`README.md`](README.md). For the running decision log — open issues, closed issues, every design tradeoff with date-stamped rationale — see [`ISSUES.md`](ISSUES.md).
+
+For the theory of operation and the rationale behind these decisions — why shadow-paging over WAL, the rejected alternatives, the implementation history — see [`THEORY.md`](THEORY.md).
 
 This is a living document; update it when the architecture changes. Decisions documented here should be supportable by the code at the time you read it — if a claim and the code disagree, trust the code and update the doc.
 
 ## Table of contents
 
-1. [Design philosophy](#design-philosophy)
+1. [Design commitments](#design-commitments)
 2. [Commenting standards](#commenting-standards)
 3. [Layer model](#layer-model)
 4. [Commit protocol](#commit-protocol)
@@ -14,21 +16,17 @@ This is a living document; update it when the architecture changes. Decisions do
 6. [On-disk format](#on-disk-format)
 7. [Cross-cutting concepts](#cross-cutting-concepts)
    - [On-disk encryption](#on-disk-encryption)
-8. [Benchmark infrastructure](#benchmark-infrastructure)
-9. [Implementation history](#implementation-history)
-10. [Glossary](#glossary)
+8. [Glossary](#glossary)
 
 ---
 
-## Design philosophy
+## Design commitments
 
-Three commitments shape everything else:
+Three enforced facts shape everything else (rationale in THEORY.md):
 
-- **Single-writer, embedded.** Exactly one process owns the file at a time, enforced by `flock`. The Rust API is `&mut self` for every mutator; there is no internal locking, no concurrent transactions, no MVCC. This is *philosophical* (see the project memory note "Chisel single-client design is philosophical"), not a v1 simplification — the type system encodes it.
-- **Shadow paging, not WAL.** Every write goes to a fresh page. The previously-committed superblock keeps pointing at the previous (intact) pages until commit swaps in a new superblock. Crash recovery is "pick the winning superblock" — there is no log to replay and no recovery procedure as such.
-- **Durability over performance.** Every commit performs two `fsync` calls (data, then superblock). Every page on disk carries an XXH3 checksum validated on load. The poison model (see below) treats any `fsync` failure as terminal because Linux fsyncgate semantics make retry unsafe.
-
-These three together explain most of Chisel's other choices (poison model, per-module COW, exclusive `flock` even for readers).
+- **Single-writer, embedded.** Exactly one process owns the file at a time, enforced by `flock`. The Rust API is `&mut self` for every mutator; no internal locking, no concurrent transactions, no MVCC.
+- **Shadow paging, not WAL.** Every write goes to a fresh page; the previously-committed superblock keeps pointing at the previous intact pages until commit swaps in a new superblock. Recovery is "pick the winning superblock" — no log to replay.
+- **Durability over performance.** Every commit performs two (three with the I28 pre-drain) `fsync` calls (data, then superblock). Every page carries an XXH3 checksum validated on load. Any `fsync` failure poisons the manager (fsyncgate makes retry unsafe).
 
 ---
 
@@ -49,31 +47,40 @@ When a comment and the code disagree, the comment is stale by default. Update or
 
 ## Layer model
 
-Chisel's modules form a strict bottom-up dependency graph: each layer only depends on layers below it, never sideways or upward. The diagram below is annotated with the responsibility of each module.
+Chisel's modules form a strict bottom-up dependency graph: each layer only depends on layers below it, never sideways or upward. Read the codebase in dependency order and you never have to forward-reference.
 
 ```mermaid
 flowchart BT
     page["page.rs<br/>constants, checksums, PageType"]
     error["error.rs<br/>ChiselError, is_fatal()"]
-    superblock["superblock.rs<br/>superblock layout, select()"]
-    page_io["page_io.rs<br/>raw file I/O, flock<br/>(only module touching FS)"]
-    page_cache["page_cache.rs<br/>LRU cache, dirty tracking,<br/>checksum validation on load"]
+    handle["handle.rs<br/>public Handle/Tag newtypes"]
+    crypto["crypto/mod.rs<br/>PageCipher, KDF envelope,<br/>DEK wrap/unwrap, Key types"]
+    superblock["superblock/ (mod.rs + crypto_header.rs)<br/>superblock layout, select(),<br/>sealed body, key-slot table"]
+    page_io["page_io.rs<br/>raw file I/O, flock, stride<br/>(only module touching FS)"]
+    lru["lru.rs<br/>O(1) intrusive LRU index"]
+    page_cache["page_cache.rs<br/>LRU cache, dirty tracking,<br/>checksum validation, cipher"]
+    spillway["spillway.rs<br/>sidecar dirty-overflow file"]
     freemap["freemap.rs<br/>bitmap free-page tracking<br/>(single-page leaf primitive)"]
     freemap_tree["freemap_tree.rs<br/>COW radix tree of bitmap leaves"]
     data_page["data_page.rs<br/>slotted page (R1 packing)"]
     overflow["overflow.rs<br/>large-value chains"]
     handle_table["handle_table.rs<br/>radix tree, per-module COW"]
     membership_index["membership_index.rs<br/>RadixU64 + two-level<br/>MembershipIndex (tag→handles)"]
-    transaction["transaction.rs<br/>TransactionManager:<br/>orchestrates everything below"]
+    transaction["transaction/ (mod.rs + ~15 submodules)<br/>TransactionManager:<br/>orchestrates everything below"]
     defrag["defrag.rs<br/>sparse-page consolidation"]
     stats["stats.rs<br/>Stats snapshot type"]
     lib["lib.rs<br/>Chisel: thin public API"]
 
     page --> page_io
     error --> page_io
+    crypto --> page_io
     page --> page_cache
     error --> page_cache
+    crypto --> page_cache
     page_io --> page_cache
+    lru --> page_cache
+    page_cache --> spillway
+    crypto --> superblock
     page --> freemap
     page --> data_page
     page --> overflow
@@ -95,10 +102,9 @@ flowchart BT
     error --> transaction
     transaction --> defrag
     transaction --> stats
+    handle --> lib
     transaction --> lib
 ```
-
-Why bottom-up matters: it means you can read the codebase in dependency order and never have to forward-reference. It also means a parallel review pass (which Chisel has had three of) can split across layers cleanly — see the 2026-04-22 review pass that dispatched five agents, one per layer group.
 
 ### Module responsibilities at a glance
 
@@ -106,25 +112,31 @@ Why bottom-up matters: it means you can read the codebase in dependency order an
 |---|---|---|---|
 | 1 | `page.rs` | Page size, type tags, header sizes, magic, format-version constants, XXH3 checksum primitives. | `PAGE_SIZE = 8192`; checksum lives in the last 8 bytes; little-endian on disk. |
 | 1 | `error.rs` | `ChiselError` enum, `is_fatal()` classifier (operational vs fatal). | Fatal variants poison the manager (I1). |
-| 1 | `superblock.rs` | In-memory `Superblock` struct, `serialize`/`deserialize`, `select()` across N candidate slots. | Magic + checksum + `superblock_count ∈ 2..=16` filter slots before tie-breaking by `txn_counter`. |
-| 2 | `page_io.rs` | Raw `pread`/`pwrite` of fixed-size pages, exclusive `flock`, `fsync`, in-memory `Vec<u8>` backing. Tracks cumulative successful `fsync_calls` count via a `Cell<u64>`. | The **only** module that touches the filesystem; everything else uses it through `PageCache`. |
-| 3 | `page_cache.rs` | LRU cache over `PageIo`, dirty tracking, checksum validation on load, spillway overflow, and `CacheFull`/`SpillwayFull` errors. Owns three `Cell<u64>` engine-activity counters (cache hits/misses, pages allocated) and exposes `counters()` aggregating them with `PageIo::fsync_count`. | Soft eviction at `max_pages`; dirty overflow spills to a sidecar Spillway file (cap = `spillway_max_bytes`); `CacheFull` at strict `max_pages` when spillway is disabled (`spillway_max_bytes=0`); checksums verified on disk LOAD only. |
+| 1 | `handle.rs` | Public `Handle` (`u64`) and `Tag` (`NonZeroU32`) newtypes for the API surface. | `#[repr(transparent)]` on `Handle` is load-bearing — the bench adapter transmutes `&[u64]` → `&[Handle]` (I120/I126). Lives ABOVE the engine; the engine stays raw-integer. |
+| 1 | `crypto/mod.rs` | At-rest crypto core: XChaCha20-Poly1305 `PageCipher` (page + body seal/open), envelope KDF (HKDF-SHA256 raw / Argon2id passphrase), DEK wrap/unwrap, zeroizing `Key`/`Argon2Params`. | Standalone — touches no engine layer. Only vetted RustCrypto primitives; all randomness OS-sourced. `ENC_PAGE_SIZE = 8232`, `NONCE_LEN = 24`, `TAG_LEN = 16`, `DEK_LEN = 32`. |
+| 1 | `superblock/` (`mod.rs` + `crypto_header.rs`) | In-memory `Superblock` struct, `serialize`/`deserialize`, `select()` across N candidate slots; `crypto_header.rs` holds the plaintext crypto-header + 8-slot key-slot table and the sealed-body decrypt path. | Magic + checksum + `superblock_count ∈ 2..=16` filter slots before tie-breaking by `txn_counter`. Encrypted DBs seal the sensitive body under the DEK. |
+| 2 | `page_io.rs` | Raw `pread`/`pwrite` of fixed-**stride** pages, exclusive `flock`, `fsync`, in-memory `Vec<u8>` backing. Tracks cumulative successful `fsync_calls` via `Cell<u64>`. Stride = `PAGE_SIZE` (plaintext) or `ENC_PAGE_SIZE` (encrypted), set once via `set_stride`. | The **only** module that touches the filesystem; crypto-agnostic (moves `stride`-byte blobs at `page_id * stride`). |
+| 2 | `lru.rs` | O(1) intrusive doubly-linked LRU index over `u64` page ids (`FxHashMap`-backed, I77). | Replaces the O(n) `VecDeque::retain` LRU; consumed only by `page_cache`. |
+| 3 | `page_cache.rs` | LRU cache over `PageIo`, dirty tracking, checksum validation on load, `PageCipher` seal/open at the I/O boundary, spillway overflow, `CacheFull`/`SpillwayFull` errors. Owns three `Cell<u64>` engine-activity counters (cache hits/misses, pages allocated) and aggregates them with `PageIo::fsync_count` into `counters()`. | Soft eviction at `max_pages`; dirty overflow spills to a sidecar (cap = `spillway_max_bytes`); `CacheFull` at strict `max_pages` when spillway disabled (`spillway_max_bytes=0`); checksums verified on disk LOAD only. |
+| 3 | `spillway.rs` | Sidecar `<db>.spillway` file for dirty pages the LRU is forced to spill. Per-slot XXH3 over `page_id ‖ payload`; crypto-agnostic (plaintext 8192-byte page or sealed 8232-byte blob). | Never `fsync`ed; truncated at open/commit/rollback — its content is always discardable uncommitted state. |
 | 4 | `freemap.rs` | Single-page bitmap primitive: `allocate_first` / `mark_free` on one `[u8; PAGE_SIZE]` buffer. | Pure buffer manipulation; no cache or I/O. Composed into the multi-page tree by `freemap_tree.rs`. |
 | 4 | `freemap_tree.rs` | COW radix tree of FreeMap leaves; the full multi-page freemap. | All structural COW pages sourced out-of-band (never from the bitmap); session-COW dedup (one COW per node per commit). |
 | 4 | `data_page.rs` | Slotted page layout (R1): slot directory grows forward, packed value data grows backward, dead-slot tombstones reclaimed only by `compact()`. | Slot indices are stable until compact; compact returns an old→new mapping for callers to rewrite. |
 | 4 | `overflow.rs` | Singly-linked overflow chains for values > inline threshold. | `total_length` repeated on every chain page; `next_page == 0` terminates; cycle detection bounded by `total_length / OVERFLOW_PAYLOAD` (I14). |
 | 5 | `handle_table.rs` | Radix tree mapping `u64` handle → `(page_id, slot_index)`. Implements its own copy-on-write atop `PageCache::new_page`. | Capacity = `510 × 1021^depth`; `find_leaf` short-circuits on `handle ≥ capacity` to `Ok(None)` (I26). |
 | 5 | `membership_index.rs` | Reverse index `tag → {handles}` for chunk tags. A generic copy-on-write radix `RadixU64` (u64 key → u64 value, 0 = absent) used twice: an outer tree keyed by tag whose value bit-packs `(inner_depth \| inner_root)`, and per-tag inner trees keyed by handle. Returns the new root id after a COW mutation, like `handle_table`. | Fan-out 1021 per level; `0` is the absent sentinel; outer value packs `inner_root` in low 58 bits, `inner_depth` in top 6. |
-| 6 | `transaction.rs` | `TransactionManager`: orchestrates begin/commit/rollback, savepoints, `persist_freemap`, the commit protocol, the poison flag. | Commit protocol step ordering is load-bearing — see next section. |
+| 6 | `transaction/` (`mod.rs` + submodules) | `TransactionManager`: orchestrates begin/commit/rollback, savepoints, `persist_freemap`, the commit protocol, key-slot management, the poison flag. Submodules: `commit`, `lifecycle`, `mutate`, `read`, `savepoints`, `named_roots`, `staging` (I18 atomic allocate), `freemap` (structural-page recycle), `packing` (R1 `SlotPacker`), `keys` (key-slot ops), `recovery` (`create_new`/`open_existing`), `config`, `fault` (test-only injection), `stats`. | Commit protocol step ordering is load-bearing — see next section. |
 | 7 | `defrag.rs` | Sparse-page consolidation; runs inside an active transaction. | `pages_examined`/`pages_freed` are page-granular (I17). |
 | 7 | `stats.rs` | Two snapshot structs: `Stats` (`handle_count`, `total_pages`, `file_size_bytes`) and `ChiselCounters` (cache hits/misses, pages allocated, fsync calls — cumulative-from-open engine activity). | Both are point-in-time snapshots, not live views. `ChiselCounters` is `#[non_exhaustive]` so future counters can be added without a breaking change. |
-| 8 | `lib.rs` | `Chisel` public API; thin wrapper over `TransactionManager`. | `&mut self` everywhere except `read`/`get_root_name`/`handles`/`stats`/`counters` (F3). |
+| 8 | `lib.rs` | `Chisel` public API; thin wrapper over `TransactionManager`. Public surface includes the encryption additions: `Key`, `Argon2Params`, `Options::encryption_key` / `argon2_params`, and `add_key` / `rotate_key` / `remove_key`. | `&mut self` everywhere except `read`/`get_root_name`/`handles`/`stats`/`counters` (F3). |
+
+> `bench/` is a `default-members` workspace member (I58/I61), so a root `cargo test` runs its tests too.
 
 ---
 
 ## Commit protocol
 
-The commit protocol is shadow paging's load-bearing part: the order of operations within `TransactionManager::commit` determines the crash-safety guarantee. Reordering any step changes what a recovering reader can observe.
+The order of operations within `TransactionManager::commit` determines the crash-safety guarantee. Reordering any step changes what a recovering reader can observe.
 
 ```mermaid
 sequenceDiagram
@@ -149,13 +161,13 @@ sequenceDiagram
     TM-->>U: Ok(())
 ```
 
-### Why each step is in this order
+### Step ordering (each step is load-bearing; rationale in THEORY.md)
 
-1. **Pre-drain flush.** `persist_freemap` calls `allocate_data_page`, which can trip `maybe_evict`'s spill-or-error decision if every cached page is dirty (nothing evictable, spillway disabled or full). `CacheFull` is operational-by-design (caller recovers via commit/rollback) but the commit wrapper poisons on any error — so a `CacheFull` raised mid-commit would silently demote operational to fatal. Pre-draining clears every dirty pin so the strict cap is reachable via normal eviction. Cost: one extra `fsync`. (See I28.)
-2. **`persist_freemap` allocates structural COW pages BEFORE merging.** The freed pages and the old freemap tree pages are both still referenced by the *currently-committed* superblock. Structural COW targets are sourced from an out-of-band recycle pool (dead freemap pages deferred one commit) or file extension, NEVER from the freemap's own bitmap — sourcing from the bitmap would clear a bit, COW a leaf, recurse, and never terminate. Allocating structural pages first guarantees the new page ids are either already-free in the committed state or freshly extended. Per-leaf, the allocate-before-merge (I18) ordering is preserved. (See I18.)
-3. **Two separate fsyncs (data + superblock).** Linux's `fsync` does not order writes within itself — the OS may write the superblock to disk before the data pages it references. Splitting into two fsyncs enforces "all data durable BEFORE superblock durable." A crash between them leaves the previous (intact) superblock active.
-4. **Round-robin write to `txn_counter % N`.** The "active" superblock is whichever slot has the highest valid counter. Writing to `txn_counter % N` always targets the stalest slot; the previously-active slot stays untouched. A torn write can damage the new superblock but cannot damage any of the N-1 last-known-good ones. Higher N (configurable 2..=16) trades disk space for survival of consecutive torn-write retries. (See R4.)
-5. **Promote in-memory state LAST.** Until the superblock fsync returns, the transaction is not durable. Updating `committed_roots` before that point would make in-memory state lie about durability — a subsequent reader could see uncommitted handles.
+1. **Pre-drain flush before `persist_freemap`** — clears every dirty pin so the strict cap is reachable via normal eviction, so a mid-commit `CacheFull` can't be silently promoted to fatal. Cost: one extra `fsync`. (I28)
+2. **`persist_freemap` allocates structural COW pages BEFORE merging** — structural targets are sourced out-of-band (one-commit-deferred recycle pool or file extension), NEVER from the freemap's own bitmap (that would recurse without termination). (I18)
+3. **Two separate fsyncs (data then superblock)** — enforces "all data durable BEFORE superblock durable"; `fsync` does not order writes within itself.
+4. **Round-robin write to `txn_counter % N`** — always targets the stalest slot; a torn write cannot damage any of the N-1 last-known-good slots. N configurable 2..=16. (R4)
+5. **Promote in-memory state LAST** — until the superblock fsync returns, the transaction is not durable; promoting earlier would make in-memory state lie about durability.
 
 ### What happens on failure at each step
 
@@ -230,6 +242,8 @@ A Chisel file is a sequence of fixed-size 8 KB pages. The first N pages (where `
 
 Every page ends with an 8-byte XXH3 checksum over bytes `0..CHECKSUM_OFFSET` (= bytes `0..8184`). `PageCache` validates the checksum on every cache miss; cache hits skip revalidation because the in-memory bytes are trusted between writes (the exclusive `flock` keeps any other Chisel-or-cooperating process from scribbling on the file). A checksum mismatch on load is fatal (`ChecksumMismatch`).
 
+(For encrypted databases the on-disk stride is 8232 bytes per page; see [On-disk encryption](#on-disk-encryption).)
+
 `flock` is POSIX-advisory: cooperating processes (any other Chisel instance, or any tool that honours advisory locks) respect it; a tool that bypasses advisory locking — `cp` during a transaction, naive backup scripts, some sync utilities — can still corrupt the file even with Chisel holding the lock. The single-writer model assumes external respect for the lock; see README's "Platform support" section for the user-facing version of this caveat.
 
 ### Common page header
@@ -282,9 +296,14 @@ bytes        | field                              | type
 308..312     | superblock_count                   | u32 LE (= N, in 2..=16)
 312..320     | root_membership_index_page         | u64 LE (PAGE_ID_NONE if no index)
 320..324     | freemap_depth                      | u32 LE (0 = single-page/depth-0)
-324..8184    | reserved (zeroed for forward compat)| [u8; ~7860]
+324..8184    | reserved / crypto region           | see below
 8184..8192   | XXH3 checksum                      | u64 LE
 ```
+
+Bytes **324..8184** are conditional on whether the database is encrypted:
+
+- **Plaintext DB:** the whole range is reserved (zeroed for forward compat), and every sensitive body field above (root pointers, `total_pages`, `next_handle`, `freemap_depth`, `named_roots`) is stored in plaintext at its offset.
+- **Encrypted DB:** bytes **324..1356** hold the plaintext crypto-header + 8-slot key-slot table (8-byte prefix at 324..332, slots at 332..1356). The sensitive body fields are NOT plaintext — they are **sealed under the DEK** as a `nonce ‖ tag ‖ ciphertext` sub-blob. The plaintext portion (magic, format version, txn counter, page size, superblock count, crypto-header) retains its XXH3 checksum so `select()` still works before any decryption. See the [On-disk encryption](#on-disk-encryption) subsection for the exact key-slot record layout.
 
 `Superblock::select` reads up to `MAX_SUPERBLOCKS` (= 16) candidate pages, calls `deserialize` on each (which fails fast on bad checksum / wrong magic / out-of-range `superblock_count`), and `max_by_key`s on `txn_counter`. Ties break by lowest slot index (deterministic but rare in practice — only seen during the `create_new` seeding window before the first user commit).
 
@@ -479,7 +498,7 @@ bytes              | field                         | type
 8184..8192         | XXH3 checksum                 | u64 LE
 ```
 
-`allocate_first` returns the lowest free page id by scanning bytes for non-zero values and using `trailing_zeros` to find the bit. (An `allocate_near(target)` radius-scan variant existed but was removed in the PR #46 dead-code sweep — no caller used it.)
+`allocate_first` returns the lowest free page id by scanning bytes for non-zero values and using `trailing_zeros` to find the bit.
 
 ```text
 FreeMapInterior page (PageType = 0x07)
@@ -507,21 +526,19 @@ The tree is consumed during commit's `persist_freemap`: pages freed during the t
 
 ### Handle stability
 
-A handle is a `u64` returned by `allocate()`. Handles are assigned monotonically from `next_handle` (a counter in the superblock) and **never reused** within a database's lifetime, even after delete. Delete writes a tombstone (`HandleFlags::Deleted`) into the leaf entry; the slot stays allocated, the page stays valid, but `lookup` reports `Ok(None)` and the user-facing API returns `InvalidHandle`. This permanent-burn policy is what makes handles safe to embed in long-lived references (e.g., from another data structure or another database) without worrying about a stale handle pointing at unrelated data after a delete-and-realloc cycle.
+A handle is a `u64` returned by `allocate()`. Handles are assigned monotonically from `next_handle` (a counter in the superblock) and **never reused** within a database's lifetime, even after delete. Delete writes a tombstone (`HandleFlags::Deleted`) into the leaf entry; the slot stays allocated, the page stays valid, but `lookup` reports `Ok(None)` and the user-facing API returns `InvalidHandle`. This permanent-burn policy makes handles safe to embed in long-lived references without a stale handle later pointing at unrelated data after a delete-and-realloc cycle.
 
 The radix-tree indirection means values can move freely on disk — `update()` to a larger value, `defrag()` consolidation, future page-format upgrades — without changing the handle the caller holds.
 
-Within-session iteration stability follows from that same handle identity. `handles()` and `handles_with_tag()` walk arithmetic radix trees in a structure-only traversal, so within one open instance repeated scans return an identical `Vec` — same handles, same order — as long as the live set is unchanged and no `defrag` has run. This is a *repeatability* guarantee only: the order itself is unspecified (it is not promised to be sorted, and may differ after a reopen or `defrag`, or across versions), which keeps the index internals free to change. The guarantee is deliberately scoped to a single session and does not survive reopen or `defrag`; it rests on the radix-depth re-derivation invariant (see [In-memory radix depth is re-derived from the root](#in-memory-radix-depth-is-re-derived-from-the-root-never-stored)) — a rolled-back grow must restore depth or a later scan would mis-enumerate.
+Within-session iteration stability follows from that same handle identity. `handles()` and `handles_with_tag()` walk arithmetic radix trees in a structure-only traversal, so within one open instance repeated scans return an identical `Vec` — same handles, same order — as long as the live set is unchanged and no `defrag` has run. This is a *repeatability* guarantee only: the order itself is unspecified (not promised sorted, may differ after a reopen or `defrag`, or across versions). The guarantee is scoped to a single session and does not survive reopen or `defrag`; it rests on the radix-depth re-derivation invariant (see [In-memory radix depth is re-derived from the root](#in-memory-radix-depth-is-re-derived-from-the-root-never-stored)).
 
 ### Per-module copy-on-write
 
-Chisel does not have a centralized COW abstraction. Each layer-4 / layer-5 module that mutates pages (handle_table, freemap_tree during persist) implements COW by allocating fresh pages, writing the new state into them, and returning the new root id to the caller. The previously-committed page is left untouched on disk; it remains valid and reachable through the previously-committed superblock for the entire duration of the new transaction.
-
-This per-module pattern is deliberate. A monolithic COW abstraction was considered and rejected — it would have forced every page-type module to express its mutations through a uniform interface, and the modules' actual COW shapes are different enough (handle table walks a tree; freemap_tree COWs the touched leaf+spine of a radix tree; data pages reuse the same page across multiple commits via `claim_page`) that a generic interface would have leaked detail.
+Chisel does not have a centralized COW abstraction. Each layer-4 / layer-5 module that mutates pages (handle_table, freemap_tree during persist) implements COW by allocating fresh pages, writing the new state into them, and returning the new root id to the caller. The previously-committed page is left untouched on disk; it remains valid and reachable through the previously-committed superblock for the entire duration of the new transaction. (Why per-module rather than a monolithic COW abstraction: rationale in THEORY.md.)
 
 ### In-memory radix depth is re-derived from the root, never stored
 
-Both radix trees — the handle table and the membership index's outer tree — keep their current depth as an in-memory field (`HandleTable.depth`, `MembershipIndex.outer_depth`) that is NOT carried in `Roots` and so not in the superblock; it is derivable by walking the left spine from the root (each `grow()` installs the old root at child 0). `RadixU64::recover_depth` / `HandleTable::recover_depth` are those walks. Every path that restores a root must re-derive the depth or the in-memory descent depth disagrees with the page it descends: on OPEN (seed both depths from the roots) and on ROLLBACK / rollback_to (after `current_roots` rewinds, re-derive both from the restored roots — a rolled-back `grow()` shrinks the tree by a level; a stale-deep depth would mis-descend and return `InvalidHandle` for committed handles, or mis-enumerate a tag). This was a real silent-corruption bug: it surfaced first in the membership index during chunk-tags development and was recognized as the same root cause in the handle table. The handle-table half is **I99**, the membership half **C1**; both fixes extract the open-time spine walk into a reusable `recover_depth` called from both rollback paths.
+Both radix trees — the handle table and the membership index's outer tree — keep their current depth as an in-memory field (`HandleTable.depth`, `MembershipIndex.outer_depth`) that is NOT carried in `Roots` and so not in the superblock; it is derivable by walking the left spine from the root (each `grow()` installs the old root at child 0). `RadixU64::recover_depth` / `HandleTable::recover_depth` are those walks. **Invariant:** every path that restores a root must re-derive the depth, or the in-memory descent depth disagrees with the page it descends. This means: on OPEN (seed both depths from the roots) and on ROLLBACK / rollback_to (after `current_roots` rewinds, re-derive both from the restored roots — a rolled-back `grow()` shrinks the tree by a level; a stale-deep depth would mis-descend and return `InvalidHandle` for committed handles, or mis-enumerate a tag). The handle-table half is **I99**, the membership half **C1**. (Bug history in THEORY.md.)
 
 ### Chunk tags (the membership index in use)
 
@@ -553,7 +570,7 @@ The client byte is a single opaque `u8` stored in entry byte `[15]`. Chisel stor
 
 The page cache enforces a strict cap (`Options::cache_max_bytes`). When the cache is full and every entry is dirty (so nothing is evictable), overflow dirty pages spill to a sidecar file `<db_path>.spillway` rather than returning `CacheFull`. The spillway is bounded by `Options::spillway_max_bytes` (default `1024 × cache_max_bytes` = 8 GiB at the 8 MiB cache default); `SpillwayFull { limit_bytes }` fires when both the cache and the spillway are exhausted. Setting `spillway_max_bytes = 0` disables the spillway and restores `CacheFull`-at-cap semantics.
 
-Spillway slots carry their own per-slot XXH3 checksum over `page_id || page_bytes`, distinct from the main-file page checksum, so a corrupt spillway slot is detected on rehydrate. The spillway is never `fsync`ed — its content does not need to survive a crash; it's truncated at open and at every commit/rollback. A crash with a non-empty spillway just discards its contents on the next open, which is correct because anything in the spillway was uncommitted dirty state.
+Spillway slots carry their own per-slot XXH3 checksum over `page_id ‖ page_bytes`, distinct from the main-file page checksum, so a corrupt spillway slot is detected on rehydrate. The spillway is never `fsync`ed — its content does not need to survive a crash; it's truncated at open and at every commit/rollback. A crash with a non-empty spillway just discards its contents on the next open, which is correct because anything in the spillway was uncommitted dirty state.
 
 The no-spill commit cost is **3 fsyncs**: pre-drain flush (I28) + main-pages flush + superblock. The pre-drain handles a subtle interaction in the commit protocol (see [Commit protocol](#commit-protocol) step 1).
 
@@ -585,15 +602,13 @@ The fixed table size (8 entries × 32-byte slots) is intentional: it keeps the s
 
 ### Defragmentation
 
-`defrag()` consolidates sparse data pages: it identifies pages whose live-slot count falls below a threshold and re-inserts their live values, freeing the source pages for reclamation. Defrag runs *inside* an active transaction so it composes with other work and is atomic on commit — this is intentional, not an oversight; the alternative ("auto-begin / auto-commit") would have made defrag impossible to schedule alongside a larger maintenance batch.
+`defrag()` consolidates sparse data pages: it identifies pages whose live-slot count falls below a threshold and re-inserts their live values, freeing the source pages for reclamation. Defrag runs *inside* an active transaction so it composes with other work and is atomic on commit.
 
 The cap parameter (`DefragOptions::max_pages`) bounds the number of *values* relocated in one pass, despite the legacy name (kept for API stability; see C4 in ISSUES.md).
 
 ### Poison model
 
-On any fatal error — an `IoError` from `fsync`, a `ChecksumMismatch` on a page load, a `CorruptSuperblock` on open, any error raised after the commit protocol has begun — the `TransactionManager` becomes **poisoned**. Every subsequent call returns `ChiselError::Poisoned`, including reads. The only legal recovery is to drop the `Chisel` handle and call `Chisel::open` again; the shadow-paging recovery path then returns the database to its last-durable state.
-
-This mirrors `std::sync::Mutex` poisoning. It is mandatory because Linux fsyncgate (post-2018) makes retrying a failed `fsync()` unsafe — the kernel may have discarded the dirty pages already, and a subsequent successful `fsync()` does not mean earlier data is durable. The reopen-to-recover idiom exercises the same code path as crash recovery, which has the side benefit of testing the recovery path on every real-world poison event. (See I1 for the full design and I29 for what `UnsupportedFormatVersion` means under the packed scheme.)
+On any fatal error — an `IoError` from `fsync`, a `ChecksumMismatch` on a page load, a `CorruptSuperblock` on open, a `DecryptionFailed`, any error raised after the commit protocol has begun — the `TransactionManager` becomes **poisoned**. Every subsequent call returns `ChiselError::Poisoned`, **including reads**. The only legal recovery is to drop the `Chisel` handle and call `Chisel::open` again; the shadow-paging recovery path then returns the database to its last-durable state. (See I1; rationale — fsyncgate, the Mutex analogy — in THEORY.md.)
 
 ### Engine-activity counters
 
@@ -603,143 +618,79 @@ Three semantic conventions matter:
 
 - **Counters reset on close + reopen**, because `PageCache` and `PageIo` are reconstructed. There is no persistent counter state on disk — the in-memory `Cell<u64>` is the entire record.
 - **Misses, allocations, and hit increments record *attempts*, not successes.** `cache_misses` is incremented before `load_page` (so a checksum-mismatch error still records the miss); `pages_allocated` is incremented before `maybe_evict` (so a `CacheFull` allocation still records the attempt). `fsync_calls` is the asymmetric exception: it counts only *successful* fsyncs, because a failed fsync poisons the engine (I1) and the counter on a poisoned engine has no defined further meaning.
-- **Reads via `Chisel::counters()` are `&self`** and do not mutate. The bench harness reads counters before and after a measurement and reports the delta; that's the primary intended consumer, but the counters are also useful for ad-hoc debugging ("how many cache misses did this query cause?").
+- **Reads via `Chisel::counters()` are `&self`** and do not mutate. The bench harness reads counters before and after a measurement and reports the delta; that's the primary intended consumer, but the counters are also useful for ad-hoc debugging.
 
-The counter set is fixed at four for v1 of the instrumentation (PR 1 of the bench-suite series). `#[non_exhaustive]` on `ChiselCounters` keeps the door open for adding a fifth counter later without a breaking change.
+The counter set is fixed at four for v1 of the instrumentation. `#[non_exhaustive]` on `ChiselCounters` keeps the door open for adding a fifth counter later without a breaking change.
 
 ### Format versioning (two-tier)
 
 Chisel versions its on-disk format at two levels.
 
-- **File level** (I29): the superblock carries a packed `format_version` u32 — upper 16 bits MAJOR, lower 16 bits MINOR. Open-time gate compares MAJOR only. Any same-major file opens regardless of minor; a different-major file is rejected with `UnsupportedFormatVersion`. This is what makes the README's "sacred within a major version" promise enforceable.
-- **Page level** (I31): each non-superblock page carries a one-byte `page_format_version` in its header (byte 1 for Data/Overflow/FreeMap; byte 2 for HandleTable, where byte 1 holds the FLAG byte). This lets individual page layouts evolve within a major without a file-wide bump. The current value is `0` everywhere. The post-1.0 upgrade plan is lazy migration: reads *will* dispatch on the version byte (the per-module decode helpers and `page::page_format_version()` exist but are **dormant today** — `PageCache::load_page` validates only the XXH3 checksum and nothing reads the version byte yet), writes always stamp the current version, and an opt-in eager upgrader (deferred) sweeps remaining old pages.
+- **File level** (I29): the superblock carries a packed `format_version` u32 — upper 16 bits MAJOR, lower 16 bits MINOR. Open-time gate compares MAJOR only. Any same-major file opens regardless of minor; a different-major file is rejected with `UnsupportedFormatVersion`. This is what makes the README's "sacred within a major version" promise enforceable. (Plaintext DBs stamp MAJOR = 1; encrypted DBs stamp MAJOR = 2 — see [On-disk encryption](#on-disk-encryption).)
+- **Page level** (I31): each non-superblock page carries a one-byte `page_format_version` in its header (byte 1 for Data/Overflow/FreeMap/Membership; byte 2 for HandleTable, where byte 1 holds the FLAG byte). This lets individual page layouts evolve within a major without a file-wide bump. The current value is `0` everywhere. The post-1.0 upgrade plan is lazy migration: reads *will* dispatch on the version byte (the per-module decode helpers and `page::page_format_version()` exist but are **dormant today** — `PageCache::load_page` validates only the XXH3 checksum and nothing reads the version byte yet), writes always stamp the current version, and an opt-in eager upgrader (deferred) sweeps remaining old pages.
 
-Both schemes leave reserved space for forward compatibility — the superblock has bytes 324..8184 reserved (after the `freemap_depth` field at 320..324), and every non-superblock page has bytes 8..16 reserved (8 bytes / 64 bits) for future common-header fields.
+Both schemes leave reserved space for forward compatibility — the superblock has bytes 324..8184 reserved (after `freemap_depth` at 320..324; used by the crypto-header on encrypted DBs), and every non-superblock page has bytes 8..16 reserved (8 bytes / 64 bits) for future common-header fields.
 
 ### On-disk encryption
 
-Chisel supports optional authenticated encryption of database files. An encrypted database is indistinguishable from random bytes to a reader without the key; each page is individually authenticated, so corruption (accidental or deliberate) is detected before any plaintext is returned.
+Chisel supports optional authenticated encryption of database files (shipped; MAJOR = 2). An encrypted database is indistinguishable from random bytes without the key; each page is individually authenticated, so corruption (accidental or deliberate) is detected before any plaintext is returned. (Threat-model discussion, nonce-reuse-negligibility argument, and DEK/KEK envelope rationale live in THEORY.md.)
 
-**Cipher.** XChaCha20-Poly1305 (IETF extended-nonce variant). Each page write generates a fresh random 192-bit nonce; the extended nonce space (2¹⁹²) makes nonce reuse under shadow-paging page reassignment negligible in practice (spec §2.1). The on-disk layout per encrypted page is `ciphertext(8192) ‖ tag(16) ‖ nonce(24)` = 8232 bytes (`ENC_PAGE_SIZE`). The additional data (AAD) for each page is the 8-byte little-endian `page_id`, which binds ciphertext to its slot and prevents a valid block from being relocated to another page position without detection.
+**Cipher.** XChaCha20-Poly1305 (IETF extended-nonce variant). Each page write generates a fresh random 192-bit nonce. The on-disk layout per encrypted page is `ciphertext(8192) ‖ tag(16) ‖ nonce(24)` = 8232 bytes (`ENC_PAGE_SIZE`). The additional data (AAD) for each page is the 8-byte little-endian `page_id`, which binds ciphertext to its slot and prevents a valid block from being relocated to another page position without detection.
 
-**On-disk stride.** Encrypted databases use a uniform 8232-byte stride for every page including the superblock slots. Plaintext databases continue to use the 8192-byte stride; the two are mutually exclusive and the stride is recorded in the superblock's plaintext crypto-header so the engine reads the correct number of bytes before attempting any operation. The `page_io` layer is stride-agnostic: callers set the stride once (via `PageIo::set_stride`) and all subsequent raw reads and writes use it.
+**On-disk stride.** Encrypted databases use a uniform 8232-byte stride for every page including the superblock slots. Plaintext databases use the 8192-byte stride; the two are mutually exclusive and the stride is recorded in the superblock's plaintext crypto-header (bytes 325..329) so the engine reads the correct number of bytes before any operation. The `page_io` layer is stride-agnostic: callers set the stride once (via `PageIo::set_stride`) and all subsequent raw reads/writes use it.
 
-**Envelope (key hierarchy).** A random 256-bit per-database encryption key (DEK) encrypts all page content. The DEK itself is never stored in plaintext: it is wrapped under a key-encryption key (KEK) and the wrapped form is held in a plaintext key-slot table inside the superblock's reserved region (bytes 324..1356; 8 slots × 128 bytes each, preceded by an 8-byte prefix (1-byte algorithm id, 4-byte stride, 3 reserved bytes); the key-slot table begins at byte 332). Each slot stores the KDF identity, KDF parameters, salt, wrap nonce, wrapped DEK, and wrap tag. There are two KEK derivation paths:
+**Envelope (key hierarchy).** A random 256-bit per-database DEK encrypts all page content. The DEK is never stored in plaintext: it is wrapped under a key-encryption key (KEK) and the wrapped form is held in a plaintext key-slot table inside the superblock's reserved region. The crypto-header + key-slot table occupy bytes **324..1356**:
+
+```text
+Crypto-header (in the superblock's reserved region)
+
+bytes      | field
+-----------|-----------------------------------------------------
+324..325   | algorithm (u8; 1 = XChaCha20-Poly1305, 0 = plaintext)
+325..329   | stride (u32 LE; 8232 for encrypted)
+329..332   | reserved (zero)
+332..1356  | 8 key-slot records × 128 bytes each
+
+Key-slot record (128 bytes; trailing bytes reserved/zero)
+0          | state (u8; 1 = active, 0 = empty)
+1          | kdf_id (u8; 1 = HKDF, 2 = Argon2id)
+2..14      | argon2 params: m_cost(u32) | t_cost(u32) | p_cost(u32) (zero for HKDF)
+14..30     | salt (16)
+30..54     | wrap_nonce (24)
+54..86     | wrapped_dek (32)
+86..102    | wrap_tag (16)
+102..128   | reserved
+```
+
+Two KEK derivation paths:
 
 - **Raw key** (`Key::Raw`): KEK = HKDF-SHA256(ikm=key material, salt=slot salt, info=`"chisel-kek"`).
 - **Passphrase** (`Key::Passphrase`): KEK = Argon2id(password, salt, m/t/p from the slot's stored parameters).
 
 The DEK wrapping uses detached XChaCha20-Poly1305 with AAD bound to the slot's KDF metadata, so an attacker cannot swap a slot's KDF parameters to force mis-derivation without breaking the tag.
 
-**Superblock body protection.** The superblock's sensitive body — root pointers (`root_handle_table`, `root_freemap_page`, `root_tag_map_page`), `total_pages`, `next_handle`, `freemap_depth`, and the `named_roots` name table — is sealed under the DEK as a `nonce ‖ tag ‖ ciphertext` sub-blob whose AAD binds it to the superblock's identity. The plaintext portion of the superblock (magic, format version, txn counter, page size, superblock count, crypto-header) retains its XXH3 checksum so the A/B torn-write selector (`select()`) still works before any decryption.
+**Superblock body protection.** The sensitive body — root pointers (`root_handle_table`, `root_freemap_page`, `root_membership_index_page`), `total_pages`, `next_handle`, `freemap_depth`, and the `named_roots` table — is sealed under the DEK as a `nonce ‖ tag ‖ ciphertext` sub-blob whose AAD binds it to the superblock's identity. The plaintext portion (magic, format version, txn counter, page size, superblock count, crypto-header) retains its XXH3 checksum so the A/B torn-write selector (`select()`) still works before any decryption.
 
-**Format version.** Encrypted databases stamp file-level **MAJOR = 2, MINOR = 0**. Plaintext databases remain at MAJOR = 1. The existing open-time gate (which rejects any file whose MAJOR differs from the compiled-in `FORMAT_MAJOR_VERSION`) therefore hard-rejects an encrypted database on an encryption-unaware binary with `UnsupportedFormatVersion`, preventing ciphertext from being silently misread as page data. No per-page (I31) format change is needed — the logical page image is unchanged.
+**Format version.** Encrypted databases stamp file-level **MAJOR = 2, MINOR = 0**; plaintext stays MAJOR = 1. The open-time gate hard-rejects an encrypted database on an encryption-unaware binary with `UnsupportedFormatVersion`, preventing ciphertext from being silently misread as page data. No per-page (I31) change is needed — the logical page image is unchanged.
 
-**Key management.** Credential rotation is O(1) and crash-safe — it never re-encrypts any page:
+**Key management.** Credential rotation is O(1) and crash-safe — it never re-encrypts any page. Each operation is a normal superblock commit through the A/B + fsync protocol:
 
 - `add_key(old_key, new_key)`: derives a new KEK, wraps the same DEK into a free slot, then commits.
 - `rotate_key(old_key, new_key)`: `add_key` followed by clearing the old slot in the same commit.
 - `remove_key(key)`: clears the matching slot, refusing to clear the last active slot (which would make the database permanently unreadable).
 
-Each operation is a normal superblock commit through the A/B + fsync protocol. Bulk DEK rotation (re-encrypting every page under a fresh DEK — relevant only when the DEK itself is believed compromised) is deferred; see I142.
+Bulk DEK rotation (re-encrypting every page under a fresh DEK) is deferred; see I142.
 
-**Spillway.** For encrypted databases the in-memory spillway carries sealed blobs: pages are encrypted exactly once on eviction from the page cache (`seal` on evict-to-spillway) and copied verbatim — without decryption or re-encryption — on drain to the main file. Rehydration from the spillway decrypts the blob back into the cache. This means no plaintext page content is ever written to disk by an encrypted database, even during spill.
+**Spillway.** For encrypted databases the in-memory spillway carries sealed blobs: pages are encrypted exactly once on eviction (`seal` on evict-to-spillway) and copied verbatim — no decryption or re-encryption — on drain to the main file. Rehydration decrypts the blob back into the cache. No plaintext page content is ever written to disk by an encrypted database, even during spill.
 
-**Threat-model boundary.** Provided: confidentiality of all user data and sensitive metadata at rest; AEAD tamper-detection per page and per superblock body (any modification surfaces as the fatal `DecryptionFailed` error, which poisons the engine); anti-relocation (AAD = `page_id` prevents transplanting a ciphertext block to a different slot). Not provided: rollback/replay resistance (an attacker who substitutes a wholly older, validly-signed database image cannot be detected without an external monotonic trust anchor such as a TPM); in-memory protection beyond `zeroize`-on-drop for the DEK and page plaintext; traffic-analysis resistance (file size, page count, and access patterns are visible).
-
----
-
-## Benchmark infrastructure
-
-The `bench/` subcrate is a workspace member (listed in `members` and `default-members`, so a root `cargo test` runs it) that path-deps on the root `chisel` crate. It provides three measurement layers comparing Chisel against [redb](https://github.com/cberner/redb) and SQLite:
-
-1. **Cross-engine equivalence tests** — five scenarios × three engines × snapshot/restore checks, asserting that all three engines produce identical observable state for the same workload. Catches semantic divergence in the workload-replay machinery before it contaminates measurement.
-2. **Criterion micro-grid** — six rows of small-scoped operations (single-tx allocate, point-read, single-tx update at small batch sizes), 165 cells of wall-clock + file-size + Chisel-internal-counter metrics. Drives the `Engine` trait through tight loops.
-3. **YCSB-style scenario tier** — four end-to-end workloads (YCSB-A 50/50 read/update Zipfian; YCSB-B 95/5 read-heavy Zipfian; Mutation Log 25/25/25/25 alloc/read/update/delete uniform; Document Store 70/20/10 read/alloc/update with log-normal sizes). Timed with `Instant::now()` rather than Criterion — Criterion's many-samples-per-bench model exceeds the 1-6 minute scenario budget.
-
-A post-processor (`chisel-bench-summarize`) reads scenario metrics + Criterion archive data and emits three artifacts: per-cell `summary.md`, flat `results.json` (composite-key schema for the CI diff binary), and `cross-engine.md` (a per-metric Chisel/redb/SQLite comparison: throughput, p99 latency, file size). A diff binary (`chisel-bench-diff`) consumes two `results.json` files and posts a sticky regression-report comment on each PR.
-
-### macOS fsync semantics
-
-On macOS, Chisel calls `fcntl(F_FULLFSYNC)` via Rust's `sync_all` — durable through the disk's write cache. SQLite's default `fsync()` on macOS only flushes to the disk's write cache without `F_FULLFSYNC`, so unmodified `SqliteEngine` runs ~3 orders of magnitude faster than `ChiselEngine` on `Strict` durability. The bench harness closes this gap by issuing `PRAGMA fullfsync=ON` in `SqliteEngine::open_file` for `Strict` mode (no `#[cfg(target_os)]` gate — Linux ignores the pragma). With the fix, both engines pay the same per-commit `F_FULLFSYNC` cost on macOS, and Linux runs are unchanged.
-
-Without the fix, comparing chisel-strict vs sqlite-strict on macOS measures Apple-vs-Apple disk-cache semantics, not engine performance. With the fix, the comparison reflects the engines themselves.
-
-### Counter-driven measurement
-
-Engine activity is observable via `Chisel::counters()` (cumulative-from-open: cache hits/misses, pages allocated, fsyncs). The micro-grid records counter snapshots before/after each cell so the post-processor can attribute throughput differences to fsync count, cache pressure, or page-allocation rate. This is why `ChiselCounters` is `#[non_exhaustive]` — the bench harness reads these via the public API, but additional counters can be added without a breaking change.
-
-The asymmetry "fsync_calls counts only successes; everything else counts attempts" matters here: a `CacheFull` allocation still bumps `pages_allocated`, but a failed fsync poisons the engine and stops counter increments. The bench harness handles poisoning by aborting that cell rather than fudging the numbers.
-
----
-
-## Implementation history
-
-This section is a date-stamped narrative of the larger pieces of work that landed in the engine and the bench harness. The intent is to give a future reader (human or AI) the context to understand *why* the code looks the way it does — the running decision log lives in `ISSUES.md`, but the prose context for each major thrust lives here.
-
-### Benchmark suite (PRs 1–8)
-
-The bench-suite series ran from 2026-04-30 through 2026-05-04 and landed in eight PRs against `main`:
-
-- **PR 1 (2026-04-30)** — counter instrumentation. Added the four `Chisel::counters()` fields (`cache_hits`, `cache_misses`, `pages_allocated`, `fsync_calls`) as `Cell<u64>` increments at the site of each operation. `ChiselCounters` is `#[non_exhaustive]` so future counters can be added without a breaking change. Documented in [Engine-activity counters](#engine-activity-counters).
-- **PR 2 (2026-04-30)** — `bench/` subcrate + `Engine` trait + `ChiselEngine`. The `bench/` directory was a sibling subcrate at this point (I61 later made it a `default-members` workspace member); it path-deps on the root `chisel` crate.
-- **PR 3 (2026-04-30)** — `RedbEngine` + `SqliteEngine` + cross-engine equivalence tests (five scenarios × three engines = 15 tests). SQLite snapshot-restore required `Engine::flush_for_snapshot()` (default no-op; SQLite override does `journal_mode=DELETE`) because WAL mode leaves committed data in the `-wal` sibling between explicit checkpoints — `std::fs::copy` of the main `.db` alone otherwise yields "database disk image is malformed" on reopen.
-- **PR 4a (2026-04-30)** — workload data layer. `Operation` / `Workload` types plus six seeded generators in `bench/src/workload.rs`, ChaCha8Rng-pinned for cross-version reproducibility.
-- **PR 4b (2026-05-01)** — Runner machinery + 6-row Criterion micro grid in `bench/src/runner.rs` + `bench/benches/micro_grid.rs`. Produces 165 cells of wall-clock + file-size + Chisel-internal-counter metrics into `target/criterion/...` and `bench/results/aux_metrics.jsonl`. The original PR 4 from the master spec was split into 4a + 4b once it became clear ~600 LOC in one PR was less reviewable than two smaller PRs.
-
-  The 4b grid is 6 rows, not the 9 the master spec called for: three 1000-per-tx variants (update, delete, delete_many) were dropped during implementation because 1000 random ops over the prepopulated DB pin a working set of dirty pages exceeding Chisel's pre-spillway 2048-page cache ceiling. The dropped row functions remain in `micro_grid.rs` (with `#[allow(dead_code)]`) so they can be re-enabled in a future PR with a configurable larger cache.
-
-- **PR 5 (2026-05-03)** — markdown summary post-processor. Binary `chisel-bench-summarize` in `bench/src/bin/summarize.rs` plus a library module under `bench/src/summary/`. Reads Criterion's `sample.json` per cell plus `bench/results/aux_metrics.jsonl` and emits three artifacts under `bench/results/<UTC-ISO8601>/`: `summary.md` (per-row markdown tables with magnitude-adaptive units), `results.json` (flat composite-key schema for PR 7's CI diff), and `raw/` (archival copy of estimates.json + sample.json per cell). Percentiles are computed directly from `sample.json` per-iteration times via numpy-style linear interpolation (consistent p50/p95/p99 semantics rather than mixing Criterion's bootstrap median with a CI proxy).
-- **PR 6 (2026-05-03)** — scenario tier. Four YCSB-style end-to-end workloads in `bench/src/scenarios.rs` + `bench/benches/scenarios.rs`, driven by `run_scenario_cell` in `bench/src/runner.rs`. YCSB-A (50/50 read/update, Zipfian θ=0.99), YCSB-B (95/5), Mutation Log (25/25/25/25 alloc/read/update/delete uniform), Document Store (70/20/10 read/alloc/update with lognormal sizes, Zipfian θ=0.7). Each runs once per strict durability mode → 12 cells. Inline `Instant::now()` timing rather than Criterion (the master-spec budget of 1–6 minutes per full tier rules out Criterion's many-samples-per-bench model).
-
-  Three latent bugs surfaced at PR 6's end-to-end acceptance gate that no per-task unit test caught: (1) `run_scenario_cell` originally did one-allocate-per-tx during prepop (100K fsyncs on chisel-strict ≈ 12 min/cell on macOS APFS); fixed by mirroring PR 4b's byte-accumulator chunking. (2) `gen_mutation_log` generated Read/Update/Delete on indices without tracking which had been deleted; replaced with a state-aware walk maintaining a live-set `Vec<usize>`. (3) `discover_cells` errored `NoCellsFound` when the criterion dir was empty even with scenarios present; `summarize.rs` now lets the unified `cells.is_empty() && scenarios.is_empty()` gate decide.
-
-  Runtime caveat: the spec target was 1–6 minutes / 10 minutes ceiling. On macOS that ceiling is unreachable — Chisel uses Rust's `sync_all` which calls `fcntl(F_FULLFSYNC)` (durable through the disk cache), while SQLite by default uses plain `fsync()` (which on macOS only flushes to the disk's write cache without `F_FULLFSYNC`). Result: chisel-strict cells are fsync-bound at ~5–10 ms per commit while sqlite-strict cells run ~3 orders of magnitude faster. Full 12-cell grid takes ~70–90 minutes on macOS APFS; Linux CI runners are much faster.
-- **PR 7 (2026-05-04)** — CI integration. `chisel-bench-diff` binary at `bench/src/bin/diff.rs` plus `.github/workflows/bench.yml` that runs the scenario tier on each PR, diffs against `main`'s baseline, and posts a sticky regression-report comment. Two-checkout strategy: build + run scenarios on `main`, build + run on PR HEAD, summarize both, run the diff binary, post via `peter-evans/find-comment` + `create-or-update-comment` keyed on the marker `<!-- chisel-bench-diff -->`. Thresholds: throughput + p50 at 5%, p95 + p99 at 10%, worse-direction only, no absolute time floor in v1. Pinned to `ubuntu-latest` per the PR 6 macOS fsync caveat. Signal-only — never blocks merge.
-
-  PR 7's first acceptance gate caught a real environmental issue: `origin/main` was 76 commits behind local `main` because PRs 4–6 were merged locally but never pushed to GitHub. Fix was a single `git push origin main`. Pattern worth remembering: any workflow that does `Checkout main` + build assumes `origin/main` is current.
-
-- **PR 8 (2026-05-04)** — cross-engine comparison report + macOS-fsync fairness fix. `chisel-bench-summarize` now emits `cross-engine.md` alongside `summary.md` and `results.json` (three per-metric tables: throughput, p99 latency, file size) over the four PR 6 scenarios in strict mode. `SqliteEngine::open_file` issues `PRAGMA fullfsync=ON` for `DurabilityMode::Strict` — no `#[cfg(target_os)]` gate (Linux ignores it; macOS uses `fcntl(F_FULLFSYNC)`), one extra PRAGMA exec at open time. Closes the cross-engine fairness gap that was pre-existing from PR 3's `SqliteEngine` wrapper.
-
-  PR 8's first-run bench-diff signal is a useful calibration point for GitHub-runner variance on the scenario tier: two `document-store` p50 cells flagged as "regressed" (redb-strict +9.4%, chisel-strict +5.6%) while throughput on both was within ±1% (genuine noise on microsecond-scale measurements). Future bench-diff readers should treat ≤±15% deltas on the scenario tier as plausible runner noise rather than real perf signals; the diff binary's job is to surface them, not to gate merges.
-
-A small followup landed alongside PR 8: `bench.yml` now uploads the PR-side `summarize` output (`cross-engine.md`, `summary.md`, `results.json`) as a workflow artifact `bench-results-pr-<N>` with 90-day retention. Retrieve via:
-
-```
-gh run download <run-id> --repo pgexperts/chisel --name bench-results-pr-<N>
-```
-
-Get `<run-id>` from `gh run list --branch <branch>` or the PR checks page. The `raw/` Criterion archive is intentionally absent from scenario-tier output — scenarios use `Instant::now()` timing rather than Criterion. Main-side output is not uploaded; for absolute README/release-notes numbers, run on dedicated hardware rather than the shared CI runner.
-
-Master design spec at `docs/superpowers/specs/2026-04-25-chisel-benchmark-suite-design.md` covers PRs 1–7; PR 8 has its own spec/plan pair at `docs/superpowers/specs/2026-05-04-chisel-bench-cross-engine-design.md` and `docs/superpowers/plans/2026-05-04-chisel-bench-cross-engine.md`.
-
-### Spillway feature (2026-05-04)
-
-The spillway landed out-of-band from the bench-suite series on the same day as PR 8. It adds `src/spillway.rs` plus integration across `PageCache` (spill on dirty overflow, rehydrate on miss, drain under the existing fsync, truncate on rollback) and the public API (`Chisel::set_cache_max_bytes` / `set_spillway_max_bytes` / `set_drain_insertion`).
-
-Breaking changes:
-- `Options::cache_size: usize` (page count) → `Options::cache_max_bytes: u64` (bytes); default unchanged at 8 MiB.
-- New `Options::spillway_max_bytes` (default `1024 × cache_max_bytes` = 8 GiB; 0 disables the spillway and restores legacy `CacheFull`-at-cap semantics).
-- New `Options::drain_insertion` (`LruTail` default | `Mru`).
-- The pre-existing 8× `HARD_CEILING_MULTIPLIER` elasticity is removed.
-
-The bench engine (`bench/src/chisel_engine.rs`) was updated mid-PR to enable the spillway by default. The original "spillway disabled for cross-engine fairness" reasoning was backwards: SQLite uses a temp file for transaction overflow, redb uses on-disk btrees; disabling Chisel's spillway makes Chisel the only engine that fails on big transactions, which is the unfair config.
-
-Spec/plan at `docs/superpowers/specs/2026-05-03-chisel-spillway-design.md` + `docs/superpowers/plans/2026-05-04-chisel-spillway.md`. Engine-side description in [Cross-cutting concepts → Spillway](#spillway).
-
-### Lessons captured during the spillway rollout
-
-Three engineering lessons surfaced during the spillway PR that are worth remembering for future cross-cutting work:
-
-1. **Per-task `cargo test` from the repo root did NOT run the bench subcrate's tests (at the time).** Bench was a sibling crate, not a workspace member. `cd bench && cargo test` was documented separately, but per-task gates skipped it. The final whole-PR review caught the missed bench test failures. Tracked as I58 in ISSUES.md and since RESOLVED: I58/I61 made `bench/` a `default-members` workspace member, so a root `cargo test` now covers it.
-2. **A breaking change in cache discipline ripples to every consumer that papered over a different limitation.** The bench engine had been quietly relying on the 8× elasticity as a substitute for proper transaction-overflow handling. Removing the elasticity exposed the missing config; the right fix was to give Chisel the spillway (production parity), not to keep it disabled and lower other budgets.
-3. **No-spill commit cost is 3 fsyncs, not 2.** I28 pre-drain flush + main-pages flush + superblock. The spillway spec called it "two-fsync" because the spec author was thinking only of the spillway's contribution (zero); the actual baseline was already 3. The `no_spill_workload_preserves_two_fsync_commit` test now pins to `== 3` with documentation of the protocol so a future reader knows what each fsync covers.
+**Tamper detection.** Any modification to a page or the superblock body surfaces as the fatal `DecryptionFailed` error, which poisons the engine.
 
 ---
 
 ## Glossary
 
 - **COW (copy-on-write)** — every mutation writes to a fresh page rather than modifying an existing one. The previously-committed page stays valid until the superblock swap promotes the new state.
+- **DEK / KEK** — Data Encryption Key (encrypts all pages) and Key Encryption Key (wraps the DEK). The DEK is stored only in wrapped form in the superblock's key-slot table. See [On-disk encryption](#on-disk-encryption).
 - **Handle** — a stable `u64` returned by `allocate()`. Survives `update()`, `defrag()`, and reopen.
 - **HandleEntry** — the 16-byte record in a handle-table leaf describing one handle's `(page_id, slot_index, flags)`.
 - **Inline value** — a value small enough to live in a data-page slot directly. Larger values overflow.
@@ -747,12 +698,13 @@ Three engineering lessons surfaced during the spillway PR that are worth remembe
 - **Operational error** — a `ChiselError` variant indicating the caller made a mistake or hit a transient condition; the database is fine. `is_fatal()` returns false.
 - **Overflow chain** — a singly-linked sequence of overflow pages holding one large value. Owned exclusively by one handle.
 - **PAGE_ID_NONE** — `u64::MAX`. Sentinel meaning "not yet allocated" for root pointers (handle-table root, freemap root).
-- **PageType** — the 1-byte tag at offset 0 of every non-superblock page. Values: `0x01` HandleTable, `0x02` Data, `0x03` Overflow, `0x04` FreeMap, `0x05` MembershipInterior, `0x06` MembershipLeaf. `0x00` is reserved so a zeroed page cannot masquerade as a valid type.
+- **PageType** — the 1-byte tag at offset 0 of every non-superblock page. Values: `0x01` HandleTable, `0x02` Data, `0x03` Overflow, `0x04` FreeMap, `0x05` MembershipInterior, `0x06` MembershipLeaf, `0x07` FreeMapInterior. `0x00` is reserved so a zeroed page cannot masquerade as a valid type.
 - **Poison** — the state a `TransactionManager` enters after any fatal error. Every subsequent call returns `Poisoned` until the handle is dropped and the database reopened.
 - **Shadow paging** — the durability technique Chisel uses: writes go to new pages; commit swaps a superblock pointer; old state stays intact for crash recovery.
 - **Slot packing (R1)** — multiple values per data page. Each value occupies one slot; the slot directory grows forward and value data grows backward from the page's checksum.
 - **Slot tombstone** — a slot directory entry with `SLOT_FLAG_DEAD`. Reclaimed by `compact()`, not reused by `insert()`.
-- **Superblock** — the page (one of N slots at the file head) that names the current handle-table root, freemap root, membership-index root, named roots, and durability metadata. Picked by `Superblock::select` on open. The membership-index root is a fourth root that swaps atomically with the others on each commit.
+- **Stride** — the on-disk unit size read/written per page: `PAGE_SIZE` (8192) plaintext, `ENC_PAGE_SIZE` (8232) encrypted. Recorded in the crypto-header; set on `PageIo` via `set_stride`.
+- **Superblock** — the page (one of N slots at the file head) that names the current handle-table root, freemap root, membership-index root, named roots, and durability metadata. Picked by `Superblock::select` on open.
 - **Tombstone (handle)** — a `HandleEntry` with `HandleFlags::Deleted`. The slot stays allocated; the handle is permanently retired (never reused). See "permanent-burn policy" in [Handle stability](#handle-stability).
 - **txn_counter** — monotonically-increasing u64 in every committed superblock. Used by `select` to pick the winner across slots and by the round-robin to decide which slot to write next.
 - **Watermark rollback (I3)** — the rollback strategy: cache + file are truncated to `committed_roots.total_pages`. Pages allocated during the transaction (id ≥ watermark) get dropped; freemap-reused pages (id < watermark) get their dirty cache entries discarded. No undo log. Rollback also re-derives the handle-table and membership-index depths from the restored roots (those in-memory radix depths are not part of the snapshot; I99 / C1).

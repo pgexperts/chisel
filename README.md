@@ -19,6 +19,7 @@ Pre-1.0. Current release: `0.1.0`. The API is stable-by-intent but subject to re
 - **Named roots** — a small fixed table in the superblock mapping string names to handles. Survives commit / rollback transactionally.
 - **Defragmentation** — explicit `defrag()` consolidates sparse pages and returns a count-based stats record.
 - **In-memory mode** — same engine, `Vec<u8>`-backed I/O, no file and no lock. For tests, benchmarks, and ephemeral work.
+- **At-rest encryption** — optional, off by default. Every page is sealed with XChaCha20-Poly1305 AEAD under a client-supplied key (raw 32-byte or Argon2id passphrase). An 8-slot envelope table wraps the data-encryption key, so credential rotation is O(1) — no bulk re-encryption.
 - **Poison model** — any fatal error (I/O failure, checksum mismatch, commit-protocol failure) poisons the handle; recovery is drop-and-reopen. Mirrors `std::sync::Mutex` poisoning.
 - **Single-writer** — exclusive `flock` at the filesystem level; `&mut self` on every mutating method.
 
@@ -75,12 +76,14 @@ Cargo workspace with three members: the root `chisel` engine, the `python/` PyO3
 
 ```bash
 cargo build
-cargo test
-cargo clippy -- -D warnings
+cargo test                                # engine + bench (default-members); do NOT use --lib
+cargo clippy --workspace -- -D warnings   # --workspace also lints the python/ binding
 cargo fmt -- --check
 ```
 
-CI runs the Rust checks above plus a Python matrix (CPython 3.11 and 3.13 × Linux/macOS) that builds the PyO3 binding via `maturin develop` and runs `pytest` in `python/tests`. A separate workflow builds abi3 wheels on tagged releases.
+`cargo test` from the workspace root covers the engine and the bench crate (`default-members = [".", "bench"]`). Do **not** use `cargo test --lib` — it skips the `tests/` integration suite. MSRV is verified with a library-only build under the pinned toolchain: `cargo +1.82 build -p chisel`.
+
+CI runs the Rust checks above plus a Python matrix (CPython 3.11 and 3.13 × Linux/macOS) that builds the PyO3 binding via `maturin develop --release` and runs `pytest -v` in `python/tests`. A separate workflow builds abi3 wheels on tagged releases.
 
 ### Python binding
 
@@ -89,9 +92,9 @@ The `python/` subcrate is a PyO3 wrapper (`chisel-py` → `_chisel.abi3.so`) wit
 ```bash
 cd python
 python -m venv .venv && source .venv/bin/activate
-pip install maturin pytest
-maturin develop
-pytest
+pip install maturin pytest hypothesis   # the `test` extra requires pytest>=8 and hypothesis>=6
+maturin develop --release
+pytest -v
 ```
 
 See [`python/README.md`](python/README.md) for usage.
@@ -215,6 +218,34 @@ let mut db = Chisel::open_in_memory()?;
 
 For tuned options (cache size, superblock count), use `Chisel::open_in_memory_with_options(options)`.
 
+### Encryption
+
+Encryption is opt-in and driven entirely through `Options::encryption_key`. A key is supplied as a `chisel::Key`:
+
+- `Key::Raw(bytes)` — high-entropy key material (32 bytes), stretched to a key-encryption key via HKDF-SHA256.
+- `Key::Passphrase(string)` — a human secret, stretched via Argon2id (memory-hard). Cost comes from `Options::argon2_params` on create, or the stored slot's params on reopen.
+
+Both variants zeroize their material on drop.
+
+```rust
+use chisel::{Chisel, Key, Options};
+use std::path::Path;
+use zeroize::Zeroizing;
+
+// Create (or reopen) an encrypted database.
+let key = Key::Passphrase(Zeroizing::new("correct horse battery staple".into()));
+let mut db = Chisel::open(
+    Path::new("secret.db"),
+    Options::default().encryption_key(key),
+)?;
+```
+
+On create, Chisel generates a random data-encryption key (DEK), encrypts every page under it with XChaCha20-Poly1305, and wraps the DEK under a key-encryption key derived from your supplied key. On reopen, the supplied key must unwrap one of the on-disk key slots or `open` fails with `InvalidEncryptionKey`. Supplying a key to a plaintext DB returns `EncryptionNotSupported`; omitting it on an encrypted DB returns `NoEncryptionKey`.
+
+The wrapped DEK lives in an **8-slot key table**. Because the DEK itself never changes, credential rotation only re-wraps the DEK in a slot — it is O(1), independent of database size. `add_key` stages a second credential (both open the DB), `rotate_key` replaces one credential in place, and `remove_key` retires one (refusing the last remaining slot with `LastKeySlot`). A full table returns `NoFreeKeySlot`.
+
+See [ARCHITECTURE.md#on-disk-encryption](ARCHITECTURE.md#on-disk-encryption) for the on-disk layout (crypto header, key slots, per-page nonce stride) and [THEORY.md](THEORY.md) for the rationale behind the envelope scheme and the shadow-paging nonce discipline (with [ISSUES.md](ISSUES.md) as the dated decision log).
+
 ## API reference
 
 | Method | Purpose |
@@ -248,7 +279,11 @@ For tuned options (cache size, superblock count), use `Chisel::open_in_memory_wi
 | `handles()` | Enumerate all live handles; repeatable within a session, order unspecified (takes `&self`) |
 | `stats()` | Handle count, page count, file size (takes `&self`) |
 | `counters()` | Engine-activity counters: cache hits/misses, fsync calls, pages allocated (takes `&self`) |
+| `file_size_bytes()` | Physical size of the database file in bytes (takes `&self`) |
 | `defrag(options)` | Consolidate sparse pages |
+| `add_key(existing, new)` | Stage a second credential; both `existing` and `new` then open the DB. `Result<()>` |
+| `rotate_key(old, new)` | Replace credential `old` with `new` in place. `Result<()>` |
+| `remove_key(key)` | Retire credential `key`; `LastKeySlot` if it is the only one. `Result<()>` |
 
 ## Options
 
@@ -262,8 +297,12 @@ let options = Options {
     create_if_missing: true,
     read_only: false,
     superblock_count: 2,                         // 2..=16; only consulted on create
+    encryption_key: None,                        // Some(key) to create/open an encrypted DB
+    argon2_params: None,                          // None = OWASP defaults; only used on create
 };
 ```
+
+`Options` is `#[non_exhaustive]`, so build a customized value with the chained setters rather than a struct literal from another crate: `Options::default().cache_max_bytes(N).encryption_key(key)`. Every field has a matching setter, including `Options::encryption_key(key)` and `Options::argon2_params(params)`.
 
 `cache_max_bytes` is a strict cap on the in-memory LRU cache. When the cache is full and a dirty page cannot be evicted, overflow dirty pages spill to a sidecar `Spillway` file rather than returning an error. The spillway file is bounded by `spillway_max_bytes` (default 8 GiB). Setting `spillway_max_bytes = 0` disables the spillway entirely, restoring the pre-spillway `CacheFull` semantics at the strict cache cap: the operational error `CacheFull` fires when the cache is full and no eviction is possible. With the spillway enabled, exhausting both the cache and the spillway returns `SpillwayFull { limit_bytes }` (also operational; caller recovers by committing or rolling back).
 
@@ -271,17 +310,21 @@ let options = Options {
 
 `superblock_count` is set at create time and stored on disk; reopening discovers it from the winning superblock. Higher N increases durability against consecutive torn writes at the cost of N × 8 KB of file space: N = 3 survives one torn commit plus a torn retry, N = 4 survives two retries.
 
+`encryption_key` defaults to `None` (plaintext). `Some(key)` creates a new encrypted database (sealing a fresh random data-encryption key under the supplied key) or reopens one (unwrapping the stored key). `argon2_params` defaults to `None`, which uses the OWASP-recommended Argon2id cost (19 MiB / t=2 / p=1) when deriving a key from a `Key::Passphrase` on create; it is ignored for raw keys and on reopen (the stored slot carries its own params). See the [Encryption](#encryption) concept below.
+
 ## Error handling
 
 `ChiselError` splits into two conceptual tiers.
 
 **Operational errors** — the database is healthy; the caller made a mistake. Catch and continue.
 
-`InvalidHandle`, `TagMismatch`, `NoActiveTransaction`, `TransactionAlreadyActive`, `TransactionInProgress`, `SavepointNotFound`, `DuplicateSavepoint`, `ReadOnlyMode`, `FileNotFound`, `InvalidRootName`, `RootNameTableFull`, `InvalidSuperblockCount`, `CacheFull`, `SpillwayFull`.
+`InvalidHandle`, `TagMismatch`, `NoActiveTransaction`, `TransactionAlreadyActive`, `TransactionInProgress`, `SavepointNotFound`, `DuplicateSavepoint`, `ReadOnlyMode`, `FileNotFound`, `InvalidRootName`, `RootNameTableFull`, `InvalidSuperblockCount`, `CacheFull`, `SpillwayFull`, `NoEncryptionKey`, `InvalidEncryptionKey`, `EncryptionNotSupported`, `NoFreeKeySlot`, `LastKeySlot`.
 
 **Fatal errors** — storage integrity is in question. Drop the handle and reopen.
 
-`IoError`, `ChecksumMismatch`, `CorruptSuperblock`, `FileSizeMismatch`, `LockFailed`, `UnsupportedFormatVersion`, `CorruptPage`, `InvalidPageId`, `Poisoned`.
+`IoError`, `ChecksumMismatch`, `CorruptSuperblock`, `FileSizeMismatch`, `LockFailed`, `UnsupportedFormatVersion`, `UnsupportedPageSize`, `CorruptPage`, `InvalidPageId`, `DecryptionFailed`, `Poisoned`.
+
+`DecryptionFailed { page_id }` is fatal: an AEAD authentication failure while decrypting an already-read page means the ciphertext or session key can no longer be trusted, so it poisons the handle exactly like `ChecksumMismatch` (see the poison model below). It is distinct from the operational `InvalidEncryptionKey`, which fires at open time when the supplied key unwraps no key slot — before any data page is served.
 
 Use `ChiselError::is_fatal()` to classify at runtime.
 
@@ -313,13 +356,15 @@ Versioning is two-tiered.
 
 **File level** — each superblock carries a packed `format_version` u32: upper 16 bits = MAJOR, lower 16 bits = MINOR. The open-time gate compares MAJOR only. A 1.3 binary opens a 1.7 file cleanly, but a 1.3 binary rejects a 2.0 file. Minor bumps within a major are reserved for additive changes, so older binaries can safely *read* newer-minor files. The chunk-tags feature is the first such additive minor bump (MINOR 0 → 1): it adds a per-chunk tag and a membership index, and pre-tag files open cleanly with every chunk untagged.
 
+Encryption introduces the second major: an encrypted database is stamped MAJOR = 2 (`FORMAT_MAJOR_VERSION_ENCRYPTED`), because its on-disk layout carries a crypto header and every page is ciphertext — an encryption-unaware or older binary cannot make sense of it. The MAJOR-only open gate therefore hard-rejects a MAJOR = 2 file with `UnsupportedFormatVersion` rather than misreading it, exactly as it rejects any future incompatible major. Plaintext databases stay at MAJOR = 1.
+
 **Page level** — each non-superblock page carries a one-byte `page_format_version` in its header, letting individual page layouts evolve within a major without a file-wide format bump. The post-1.0 upgrade story is lazy migration: on read, the page-type module dispatches on its page's declared version; on write, it always produces the current version; cold pages stay in the old layout until an opt-in `db.upgrade()` sweep rewrites them. An additional 8 bytes are reserved in every non-superblock page header for future common-header fields.
 
 Write safety across minors is a narrower guarantee: a binary at MINOR = *m* opening a file at MINOR = *m' > m* cannot safely commit without risking overwriting fields it doesn't know about. The open gate is MAJOR-only by design, so minor variants coexist — same-major files of any minor open successfully, and the chunk-tags MINOR = 1 variant is the first such case. The write-refusal arm (refuse writes when file MINOR > binary MINOR, leaving the newer-minor file read-only) is not yet wired up; it lands with the first post-1.0 minor bump that makes the direction observable. The post-1.0 cross-minor read-compatibility guarantee is absolute; write-compatibility requires binary MINOR ≥ file MINOR.
 
 ### Pre-1.0 caveat
 
-Until Chisel reaches 1.0, the on-disk format may change between pre-release builds without a major-version bump. Any such pre-1.0 change will be called out in release notes. The first 1.0 release freezes MAJOR at 1 for the entire 1.x line.
+Until Chisel reaches 1.0, the on-disk format may change between pre-release builds without a major-version bump. Any such pre-1.0 change will be called out in release notes. The first 1.0 release freezes the plaintext format at MAJOR = 1 for the entire 1.x line; encrypted databases carry MAJOR = 2 (see above), and each major's on-disk format is sacred within that major.
 
 Files written by prior development builds (pre-1.0 flat `format_version`, which decodes as MAJOR = 0) are rejected at open time — recreate the database. No production-grade migration is provided for pre-release files.
 
@@ -348,9 +393,24 @@ A PyO3 wrapper lives in the `python/` subdirectory and will be published to PyPI
 
 The Python API mirrors the Rust one but adds context managers for transactions and savepoints.
 
+Encryption is exposed through the `open()` `encryption_key` keyword (default `None`): pass `bytes` for a raw 32-byte key or `str` for a passphrase. The three key-management methods take the same `bytes | str` credential vocabulary:
+
+```python
+import chisel
+
+db = chisel.open("secret.db", encryption_key="correct horse battery staple")
+
+db.add_key(existing="correct horse battery staple", new=b"\x00" * 32)  # stage a 2nd credential
+db.rotate_key(old=b"\x00" * 32, new="new passphrase")                   # replace in place
+db.remove_key("correct horse battery staple")                          # retire one
+```
+
+`add_key` / `rotate_key` raise `NoFreeKeySlotError` when the 8-slot table is full; `remove_key` raises `LastKeySlotError` rather than leaving the DB with no usable credential.
+
 ## Design documents
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — living architecture overview: layer model, commit protocol, recovery, full on-disk format byte-by-byte, and cross-cutting concepts. Start here if you're reading the codebase for the first time.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — living architecture overview: layer model, commit protocol, recovery, full on-disk format byte-by-byte, and cross-cutting concepts. Start here if you're reading the codebase to *act* on it.
+- [`THEORY.md`](THEORY.md) — theory of operation: *why* the design is what it is — the load-bearing decisions, the rejected alternatives, and the implementation history. Read this to build a durable model before changing the engine.
 - [`ISSUES.md`](ISSUES.md) — running decision log: open issues, closed issues, and every design tradeoff with date-stamped rationale.
 
 ## License
