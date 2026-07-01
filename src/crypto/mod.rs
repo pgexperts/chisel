@@ -284,7 +284,8 @@ pub fn random_dek() -> Dek {
 /// Holds the DEK and performs the two seal/open transforms the engine needs:
 /// whole-page (fixed 8192→8232) and variable-length body (superblock sub-blob).
 /// Lives in the page-cache layer in later phases; here it is fully standalone.
-/// Constructs the AEAD cipher once and reuses it across calls.
+/// The AEAD cipher is derived from the DEK on each `seal`/`open` call; this is
+/// cheap for XChaCha20-Poly1305 and avoids holding any additional per-call state.
 ///
 /// `Clone` produces an independent copy with its own `Zeroizing` DEK (both
 /// copies wipe on drop independently). Used when the cache and the session

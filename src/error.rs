@@ -657,7 +657,7 @@ mod tests {
             "Display {msg:?} should mention page id 7"
         );
 
-        // source() is None for all four — none wrap an inner cause.
+        // source() is None for all six — none wrap an inner cause.
         use std::error::Error;
         for e in [
             ChiselError::NoEncryptionKey,
