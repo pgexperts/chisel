@@ -1,21 +1,25 @@
-// encryption_create.rs — Integration tests for Task 2.3: create_new with a key.
-//
-// Scope: verify the CREATE ARTIFACT (the serialised page 0) without exercising
-// the open path (the MAJOR=2 gate is Task 2.4). Concretely:
-//   - MAJOR is 2 in the on-disk superblock
-//   - slot 0 is populated (state=active)
-//   - sensitive fields (named_roots names) are NOT in cleartext
-//   - the wrapped DEK round-trips: unwrap_dek under the same key recovers
-//     a valid DEK (smoke-tests the wrap/AAD path without going through open)
-//
-// All file-backed tests use a tempfile that is deleted on drop.
+//! transaction::create_tests — create-artifact tests for encrypted DBs.
+//!
+//! Scope: verify the CREATE ARTIFACT (the serialised page 0) without exercising
+//! the open path. Concretely:
+//!   - MAJOR is 2 in the on-disk superblock
+//!   - slot 0 is populated (state=active)
+//!   - sensitive fields (named_roots names) are NOT in cleartext
+//!   - the wrapped DEK round-trips: unwrap_dek under the same key recovers
+//!     a valid DEK (smoke-tests the wrap/AAD path without going through open)
+//!
+//! Relocated from tests/encryption_create.rs after the crypto/superblock/format
+//! internals were scoped to pub(crate); these assertions need direct access to
+//! CryptoHeader/KeySlot/derive_kek/unwrap_dek which are no longer public. All
+//! file-backed tests use a tempfile that is deleted on drop.
 
-use chisel::{
-    derive_kek, unwrap_dek, CryptoHeader, KdfId, Key, KeySlot,
-    Options, ALGO_XCHACHA20POLY1305, CRYPTO_HEADER_OFFSET, KEY_SLOT_COUNT, KEY_SLOT_SIZE,
-    PAGE_SIZE,
+use crate::crypto::{derive_kek, unwrap_dek, KdfId, Key};
+use crate::page::{format_major, FORMAT_MAJOR_VERSION_ENCRYPTED, PAGE_SIZE};
+use crate::superblock::{
+    CryptoHeader, KeySlot, ALGO_XCHACHA20POLY1305, CRYPTO_HEADER_OFFSET, KEY_SLOT_COUNT,
+    KEY_SLOT_SIZE,
 };
-use chisel::{format_major, FORMAT_MAJOR_VERSION_ENCRYPTED};
+use crate::Options;
 use std::fs;
 use std::io::Read as _;
 use zeroize::Zeroizing;
@@ -60,11 +64,8 @@ impl Drop for TempDb {
 fn create_encrypted_db_stamps_major_2() {
     let tmp = TempDb::new("major2_raw");
     let key = Key::Raw(Zeroizing::new(vec![0xAB_u8; 32]));
-    let db = chisel::Chisel::open(
-        tmp.path(),
-        Options::default().encryption_key(key),
-    )
-    .expect("create encrypted db");
+    let db = crate::Chisel::open(tmp.path(), Options::default().encryption_key(key))
+        .expect("create encrypted db");
     drop(db);
 
     let page0 = tmp.read_page0();
@@ -81,11 +82,8 @@ fn create_encrypted_db_stamps_major_2() {
 fn create_encrypted_db_passphrase_stamps_major_2() {
     let tmp = TempDb::new("major2_pass");
     let key = Key::Passphrase(Zeroizing::new("hunter2".to_string()));
-    let db = chisel::Chisel::open(
-        tmp.path(),
-        Options::default().encryption_key(key),
-    )
-    .expect("create encrypted db passphrase");
+    let db = crate::Chisel::open(tmp.path(), Options::default().encryption_key(key))
+        .expect("create encrypted db passphrase");
     drop(db);
 
     let page0 = tmp.read_page0();
@@ -99,11 +97,8 @@ fn create_encrypted_db_passphrase_stamps_major_2() {
 fn create_encrypted_db_populates_slot_0_only() {
     let tmp = TempDb::new("slot0");
     let key = Key::Raw(Zeroizing::new(vec![0x77_u8; 32]));
-    let db = chisel::Chisel::open(
-        tmp.path(),
-        Options::default().encryption_key(key),
-    )
-    .expect("create");
+    let db = crate::Chisel::open(tmp.path(), Options::default().encryption_key(key))
+        .expect("create");
     drop(db);
 
     let page0 = tmp.read_page0();
@@ -148,11 +143,8 @@ fn create_encrypted_db_sealed_body_is_present() {
 
     let tmp = TempDb::new("cleartext_check");
     let key = Key::Raw(Zeroizing::new(vec![0xCC_u8; 32]));
-    let db = chisel::Chisel::open(
-        tmp.path(),
-        Options::default().encryption_key(key),
-    )
-    .expect("create");
+    let db = crate::Chisel::open(tmp.path(), Options::default().encryption_key(key))
+        .expect("create");
     drop(db);
 
     let page0 = tmp.read_page0();
@@ -172,16 +164,13 @@ fn create_encrypted_db_sealed_body_is_present() {
 /// from the same raw key, and verify `unwrap_dek` succeeds.
 ///
 /// This exercises the wrap→unwrap round-trip without going through the open
-/// path (which Task 2.4 implements).
+/// path.
 #[test]
 fn slot0_dek_unwraps_with_correct_key() {
     let tmp = TempDb::new("unwrap");
     let key = Key::Raw(Zeroizing::new(vec![0x5A_u8; 32]));
-    let db = chisel::Chisel::open(
-        tmp.path(),
-        Options::default().encryption_key(key.clone()),
-    )
-    .expect("create");
+    let db = crate::Chisel::open(tmp.path(), Options::default().encryption_key(key.clone()))
+        .expect("create");
     drop(db);
 
     let page0 = tmp.read_page0();
@@ -223,11 +212,8 @@ fn slot0_dek_unwraps_with_correct_key() {
 fn slot0_dek_unwrap_fails_with_wrong_key() {
     let tmp = TempDb::new("wrong_key");
     let key = Key::Raw(Zeroizing::new(vec![0x5A_u8; 32]));
-    let db = chisel::Chisel::open(
-        tmp.path(),
-        Options::default().encryption_key(key),
-    )
-    .expect("create");
+    let db = crate::Chisel::open(tmp.path(), Options::default().encryption_key(key))
+        .expect("create");
     drop(db);
 
     let page0 = tmp.read_page0();

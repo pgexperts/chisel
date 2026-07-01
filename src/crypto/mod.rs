@@ -80,6 +80,7 @@ impl Clone for Dek {
 pub struct Kek(Zeroizing<[u8; 32]>);
 
 impl Kek {
+    #[cfg(test)]
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Kek(Zeroizing::new(bytes))
     }
@@ -162,6 +163,13 @@ pub fn derive_kek(
         Key::Raw(bytes) => bytes.as_slice(),
         Key::Passphrase(s) => s.as_bytes(),
     };
+    // Reject empty key material: HKDF and Argon2id both accept a zero-length
+    // ikm and would silently derive a KEK from nothing, so a caller-supplied
+    // empty key must be refused at this trust boundary rather than producing a
+    // usable wrap. Documented in this function's # Errors as BadKeyLength.
+    if ikm.is_empty() {
+        return Err(CryptoError::BadKeyLength);
+    }
     // Zeroizing so the derived key never lingers un-wiped on the stack: on the
     // success path it is MOVED into Kek (no copy left behind), and on any error
     // path partial KDF output is wiped on drop.

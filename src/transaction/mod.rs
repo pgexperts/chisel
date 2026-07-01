@@ -239,6 +239,8 @@ pub struct TransactionManager {
 mod commit;
 mod config;
 #[cfg(test)]
+mod create_tests;
+#[cfg(test)]
 mod fault;
 mod freemap;
 mod keys;
