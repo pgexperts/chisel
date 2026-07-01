@@ -292,6 +292,7 @@ version = "0.1.0"
 dependencies = [
  "chisel",
  "pyo3",
+ "zeroize",
 ]
 
 [[package]]

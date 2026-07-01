@@ -114,6 +114,15 @@ create_exception!(_chisel, TransactionInProgressError, OperationalError);
 // left unmodified — the mismatch is purely a caller error, not a
 // data-integrity problem.
 create_exception!(_chisel, TagMismatchError, OperationalError);
+// Encryption-related operational errors: the database is intact; the caller
+// supplied wrong or missing key material. All three have is_fatal() = false.
+// NoEncryptionKey: encrypted DB opened without an encryption_key argument.
+create_exception!(_chisel, NoEncryptionKeyError, OperationalError);
+// InvalidEncryptionKey: encryption_key was supplied but unwraps no key slot
+// (wrong passphrase or wrong raw bytes).
+create_exception!(_chisel, InvalidEncryptionKeyError, OperationalError);
+// EncryptionNotSupported: encryption_key was supplied but the DB is plaintext.
+create_exception!(_chisel, EncryptionNotSupportedError, OperationalError);
 // ISSUES.md I25: raised by PyChisel's with_inner_io/with_inner_mut_io
 // helpers when `inner` has been cleared by a prior close(). Distinct
 // from PoisonedError because close() is a user action — the DB file
@@ -133,6 +142,9 @@ create_exception!(_chisel, AlreadyFinishedError, OperationalError);
 // Fatal — matches ChiselError::is_fatal() in src/error.rs exactly.
 // IoError is NOT declared here: it needs two bases (FatalError + OSError) and is
 // built in `register` via `build_io_error_class` / cached in `IO_ERROR_CLASS`.
+// DecryptionFailed: a page-read failed MAC verification after a successful open.
+// is_fatal() = true — data integrity cannot be confirmed; treat as poison.
+create_exception!(_chisel, DecryptionFailedError, FatalError);
 create_exception!(_chisel, ChecksumMismatchError, FatalError);
 create_exception!(_chisel, CorruptSuperblockError, FatalError);
 create_exception!(_chisel, FileSizeMismatchError, FatalError);
@@ -199,6 +211,15 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         py.get_type::<AlreadyFinishedError>(),
     )?;
     m.add("TagMismatchError", py.get_type::<TagMismatchError>())?;
+    m.add("NoEncryptionKeyError", py.get_type::<NoEncryptionKeyError>())?;
+    m.add(
+        "InvalidEncryptionKeyError",
+        py.get_type::<InvalidEncryptionKeyError>(),
+    )?;
+    m.add(
+        "EncryptionNotSupportedError",
+        py.get_type::<EncryptionNotSupportedError>(),
+    )?;
 
     // IoError multiply-inherits (FatalError, OSError); register that class and
     // cache it so `to_py_err` constructs instances of it (not a single-base
@@ -230,6 +251,10 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CorruptPageError", py.get_type::<CorruptPageError>())?;
     m.add("InvalidPageIdError", py.get_type::<InvalidPageIdError>())?;
     m.add("PoisonedError", py.get_type::<PoisonedError>())?;
+    m.add(
+        "DecryptionFailedError",
+        py.get_type::<DecryptionFailedError>(),
+    )?;
 
     Ok(())
 }
@@ -278,6 +303,12 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
         // the chunk and membership index are left intact, so it is
         // operational — distinct from any data-integrity problem.
         RustChiselError::TagMismatch { .. } => TagMismatchError::new_err(msg),
+        // Encryption: operational (wrong/missing key, plaintext DB).
+        RustChiselError::NoEncryptionKey => NoEncryptionKeyError::new_err(msg),
+        RustChiselError::InvalidEncryptionKey => InvalidEncryptionKeyError::new_err(msg),
+        RustChiselError::EncryptionNotSupported => EncryptionNotSupportedError::new_err(msg),
+        // Fatal encryption: MAC verification failed on a page read after open.
+        RustChiselError::DecryptionFailed { .. } => DecryptionFailedError::new_err(msg),
         // Fatal
         //
         // I42 (ISSUES.md, 2026-05-22): expose the inner io::Error's errno

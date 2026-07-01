@@ -145,7 +145,8 @@ impl From<PyDrainInsertion> for chisel::DrainInsertion {
     drain_insertion = PyDrainInsertion::LruTail,
     create_if_missing = true,
     read_only = false,
-    superblock_count = 2
+    superblock_count = 2,
+    encryption_key = None
 ))]
 // open() has 8 args; clippy warns at 7. All but `path` are keyword-only
 // (note the `*` in the pyo3(signature) above), so the user can never
@@ -163,6 +164,7 @@ pub fn open(
     create_if_missing: bool,
     read_only: bool,
     superblock_count: u32,
+    encryption_key: Option<Py<PyAny>>,
 ) -> PyResult<PyChisel> {
     // Coerce path to PathBuf under the GIL first. Accept str fast-path
     // and fall back to os.fspath() for any os.PathLike (pathlib.Path, etc).
@@ -182,6 +184,31 @@ pub fn open(
                 os.call_method1("fspath", (obj,))?.extract()?
             };
             Some(PathBuf::from(s))
+        }
+    };
+
+    // Coerce encryption_key under the GIL (before py.detach): `bytes` →
+    // Key::Raw, `str` → Key::Passphrase. Done here so a bad type raises a
+    // synchronous Python TypeError, matching the path coercion above.
+    // Key material is wrapped in Zeroizing immediately; the bytes/str borrow
+    // is released before the GIL drop so no key material escapes the GIL window.
+    let key: Option<chisel::Key> = match encryption_key {
+        None => None,
+        Some(obj) => {
+            let bound = obj.bind(py);
+            if let Ok(b) = bound.cast::<pyo3::types::PyBytes>() {
+                Some(chisel::Key::Raw(zeroize::Zeroizing::new(
+                    b.as_bytes().to_vec(),
+                )))
+            } else if let Ok(s) = bound.cast::<PyString>() {
+                Some(chisel::Key::Passphrase(zeroize::Zeroizing::new(
+                    s.to_str()?.to_owned(),
+                )))
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "encryption_key must be bytes (raw key) or str (passphrase)",
+                ));
+            }
         }
     };
 
@@ -205,13 +232,16 @@ pub fn open(
     // builder. Every field is set explicitly because Python kwargs
     // already encode the caller's intent — there are no
     // "leave at default" cases at this boundary.
-    let options = chisel::Options::default()
+    let mut options = chisel::Options::default()
         .cache_max_bytes(cache_max_bytes)
         .spillway_max_bytes(resolved_spillway_max_bytes)
         .drain_insertion(drain_insertion.into())
         .create_if_missing(create_if_missing)
         .read_only(read_only)
         .superblock_count(superblock_count);
+    if let Some(k) = key {
+        options = options.encryption_key(k);
+    }
 
     // Engine calls can block on I/O (flock, fsync, file creation), so
     // release the GIL while they run. Chisel is Send (single-threaded
