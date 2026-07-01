@@ -232,12 +232,11 @@ impl FreeMapTree {
     /// Is `id` currently free? Absent subtree (or past reach) reads as in-use.
     ///
     /// Read-only query: production allocation/free goes through `allocate_first`
-    /// / `mark_free_growing`, so the only consumers are the in-crate tests and
-    /// the transaction layer's C1-invariant assertions (both `#[cfg(test)]`).
-    /// Kept on the non-test build as a legitimate diagnostic accessor; the
-    /// targeted allow (covering its sole helper `find_leaf`) documents that it
-    /// is intentionally retained rather than dead.
-    #[allow(dead_code)]
+    /// / `mark_free_growing`. The production consumer of this accessor is
+    /// `FreemapRecycle::reclaim_orphans` (the defrag orphan-sweep), which calls
+    /// it to confirm a freemap-typed dead page is genuinely free before
+    /// reclaiming it; the in-crate tests and the transaction layer's
+    /// C1-invariant assertions are the other (`#[cfg(test)]`) consumers.
     pub fn is_free(&self, cache: &mut PageCache, id: u64) -> Result<bool> {
         let Some(leaf) = self.find_leaf(cache, id)? else {
             return Ok(false);

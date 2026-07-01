@@ -138,8 +138,10 @@ pub struct DefragStats {
 ///      `txm.sparse_data_pages(sparse_threshold)`. A page is sparse if
 ///      its live-slot count is at or below `threshold × max_observed`.
 ///      Dense pages are left alone.
-///   3. Record the initial data-page count so we can report
-///      `pages_freed` at the end as the net drop (I17).
+///   3. Snapshot the initial set of data-page IDs (not a count) so we can
+///      report `pages_freed` at the end as the set difference against the
+///      final set — a net count delta is the wrong metric here, see the
+///      header (I17).
 ///   4. Snapshot the handle list up front so the iteration walks a
 ///      stable set rather than a handle table we are concurrently
 ///      rewriting via update().
@@ -149,8 +151,9 @@ pub struct DefragStats {
 ///      cursor, which is a fresh, densely-packed page. Repeat until
 ///      the max-work cap (if any) is reached.
 ///   6. Track UNIQUE sparse pages touched via a HashSet (for accurate
-///      `pages_examined`) and compute `pages_freed` as the net drop
-///      in data-page count after the sweep.
+///      `pages_examined`) and compute `pages_freed` as the set difference
+///      between the initial and final data-page-ID sets (NOT a net count
+///      delta — see header).
 ///   7. Reclaim freemap pages orphaned by a prior crash that lost the
 ///      in-memory structural recycle pool, via
 ///      `txm.reclaim_freemap_orphans` (reported as

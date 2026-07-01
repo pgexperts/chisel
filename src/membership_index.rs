@@ -638,6 +638,10 @@ impl MembershipIndex {
             inner_root = inner.create_root(cache, alloc)?;
         }
         let new_inner_root = inner.insert(cache, inner_root, handle, 1, alloc, freed)?;
+        // Pack the POST-insert `inner.depth`, not the stale `inner_depth` from
+        // unpack_inner: this insert may have grown the inner tree, bumping its
+        // depth. Persisting the old depth would make later readers descend the
+        // wrong number of levels (invisible at depth 0; see inner_grow_roundtrip).
         let packed = pack_inner(new_inner_root, inner.depth);
         let new_outer_root = outer.insert(cache, root, tag as u64, packed, alloc, freed)?;
         self.outer_depth = outer.depth;
