@@ -165,6 +165,36 @@ impl TransactionManager {
         new_header.slots[old_idx] = crate::superblock::KeySlot::EMPTY;
         self.rewrite_crypto_header(new_header)
     }
+
+    /// Clear the slot `key` unlocks. Refuses to remove the LAST active slot
+    /// (`LastKeySlot`) — a database with zero usable credentials is
+    /// unrecoverable, so this is an operational error that changes nothing.
+    ///
+    /// The last-slot check happens AFTER proving the supplied key is valid, so
+    /// a key that unlocks nothing on a single-slot DB gets `InvalidEncryptionKey`
+    /// rather than the more confusing `LastKeySlot`.
+    ///
+    /// # Errors
+    /// `Poisoned` — manager is in the poison state; `EncryptionNotSupported` —
+    /// plaintext DB; `InvalidEncryptionKey` — `key` unlocks no slot;
+    /// `LastKeySlot` — `key` IS the only active credential (removal refused,
+    /// nothing is changed). I/O failures from the superblock rewrite are fatal
+    /// and poison the manager.
+    pub(crate) fn remove_key(&mut self, key: &crate::crypto::Key) -> Result<()> {
+        if self.poisoned.get() {
+            return Err(ChiselError::Poisoned);
+        }
+        let header = self.crypto_header.as_ref().ok_or(ChiselError::EncryptionNotSupported)?;
+        let (idx, _dek) = header.unlock(key)?; // → InvalidEncryptionKey if none
+        // Check AFTER confirming the key is valid: an unknown key on a
+        // single-slot DB should report InvalidEncryptionKey, not LastKeySlot.
+        if header.active_count() <= 1 {
+            return Err(ChiselError::LastKeySlot);
+        }
+        let mut new_header = *header;
+        new_header.slots[idx] = crate::superblock::KeySlot::EMPTY;
+        self.rewrite_crypto_header(new_header)
+    }
 }
 
 #[cfg(test)]

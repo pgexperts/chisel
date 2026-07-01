@@ -970,6 +970,21 @@ impl Chisel {
     pub fn rotate_key(&mut self, old: &crypto::Key, new: &crypto::Key) -> Result<()> {
         self.txm.rotate_key(old, new)
     }
+
+    /// Revoke the credential `key`. After this returns, `key` no longer opens
+    /// the database; any other credentials are unaffected. Refuses to remove
+    /// the only remaining credential. O(1) — the data key is unchanged, no
+    /// page is re-encrypted.
+    ///
+    /// # Errors
+    /// `EncryptionNotSupported` if the database has no encryption;
+    /// `InvalidEncryptionKey` if `key` unlocks no slot; `LastKeySlot` if
+    /// `key` is the only active credential (removing it would make the database
+    /// permanently unopenable — nothing is changed). An fsync/superblock
+    /// failure is fatal and poisons the handle.
+    pub fn remove_key(&mut self, key: &crypto::Key) -> Result<()> {
+        self.txm.remove_key(key)
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! Integration tests for Chisel::add_key and Chisel::rotate_key.
+//! Integration tests for Chisel::add_key, Chisel::rotate_key, and Chisel::remove_key.
 //!
 //! Each test uses the public API only (Key / Chisel / ChiselError / Options).
 //! The underlying DEK is never re-generated, so add_key / rotate_key are pure
@@ -168,6 +168,88 @@ fn rotate_key_full_table_is_no_free_key_slot() {
     assert!(
         matches!(err, ChiselError::NoFreeKeySlot),
         "expected NoFreeKeySlot, got {err:?}"
+    );
+    assert!(!db.is_poisoned());
+}
+
+// ── remove_key ───────────────────────────────────────────────────────────────
+
+/// After remove_key the revoked credential is rejected at open; all other
+/// credentials continue to decrypt the same data (DEK is shared across slots).
+#[test]
+fn remove_key_leaves_others_working() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("db");
+    let h = {
+        let mut db = Chisel::open(&path, Options::default().encryption_key(raw(1))).unwrap();
+        db.begin().unwrap();
+        let h = db.allocate(b"v").unwrap();
+        db.commit().unwrap();
+        db.add_key(&raw(1), &raw(2)).unwrap();
+        db.remove_key(&raw(1)).unwrap(); // drop the first credential
+        db.close().unwrap();
+        h
+    };
+    // raw(1) is gone — open must fail.
+    let err = Chisel::open(&path, Options::default().encryption_key(raw(1)))
+        .err()
+        .expect("old key must be rejected after remove");
+    assert!(
+        matches!(err, ChiselError::InvalidEncryptionKey),
+        "expected InvalidEncryptionKey, got {err:?}"
+    );
+    // raw(2) still opens and reads the original data.
+    let db = Chisel::open(&path, Options::default().encryption_key(raw(2))).unwrap();
+    assert_eq!(db.read(h).unwrap(), b"v");
+    db.close().unwrap();
+}
+
+/// remove_key with the only active credential returns LastKeySlot and leaves
+/// the database intact (the rejected op must not mutate anything).
+#[test]
+fn remove_last_key_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("db");
+    let mut db = Chisel::open(&path, Options::default().encryption_key(raw(1))).unwrap();
+    // Only one active slot — removing it would permanently brick the database.
+    let err = db.remove_key(&raw(1)).unwrap_err();
+    assert!(
+        matches!(err, ChiselError::LastKeySlot),
+        "expected LastKeySlot, got {err:?}"
+    );
+    assert!(!db.is_poisoned());
+    // Reopen with the same key to confirm nothing was mutated.
+    drop(db);
+    let db2 = Chisel::open(&path, Options::default().encryption_key(raw(1))).unwrap();
+    assert!(!db2.is_poisoned());
+    db2.close().unwrap();
+}
+
+/// remove_key with a key that unlocks no slot returns InvalidEncryptionKey.
+#[test]
+fn remove_unknown_key_is_invalid_encryption_key() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("db");
+    let mut db = Chisel::open(&path, Options::default().encryption_key(raw(1))).unwrap();
+    db.add_key(&raw(1), &raw(2)).unwrap();
+    let err = db.remove_key(&raw(9)).unwrap_err();
+    assert!(
+        matches!(err, ChiselError::InvalidEncryptionKey),
+        "expected InvalidEncryptionKey, got {err:?}"
+    );
+    assert!(!db.is_poisoned());
+}
+
+/// remove_key on a plaintext database returns EncryptionNotSupported.
+#[test]
+fn remove_key_plaintext_db_returns_encryption_not_supported() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("db");
+    let mut db = Chisel::open(&path, Options::default()).unwrap();
+    let err = db.remove_key(&raw(1)).unwrap_err();
+    assert!(
+        matches!(err, ChiselError::EncryptionNotSupported),
+        "expected EncryptionNotSupported, got {err:?}"
     );
     assert!(!db.is_poisoned());
 }
