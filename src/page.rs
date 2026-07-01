@@ -117,6 +117,19 @@ pub const FORMAT_MINOR_VERSION: u16 = 1;
 /// 1 → 2 hard-rejects old binaries (which gate on FORMAT_MAJOR_VERSION == 1).
 pub const FORMAT_MAJOR_VERSION_ENCRYPTED: u16 = 2;
 
+/// MINOR version for the encrypted-DB format series. Starts at 0 (first
+/// encrypted release). Encrypted DBs carry their own minor series: a minor bump
+/// here signals an additive change inside an encrypted DB's superblock fields,
+/// just as `FORMAT_MINOR_VERSION` does for plaintext DBs.
+pub const FORMAT_MINOR_VERSION_ENCRYPTED: u16 = 0;
+
+/// Packed format_version stamped into every ENCRYPTED database's superblock:
+/// `pack_format_version(FORMAT_MAJOR_VERSION_ENCRYPTED, FORMAT_MINOR_VERSION_ENCRYPTED)`.
+/// An encryption-unaware binary (FORMAT_MAJOR_VERSION == 1) rejects this as
+/// `UnsupportedFormatVersion`, which is the intended hard-reject behaviour.
+pub const ENCRYPTED_FORMAT_VERSION: u32 =
+    pack_format_version(FORMAT_MAJOR_VERSION_ENCRYPTED, FORMAT_MINOR_VERSION_ENCRYPTED);
+
 /// Pack the encrypted-DB format version: MAJOR=2, MINOR=current. Used by
 /// `create_new` when a key is supplied, and by Task 2.4's open-time gate.
 pub fn format_version_encrypted() -> u32 {

@@ -644,3 +644,67 @@ fn unwrap_first_matching_slot(
     }
     Err(ChiselError::InvalidEncryptionKey)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::page::{self, ENCRYPTED_FORMAT_VERSION, FORMAT_VERSION, PAGE_SIZE};
+    use crate::superblock::Superblock;
+
+    /// Prove that an encryption-unaware open (no key, no crypto header
+    /// expected) hard-rejects a MAJOR=2 superblock with
+    /// `UnsupportedFormatVersion`. This is the gate-rejection guarantee: an
+    /// old binary (FORMAT_MAJOR_VERSION == 1) can never accidentally read an
+    /// encrypted DB's 8232-byte-stride data as plaintext 8192-byte pages.
+    ///
+    /// The mechanism: `open_existing` computes `expected_major = if
+    /// sb.encryption.is_some() { 2 } else { 1 }`. A MAJOR=2 file with no
+    /// crypto header has `sb.encryption = None`, so `expected_major = 1`, but
+    /// `format_major(sb.format_version) = 2` — mismatch → error.
+    #[test]
+    fn encrypted_major_version_is_rejected_by_plaintext_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enc_major.chsl");
+
+        // Build a valid plaintext superblock (superblock_count=2 for the
+        // default layout), then overwrite its format_version with the
+        // encrypted-DB MAJOR=2 value. Everything else is a normal empty DB —
+        // in particular, `sb.encryption` stays None, so the gate's
+        // `expected_major` resolves to 1 (plaintext), not 2.
+        let mut sb = Superblock::new_empty(2);
+        sb.format_version = ENCRYPTED_FORMAT_VERSION; // pack(2, 0)
+        assert_eq!(
+            page::format_major(sb.format_version),
+            2,
+            "sanity: ENCRYPTED_FORMAT_VERSION must have MAJOR=2"
+        );
+
+        // Write the superblock as page 0 at plaintext stride (the format-
+        // version gate fires before stride-dependent reads; page 0 is always
+        // at offset 0).
+        let bytes = sb.serialize();
+        assert_eq!(bytes.len(), PAGE_SIZE);
+        std::fs::write(&path, bytes).unwrap();
+
+        // Open without a key: simulates an encryption-unaware binary.
+        // Must be rejected with UnsupportedFormatVersion.
+        let err = crate::Chisel::open(&path, crate::Options::default())
+            .err()
+            .expect("MAJOR=2 file opened without a key must fail");
+        match err {
+            ChiselError::UnsupportedFormatVersion { found, expected } => {
+                assert_eq!(
+                    page::format_major(found),
+                    2,
+                    "error must report the MAJOR=2 version found on disk"
+                );
+                assert_eq!(
+                    expected,
+                    FORMAT_VERSION, // pack(1, 1) — what a plaintext binary expects
+                    "error must report FORMAT_VERSION as the expected version for a no-key open"
+                );
+            }
+            other => panic!("expected UnsupportedFormatVersion, got {other:?}"),
+        }
+    }
+}
