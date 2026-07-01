@@ -955,6 +955,12 @@ impl PageCache {
     /// A checksum mismatch is a fatal corruption error per ARCHITECTURE.md —
     /// `ChecksumMismatch` signals the database is broken, not merely that
     /// the operation failed.
+    ///
+    /// The encrypted cold-load path has the same severity: a `DecryptionFailed`
+    /// from `PageCipher::open` (AEAD tag rejection) is `is_fatal()` — it poisons
+    /// the manager exactly like `ChecksumMismatch`, not an operational error the
+    /// caller can retry. The XXH3 checksum and the AEAD tag are peer integrity
+    /// checks: either failing means the persisted bytes are untrustworthy.
     fn load_page(&mut self, page_id: u64) -> Result<()> {
         self.maybe_evict()?;
 

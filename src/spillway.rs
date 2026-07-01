@@ -11,6 +11,11 @@
 //              process and unconditionally discarded.
 //   spill      page_id allocates a slot (or overwrites its existing
 //              one), bytes + per-slot checksum are written.
+//              Writes are deliberately NOT fsynced: spillway content never
+//              crosses a transaction boundary (rebuilt on demand, discarded at
+//              `truncate` on commit/rollback and as crash garbage at `open`), so
+//              a durability barrier would be wasted I/O. The per-slot XXH3 still
+//              guards a torn write; durability is intentionally omitted.
 //   rehydrate  slot is read, checksum verified, bytes returned.
 //   truncate   file shrunk to zero, resident-set index cleared. Called
 //              at commit, rollback, and defrag.

@@ -215,6 +215,10 @@ impl PageIo {
     pub fn set_stride(&mut self, stride: usize) {
         self.stride = stride;
         let len = match &mut self.backing {
+            // Infallible by signature (the encrypted-open bootstrap has no Result
+            // to thread into): a seek failure means a broken fd, already fatal under
+            // the single-writer flock. Falling back to 0 makes reads fail closed
+            // (InvalidPageId) instead of computing offsets against a stale count.
             Backing::File { file } => file.seek(SeekFrom::End(0)).unwrap_or(0),
             Backing::Memory { bytes } => bytes.len() as u64,
         };

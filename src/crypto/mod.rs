@@ -183,6 +183,11 @@ pub fn derive_kek(
         KdfId::Argon2id => {
             let p = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(32))
                 .map_err(|_| CryptoError::Kdf)?;
+            // Version::V0x13 and the 32-byte output length (`Some(32)` above) are
+            // pinned to the on-disk format, exactly like KEK_INFO on the HKDF path:
+            // changing either re-derives a different KEK, so every existing Argon2id
+            // slot would stop unwrapping (silent data loss). Bump the format version
+            // deliberately if this ever changes; the argon2id KAT test pins it.
             let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, p);
             a2.hash_password_into(ikm, salt, okm.as_mut())
                 .map_err(|_| CryptoError::Kdf)?;
