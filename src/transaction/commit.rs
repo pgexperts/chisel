@@ -7,7 +7,7 @@
 
 use super::*;
 
-/// Borrows of the exactly-ten pieces of `TransactionManager` state the commit
+/// Borrows of the exactly-twelve pieces of `TransactionManager` state the commit
 /// protocol touches, bundled so `commit_inner` can stay a thin caller while the
 /// load-bearing sequence lives here. All fields are distinct manager fields (plus
 /// the shared `&RefCell` for the cache), so the borrow checker accepts the

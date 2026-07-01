@@ -152,7 +152,8 @@ const KEK_INFO: &[u8] = b"chisel-kek-v1";
 /// # Errors
 /// Returns `CryptoError::Kdf` if the KDF primitive rejects its parameters
 /// (e.g. Argon2id with zero memory cost). Returns `CryptoError::BadKeyLength`
-/// if `kdf == Hkdf` and the raw key bytes are empty.
+/// if the supplied key material is empty (an empty `Raw` key or empty
+/// `Passphrase`), regardless of `kdf`.
 pub fn derive_kek(
     key: &Key,
     kdf: KdfId,

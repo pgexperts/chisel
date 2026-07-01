@@ -50,8 +50,9 @@ use chisel::Chisel;
 use crate::errors::to_py_err;
 
 /// Map a Python key argument to a `chisel::Key`. `bytes` → `Key::Raw` (any
-/// length; the engine validates the length and raises BadKeyLength via
-/// to_py_err if it is wrong). `str` → `Key::Passphrase`. Anything else raises
+/// non-empty length is accepted; empty key material is refused deep in the
+/// engine and surfaces as InvalidEncryptionKeyError via to_py_err). `str` →
+/// `Key::Passphrase`. Anything else raises
 /// a Python `TypeError`. Key material is wrapped in `Zeroizing` immediately so
 /// it is scrubbed when the `Key` is dropped; we never log or repr the value.
 ///

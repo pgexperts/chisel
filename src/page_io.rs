@@ -10,7 +10,8 @@
 // Two backings, one interface:
 // - `Backing::File` — the durable path. Owns a `File` handle for its entire
 //   lifetime; the advisory flock is tied to that fd and released on drop.
-//   Two fsyncs per commit; shadow paging guarantees crash consistency.
+//   Three fsyncs per commit (I28 pre-drain, data pages, superblock); shadow
+//   paging guarantees crash consistency.
 // - `Backing::Memory` — the ephemeral path. Pages live in a flat `Vec<u8>`
 //   addressed by `page_id * stride`; fsync is a no-op; no flock is taken.
 //   Used for benchmark parity with SQLite `:memory:` — see the in-memory-mode
