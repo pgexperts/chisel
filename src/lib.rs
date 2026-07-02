@@ -373,6 +373,15 @@ impl Chisel {
         }
 
         let io = PageIo::open(path, options.read_only)?;
+        // I143: decide create-vs-open from the file length observed AFTER the
+        // flock is held (page_count() returns the count cached from the post-lock
+        // length), NOT from the pre-lock `file_exists` stat. The pre-lock stat
+        // races a concurrent creator: another process can create + commit +
+        // release the lock between our stat and our lock, and the stale boolean
+        // would then run create_new over its just-committed data. `file_exists`
+        // stays above only for the create_if_missing gate, which must remain
+        // pre-lock so a refused open never materializes an empty file.
+        let existed = io.page_count()? > 0;
         let cache = PageCache::new(
             io,
             options.cache_max_bytes,
@@ -381,7 +390,7 @@ impl Chisel {
             SpillwayLocation::Path(path.to_path_buf()),
         );
 
-        let txm = if file_exists {
+        let txm = if existed {
             // Existing database: N is discovered from the on-disk
             // superblock. options.superblock_count is ignored here.
             TransactionManager::open_existing(cache, options.encryption_key.clone())?

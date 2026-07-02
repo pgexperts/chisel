@@ -255,6 +255,18 @@ impl TransactionManager {
         if let Some(stride) =
             Superblock::deserialize(&page0).and_then(|sb| sb.encryption.map(|h| h.stride as usize))
         {
+            // I144: the stride comes from the plaintext crypto-header, guarded
+            // only by the forgeable (non-cryptographic) XXH3 page checksum — the
+            // same trust boundary decrypt_body already bounds-checks ct_len at.
+            // ENC_PAGE_SIZE is the only value ever written; reject anything else
+            // BEFORE set_stride, which divides the file length by stride (a forged
+            // 0 is a division-by-zero panic; a huge value drives multi-GiB read
+            // allocations). Fail as CorruptSuperblock, honoring poison-not-panic.
+            if stride != crate::crypto::ENC_PAGE_SIZE {
+                return Err(ChiselError::CorruptSuperblock {
+                    defects: Vec::new(),
+                });
+            }
             cache.io_mut().set_stride(stride);
         }
         // With an intact page 0 the stride is already correct here, so this
