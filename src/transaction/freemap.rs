@@ -663,12 +663,22 @@ impl TransactionManager {
     pub(crate) fn reclaim_freemap_orphans(&mut self) -> Result<u64> {
         let savepoint_active = !self.savepoints.is_empty();
         let superblock_count = self.superblock_count;
-        let mut cache = self.cache.borrow_mut();
-        self.freemap.reclaim_orphans(
-            &mut cache,
-            &mut self.current_roots,
-            savepoint_active,
-            superblock_count,
-        )
+        // I145: wrap the sweep in poison_on_fatal like every other TM entry point.
+        // A fatal error mid-sweep (an IoError/CorruptPage from a page read or a
+        // live-page cache.get) otherwise returns un-poisoned, and reclaim_orphans
+        // writes the partially-advanced freemap root back into current_roots even
+        // on its error path — leaving a usable manager holding an indeterminate
+        // freemap. The inner borrow is scoped so the cache is released before
+        // poison_on_fatal takes &self.
+        let result = {
+            let mut cache = self.cache.borrow_mut();
+            self.freemap.reclaim_orphans(
+                &mut cache,
+                &mut self.current_roots,
+                savepoint_active,
+                superblock_count,
+            )
+        };
+        self.poison_on_fatal(result)
     }
 }

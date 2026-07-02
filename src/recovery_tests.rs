@@ -9,10 +9,11 @@
 
 use crate::page::{self, PageType, PAGE_SIZE};
 use crate::superblock::Superblock;
-use crate::{Chisel, ChiselError, Options};
+use crate::{Chisel, ChiselError, Key, Options};
 use std::fs;
 use std::io::{Read as _, Seek, SeekFrom, Write};
 use tempfile::{NamedTempFile, TempDir};
+use zeroize::Zeroizing;
 
 /// Scan the file for the first page whose type tag matches `want` and
 /// return its page id. Panics if no such page exists; test helper only.
@@ -1621,5 +1622,31 @@ fn test_open_rejects_page_size_mismatch() {
         }
         Err(e) => panic!("expected UnsupportedPageSize, got {e:?}"),
         Ok(_) => panic!("Chisel::open accepted a file with a mismatched page_size"),
+    }
+}
+
+// I144 regression: a forged crypto-header stride must fail the open with a typed
+// CorruptSuperblock, never a division-by-zero panic in set_stride (the stride is
+// plaintext, guarded only by the forgeable XXH3 checksum). Page 0 is always read
+// first to learn the stride, so we scribble byte 325 (the u32 stride field at
+// CRYPTO_HEADER_OFFSET+1) to 0 and re-stamp the checksum so deserialize accepts it.
+#[test]
+fn corrupt_crypto_header_stride_errors_not_panic() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("enc.db");
+    let opts = || Options::default().encryption_key(Key::Raw(Zeroizing::new(vec![0x11u8; 32])));
+    {
+        let mut db = Chisel::open(&path, opts()).unwrap();
+        db.begin().unwrap();
+        db.allocate(b"payload").unwrap();
+        db.commit().unwrap();
+    }
+    rewrite_page_with_valid_checksum(&path, 0, |buf| {
+        buf[325..329].copy_from_slice(&0u32.to_le_bytes());
+    });
+    match Chisel::open(&path, opts()) {
+        Err(ChiselError::CorruptSuperblock { .. }) => {}
+        Err(other) => panic!("expected CorruptSuperblock for a forged stride, got {other:?}"),
+        Ok(_) => panic!("forged-stride open unexpectedly succeeded (should have failed)"),
     }
 }
