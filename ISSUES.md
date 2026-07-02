@@ -1725,3 +1725,144 @@ Source: **[encryption 2026-06-29]** — deferred work captured while implementin
 Bulk DEK rotation is only needed when the DEK itself is believed compromised (e.g., a process memory dump exposed the in-session DEK). Credential rotation — the far more common operational need (password change, key rollover, adding a second credential) — is already available and O(1). Because no production databases exist today and the DEK is not separately distributed, the risk of DEK compromise is low; the heavy whole-file cost makes this a poor default rotation path.
 
 **Direction of fix (when needed):** Implement a `rekey(old_key, new_key)` or `rekey_dek(key)` API that (1) generates a fresh DEK, (2) reads, decrypts, re-encrypts, and writes back every non-superblock page in a single pass using the existing stride-aware `PageIo`, (3) re-wraps the new DEK into all currently-active key slots, and (4) commits an updated superblock. The operation must be crash-safe: either complete or leave the original file intact. A copy-then-atomic-rename strategy (write the new file alongside, then rename) is the simplest crash-safe approach for an embedded store; an in-place two-pass strategy is also possible but more complex. Reuse `PageCipher::seal` / `PageCipher::open` and `CryptoHeader` from the existing crypto layer.
+
+---
+
+## Deep review 2026-07-02
+
+Source: **[deepdive 2026-07-02]** — fresh-eyes Rust review at `581be36`; full report at `docs/reviews/review-20260702-001902.md`. Every BUG/DESIGN finding here was confirmed by an independent adversarial verification pass (0 refuted). The four BUGs (I143–I146) are fixed in PR #89; the DESIGN/SMELL items are recorded for triage. Delta vs the prior two reviews: **0 regressions, 71 findings verified resolved.**
+
+#### I143. TOCTOU create-vs-open race: create decision made before the flock [deepdive 2026-07-02] — **P1** ✅ FIXED 2026-07-02 (PR #89)
+**Where:** `src/lib.rs:366`
+
+**Problem:** Chisel::open decides create-vs-open BEFORE the flock is taken: `file_exists` is computed at lines 366-369, the exclusive lock is only acquired inside `PageIo::open` at line 375, and the stale boolean then selects `TransactionManager::create_new` at line 389. The doc comment (lines 339-341) claims the lock is acquired 'before any parsing... rather than racing on the superblock', but the create/open decision itself races. Cross-process TOCTOU with silent data loss: process B stats a nonexistent/zero-length file; process A concurrently creates the DB, commits data, and closes (releasing the flock); B then acquires the lock and runs create_new on the now-populated file, writing a fresh superblock over A's committed database. Multi-process exclusion is an explicit part of the public contract (flock, LockFailed), so this is exactly the race the lock exists to prevent.
+
+**Direction of fix:** Re-check the file length after the flock is held (e.g. have PageIo::open return whether it created the file, or re-stat via the locked fd) and choose create_new vs open_existing from that post-lock observation.
+
+**Fixed (2026-07-02, PR #89):** see the commit; a regression test is included where feasible (I144 forges the on-disk stride and asserts a typed error, not a panic).
+
+#### I144. Unvalidated crypto-header `stride` → div-by-zero panic / huge-alloc DoS on open [deepdive 2026-07-02] — **P1** ✅ FIXED 2026-07-02 (PR #89)
+**Where:** `src/transaction/recovery.rs:258`
+
+**Problem:** open_existing takes the crypto-header's stride field verbatim (`sb.encryption.map(|h| h.stride as usize)`) and calls `cache.io_mut().set_stride(stride)` with no validation. `PageIo::set_stride` (src/page_io.rs:226) computes `len / stride as u64`. The header comment in src/superblock/crypto_header.rs:11 claims stride is "validated by the engine"; no such check exists anywhere (only the two hardcoded ENC_PAGE_SIZE fallback sites are safe). stride is a plaintext field protected only by the forgeable XXH3 page checksum — the codebase itself established this trust boundary when it bounds-checked ct_len in decrypt_body for exactly this reason. A forged stride of 0 is a guaranteed division-by-zero panic at open (DoS, violates the poison-not-panic error model); a huge stride drives multi-GiB read-buffer allocations. Also a first-class comment-vs-code mismatch.
+
+**Direction of fix:** Before set_stride, require header.stride == ENC_PAGE_SIZE as u32 (the only value ever written) and treat a mismatch like an unsupported format / corrupt slot; that also makes the crypto_header.rs comment true.
+
+**Fixed (2026-07-02, PR #89):** see the commit; a regression test is included where feasible (I144 forges the on-disk stride and asserts a typed error, not a panic).
+
+#### I145. `reclaim_freemap_orphans` not poison-wrapped — fatal mid-sweep leaves a usable, indeterminate manager [deepdive 2026-07-02] — **P2** ✅ FIXED 2026-07-02 (PR #89)
+**Where:** `src/transaction/freemap.rs:663`
+
+**Problem:** Minor imprecision only: the failure requires the fatal error to strike mid-sweep (reachable_pages, a live-page cache.get, or mark_free_growing); the CorruptPage/ChecksumMismatch skip on dead pages at freemap.rs:457-458 is intentionally non-poisoning and not part of the bug. The BUG severity and substance are correct as stated. A fatal `IoError`/`CorruptPage` from `reachable_pages`, `cache.get`, or `mark_free_committed_path` during the sweep returns to the caller with the manager NOT poisoned. Worse, `mark_free_committed_path` writes the partially-advanced tree root back into `current_roots` even on error (put_tree on the error path, freemap.rs:291-293), so the un-poisoned manager holds a freemap tree in an indeterminate mid-mutation state that a subsequent `commit()` will happily make durable — exactly the class of state the I1 poison model exists to fence off.
+
+**Direction of fix:** Wrap the sweep at the TransactionManager boundary the same way as everything else: `let result = self.freemap.reclaim_orphans(...); self.poison_on_fatal(result)` inside `reclaim_freemap_orphans` (freemap.rs:663-673).
+
+**Fixed (2026-07-02, PR #89):** see the commit; a regression test is included where feasible (I144 forges the on-disk stride and asserts a typed error, not a panic).
+
+#### I146. README says the newer-minor write-refusal gate is unwired; it shipped as I29 [deepdive 2026-07-02] — **P2** ✅ FIXED 2026-07-02 (PR #89)
+**Where:** `README.md:363`
+
+**Problem:** README.md:363 falsely states the MINOR write-refusal gate is "not yet wired up"; it shipped as the I29 write-gate in src/transaction/recovery.rs:409-411 (force_read_only on file-MINOR > binary-MINOR, mutations return ReadOnlyMode), consistent with THEORY.md:132 (repo root). Only the README sentence needs updating. This is the user-facing compatibility contract, in a README refreshed three commits ago (#86). A user reading README concludes that opening a newer-minor file risks clobbering unknown fields on write; in reality mutations return ReadOnlyMode. The two design docs disagree with each other on a safety guarantee.
+
+**Direction of fix:** Update README's format-compatibility section to say the read-only write-gate is implemented (matching THEORY.md:132 and recovery.rs:409); drop the "lands with the first post-1.0 minor bump" sentence.
+
+**Fixed (2026-07-02, PR #89):** see the commit; a regression test is included where feasible (I144 forges the on-disk stride and asserts a typed error, not a panic).
+
+#### I147. HandleTable::insert grow loop unbounded for handle==u64::MAX (latent; unreachable via monotonic handles) [deepdive 2026-07-02] — **P3** 🔶 OPEN
+**Where:** `src/handle_table.rs:253`
+
+**Problem:** HandleTable::insert's grow loop (src/handle_table.rs:253) is unbounded: for handle == u64::MAX, capacity() saturates to u64::MAX at depth 6 and the loop allocates one page per iteration forever, and delete (line 289) reports u64::MAX absent at saturated capacity while find_leaf (lines 694-697) explicitly supports it. Real code-level defect and internally inconsistent with the module's own MAX_DEPTH comment and read path, but unreachable through the engine (handles are monotonic from 1), so latent — fix by bounding the loop with `&& self.depth < MAX_DEPTH` as FreeMapTree::mark_free_growing does. Runaway loop with unbounded page allocation on a key the module's own comments and read path explicitly claim to support. Practically unreachable through the engine today (handles are monotonic from `next_handle` starting at 1, so u64::MAX needs ~1.8e19 allocations), but it is a live in-crate API and the code around it (find_leaf's u64::MAX carve-out, the MAX_DEPTH comment) asserts the case is handled when it is not.
+
+**Direction of fix:** Mirror freemap_tree: bound the loop (`while handle >= self.capacity() && self.depth < MAX_DEPTH`) and/or make `grow` a no-op at MAX_DEPTH; give `delete` the same `cap != u64::MAX` exemption `find_leaf` has.
+
+#### I148. `free_subtree` / membership descent has no positional type check — corrupt-but-checksummed page amplifies corruption [deepdive 2026-07-02] — **P2** 🔶 OPEN
+**Where:** `src/membership_index.rs:84`
+
+**Problem:** As stated, with one softening: the remove()-path scenario where leaf values (1) are freed as page ids usually aborts earlier with a misleading ChecksumMismatch (inner.delete/any_present descend the same bogus depth before free_subtree runs), so the sharpest unmitigated instance is a corrupt interior child pointer at the depth-1 boundary of free_subtree, which is pushed into `freed` without any read or validation. Inconsistent hardening across the crate's three radixes against the exact threat model the repo tests everywhere (checksum-valid, structurally wrong pages): freemap_tree, overflow, and data_page fail closed with typed CorruptPage; handle_table and membership_index fail open. For `free_subtree` the failure mode is corruption amplification — bogus ids (potentially live data pages or even superblock slot 1) enter `txn_freed_pages` and get marked reusable at commit.
+
+**Direction of fix:** Add the freemap_tree-style positional type check (`buf[0]` vs expected MembershipLeaf/MembershipInterior/HandleTable+FLAG) on every descent read in find_leaf/insert_recursive/delete_recursive/iter/free_subtree, returning CorruptPage on mismatch.
+
+#### I149. `total_length` trusted unbounded before `Vec::with_capacity` — corrupt chain can OOM (contradicts I14) [deepdive 2026-07-02] — **P2** 🔶 OPEN
+**Where:** `src/overflow.rs:183`
+
+**Problem:** As stated, with one precision: the failing page cannot arise from any legitimate Chisel write or from the stale-handle scenario (a genuinely Overflow-typed page always carries a truthfully-written total_length, replicated per page). Reaching the panic requires on-disk corruption/tampering that also passes the XXH3 checksum. Within the module's own I14 standard — corrupt-but-checksummed chains surface as typed CorruptPage, never panic/abort — the gap is real: total_length is the one header field read() trusts unbounded before allocating, and a cheap bound (next_page_id * OVERFLOW_PAYLOAD, the same universe bound reclaim_orphans uses) would close it. The module's own hardening standard (I14: corrupt-but-checksummed chains must surface as typed CorruptPage, never a panic/abort) is contradicted for the one field it trusts most. A well-formed chain can never carry more bytes than the file holds, so a cheap plausibility bound exists and is already used elsewhere (reclaim_orphans uses cache.next_page_id()).
+
+**Direction of fix:** Bound total_length against a file-derived maximum (cache.next_page_id() * OVERFLOW_PAYLOAD → CorruptPage if exceeded), or clamp the initial with_capacity and let Vec grow as pages are validated.
+
+#### I150. Attacker-controlled Argon2 params consumed before the AEAD tag rejects — KDF-param OOM/DoS [deepdive 2026-07-02] — **P2** 🔶 OPEN
+**Where:** `src/superblock/crypto_header.rs:209`
+
+**Problem:** As stated, except the twin lives at src/transaction/recovery.rs:625-653 (derive_kek call at line 637), not src/superblock/recovery.rs. Everything else — params-before-auth ordering, u32::MAX m_cost accepted by argon2 0.5.3, re-stampable XXH3 checksum — checks out. Fix is a small read-time ceiling on the slot's Argon2 params (or clamp in derive_kek) before deriving. An attacker who edits a slot's m_cost/t_cost/p_cost and re-stamps the non-cryptographic XXH3 checksum turns every subsequent open into an OOM/allocation-abort (or minutes of grinding). Unauthenticated-KDF-param DoS is inherent to the construction, but an unbounded cost parameter converts "corrupt file fails to open" into "process dies".
+
+**Direction of fix:** Clamp attacker-controlled params with sanity ceilings before deriving (e.g. m_cost <= a few GiB, t_cost/p_cost small maxima); reject out-of-range slots the same way as an unknown kdf_id (skip/continue), so a tampered slot degrades to InvalidEncryptionKey.
+
+#### I151. Pack cursor not gated on packing_enabled; rollback restores a live cursor under an active savepoint → in-place write below the watermark [deepdive 2026-07-02] — **P2** 🔶 OPEN
+**Where:** `src/transaction/packing.rs:119`
+
+**Problem:** `SlotPacker::insert` consults `self.insert_cursor` unconditionally — the cursor branch is not gated on `packing_enabled`. `rollback_to_inner` (savepoints.rs:98-102) restores the packer snapshot taken at savepoint creation, which was captured BEFORE `clear_cursor()` ran (savepoints.rs:32-33), so rolling back to the first savepoint of a transaction that had packed inserts restores a live `Some(P)` cursor while that savepoint is still on the stack. This contradicts the module's stated invariant (packing.rs:27-28: "Packing is disabled entirely when savepoints are active") and the savepoint design premise that no in-place mutation happens below the savepoint watermark. After the restore, the next insert writes a slot into pre-watermark page P in place; a second `rollback_to` to the same savepoint truncates only >= watermark, so P keeps the physically-written slot forever — each rollback_to+insert cycle leaks one dead slot into a page that then gets committed (rolled-back value bytes become durable). No API-visible wrong reads, but the rollback mechanism's "nothing below the watermark changed" premise is silently violated.
+
+**Direction of fix:** Gate the cursor branch on `packing_enabled` (`if packing_enabled { if let Some(cursor) = self.insert_cursor { ... } }`) — one guard at the single decision point, which also makes the restore harmless — or have `restore()` force the cursor to None when a savepoint remains active.
+
+#### I152. I29 write-gate compares file MINOR against the plaintext constant unconditionally — a future (2,1) file opens writable [deepdive 2026-07-02] — **P2** 🔶 OPEN
+**Where:** `src/transaction/recovery.rs:409`
+
+**Problem:** The I29 write-gate compares the file's MINOR against the plaintext constant `page::FORMAT_MINOR_VERSION` (= 1) unconditionally, but src/page.rs:120-123 declares that the encrypted MAJOR=2 series "carries its own minor series, independent of plaintext" starting at FORMAT_MINOR_VERSION_ENCRYPTED = 0. A future encrypted file at (2,1) opened by today's binary (whose encrypted-series minor is 0) evaluates `1 > 1 == false` and stays WRITABLE — exactly the clobber-newer-fields hazard the gate exists to prevent. Latent today (no (2,≥1) files exist), but the gate silently fails for the second major series the moment its minor is first bumped.
+
+**Direction of fix:** Select the comparison constant by major series: gate against FORMAT_MINOR_VERSION_ENCRYPTED when the file's MAJOR is 2, FORMAT_MINOR_VERSION when 1.
+
+#### I153. Per-page temporal replay: page AAD is page_id only, so stale-but-valid pages can be spliced into a current DB [deepdive 2026-07-02] — **P2** 🔶 OPEN
+**Where:** `src/crypto/mod.rs:321`
+
+**Problem:** Accurate as written; one refinement: 're-authenticates forever' holds until a (currently deferred) full DEK rotation/re-encryption — KEK rotation does not invalidate old sealed images. An attacker with file access can splice stale versions of individual pages into a current database, producing a mixed state that never existed at any commit (stale freemap or tree pages that pass AEAD and then corrupt structure silently). The design spec's documented non-goal covers only substitution of a "wholly older, validly-signed database image"; per-page temporal splicing is strictly stronger and is not covered by the spec's "cryptographic tamper-detection" / anti-relocation claims.
+
+**Direction of fix:** At minimum, extend the spec §9 boundary to name per-page replay explicitly. If it should be defended, bind pages to a commit epoch in the AAD (costs rewriting reachable pages on epoch bump) or hash-chain page tags into the sealed superblock body.
+
+#### I154. Blanket CryptoError→InvalidEncryptionKey conflates bad Argon2Params on create/add_key with a wrong key [deepdive 2026-07-02] — **P3** 🔶 OPEN
+**Where:** `src/error.rs:397`
+
+**Problem:** Accurate as stated. Minor precision note: the add_key path (keys.rs:151) reaches InvalidEncryptionKey via an explicit `.map_err`, not the blanket From impl, but the effect (BadKeyLength/Kdf on the new credential reported as "does not match any key slot") is identical. Creating a brand-new encrypted DB with bad Argon2Params yields 'key does not match any key slot' — nonsensical on create where no slots exist yet; the same conflation hits add_key's wrap of the NEW credential (transaction/keys.rs:151 map_err → InvalidEncryptionKey). The comment above the From impl claims a CryptoError here 'is always a key-or-KDF problem on intact on-disk data', which is true, but collapsing 'your params are invalid' into 'your key is wrong' sends users debugging the wrong thing.
+
+**Direction of fix:** Validate `argon2_params` (and raw-key length) in open()/the setter alongside the existing superblock_count check, or map Kdf/BadKeyLength to a distinct operational variant (e.g. InvalidKeyParameters) instead of the blanket InvalidEncryptionKey.
+
+#### I155. Finished PyTransaction data ops don't check the `finished` guard — a stray op aliases into the next transaction [deepdive 2026-07-02] — **P2** 🔶 OPEN
+**Where:** `python/src/transaction.rs:135`
+
+**Problem:** PyTransaction's data operations (allocate, read, update, delete, delete_many, allocate_tagged, set_root_name, savepoint, etc., lines 135–227) do not check the `finished` guard; only commit()/rollback()/__exit__ do. A finished Transaction object still forwards every operation to the db. After `t1 = db.transaction(); t1.commit(); t2 = db.transaction()`, a stray `t1.allocate(b"x")` silently writes into t2's transaction — the exact 'called the wrong object' bug class that the I22/I24 AlreadyFinishedError guard was added to surface, applied to commit/rollback but not to the data ops. If no new transaction is active the engine at least raises NoActiveTransactionError, but the aliasing case is silent data misattribution.
+
+**Direction of fix:** Check `finished` at the top of each forwarding method and raise AlreadyFinishedError, consistent with the commit/rollback policy.
+
+#### I156. GIL held across commit fsyncs and Argon2id passphrase rotate_key — freezes all Python threads for the KDF/fsync duration [deepdive 2026-07-02] — **P3** 🔶 OPEN
+**Where:** `python/src/db.rs:652`
+
+**Problem:** Per-op engine calls (including commit's 3 fsyncs, defrag, and add_key/rotate_key/remove_key) hold the GIL for their full duration; only open() detaches (db.rs:276). With passphrase keys, rotate_key runs Argon2id (19 MiB, t=2) once or twice under the GIL — roughly 100-300 ms, not seconds — freezing all other Python threads. The GIL-hold is an explicitly documented design tradeoff (db.rs:634-651 names the consequence and both fix paths), but that comment predates the encryption work (2026-06-20 vs PR #85), so the memory-hard KDF case was never weighed; the comment should at least be updated to name key ops alongside commit/defrag. A passphrase rotate_key or a large commit freezes every other Python thread in the process for the full KDF/fsync duration — seconds-scale for Argon2id. The encryption work postdates the 'per-op calls hold the GIL' comment, which was reasoned about quick engine ops, not a deliberately slow memory-hard KDF.
+
+**Direction of fix:** Move the mutex acquisition inside py.detach (detach → lock → engine call → unlock → reattach); the closure only needs Chisel: Send, which open() already proves. Do NOT detach while holding the guard — that inverts the GIL/Mutex order and can deadlock. At minimum, detach around the three key-management methods.
+
+#### I157. redb-strict skips F_FULLFSYNC on macOS — the PR-8 fairness fix was applied to SQLite but not redb [deepdive 2026-07-02] — **P3** 🔶 OPEN
+**Where:** `bench/src/redb_engine.rs:93`
+
+**Problem:** DurabilityMode::Strict maps to redb Durability::Immediate, which on macOS commits via File::sync_data() (redb-2.6.3 unix.rs backend); Rust std's sync_data on Darwin issues fcntl(F_BARRIERFSYNC) (and even a plain fdatasync would not flush the disk write cache). Meanwhile chisel-strict commits via sync_all/F_FULLFSYNC (src/page_io.rs:445-448,480) and sqlite-strict is deliberately handicapped to parity with PRAGMA fullfsync=ON (bench/src/sqlite_engine.rs:50-62), whose comment explicitly names the ~3-orders-of-magnitude macOS artifact this causes. The PR-8 fairness fix was applied to SQLite but not redb, so on macOS (the dev machine this repo runs benches on) redb-strict skips the F_FULLFSYNC cost that both other strict engines pay. Cross-engine strict comparisons on macOS systematically flatter redb — exactly the measurement artifact the sqlite comment says the harness exists to prevent.
+
+**Direction of fix:** redb exposes no full-fsync knob, so either document the asymmetry in the DurabilityMode::Strict doc and the summary renderer (footnote redb-strict on macOS), or treat macOS redb-strict numbers as non-comparable and rely on Linux CI for cross-engine strict columns.
+
+#### I158. freemap_churn claims aux-metric persistence that never happens — reclamation regressions are invisible [deepdive 2026-07-02] — **P3** 🔶 OPEN
+**Where:** `bench/benches/freemap_churn.rs:193`
+
+**Problem:** The comments at freemap_churn.rs lines 14, 126, and 193 claim the churn metrics are persisted to bench/results/aux_metrics.jsonl via AuxMetricsWriter, but this bench never uses that writer (it exists in bench/src/runner.rs and is used only by micro_grid.rs); the pages_allocated and file-size deltas are computed in the timed closures and discarded via black_box, so only wall-clock timing is reported. The bench's two stated purposes — trend-tracking the flat-high-water property and reclamation pages_allocated — are unfulfilled: only wall-clock timing reaches Criterion's output. A freemap reclamation regression (file growing per commit) would be invisible unless it also changed timing. The comments tell a reader the safety net exists when it does not.
+
+**Direction of fix:** Either wire an AuxMetricsWriter (as micro_grid does) to emit the deltas per case, or delete the three aux-file claims and state that only timing is tracked.
+
+#### I159. No test combines encryption with the on-disk (Path) spillway sidecar — the 'no plaintext hits disk' promise is only unit-tested in-memory [deepdive 2026-07-02] — **P2** 🔶 OPEN
+**Where:** `tests/spillway_integration.rs:22`
+
+**Problem:** No test anywhere combines encryption with the production on-disk spillway sidecar. Chisel::open always uses SpillwayLocation::Path (src/lib.rs:381), but every encrypted-spillway test (src/page_cache.rs:1985 fresh_encrypted_cache_with_spillway) hardcodes SpillwayLocation::InMemory, and tests/spillway_integration.rs never sets encryption_key (grep confirms zero 'encryption' hits in the spillway integration tests). The spillway sidecar is a second file that receives page payloads mid-transaction. The at-rest-encryption promise ('no plaintext hits disk') is exactly about this path, and the only coverage is unit-level against an in-memory buffer. A regression that routed plaintext bytes into the Path-backed sidecar (e.g. a drain refactor picking the wrong payload_size branch) would pass the entire suite.
+
+**Direction of fix:** Add one integration test: open an encrypted DB with a ~4-page cache, allocate sentinel-patterned values until pages spill, scan the sidecar file for the sentinel bytes (must be absent), then commit + reopen + read back.
+
+#### I160. RadixU64::insert(u64::MAX) infinite grow loop + delete lacks find_leaf's cap guard (latent; twin of I147) [deepdive 2026-07-02] — **P3** 🔶 OPEN
+**Where:** `src/membership_index.rs:243`
+
+**Problem:** Latent, unreachable-from-public-API inconsistency in the pub(crate) RadixU64: insert(key = u64::MAX) infinite-loops in the grow() while-loop (capacity saturates at u64::MAX for depth >= 6, and grow has no MAX_DEPTH cap), and delete lacks find_leaf's cap != u64::MAX exemption (benign today since u64::MAX can never be inserted, but contradicts find_leaf's documented u64::MAX support). Production keys are u32 tags and validated engine-minted handles, so no external input reaches these paths; fix is a one-line MAX_DEPTH cap / error in the grow loop plus mirroring find_leaf's guard in delete. Same runaway grow-and-allocate loop; same internal contradiction with find_leaf's explicit u64::MAX support and the MAX_DEPTH comment (lines 22-27, "forces one final grow to depth 6"). Unreachable in practice via engine-assigned handles / u32 tags, but latent for any future in-crate caller of the generic radix.
+
+**Direction of fix:** Add `&& self.depth < MAX_DEPTH` to the grow loop (or a MAX_DEPTH no-op in `grow`, matching FreeMapTree::grow), and align `delete`'s capacity guard with `find_leaf`'s saturated-capacity exemption.
+
