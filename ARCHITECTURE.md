@@ -195,9 +195,10 @@ sequenceDiagram
 
     U->>L: open(path, options)
     L->>L: validate options.superblock_count ∈ 2..=16
-    L->>L: file exists & non-empty?
-    alt file exists
-        L->>IO: PageIo::open (acquires flock)
+    L->>L: file_exists? (pre-lock stat;<br/>gates create_if_missing only)
+    L->>IO: PageIo::open (acquires flock)
+    L->>IO: page_count() — post-lock length
+    alt existed (post-lock page_count > 0)
         L->>TM: open_existing(cache)
         TM->>IO: read pages 0..MAX_SUPERBLOCKS
         TM->>SB: deserialize each candidate
@@ -208,7 +209,6 @@ sequenceDiagram
         TM->>TM: re-derive handle-table + membership<br/>outer depth from their roots (I99 / C1)
         TM-->>L: TransactionManager
     else fresh
-        L->>IO: PageIo::open
         L->>TM: create_new(cache, superblock_count)
         Note over TM: I2: write all N slots with<br/>staggered counters so a torn<br/>first commit has a fallback
     end
@@ -216,6 +216,8 @@ sequenceDiagram
 ```
 
 The format-version gate after `select` is what makes the README's "sacred within a major version" promise concrete: a file written by a future, incompatible MAJOR is rejected with `UnsupportedFormatVersion`. Same-major files (any minor) open cleanly. (See I29 for the packed-MAJOR/MINOR scheme; I31 for the per-page version byte that supports lazy upgrade within a major.)
+
+**Landmine:** the create-vs-open decision must come from `page_count()` observed *after* `PageIo::open` holds the flock, never from the pre-lock `file_exists` stat — a pre-lock decision races a concurrent creator (process B stats an empty file, process A creates + commits + closes, B's stale decision then runs `create_new` over A's committed data). `file_exists` still gates `create_if_missing`, since a refused open must never materialize an empty file — but it must not also decide create-vs-open (I143).
 
 ---
 
@@ -610,6 +612,8 @@ The cap parameter (`DefragOptions::max_pages`) bounds the number of *values* rel
 
 On any fatal error — an `IoError` from `fsync`, a `ChecksumMismatch` on a page load, a `CorruptSuperblock` on open, a `DecryptionFailed`, any error raised after the commit protocol has begun — the `TransactionManager` becomes **poisoned**. Every subsequent call returns `ChiselError::Poisoned`, **including reads**. The only legal recovery is to drop the `Chisel` handle and call `Chisel::open` again; the shadow-paging recovery path then returns the database to its last-durable state. (See I1; rationale — fsyncgate, the Mutex analogy — in THEORY.md.)
 
+**Landmine:** every `TransactionManager` method with a fatal-error path must route its `Result` through `self.poison_on_fatal(result)` before returning. A new entry point that instead propagates the error directly (a bare `?`) bypasses this — the manager stays unpoisoned while a subsequent partial mutation may already have reached `current_roots`, so a later `commit()` can durably persist an indeterminate state (I145: `reclaim_freemap_orphans` missed this wrap).
+
 ### Engine-activity counters
 
 `Chisel::counters()` returns a `ChiselCounters` snapshot of four cumulative-from-open counters: `cache_hits`, `cache_misses`, `pages_allocated`, and `fsync_calls`. Each counter is a `Cell<u64>` living at the site that increments it (`PageCache` for the first three, `PageIo` for fsync), and `PageCache::counters()` aggregates them into a single struct read via `PageIo::fsync_count()`.
@@ -638,6 +642,8 @@ Chisel supports optional authenticated encryption of database files (shipped; MA
 **Cipher.** XChaCha20-Poly1305 (IETF extended-nonce variant). Each page write generates a fresh random 192-bit nonce. The on-disk layout per encrypted page is `ciphertext(8192) ‖ tag(16) ‖ nonce(24)` = 8232 bytes (`ENC_PAGE_SIZE`). The additional data (AAD) for each page is the 8-byte little-endian `page_id`, which binds ciphertext to its slot and prevents a valid block from being relocated to another page position without detection.
 
 **On-disk stride.** Encrypted databases use a uniform 8232-byte stride for every page including the superblock slots. Plaintext databases use the 8192-byte stride; the two are mutually exclusive and the stride is recorded in the superblock's plaintext crypto-header (bytes 325..329) so the engine reads the correct number of bytes before any operation. The `page_io` layer is stride-agnostic: callers set the stride once (via `PageIo::set_stride`) and all subsequent raw reads/writes use it.
+
+**Landmine:** `stride` is guarded only by the page's forgeable XXH3 checksum, not the AEAD tag — it must be readable before any DEK is available, so it cannot live inside the sealed body. `open_existing` validates `stride == ENC_PAGE_SIZE` before calling `set_stride`; skip that check and a forged stride of 0 divides-by-zero panics `set_stride`, while a huge forged stride drives multi-GiB read allocations — both on `open` alone, no key required (I144).
 
 **Envelope (key hierarchy).** A random 256-bit per-database DEK encrypts all page content. The DEK is never stored in plaintext: it is wrapped under a key-encryption key (KEK) and the wrapped form is held in a plaintext key-slot table inside the superblock's reserved region. The crypto-header + key-slot table occupy bytes **324..1356**:
 
