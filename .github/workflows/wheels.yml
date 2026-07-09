@@ -1,0 +1,157 @@
+name: Build wheels
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  # I59 (ISSUES.md, 2026-05-22): early cargo test gate so a broken tagged
+  # commit fails fast instead of after the long wheel build.
+  cargo-test-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `--release` compiles out #[cfg(debug_assertions)] tests (e.g.
+      # page_cache::claim_page_asserts_on_dirty_page in page_cache.rs).
+      # That is a known, accepted coverage boundary: the debug-gated
+      # invariant tests are covered by ci.yml's debug `test` job on the
+      # PR that precedes the tag. A hotfix tagged outside the normal PR
+      # flow would bypass them; this is accepted as-is.
+      - run: cargo test --release
+      # I109 (ISSUES.md, 2026-06-21): audit the tag/release path too. ci.yml's
+      # audit job only runs on push/PR to main, so a vulnerable dependency
+      # introduced and tagged WITHOUT merging through a PR would otherwise
+      # publish wheels unaudited. Gate the wheel/sdist build (both `needs:`
+      # this job) on a clean cargo audit.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  # One runner per native platform, no QEMU and no 32-bit:
+  #   * Linux x86_64 and aarch64 each on their own native runner.
+  #   * macOS builds BOTH arches on the arm64 runner -- arm64 native and
+  #     x86_64 cross-compiled -- because Intel macOS hosted runners are not
+  #     reliably available (macos-13 sat queued for hours).
+  # CIBW_ARCHS_LINUX=auto64 keeps each Linux runner to its native 64-bit arch
+  # and excludes i686 (its manylinux image's rustup-init fails on a missing
+  # libatomic.so.1). Linux wheels build inside a manylinux container that ships
+  # no Rust, so CIBW_BEFORE_ALL_LINUX installs a native toolchain there; macOS
+  # builds on the host and uses the rust-toolchain targets below.
+  wheels:
+    needs: cargo-test-gate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest     # Linux x86_64
+          - runner: ubuntu-24.04-arm  # Linux aarch64 (native ARM runner)
+          - runner: macos-latest      # macOS arm64 native + x86_64 cross
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v3.4.1
+        env:
+          CIBW_BUILD: "cp311-* cp312-* cp313-*"
+          CIBW_SKIP: "*-musllinux_*"
+          # native 64-bit per runner: x86_64 on ubuntu-latest, aarch64 on
+          # ubuntu-24.04-arm. Excludes i686.
+          CIBW_ARCHS_LINUX: "auto64"
+          # both mac arches on the arm64 runner; x86_64 is cross-compiled.
+          CIBW_ARCHS_MACOS: "arm64 x86_64"
+          # the cross-built x86_64 mac wheel cannot be import-tested on an
+          # arm64 host -- build it, skip its test.
+          CIBW_TEST_SKIP: "*-macosx_x86_64"
+          # rustc's x86_64-apple-darwin floor is 10.12, above cibuildwheel's
+          # default 10.9 tag, so delocate rejected the wheel. Pin both mac
+          # arches to 11.0 (arm64's floor) so the wheel tag matches the .so.
+          CIBW_ENVIRONMENT_MACOS: "MACOSX_DEPLOYMENT_TARGET=11.0"
+          CIBW_BUILD_FRONTEND: "build"
+          CIBW_BEFORE_BUILD: "pip install maturin"
+          CIBW_BEFORE_ALL_LINUX: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+          CIBW_ENVIRONMENT_LINUX: 'PATH="$HOME/.cargo/bin:$PATH"'
+          # Pin the manylinux image (broad glibc-2.17 compat) so the
+          # cibuildwheel v3 bump does not shift the Linux wheels' glibc
+          # floor. 64-bit only, so the i686 libatomic issue does not apply.
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux2014
+          CIBW_TEST_REQUIRES: "pytest hypothesis"
+          CIBW_TEST_COMMAND: "pytest {package}/tests"
+        with:
+          package-dir: python
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.runner }}
+          path: wheelhouse/*.whl
+
+  sdist:
+    needs: cargo-test-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build sdist
+        working-directory: python
+        run: maturin sdist -o ../dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # Only runs when this workflow was itself tag-triggered (push: tags: v*),
+  # never on a manual workflow_dispatch smoke-build -- so re-running the
+  # build by hand can never accidentally publish.
+  publish-pypi:
+    if: github.event_name == 'push'
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    # Requires a "release" GitHub Actions environment (Settings > Environments)
+    # with protection rules (e.g. required reviewers). Shares the same
+    # environment name as publish-crate.yml's crates.io job so one set of
+    # protection rules gates both registries.
+    environment: release
+    permissions:
+      id-token: write # required for PyPI Trusted Publishing (OIDC)
+    steps:
+      # Collects wheels-ubuntu-latest, wheels-ubuntu-24.04-arm,
+      # wheels-macos-latest, and sdist into one flat dist/ directory --
+      # gh-action-pypi-publish expects everything under one packages-dir.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: "wheels-*"
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: sdist
+          path: dist
+
+      # Requires a Trusted Publisher configured on PyPI for "chisel-storage"
+      # (Project > Publishing), naming this repo, this workflow file, and the
+      # "release" environment -- unlike crates.io, PyPI supports configuring
+      # this as a "pending publisher" before the project's first-ever
+      # release, so this job can carry that first release too.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

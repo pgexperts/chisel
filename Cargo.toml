@@ -1,0 +1,149 @@
+# I61 (ISSUES.md, 2026-05-22): Cargo workspace declaration. Members
+# share one Cargo.lock (at workspace root) and one target/ directory,
+# so `cargo build --workspace` / `cargo test --workspace` exercise
+# the engine, the PyO3 binding, and the bench harness in one shot.
+#
+# `resolver = "2"` is the post-edition-2021 default but spelled
+# explicitly here. The 2021 resolver does NOT unify feature flags
+# across build targets (lib vs bin, deps vs dev-deps, host vs target),
+# which is what we want — the PyO3 crate uses pyo3 with
+# `extension-module` only in its own build, and the bench crate
+# pulls heavyweight deps (criterion, rusqlite, redb) that shouldn't
+# leak features into the root.
+#
+# Each member retains its own [package] block (name, version, edition,
+# rust-version, etc.) — workspace inheritance via [workspace.package]
+# is a separate refactor (cosmetic, not functional). The path-deps
+# `chisel-storage = { path = ".." }` in python/Cargo.toml and bench/Cargo.toml
+# work unchanged (the root package is named "chisel-storage" on crates.io;
+# see [lib] below for why `use chisel::...` is unaffected).
+[workspace]
+members = [".", "python", "bench"]
+# `default-members` excludes `python` from `cargo build` / `cargo test`
+# from the workspace root. The Python crate uses pyo3's
+# `extension-module` feature, which expects the linker to leave Python
+# symbols (Py_None, Py_True, etc.) undefined — they're resolved at
+# runtime by the loading Python interpreter. cargo doesn't know how
+# to do that without help; maturin sets up the right `-undefined
+# dynamic_lookup` linker flags. So the Python crate is workspace-
+# resident (shares Cargo.lock and target/) but only buildable via
+# `cd python && maturin develop` or `cargo build -p chisel-py` with
+# matching linker config.
+default-members = [".", "bench"]
+resolver = "2"
+
+[package]
+name = "chisel-storage"
+version = "1.0.0"
+edition = "2021"
+# MSRV: bump only with a release-notes call-out; CI pins this same version.
+# 1.82 is a conservative pin; the true stdlib floor is ~1.74 (io::Error::other,
+# stabilized 1.74, used in src/page_io.rs).
+rust-version = "1.82"
+authors = ["Christophe Pettus <cpettus@pgexperts.com>"]
+description = "Transactional slot-based storage engine with shadow paging"
+license = "MIT"
+repository = "https://github.com/pgexperts/chisel"
+readme = "README.md"
+# crates.io enforces ≤5 keywords, ≤20 chars each, ASCII alnum + `-`/`_`,
+# must start with a letter. Picked for findability rather than literal accuracy.
+keywords = ["database", "storage", "embedded", "transactional", "shadow-paging"]
+# crates.io categories use a controlled vocabulary
+# (see https://crates.io/category_slugs). "database-implementations" is the
+# narrow slot for a from-scratch engine; "data-structures" covers the
+# radix tree / freemap / handle table types we expose.
+categories = ["database-implementations", "data-structures"]
+
+# Published on crates.io as "chisel-storage" (the plain "chisel" name is
+# already taken by an unrelated project). The library/import name stays
+# "chisel" — Cargo resolves `use chisel::...` for any consumer depending on
+# `chisel-storage = "..."` from this [lib].name override alone, no renaming
+# needed on the consumer's side.
+[lib]
+name = "chisel"
+
+[dependencies]
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+libc = "0.2"
+# I77: rustc_hash::FxHashMap replaces the default SipHash on the two hottest
+# internal maps (PageCache.entries, LruIndex.nodes). Their keys are trusted
+# local u64 page ids with no DoS surface, so SipHash's DoS-resistance is pure
+# overhead (~2-3x slower per probe). FxHash is a fast multiply-based hash with
+# ZERO transitive dependencies — it preserves the crate's minimal-dep footprint
+# (this is only the third runtime dependency). The crates.io package is
+# `rustc-hash` (hyphen); the import path is `rustc_hash` (underscore).
+rustc-hash = "2"
+# On-disk encryption (spec 2026-06-29). All pure-Rust, well-vetted RustCrypto
+# primitives — rolling our own crypto is forbidden. These reach the published
+# crate's dependency tree only when a DB is opened with an encryption key, but
+# they are unconditional deps (the seal/open code is always compiled). Versions
+# pinned to the audited RustCrypto generation current as of 2026-06.
+chacha20poly1305 = "0.10"   # XChaCha20-Poly1305 AEAD (192-bit nonce)
+argon2 = "0.5"              # Argon2id passphrase KDF (memory-hard)
+hkdf = "0.12"               # HKDF-SHA256 raw-key KDF
+sha2 = "0.10"               # SHA-256 for HKDF
+# I61-style tilde pin: zeroize 1.9.0 AND its `zeroize_derive` macro both
+# bumped to `edition2024` (Rust 1.85+), which would push chisel's library
+# MSRV above the 1.82 floor enforced by the msrv CI job. `~1.8` (>=1.8.0,
+# <1.9.0) holds the last edition-2021 line of the core crate. We use only
+# `Zeroizing<T>` — no #[derive(Zeroize)] anywhere — so the `derive` feature
+# is dropped entirely, keeping the edition2024 `zeroize_derive` out of the
+# tree. Lift when the floor moves past 1.85; mirrors clap `~4.5` in bench.
+zeroize = "~1.8"  # wipe key material on drop (Zeroizing<T>)
+getrandom = "0.2"           # OS RNG for DEK / nonce / salt generation
+# I61-style floor pin on a TRANSITIVE dep (not used directly). argon2 0.5.3
+# hard-depends on base64ct; base64ct 1.7+ went edition2024 (Rust 1.85+), which
+# would break the 1.82 MSRV floor (msrv CI job). `~1.6` (>=1.6.0, <1.7.0) holds
+# the last edition-2021 line. base64ct only encodes PHC hash strings, which we
+# never emit (we call argon2's raw hash_password_into), so the pinned version's
+# code path is never exercised. Lift when the MSRV floor moves past 1.85.
+base64ct = "~1.6"
+
+[dev-dependencies]
+tempfile = "3"
+# `pastey` is the maintained drop-in fork of `paste` (dtolnay archived the
+# original crate 2024-10-07; RUSTSEC-2024-0436). Used only by the
+# `dual_backing_test!` macro in tests/common/mod.rs to construct
+# `_file` / `_memory` test-fn identifiers. See I72 in ISSUES.md.
+pastey = "0.1"
+# I71 (ISSUES.md, 2026-05-22): `proptest` powers the byte-roundtrip
+# property tests in src/superblock.rs, src/data_page.rs, and
+# src/freemap.rs. Dev-dep only — never reaches the published crate's
+# dependency tree. Default-feature shrinking is the killer feature
+# here: when a property fails, proptest finds the minimal failing
+# input rather than dumping a 10000-byte buffer.
+proptest = "1"
+
+# ---------------------------------------------------------------------------
+# Build profiles (I91). These live at the WORKSPACE ROOT, so they affect only
+# builds performed *inside this repo* (benches, tests, examples, local release
+# builds). Cargo ignores a dependency's profile settings — a downstream crate
+# that depends on `chisel` is unaffected; its own `[profile.release]` governs.
+# This is the consumer-neutral way to tune: the published library forces
+# nothing on its users.
+#
+# Motivation: the cross-engine bench grid compiles `chisel` and `redb` under
+# Cargo's Rust profile, while `rusqlite` (bundled) compiles SQLite's C at its
+# own -O2. Untuned, the two Rust engines built at lto=false / codegen-units=16
+# — weaker codegen than the C competitor — biasing the headline comparison.
+# fat LTO + one codegen unit closes that gap (whole-program cross-crate
+# inlining), putting the Rust engines on codegen parity with bundled SQLite.
+#
+# Cost: `cargo bench` / `cargo build --release` compile noticeably slower. The
+# gating CI jobs (test/clippy/fmt) build in the dev profile and are unaffected;
+# only the report-only bench job and explicit release builds pay it. For fast
+# local iteration on a bench, temporarily switch `lto = "fat"` to `lto = "thin"`
+# (~80% of the win at a fraction of the compile cost). Re-record tracked bench
+# baselines after this lands — the shift is uniform, not a regression.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# Profiled builds (samply / Instruments / cargo-flamegraph) need line-table
+# debuginfo that `release` omits. Select with
+# `cargo build --profile release-with-debug`. Used when measuring the engine
+# optimizations the 2026-06-01 review queued behind this groundwork (I77, I78).
+[profile.release-with-debug]
+inherits = "release"
+debug = "line-tables-only"

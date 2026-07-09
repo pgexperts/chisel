@@ -1,0 +1,2 @@
+{"row":"allocate-1pertx","mode":"chisel-strict","size":"32B","file_size_delta_bytes":8192,"counters":{"cache_hits":12,"cache_misses":3,"fsync_calls":2,"pages_allocated":4}}
+{"row":"allocate-1pertx","mode":"redb-strict","size":"32B","file_size_delta_bytes":4096,"counters":null}

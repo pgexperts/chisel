@@ -1,0 +1,128 @@
+name: Bench
+
+# Triggers on PRs to main. Posts a regression-report comment on the PR.
+# Never blocks merge — signal, not gate.
+#
+# NOTE on fork PRs: this workflow uses `pull_request` (not
+# `pull_request_target`), so `${{ secrets.GITHUB_TOKEN }}` is read-only
+# for fork PRs and the comment-post step will fail gracefully. This is
+# intentional: `pull_request_target` would run untrusted PR code with
+# elevated token privileges, a real security risk for a workflow that
+# compiles and runs arbitrary Rust. Fork-PR comment posting is not
+# supported in v1.
+on:
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight bench runs when a new commit is pushed to the same
+# PR. Bench takes ~10-25 min; stale runs aren't worth waiting for.
+concurrency:
+  group: bench-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write   # for posting the PR comment
+
+    steps:
+      - name: Checkout PR HEAD (default workspace)
+        uses: actions/checkout@v5
+
+      - name: Checkout main (sibling directory)
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          path: main-checkout
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            bench
+            main-checkout/bench
+
+      # Build everything we need up front so build failures surface
+      # before the long bench runs.
+      - name: Build bench (PR)
+        working-directory: bench
+        run: cargo build --release --bench scenarios --bin summarize --bin chisel-bench-diff
+
+      - name: Build bench (main)
+        working-directory: main-checkout/bench
+        run: cargo build --release --bench scenarios --bin summarize
+
+      - name: Run scenarios on main
+        working-directory: main-checkout/bench
+        run: cargo bench --bench scenarios
+
+      - name: Summarize main results
+        working-directory: main-checkout/bench
+        run: |
+          cargo run --release --bin summarize -- \
+            --scenarios results/scenarios_metrics.jsonl \
+            --out /tmp/main-out
+
+      - name: Run scenarios on PR
+        working-directory: bench
+        run: cargo bench --bench scenarios
+
+      - name: Summarize PR results
+        working-directory: bench
+        run: |
+          cargo run --release --bin summarize -- \
+            --scenarios results/scenarios_metrics.jsonl \
+            --out /tmp/pr-out
+
+      - name: Generate diff
+        working-directory: bench
+        run: |
+          cargo run --release --bin chisel-bench-diff -- \
+            --baseline /tmp/main-out/results.json \
+            --pr /tmp/pr-out/results.json \
+            > /tmp/diff-comment.md
+          echo "----- Diff comment preview -----"
+          cat /tmp/diff-comment.md
+
+      - name: Find existing bench comment
+        uses: peter-evans/find-comment@v4
+        id: fc
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '<!-- chisel-bench-diff -->'
+
+      - name: Create or update PR comment
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          comment-id: ${{ steps.fc.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: /tmp/diff-comment.md
+          edit-mode: replace
+
+      # Upload the PR-side summarize output (cross-engine.md, summary.md,
+      # results.json, raw/) so reviewers can grab the full per-cell detail
+      # and the cross-engine comparison table without rerunning the
+      # ~10–25 minute bench locally. `if: always()` ensures the artifact
+      # is uploaded even when the diff/post steps fail — those failures
+      # are exactly when you most want the underlying data to debug.
+      # Main-side output is intentionally not uploaded; the comparison is
+      # already encoded in the PR comment, and rerunning the diff
+      # locally requires only the PR-side file plus a fresh main run.
+      #
+      # `pull_request.number` is GitHub-generated (numeric, not user
+      # input) and is used here in a `with:` parameter, not a `run:`
+      # shell expansion — same usage pattern as the find-comment and
+      # create-or-update-comment steps above. No injection surface.
+      - name: Upload PR-side bench artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-results-pr-${{ github.event.pull_request.number }}
+          path: /tmp/pr-out/
+          if-no-files-found: warn

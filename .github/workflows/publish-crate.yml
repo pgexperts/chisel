@@ -1,0 +1,60 @@
+name: Publish crate
+
+# Fires on a published GitHub Release (a deliberate "ship this" action),
+# not on every tag push -- so a stray or draft tag never triggers a publish.
+on:
+  release:
+    types: [published]
+
+jobs:
+  # Mirrors wheels.yml's cargo-test-gate: a GitHub Release can in principle be
+  # cut against a commit that never went through ci.yml (e.g. a hand-pushed
+  # tag), so re-verify test + audit here rather than trusting the release
+  # event alone. crates.io has no "unpublish", only yank -- this gate exists
+  # specifically because that makes the publish step below unusually
+  # expensive to get wrong.
+  cargo-test-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  publish:
+    needs: cargo-test-gate
+    runs-on: ubuntu-latest
+    # Requires a "release" GitHub Actions environment (Settings > Environments)
+    # with protection rules (e.g. required reviewers) -- this is what actually
+    # gates the publish on human approval; the workflow trigger alone does not.
+    environment: release
+    permissions:
+      id-token: write # required to mint the OIDC token trusted-publishing exchanges
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Catches packaging-level issues (stray large files, missing includes)
+      # that `cargo test`/`clippy` don't -- cheap insurance before an
+      # irreversible publish.
+      - name: Dry-run package verification
+        run: cargo publish -p chisel-storage --dry-run
+
+      # Requires a Trusted Publisher Configuration for "chisel-storage" to
+      # already exist on crates.io (crate owner sets this up in the crate's
+      # settings after its first, manual publish -- crates.io has no
+      # pending-publisher mechanism for a crate's very first release, unlike
+      # PyPI). See README.md's release process notes.
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish to crates.io
+        run: cargo publish -p chisel-storage
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

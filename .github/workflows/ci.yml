@@ -1,0 +1,178 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run tests
+        run: cargo test --verbose
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # I108 (ISSUES.md, 2026-06-21): --workspace so the chisel-py PyO3 binding
+      # is linted too. Plain `cargo clippy` honors default-members = [".", "bench"],
+      # which excludes python/, so ~1,300 lines of binding Rust shipped unlinted
+      # (fmt --check already walked it; only clippy had the hole). pyo3's
+      # `extension-module` feature means no libpython link during a check, so this
+      # runs on the bare clippy runner without a Python/maturin setup.
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+  # I54 (ISSUES.md, 2026-05-22): supply-chain advisory check via cargo-audit.
+  # Runs against the RustSec advisory database. Currently the root crate
+  # ships with only `xxhash-rust` and `libc` as production deps — both
+  # well-maintained — so the practical risk surface is small. Catches any
+  # vulnerable transitive dep that creeps in via a future change.
+  #
+  # Permissions notes:
+  #   * `pull-requests: write` lets the action post per-line annotations
+  #     on PR runs.
+  #   * `checks: write` is needed on push-to-main runs — without it the
+  #     action's annotation-posting step trips "Resource not accessible
+  #     by integration" because GitHub restricts GITHUB_TOKEN's check-run
+  #     write scope on push events by default.
+  #
+  # No `ignore:` list right now. The previous RUSTSEC-2025-0020 ignore
+  # (pyo3 0.22.x PyString::from_object overflow) was removed when I75
+  # landed and bumped pyo3 from 0.22 to 0.24 (patched in 0.24.1+). If
+  # a future advisory needs ignoring, file an ISSUES.md entry
+  # explaining why before adding the ignore — don't let the list
+  # accumulate silently.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      # Run cargo audit directly rather than rustsec/audit-check, which is
+      # pinned to the deprecated Node 20 runtime (it has no Node 24 release).
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  # I55 (ISSUES.md, 2026-05-22): pin MSRV in CI. Cargo.toml declares
+  # rust-version = "1.82" (the floor stabilized by Option::is_none_or in
+  # src/page_cache.rs). This job installs exactly that toolchain and runs
+  # `cargo build` to verify the floor still works — catches any new code
+  # that requires a newer Rust without an accompanying release-notes call-out.
+  #
+  # I61 (ISSUES.md, 2026-05-22): `-p chisel-storage` scopes the build to the
+  # library crate ONLY (published package name; the library itself is still
+  # `chisel` via [lib].name in Cargo.toml). The MSRV promise is about what
+  # users see when they depend on it — bench is internal tooling whose heavy
+  # deps (criterion, rusqlite, redb, rand → getrandom, clap → clap_lex,
+  # ...) are now adopting `edition2024` faster than we want to bump our
+  # floor. Bench can lag the library's MSRV without affecting any
+  # downstream consumer.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.82
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      # I110 (ISSUES.md, 2026-06-21): lib-only ON PURPOSE. `--tests` was tried
+      # and reverted — it pulls proptest's transitive `getrandom` (which now
+      # requires `edition2024`, i.e. Rust 1.85+), so chisel's TEST tree floats
+      # above the 1.82 library floor for the same reason bench/python do (I61).
+      # The MSRV promise is about the published library, which this verifies.
+      - name: Build chisel library with MSRV toolchain
+        run: cargo build --verbose -p chisel-storage
+
+  # I58 (ISSUES.md, 2026-05-22): a dedicated `bench-tests` job once
+  # ran `cd bench && cargo test --verbose` because bench/ was a
+  # sibling crate (not workspace member), and `cargo test` from root
+  # didn't cover it. I61 made bench/ a workspace member with
+  # `default-members = [".", "bench"]`, so the `test` job's
+  # `cargo test --verbose` now exercises chisel AND chisel-bench in
+  # one shot. The standalone bench-tests job became redundant and
+  # was removed.
+
+  python:
+    needs: [test, clippy, fmt]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Create virtualenv
+        working-directory: python
+        run: python -m venv .venv
+
+      - name: Install maturin and test deps
+        working-directory: python
+        run: |
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install maturin pytest hypothesis
+
+      # `maturin develop --release` builds without debug_assertions, so the
+      # Python end-to-end test run here never exercises engine debug-assert
+      # invariants (e.g. page_cache::claim_page_asserts_on_dirty_page).
+      # That is a known, accepted coverage boundary: engine debug-assert
+      # invariants are covered by the Rust `test` job above, which builds
+      # in debug mode.
+      - name: Build and install
+        working-directory: python
+        run: |
+          . .venv/bin/activate
+          maturin develop --release
+
+      - name: Run tests
+        working-directory: python
+        run: |
+          . .venv/bin/activate
+          pytest -v

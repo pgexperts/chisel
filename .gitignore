@@ -1,0 +1,10 @@
+.superpowers/
+.worktrees/
+
+
+# Added by cargo
+
+/target
+
+# Credentials
+.keys
