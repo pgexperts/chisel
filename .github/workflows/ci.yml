@@ -94,9 +94,10 @@ jobs:
   # `cargo build` to verify the floor still works — catches any new code
   # that requires a newer Rust without an accompanying release-notes call-out.
   #
-  # I61 (ISSUES.md, 2026-05-22): `-p chisel` scopes the build to the
-  # library crate ONLY. The MSRV promise is about what users see when
-  # they depend on `chisel` — bench is internal tooling whose heavy
+  # I61 (ISSUES.md, 2026-05-22): `-p chisel-storage` scopes the build to the
+  # library crate ONLY (published package name; the library itself is still
+  # `chisel` via [lib].name in Cargo.toml). The MSRV promise is about what
+  # users see when they depend on it — bench is internal tooling whose heavy
   # deps (criterion, rusqlite, redb, rand → getrandom, clap → clap_lex,
   # ...) are now adopting `edition2024` faster than we want to bump our
   # floor. Bench can lag the library's MSRV without affecting any
@@ -115,7 +116,7 @@ jobs:
       # above the 1.82 library floor for the same reason bench/python do (I61).
       # The MSRV promise is about the published library, which this verifies.
       - name: Build chisel library with MSRV toolchain
-        run: cargo build --verbose -p chisel
+        run: cargo build --verbose -p chisel-storage
 
   # I58 (ISSUES.md, 2026-05-22): a dedicated `bench-tests` job once
   # ran `cd bench && cargo test --verbose` because bench/ was a
