@@ -349,6 +349,11 @@ Catch and continue.
 | `InvalidSuperblockCountError` | `superblock_count` outside `2..=16` |
 | `CacheFullError` | Page cache hit its strict `cache_max_bytes` cap with every cached page dirty (no clean page available for eviction) AND the spillway is disabled (`spillway_max_bytes=0`); commit or roll back to drain. When the spillway is enabled (default), the cache overflows into it instead and you'll see `SpillwayFullError` only if the spillway also fills. |
 | `SpillwayFullError` | Spillway sidecar's `spillway_max_bytes` cap was reached during a transaction; commit or roll back to drain the spillway. Database is intact. |
+| `NoEncryptionKeyError` | Opened an encrypted database without supplying `encryption_key` |
+| `InvalidEncryptionKeyError` | `encryption_key` was supplied but unwraps no key slot (wrong passphrase or wrong raw bytes) |
+| `EncryptionNotSupportedError` | `encryption_key` was supplied but the database is plaintext |
+| `NoFreeKeySlotError` | `add_key` / `rotate_key` attempted but all 8 key-slot table entries are in use |
+| `LastKeySlotError` | `remove_key` would clear the last active key slot, leaving the database permanently unopenable |
 | `TagMismatchError` | `delete_tagged(handle, tag)` was passed a `tag` that doesn't match the handle's stored tag; the chunk and membership index are left untouched |
 | `ClosedError` | Any call on a `Chisel`, `Transaction`, or `Savepoint` after `db.close()` |
 | `AlreadyFinishedError` | Second explicit drive on a transaction or savepoint |
@@ -360,6 +365,7 @@ Drop the handle and reopen.
 | Class | When it fires |
 |---|---|
 | `IoError` | Underlying filesystem I/O error. Also subclasses the builtin `OSError`, so it is catchable as `except OSError` and `.errno` is `OSError`'s native attribute (with `.strerror` set when an errno exists). Carries `.errno` (the raw OS error code, or `None` if unavailable) and `.kind` (the Rust `io::ErrorKind` name, e.g. `"PermissionDenied"`), so callers can branch on the cause without parsing the message. |
+| `DecryptionFailedError` | A page or the superblock body failed AEAD authentication (wrong key, or the ciphertext was tampered with) |
 | `ChecksumMismatchError` | A page's XXH3 checksum did not validate on load |
 | `CorruptSuperblockError` | No readable superblock slot found |
 | `FileSizeMismatchError` | File size inconsistent with the superblock's claim |
