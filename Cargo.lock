@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "chisel"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "argon2",
  "base64ct",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "chisel-bench"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "assert_cmd",
  "chisel",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "chisel-py"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chisel",
  "pyo3",

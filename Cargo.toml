@@ -33,7 +33,7 @@ resolver = "2"
 
 [package]
 name = "chisel"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 # MSRV: bump only with a release-notes call-out; CI pins this same version.
 # 1.82 is a conservative pin; the true stdlib floor is ~1.74 (io::Error::other,

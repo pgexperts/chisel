@@ -6,7 +6,7 @@ Chisel is designed for single-writer embedded use: one process holds the file vi
 
 ## Status
 
-Pre-1.0. Current release: `0.1.0`. The API is stable-by-intent but subject to revision until 1.0 ships. The on-disk format is likewise pre-stable; see [On-disk format compatibility](#on-disk-format-compatibility) for the 1.0-and-onward promise.
+1.0. Current release: `1.0.0`. Both the API and the on-disk format are now frozen per the compatibility promise in [On-disk format compatibility](#on-disk-format-compatibility).
 
 ## Features
 
@@ -29,10 +29,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-chisel = "0.1"
+chisel = "1.0"
 ```
 
-(While Chisel is pre-1.0 and not yet on crates.io, use a path or git dependency: `chisel = { path = "path/to/chisel" }`.)
+(Not yet published to crates.io; use a path or git dependency in the meantime: `chisel = { path = "path/to/chisel" }`.)
 
 ## Quick Start
 
@@ -362,11 +362,11 @@ Encryption introduces the second major: an encrypted database is stamped MAJOR =
 
 Write safety across minors is a narrower guarantee: a binary at MINOR = *m* opening a file at MINOR = *m' > m* cannot safely commit without risking overwriting fields it doesn't know about. The open gate is MAJOR-only by design, so minor variants coexist — same-major files of any minor open successfully, and the chunk-tags MINOR = 1 variant is the first such case. The write-refusal arm (refuse writes when file MINOR > binary MINOR) is implemented (I29): opening a newer-minor file forces the handle read-only, so any mutation returns `ReadOnlyMode` rather than risking a write that clobbers fields the binary doesn't know about. The post-1.0 cross-minor read-compatibility guarantee is absolute; write-compatibility requires binary MINOR ≥ file MINOR.
 
-### Pre-1.0 caveat
+### Format history
 
-Until Chisel reaches 1.0, the on-disk format may change between pre-release builds without a major-version bump. Any such pre-1.0 change will be called out in release notes. The first 1.0 release freezes the plaintext format at MAJOR = 1 for the entire 1.x line; encrypted databases carry MAJOR = 2 (see above), and each major's on-disk format is sacred within that major.
+Before 1.0, the on-disk format changed between pre-release builds without a major-version bump; such changes were called out in release notes. The 1.0 release freezes the plaintext format at MAJOR = 1 for the entire 1.x line; encrypted databases carry MAJOR = 2 (see above), and each major's on-disk format is sacred within that major going forward.
 
-Files written by prior development builds (pre-1.0 flat `format_version`, which decodes as MAJOR = 0) are rejected at open time — recreate the database. No production-grade migration is provided for pre-release files.
+Files written by prior pre-1.0 development builds (flat `format_version`, which decodes as MAJOR = 0) are rejected at open time — recreate the database. No production-grade migration is provided for pre-1.0 files.
 
 ## How durability works
 

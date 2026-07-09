@@ -1,6 +1,6 @@
 [package]
 name = "chisel-bench"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 # MSRV mirrors the root crate (1.82). The path-dep on chisel inherits its
 # floor; bench-specific deps (criterion, rusqlite, clap) all support older

@@ -1,6 +1,6 @@
 [package]
 name = "chisel-py"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 # MSRV mirrors the root crate (1.82 conservative pin; the root crate's true
 # stdlib floor is ~1.74 from io::Error::other). PyO3 has a lower MSRV of its

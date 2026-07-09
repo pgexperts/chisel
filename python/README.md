@@ -4,7 +4,7 @@ Python binding for [Chisel](..), a transactional slot-based storage engine writt
 
 ## Status
 
-Pre-1.0. Current release: `0.1.0`. The API is stable-by-intent but subject to revision until 1.0 ships. The on-disk format is likewise pre-stable; see [On-disk format compatibility](#on-disk-format-compatibility) for the 1.0-and-onward promise.
+1.0. Current release: `1.0.0`. Both the API and the on-disk format are now frozen per the compatibility promise in the [root README](../README.md#on-disk-format-compatibility).
 
 ## Install
 
