@@ -16,7 +16,7 @@ repository = "https://github.com/pgexperts/chisel"
 publish = false
 
 [dependencies]
-chisel = { path = ".." }
+chisel-storage = { path = ".." }
 redb = "2"
 rusqlite = { version = "0.31", features = ["bundled"] }
 rand = "0.8"

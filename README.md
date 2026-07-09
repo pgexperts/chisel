@@ -1,5 +1,11 @@
 # Chisel
 
+[![CI](https://github.com/pgexperts/chisel/actions/workflows/ci.yml/badge.svg)](https://github.com/pgexperts/chisel/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/chisel-storage.svg)](https://crates.io/crates/chisel-storage)
+[![docs.rs](https://docs.rs/chisel-storage/badge.svg)](https://docs.rs/chisel-storage)
+[![PyPI](https://img.shields.io/pypi/v/chisel-storage.svg)](https://pypi.org/project/chisel-storage/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A transactional, crash-durable key-value storage engine written in Rust. Chisel uses **shadow paging** (copy-on-write) to guarantee that the database file is always in a consistent state. There is no write-ahead log and no recovery procedure — after a crash, you just open the file and it's correct.
 
 Chisel is designed for single-writer embedded use: one process holds the file via `flock`, all mutations go through `&mut self`, and the API is synchronous. A PyO3 binding ships alongside the Rust crate; see [`python/README.md`](python/README.md).
@@ -29,10 +35,12 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-chisel = "1.0"
+chisel-storage = "1.0"
 ```
 
-(Not yet published to crates.io; use a path or git dependency in the meantime: `chisel = { path = "path/to/chisel" }`.)
+The published crate is named `chisel-storage` (plain `chisel` was already taken); the library itself is still `chisel`, so your code imports it as `use chisel::{Chisel, Options};` regardless.
+
+(Not yet published to crates.io; use a path or git dependency in the meantime: `chisel-storage = { path = "path/to/chisel" }`.)
 
 ## Quick Start
 

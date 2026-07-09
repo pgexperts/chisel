@@ -3,7 +3,11 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "chisel"
+# Published on PyPI as "chisel-storage" (plain "chisel" is already taken by
+# an unrelated package). The importable module stays `chisel` — module-name
+# and python-source below are untouched by this, so `import chisel` keeps
+# working regardless of the distribution name pip installs.
+name = "chisel-storage"
 version = "1.0.0"
 description = "Python binding for the Chisel transactional storage engine"
 readme = "README.md"
@@ -19,6 +23,12 @@ classifiers = [
   "Operating System :: POSIX :: Linux",
   "Operating System :: MacOS",
 ]
+
+[project.urls]
+Homepage = "https://github.com/pgexperts/chisel"
+Repository = "https://github.com/pgexperts/chisel"
+Documentation = "https://github.com/pgexperts/chisel/blob/main/python/README.md"
+Issues = "https://github.com/pgexperts/chisel/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=8", "hypothesis>=6"]

@@ -23,7 +23,7 @@ name = "_chisel"
 crate-type = ["cdylib"]
 
 [dependencies]
-chisel = { path = ".." }
+chisel-storage = { path = ".." }
 # I75 (ISSUES.md, 2026-05-22): bumped from 0.22 to clear
 # RUSTSEC-2025-0020 (Risk of buffer overflow in PyString::from_object;
 # patched in 0.24.1+). Bumped again to 0.29 to clear RUSTSEC-2026-0176

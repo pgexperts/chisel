@@ -118,3 +118,40 @@ jobs:
         with:
           name: sdist
           path: dist/*.tar.gz
+
+  # Only runs when this workflow was itself tag-triggered (push: tags: v*),
+  # never on a manual workflow_dispatch smoke-build -- so re-running the
+  # build by hand can never accidentally publish.
+  publish-pypi:
+    if: github.event_name == 'push'
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    # Requires a "release" GitHub Actions environment (Settings > Environments)
+    # with protection rules (e.g. required reviewers). Shares the same
+    # environment name as publish-crate.yml's crates.io job so one set of
+    # protection rules gates both registries.
+    environment: release
+    permissions:
+      id-token: write # required for PyPI Trusted Publishing (OIDC)
+    steps:
+      # Collects wheels-ubuntu-latest, wheels-ubuntu-24.04-arm,
+      # wheels-macos-latest, and sdist into one flat dist/ directory --
+      # gh-action-pypi-publish expects everything under one packages-dir.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: "wheels-*"
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: sdist
+          path: dist
+
+      # Requires a Trusted Publisher configured on PyPI for "chisel-storage"
+      # (Project > Publishing), naming this repo, this workflow file, and the
+      # "release" environment -- unlike crates.io, PyPI supports configuring
+      # this as a "pending publisher" before the project's first-ever
+      # release, so this job can carry that first release too.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

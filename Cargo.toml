@@ -14,8 +14,9 @@
 # Each member retains its own [package] block (name, version, edition,
 # rust-version, etc.) — workspace inheritance via [workspace.package]
 # is a separate refactor (cosmetic, not functional). The path-deps
-# `chisel = { path = ".." }` in python/Cargo.toml and bench/Cargo.toml
-# work unchanged.
+# `chisel-storage = { path = ".." }` in python/Cargo.toml and bench/Cargo.toml
+# work unchanged (the root package is named "chisel-storage" on crates.io;
+# see [lib] below for why `use chisel::...` is unaffected).
 [workspace]
 members = [".", "python", "bench"]
 # `default-members` excludes `python` from `cargo build` / `cargo test`
@@ -32,7 +33,7 @@ default-members = [".", "bench"]
 resolver = "2"
 
 [package]
-name = "chisel"
+name = "chisel-storage"
 version = "1.0.0"
 edition = "2021"
 # MSRV: bump only with a release-notes call-out; CI pins this same version.
@@ -52,6 +53,14 @@ keywords = ["database", "storage", "embedded", "transactional", "shadow-paging"]
 # narrow slot for a from-scratch engine; "data-structures" covers the
 # radix tree / freemap / handle table types we expose.
 categories = ["database-implementations", "data-structures"]
+
+# Published on crates.io as "chisel-storage" (the plain "chisel" name is
+# already taken by an unrelated project). The library/import name stays
+# "chisel" — Cargo resolves `use chisel::...` for any consumer depending on
+# `chisel-storage = "..."` from this [lib].name override alone, no renaming
+# needed on the consumer's side.
+[lib]
+name = "chisel"
 
 [dependencies]
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

@@ -1,5 +1,8 @@
 # chisel (Python binding)
 
+[![PyPI](https://img.shields.io/pypi/v/chisel-storage.svg)](https://pypi.org/project/chisel-storage/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../LICENSE)
+
 Python binding for [Chisel](..), a transactional slot-based storage engine written in Rust with shadow-paging durability. The engine is embedded, single-writer, and fully synchronous.
 
 ## Status
@@ -8,7 +11,13 @@ Python binding for [Chisel](..), a transactional slot-based storage engine writt
 
 ## Install
 
-Not yet published to PyPI; build locally with [maturin](https://www.maturin.rs/):
+```bash
+pip install chisel-storage
+```
+
+The distribution is named `chisel-storage` (plain `chisel` was already taken on PyPI); the importable module is still `chisel`, so your code reads `import chisel` regardless.
+
+Not yet published to PyPI; build locally with [maturin](https://www.maturin.rs/) in the meantime:
 
 ```bash
 pip install maturin
