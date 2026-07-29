@@ -536,3 +536,72 @@ dual_backing_test!(
     test_file_size_bytes_matches_stats,
     test_file_size_bytes_matches_stats_body
 );
+
+// --- Refusing to create a database over a file that already has content ---
+//
+// `PageIo::open` uses `.create(true).truncate(false)`, so `Chisel::open` will
+// happily adopt whatever file is at `path`. The create-vs-open decision is made
+// on the post-lock page count, which is `len / stride` and therefore 0 for ANY
+// file shorter than one page. Nothing below a page is a valid database, so the
+// only safe answer for a short-but-non-empty file is to refuse: creating over
+// it destroys the user's bytes irrecoverably.
+
+/// A file too short to hold a superblock must not be adopted and overwritten.
+#[test]
+fn open_refuses_to_create_over_a_sub_page_file() {
+    let tmp = NamedTempFile::new().unwrap();
+    let original: &[u8] = b"IMPORTANT USER DATA - not a chisel database\n";
+    std::fs::write(tmp.path(), original).unwrap();
+
+    let err = Chisel::open(tmp.path(), Options::default())
+        .err()
+        .expect("opening a non-empty sub-page file must not succeed");
+    assert!(
+        matches!(err, ChiselError::CorruptSuperblock { .. }),
+        "expected CorruptSuperblock for a short non-database file, got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path()).unwrap(),
+        original,
+        "the existing file's contents must be left untouched"
+    );
+}
+
+/// The same file with `create_if_missing(false)`: the option must be honoured.
+/// Before the fix this returned `Ok` — the length-based pre-lock gate saw a
+/// non-empty file and let the call through, then the page-count-based decision
+/// treated it as absent and created over it.
+#[test]
+fn open_with_create_if_missing_false_does_not_create_over_a_sub_page_file() {
+    let tmp = NamedTempFile::new().unwrap();
+    let original: &[u8] = b"IMPORTANT USER DATA - not a chisel database\n";
+    std::fs::write(tmp.path(), original).unwrap();
+
+    let err = Chisel::open(tmp.path(), Options::default().create_if_missing(false))
+        .err()
+        .expect("create_if_missing(false) must never create a database");
+    assert!(
+        matches!(err, ChiselError::CorruptSuperblock { .. }),
+        "expected CorruptSuperblock, got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path()).unwrap(),
+        original,
+        "the existing file's contents must be left untouched"
+    );
+}
+
+/// A zero-length file is still legitimately "nonexistent" — a crash between
+/// `creat(2)` and the first superblock write, or a bare `touch`, must keep
+/// going through the create path. This pins the boundary so the fix above
+/// cannot regress it into refusing empty files.
+#[test]
+fn open_still_creates_over_a_zero_length_file() {
+    let tmp = NamedTempFile::new().unwrap();
+    assert_eq!(std::fs::metadata(tmp.path()).unwrap().len(), 0);
+
+    let db = Chisel::open(tmp.path(), Options::default())
+        .expect("a zero-length file must go through the create path");
+    drop(db);
+    assert!(std::fs::metadata(tmp.path()).unwrap().len() > 0);
+}
