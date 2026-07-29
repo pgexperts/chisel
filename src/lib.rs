@@ -83,7 +83,11 @@ pub use page::format_major;
 // Key and Argon2Params are public API (callers need them to open encrypted DBs).
 // Crypto internals (PageCipher, CryptoError, raw constants) are pub(crate) in
 // their source modules and not re-exported here.
-pub use crypto::{Argon2Params, Key};
+// The MAX_ARGON2_* caps are public because exceeding them is now a hard
+// failure: `Options::argon2_params` above any of them makes `open` return
+// InvalidEncryptionKey at create time. A caller tuning cost parameters needs to
+// be able to see the ceiling rather than discover it by failing.
+pub use crypto::{Argon2Params, Key, MAX_ARGON2_M_COST, MAX_ARGON2_P_COST, MAX_ARGON2_T_COST};
 
 use std::path::Path;
 
@@ -270,6 +274,12 @@ impl Options {
     /// Set the Argon2id cost parameters used when deriving a KEK from a
     /// passphrase on database creation. No effect for raw keys or on reopen
     /// (the stored slot carries its own params). See [`Options::argon2_params`].
+    ///
+    /// Values are capped at [`MAX_ARGON2_M_COST`], [`MAX_ARGON2_T_COST`] and
+    /// [`MAX_ARGON2_P_COST`]; exceeding any of them makes `open` fail with
+    /// `InvalidEncryptionKey` rather than creating a database. The same cap is
+    /// what stops a hostile file's key slot from driving the Argon2 allocator
+    /// at open time, so it is enforced for both directions.
     pub fn argon2_params(mut self, params: Argon2Params) -> Self {
         self.argon2_params = Some(params);
         self
