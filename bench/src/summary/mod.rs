@@ -1,5 +1,5 @@
 // Markdown summary post-processor module. Reads PR 4b's bench output
-// (target/criterion/<row>/<mode>/<size>/sample.json + bench/results/aux_metrics.jsonl)
+// (target/criterion/<row>/<mode>/<size>/new/sample.json + bench/results/aux_metrics.jsonl)
 // and produces three artifacts under bench/results/<UTC-ISO8601>/:
 //
 //   summary.md     — human-readable per-row tables

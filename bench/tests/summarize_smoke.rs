@@ -80,10 +80,13 @@ fn summarize_smoke_runs_against_fixtures() {
         "summary.md missing ycsb-a row"
     );
 
+    // `new/` is Criterion's own directory level, and `copy_raw_archive`
+    // mirrors the source tree verbatim — so the archived path carries it too.
     let chisel_raw = raw_dir
         .join("allocate-1pertx")
         .join("chisel-strict")
-        .join("32B");
+        .join("32B")
+        .join("new");
     assert!(
         chisel_raw.join("sample.json").exists(),
         "raw chisel-strict sample.json missing"
