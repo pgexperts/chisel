@@ -139,6 +139,37 @@ use sha2::Sha256;
 /// future KDF revision can coexist.
 const KEK_INFO: &[u8] = b"chisel-kek-v1";
 
+// Upper bounds on Argon2id cost parameters.
+//
+// These exist because the parameters are ATTACKER-CONTROLLED: they are read
+// verbatim out of a key slot in the superblock's plaintext crypto header
+// (`KeySlot::read_from`) and handed to the KDF during `open`, before the
+// format-version gate and before the page-size gate. The argon2 crate provides
+// no ceiling of its own — `Params::MAX_M_COST` and `MAX_T_COST` are both
+// `u32::MAX`, with a source comment saying no upper check is needed — and its
+// working buffer is an infallible `vec![Block::default(); block_count()]`
+// (1 KiB per block). So an `m_cost` of `u32::MAX` is a 4 TiB request that
+// aborts the process rather than returning an error, and a large `t_cost` is
+// an unbounded hang. Four bytes in a file, and the host process dies.
+//
+// The cap is generous relative to real configurations: 256 MiB is 13x the
+// OWASP baseline this crate writes (19 MiB), and t/p of 16 are well above the
+// recommended 2/1. Raising them is a one-line change, but the open path must
+// stay bounded by SOMETHING — an unbounded allocator driven by untrusted bytes
+// is the vulnerability, not any particular ceiling.
+//
+// Enforced in `derive_kek` rather than at the slot-parse site because that is
+// the single point every KDF call routes through — both the open path
+// (recovery.rs, untrusted disk bytes) and the create path (recovery.rs, via
+// `Options::argon2_params`). Guarding there also stops a caller from creating
+// a database whose own parameters would make it unopenable.
+/// Maximum Argon2id memory cost in KiB (256 MiB).
+pub const MAX_ARGON2_M_COST: u32 = 262_144;
+/// Maximum Argon2id iteration count.
+pub const MAX_ARGON2_T_COST: u32 = 16;
+/// Maximum Argon2id parallelism (lanes).
+pub const MAX_ARGON2_P_COST: u32 = 16;
+
 /// Derive a 256-bit KEK from the client key and a slot's salt/params.
 ///
 /// Dispatch is on `kdf`, NOT on the `Key` variant: the slot records which KDF
@@ -150,10 +181,13 @@ const KEK_INFO: &[u8] = b"chisel-kek-v1";
 /// truth, so we never guess from the variant.)
 ///
 /// # Errors
-/// Returns `CryptoError::Kdf` if the KDF primitive rejects its parameters
-/// (e.g. Argon2id with zero memory cost). Returns `CryptoError::BadKeyLength`
-/// if the supplied key material is empty (an empty `Raw` key or empty
-/// `Passphrase`), regardless of `kdf`.
+/// Returns `CryptoError::Kdf` if the Argon2id cost parameters are outside
+/// `..=MAX_ARGON2_M_COST` / `..=MAX_ARGON2_T_COST` / `..=MAX_ARGON2_P_COST`
+/// (they arrive from an untrusted key slot on the open path, so they are
+/// bounded here before any allocation), or if the KDF primitive itself rejects
+/// them (e.g. Argon2id with zero memory cost). Returns
+/// `CryptoError::BadKeyLength` if the supplied key material is empty (an empty
+/// `Raw` key or empty `Passphrase`), regardless of `kdf`.
 pub fn derive_kek(
     key: &Key,
     kdf: KdfId,
@@ -182,6 +216,18 @@ pub fn derive_kek(
                 .map_err(|_| CryptoError::Kdf)?;
         }
         KdfId::Argon2id => {
+            // Refuse out-of-range cost parameters BEFORE constructing Params.
+            // `Params::new` accepts anything up to u32::MAX, and the allocation
+            // it authorizes is infallible, so this check is the only thing
+            // standing between a hostile key slot and a process abort. Note the
+            // HKDF arm above is deliberately unguarded: it never reads these
+            // fields, and slots written by the HKDF path leave them zero.
+            if params.m_cost > MAX_ARGON2_M_COST
+                || params.t_cost > MAX_ARGON2_T_COST
+                || params.p_cost > MAX_ARGON2_P_COST
+            {
+                return Err(CryptoError::Kdf);
+            }
             let p = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(32))
                 .map_err(|_| CryptoError::Kdf)?;
             // Version::V0x13 and the 32-byte output length (`Some(32)` above) are
@@ -720,5 +766,97 @@ mod tests {
             &expected,
             "Argon2id output changed — KDF config or format break; update golden and bump FORMAT_VERSION"
         );
+    }
+
+    // --- Bounds on cost parameters read from an untrusted superblock ---
+    //
+    // The argon2 crate deliberately enforces no upper bound: Params::MAX_M_COST
+    // and MAX_T_COST are both u32::MAX, and its block buffer is an infallible
+    // `vec![Block::default(); block_count()]`, so an oversized m_cost aborts the
+    // process rather than returning an error. Key-slot parameters come straight
+    // off disk, so the ceiling has to be ours. Literals here rather than the
+    // MAX_ARGON2_* constants so the intent is legible without chasing a const.
+
+    #[test]
+    fn derive_kek_rejects_argon2_params_above_the_cap() {
+        let key = Key::Passphrase(zeroize::Zeroizing::new("pw".to_string()));
+        let salt = [0u8; SALT_LEN];
+        let cases = [
+            // m_cost is in KiB: 262144 KiB = 256 MiB is the cap, so this is one
+            // KiB over. Deliberately not u32::MAX — pre-fix this test must FAIL,
+            // not abort the test runner by allocating 4 TiB.
+            (
+                "m_cost over cap",
+                Argon2Params {
+                    m_cost: 262_145,
+                    t_cost: 2,
+                    p_cost: 1,
+                },
+            ),
+            (
+                "t_cost over cap",
+                Argon2Params {
+                    m_cost: 19_456,
+                    t_cost: 17,
+                    p_cost: 1,
+                },
+            ),
+            (
+                "p_cost over cap",
+                Argon2Params {
+                    m_cost: 19_456,
+                    t_cost: 2,
+                    p_cost: 17,
+                },
+            ),
+        ];
+        for (what, bad) in cases {
+            assert!(
+                matches!(
+                    derive_kek(&key, KdfId::Argon2id, &salt, &bad),
+                    Err(CryptoError::Kdf)
+                ),
+                "{what}: out-of-range cost params must be refused before reaching argon2"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_kek_still_accepts_realistic_argon2_params() {
+        let key = Key::Passphrase(zeroize::Zeroizing::new("pw".to_string()));
+        let salt = [1u8; SALT_LEN];
+        // The OWASP default this crate writes, and the cap itself, must both
+        // derive. Cheap t/p so the 256 MiB case stays quick.
+        for ok in [
+            Argon2Params {
+                m_cost: 8,
+                t_cost: 1,
+                p_cost: 1,
+            },
+            Argon2Params::default(),
+            Argon2Params {
+                m_cost: 262_144,
+                t_cost: 1,
+                p_cost: 1,
+            },
+        ] {
+            assert!(
+                derive_kek(&key, KdfId::Argon2id, &salt, &ok).is_ok(),
+                "legitimate params {ok:?} must still derive"
+            );
+        }
+    }
+
+    #[test]
+    fn hkdf_ignores_argon2_params_entirely() {
+        // Raw keys use HKDF, which never reads the cost params. A slot carrying
+        // garbage params with kdf_id=HKDF must not be refused by the new bound.
+        let key = Key::Raw(zeroize::Zeroizing::new(vec![7u8; 32]));
+        let wild = Argon2Params {
+            m_cost: u32::MAX,
+            t_cost: u32::MAX,
+            p_cost: u32::MAX,
+        };
+        assert!(derive_kek(&key, KdfId::Hkdf, &[0u8; SALT_LEN], &wild).is_ok());
     }
 }

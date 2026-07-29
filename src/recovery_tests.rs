@@ -1650,3 +1650,69 @@ fn corrupt_crypto_header_stride_errors_not_panic() {
         Ok(_) => panic!("forged-stride open unexpectedly succeeded (should have failed)"),
     }
 }
+
+/// A hostile key slot must not be able to drive the Argon2 allocator.
+///
+/// The key-slot cost parameters (`m_cost`/`t_cost`/`p_cost`) are read verbatim
+/// out of the superblock's plaintext crypto header and handed to the KDF, and
+/// this happens BEFORE the format-version gate and the page-size gate — so no
+/// other validation stands between the file's bytes and the allocator. The
+/// argon2 crate enforces no ceiling of its own (`MAX_M_COST == u32::MAX`) and
+/// its block buffer is an infallible `vec![Block::default(); block_count()]`,
+/// which aborts the process on allocation failure rather than returning an
+/// error. An attacker who can hand the victim a `.chsl` file therefore gets a
+/// process kill, not a typed error.
+///
+/// Pre-fix this test aborts or hangs the runner (a 4 TiB request); post-fix it
+/// returns a normal operational error promptly.
+#[test]
+fn tampered_key_slot_cost_params_do_not_reach_the_allocator() {
+    use crate::superblock::{CRYPTO_HEADER_OFFSET, KEY_SLOT_SIZE};
+
+    let tmp = NamedTempFile::new().unwrap();
+    let pass = || Key::Passphrase(Zeroizing::new("correct horse battery".to_string()));
+
+    // Cheap-but-valid params so creating the fixture is fast; the values are
+    // overwritten below anyway.
+    let mut db = Chisel::open(
+        tmp.path(),
+        Options::default()
+            .encryption_key(pass())
+            .argon2_params(crate::Argon2Params {
+                m_cost: 8,
+                t_cost: 1,
+                p_cost: 1,
+            }),
+    )
+    .unwrap();
+    db.begin().unwrap();
+    db.allocate(b"payload").unwrap();
+    db.commit().unwrap();
+    drop(db);
+
+    // m_cost of key slot 0 lives at CRYPTO_HEADER_OFFSET + 8 (the slot table)
+    // + 2 (state byte, kdf_id byte), 4 bytes LE. Patch every superblock slot so
+    // the tampered header wins regardless of which slot recovery selects.
+    let m_cost_at = CRYPTO_HEADER_OFFSET + 8 + 2;
+    for sb_slot in 0..crate::DEFAULT_SUPERBLOCK_COUNT as u64 {
+        rewrite_page_with_valid_checksum(tmp.path(), sb_slot, |buf| {
+            // u32::MAX KiB = 4 TiB. Nothing legitimate is anywhere near this.
+            buf[m_cost_at..m_cost_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        });
+    }
+    // Slot stride sanity: this test hard-codes slot 0's offset, so a layout
+    // change that moved the table must fail loudly rather than silently
+    // patching the wrong bytes.
+    assert_eq!(
+        KEY_SLOT_SIZE, 128,
+        "key-slot stride changed; update m_cost_at"
+    );
+
+    let err = Chisel::open(tmp.path(), Options::default().encryption_key(pass()))
+        .err()
+        .expect("a slot with absurd cost params must not unwrap");
+    assert!(
+        matches!(err, ChiselError::InvalidEncryptionKey),
+        "expected InvalidEncryptionKey (the slot is skipped as non-matching), got {err:?}"
+    );
+}
