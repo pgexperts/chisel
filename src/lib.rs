@@ -25,6 +25,16 @@
 // `-D warnings`, which promotes this to a hard error — a new public `-> Result`
 // method without an `# Errors` section fails the build.
 #![warn(clippy::missing_errors_doc)]
+// The README is the entry point for every downstream user, and every Rust
+// snippet in it was a compile error against the current API — the `defrag`
+// module went `pub(crate)`, `DefragOptions`/`Options` became
+// `#[non_exhaustive]`, and tags/handles became `Tag`/`Handle` newtypes, none
+// of which the examples followed. Nothing caught it because the README was
+// not wired into the build at all. Including it here makes every fence a
+// doctest, so `cargo test` fails the next time an API change outruns the
+// docs. Fences that would touch the filesystem or need a live failure to
+// demonstrate are marked `no_run`: still compiled, just not executed.
+#![doc = include_str!("../README.md")]
 
 // I35 (ISSUES.md, 2026-05-22): every storage-internals module is
 // pub(crate). The supported public surface is the curated re-export
@@ -859,7 +869,12 @@ impl Chisel {
     /// inside an active transaction). Takes `&self` (F3).
     ///
     /// # Errors
-    /// Only on poisoning — an unbound `name` returns `Ok(None)`.
+    /// `InvalidRootName` if `name` could never have been stored in the first
+    /// place — empty, over `NAMED_ROOT_NAME_LEN` bytes, or containing a NUL.
+    /// The lookup path runs the same validation `set_root_name` does, so an
+    /// unrepresentable name is rejected rather than reported as unbound. A
+    /// merely *unbound* (but valid) name returns `Ok(None)`. Otherwise only
+    /// on poisoning.
     pub fn get_root_name(&self, name: &str) -> Result<Option<Handle>> {
         Ok(self.txm.get_root_name(name)?.map(Handle::from))
     }
@@ -868,7 +883,10 @@ impl Chisel {
     /// active transaction; becomes durable on commit.
     ///
     /// # Errors
-    /// `NoActiveTransaction` if no transaction is open.
+    /// `NoActiveTransaction` if no transaction is open; `InvalidRootName` if
+    /// `name` is empty, over `NAMED_ROOT_NAME_LEN` bytes, or contains a NUL —
+    /// the clear path runs the same validation `set_root_name` does, so an
+    /// unrepresentable name is rejected rather than treated as a no-op.
     pub fn clear_root_name(&mut self, name: &str) -> Result<()> {
         self.txm.clear_root_name(name)
     }
