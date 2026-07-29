@@ -572,10 +572,21 @@ impl Chisel {
     /// "two_fsync" label from the original spec.
     ///
     /// # Errors
-    /// `NoActiveTransaction` if none is open. Operationally, `CacheFull` or
-    /// `SpillwayFull` if the transaction's working set exceeds the cache /
-    /// spillway caps. A failure inside the fsync/superblock protocol is fatal
-    /// and poisons the handle — the previous committed state stays intact.
+    /// `NoActiveTransaction` if none is open — and that is the ONLY error this
+    /// method can return without poisoning the handle. It is checked before
+    /// the commit protocol starts; everything after that point poisons.
+    ///
+    /// This inverts the crate-wide operational/fatal contract described on
+    /// [`Chisel`], and it does so deliberately. Once `cache.flush()` has run,
+    /// the manager is in a partial-commit state, so even an ordinarily
+    /// operational error — `CacheFull` or `SpillwayFull` from a working set
+    /// that exceeds the caps — leaves nothing safe to continue from.
+    /// `commit` therefore poisons on *any* error it can reach.
+    ///
+    /// Practically: do not catch `CacheFull` from `commit` and call
+    /// `rollback` to recover, the way the operational contract would suggest.
+    /// The handle is already poisoned and `rollback` will return `Poisoned`.
+    /// Drop the handle and reopen; the previous committed state is intact.
     pub fn commit(&mut self) -> Result<()> {
         self.txm.commit()
     }
@@ -625,10 +636,18 @@ impl Chisel {
     }
 
     /// Store `value` and return a freshly minted stable handle. Handles are
-    /// u64 identifiers assigned from a monotonic counter in the superblock;
-    /// they are never reused within a database's lifetime and are stable
-    /// across updates, defrag, and reopens. Physical location may change;
-    /// the handle will not.
+    /// u64 identifiers assigned from a monotonic counter in the superblock,
+    /// and are stable across updates, defrag, and reopens. Physical location
+    /// may change; the handle will not.
+    ///
+    /// A handle is never reused **once the transaction that minted it has
+    /// committed**, including after the value is deleted. Before that, it can
+    /// be: the counter lives in the roots snapshot, so `rollback`,
+    /// `rollback_to` and crash recovery all rewind it, and the next
+    /// `allocate` hands the same id out again for different bytes. Nothing in
+    /// the entry distinguishes the two — there is no generation counter — so
+    /// only commit the transaction before recording a handle anywhere outside
+    /// the database (a log, an external index, another process).
     ///
     /// Values up to `transaction::MAX_INLINE_VALUE` are packed into a slot
     /// on a data page (R1 packing — multiple values share a page); larger

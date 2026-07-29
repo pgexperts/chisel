@@ -126,7 +126,7 @@ The macOS APFS runtime gap is real: Chisel uses `fcntl(F_FULLFSYNC)` (durable th
 
 ### Handles
 
-A handle is a stable `u64` returned by `allocate()`. It maps through a radix-tree **handle table** rooted in the superblock to a `(page, slot)` location in a slotted data page. This indirection means values can move internally — during `update()` to a larger value, or during `defrag()` — without changing the handle. Deleted handles are retired and never reused within a database's lifetime.
+A handle is a stable `u64` returned by `allocate()`. It maps through a radix-tree **handle table** rooted in the superblock to a `(page, slot)` location in a slotted data page. This indirection means values can move internally — during `update()` to a larger value, or during `defrag()` — without changing the handle. A handle that reached a commit is retired on delete and never reused. One minted by a transaction that rolls back (or is lost to crash recovery) *is* re-minted, because the counter rewinds with the rest of the roots snapshot — so commit before recording a handle outside the database.
 
 ### Transactions
 
@@ -180,13 +180,16 @@ Names are bounded in length and must be valid UTF-8 without embedded NUL; the ta
 `defrag()` consolidates sparse data pages: it re-inserts values from pages whose live-slot count falls below a threshold so those pages become fully free and can be reclaimed. It runs inside an active transaction so it composes with other work and commits atomically.
 
 ```rust
-use chisel::defrag::DefragOptions;
+use chisel::DefragOptions;
 
 db.begin()?;
-let stats = db.defrag(DefragOptions {
-    sparse_threshold: 0.25,
-    max_pages: 0,  // 0 = no cap on values relocated
-})?;
+// DefragOptions is #[non_exhaustive]; build it with the chained setters
+// rather than a struct literal.
+let stats = db.defrag(
+    DefragOptions::default()
+        .sparse_threshold(0.25)  // relocate pages under 25% full, per page
+        .max_values(0),          // 0 = no cap on values relocated
+)?;
 db.commit()?;
 ```
 
@@ -330,20 +333,26 @@ let options = Options {
 
 **Fatal errors** — storage integrity is in question. Drop the handle and reopen.
 
-`IoError`, `ChecksumMismatch`, `CorruptSuperblock`, `FileSizeMismatch`, `LockFailed`, `UnsupportedFormatVersion`, `UnsupportedPageSize`, `CorruptPage`, `InvalidPageId`, `DecryptionFailed`, `Poisoned`.
+`IoError`, `ChecksumMismatch`, `CorruptSuperblock`, `FileSizeMismatch`, `LockFailed`, `UnsupportedFormatVersion`, `UnsupportedPageSize`, `CorruptPage`, `InvalidPageId`, `DecryptionFailed`.
 
 `DecryptionFailed { page_id }` is fatal: an AEAD authentication failure while decrypting an already-read page means the ciphertext or session key can no longer be trusted, so it poisons the handle exactly like `ChecksumMismatch` (see the poison model below). It is distinct from the operational `InvalidEncryptionKey`, which fires at open time when the supplied key unwraps no key slot — before any data page is served.
 
 Use `ChiselError::is_fatal()` to classify at runtime.
 
+**`Poisoned` is in neither tier**, and `is_fatal()` returns `false` for it. That is deliberate: `is_fatal()` answers "should this error poison the handle?", and by the time you see `Poisoned` the handle already is — re-poisoning is meaningless. But it also means `Poisoned` is *not* recoverable-and-continue either: it is terminal, and the only response is the same drop-and-reopen a fatal error calls for. Match it explicitly alongside `is_fatal()`, as the snippet below does; routing it into an "operational, keep going" arm produces a loop where every call returns `Poisoned` forever.
+
 ### Poison model
 
 On any fatal error — including a failed commit-protocol fsync — the `Chisel` handle becomes **poisoned**. Every subsequent call returns `ChiselError::Poisoned`, regardless of whether it is a read or a write. The only legal recovery is to drop the handle and call `Chisel::open` again; the shadow-paging recovery path then restores the database to the last durable state.
 
+`commit` is the one method where the operational/fatal split above does not apply. Its only non-poisoning error is `NoActiveTransaction`, checked before the protocol starts. Once `cache.flush()` has run the manager is in a partial-commit state, so *every* error it can then return poisons the handle — including `CacheFull` and `SpillwayFull`, which are operational anywhere else. Do not catch those from `commit` and call `rollback` to recover: the handle is already poisoned and `rollback` will tell you so.
+
 ```rust
 match db.commit() {
     Ok(()) => (),
-    Err(e) if e.is_fatal() => {
+    // `Poisoned` is matched explicitly: is_fatal() is false for it, so it
+    // would otherwise fall into the operational arm and loop forever.
+    Err(e) if e.is_fatal() || matches!(e, ChiselError::Poisoned) => {
         drop(db);
         db = Chisel::open(path, Options::default())?;
         // Chisel is now at its last-committed state; retry the work if needed.

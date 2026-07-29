@@ -121,7 +121,7 @@ flowchart BT
 | 3 | `spillway.rs` | Sidecar `<db>.spillway` file for dirty pages the LRU is forced to spill. Per-slot XXH3 over `page_id ‖ payload`; crypto-agnostic (plaintext 8192-byte page or sealed 8232-byte blob). | Never `fsync`ed; truncated at open/commit/rollback — its content is always discardable uncommitted state. |
 | 4 | `freemap.rs` | Single-page bitmap primitive: `allocate_first` / `mark_free` on one `[u8; PAGE_SIZE]` buffer. | Pure buffer manipulation; no cache or I/O. Composed into the multi-page tree by `freemap_tree.rs`. |
 | 4 | `freemap_tree.rs` | COW radix tree of FreeMap leaves; the full multi-page freemap. | All structural COW pages sourced out-of-band (never from the bitmap); session-COW dedup (one COW per node per commit). |
-| 4 | `data_page.rs` | Slotted page layout (R1): slot directory grows forward, packed value data grows backward, dead-slot tombstones reclaimed only by `compact()`. | Slot indices are stable until compact; compact returns an old→new mapping for callers to rewrite. |
+| 4 | `data_page.rs` | Slotted page layout (R1): slot directory grows forward, packed value data grows backward. The directory is append-only — nothing is ever reclaimed within a page. | Slot indices are immutable for the page's lifetime; the handle table stores `(page_id, slot_index)` and relies on it. There is no intra-page compaction: reclamation is whole-page. |
 | 4 | `overflow.rs` | Singly-linked overflow chains for values > inline threshold. | `total_length` repeated on every chain page; `next_page == 0` terminates; cycle detection bounded by `total_length / OVERFLOW_PAYLOAD` (I14). |
 | 5 | `handle_table.rs` | Radix tree mapping `u64` handle → `(page_id, slot_index)`. Implements its own copy-on-write atop `PageCache::new_page`. | Capacity = `510 × 1021^depth`; `find_leaf` short-circuits on `handle ≥ capacity` to `Ok(None)` (I26). |
 | 5 | `membership_index.rs` | Reverse index `tag → {handles}` for chunk tags. A generic copy-on-write radix `RadixU64` (u64 key → u64 value, 0 = absent) used twice: an outer tree keyed by tag whose value bit-packs `(inner_depth \| inner_root)`, and per-tag inner trees keyed by handle. Returns the new root id after a COW mutation, like `handle_table`. | Fan-out 1021 per level; `0` is the absent sentinel; outer value packs `inner_root` in low 58 bits, `inner_depth` in top 6. |
@@ -344,7 +344,9 @@ visual:
                                                                (grows backward)
 ```
 
-Each slot directory entry is 6 bytes: 2-byte data offset + 2-byte length + 2-byte flags (`SLOT_FLAG_LIVE = 0x0001`, `SLOT_FLAG_DEAD = 0x0000`). Slot indices are stable across `insert`/`delete`/`update` — the handle table stores `(page_id, slot_index)` and relies on this. `compact()` reclaims dead slots and returns an old→new index mapping; the transaction layer is responsible for rewriting any handle-table entries that reference a compacted page.
+Each slot directory entry is 6 bytes: 2-byte data offset + 2-byte length + 2-byte flags. `SLOT_FLAG_LIVE = 0x0001` is the only flag value the code ever writes — there is no dead-slot flag, and nothing ever clears LIVE. Slot indices are stable across `insert`/`delete`/`update` — the handle table stores `(page_id, slot_index)` and relies on this — and there is no operation that renumbers them, because renumbering would invalidate every handle-table entry pointing into the page.
+
+Deleting a value therefore does **not** touch the data page at all: the handle-table entry becomes a `Deleted` tombstone, while the slot keeps its `SLOT_FLAG_LIVE` bit and its payload bytes. (That has a consequence worth knowing for the encryption threat model: a deleted inline value is not scrubbed from the page, it merely becomes unreachable.) Liveness is tracked out-of-band by `SlotPacker`'s per-page live-slot counts, not by anything on the page — which is why `DataPage::used_space` and `DataPage::iter_live`, reading only the on-page flags, still report those orphaned slots as live.
 
 `free_end - free_start` is the available space; insert fails (rather than violating the invariant) if it can't fit a new entry plus its data.
 
@@ -426,7 +428,7 @@ bytes              | field                         | type
 8184..8192         | XXH3 checksum                 | u64 LE
 ```
 
-`HandleFlags` (the byte at entry-relative offset 10): `Live = 0x01` (page_id points to a data-page slot), `Overflow = 0x02` (page_id points to the first overflow chain page), `Deleted = 0x00` (tombstone — the slot stays allocated, but `lookup` reports the handle as absent). `Deleted == 0x00` is deliberate and load-bearing: a freshly zeroed leaf page reads as all-tombstone, so `create_root`/`grow` can simply zero-fill a page, and a zero child pointer in an interior page is unambiguously "no child" (any flags byte that is not `0x01` or `0x02` decodes as `Deleted`). Tombstones are why handles are never reused: the slot is "burned" forever.
+`HandleFlags` (the byte at entry-relative offset 10): `Live = 0x01` (page_id points to a data-page slot), `Overflow = 0x02` (page_id points to the first overflow chain page), `Deleted = 0x00` (tombstone — the slot stays allocated, but `lookup` reports the handle as absent). `Deleted == 0x00` is deliberate and load-bearing: a freshly zeroed leaf page reads as all-tombstone, so `create_root`/`grow` can simply zero-fill a page, and a zero child pointer in an interior page is unambiguously "no child" (any flags byte that is not `0x01` or `0x02` decodes as `Deleted`). Tombstones are why a committed handle is never reused: the slot is "burned" forever. (Handles minted by a transaction that rolls back or is lost to crash recovery are re-minted — see [Handle stability](#handle-stability).)
 
 #### Interior page layout
 
@@ -449,7 +451,7 @@ bytes              | field                         | type
 
 The "0 child = unallocated" sentinel relies on page 0 being a superblock and therefore never a handle-table page (I8). The descent loop in `find_leaf` short-circuits to `Ok(None)` when it sees a 0 child, and also when the requested handle is `>= capacity()` (I26 — without that bounds check, the offset arithmetic walked into the checksum bytes).
 
-The flag byte at position 1 is forensic-only — no runtime code reads `FLAG_LEAF`/`FLAG_INTERIOR`; the depth walk uses child-pointer presence instead. The flag is kept because a hex-dump reader can use it to tell leaf from interior at a glance.
+The flag byte at position 1 carries `FLAG_LEAF` / `FLAG_INTERIOR` and is **part of the depth-recovery contract, not decoration**. `HandleTable::recover_depth` walks the left spine and reads it as the primary loop terminator (`if buf[1] != FLAG_INTERIOR { break; }`); the zero-child check is only the secondary terminator. That walk runs on every open and every rollback, and its result is the descent depth for every subsequent lookup — so a page written without the correct flag byte makes `recover_depth` under-report, every committed handle mis-descends, and `lookup` returns `Ok(None)` (surfacing as `InvalidHandle` for live data) with no checksum or type-tag error to signal it. Being human-readable in a hex dump is a bonus, not the reason it exists.
 
 ### Membership index pages (chunk tags)
 
@@ -528,7 +530,18 @@ The tree is consumed during commit's `persist_freemap`: pages freed during the t
 
 ### Handle stability
 
-A handle is a `u64` returned by `allocate()`. Handles are assigned monotonically from `next_handle` (a counter in the superblock) and **never reused** within a database's lifetime, even after delete. Delete writes a tombstone (`HandleFlags::Deleted`) into the leaf entry; the slot stays allocated, the page stays valid, but `lookup` reports `Ok(None)` and the user-facing API returns `InvalidHandle`. This permanent-burn policy makes handles safe to embed in long-lived references without a stale handle later pointing at unrelated data after a delete-and-realloc cycle.
+A handle is a `u64` returned by `allocate()`. Handles are assigned monotonically from `next_handle` (a counter in the superblock) and, **once committed, are never reused** — not even after delete. Delete writes a tombstone (`HandleFlags::Deleted`) into the leaf entry; the slot stays allocated, the page stays valid, but `lookup` reports `Ok(None)` and the user-facing API returns `InvalidHandle`. Within that scope the permanent-burn policy holds: a handle that was committed and later deleted will never come back pointing at different data.
+
+**The "once committed" qualifier is load-bearing.** `next_handle` lives in `Roots`, and every rewind path restores it wholesale: `rollback` (`current_roots = committed_roots.clone()`), `rollback_to` (restores the savepoint's `Roots`), and crash recovery (`next_handle: sb.next_handle` from the last durable superblock). So a handle minted inside a transaction that never commits **is** re-minted:
+
+```rust
+db.begin()?; let h  = db.allocate(a)?; db.rollback()?;
+db.begin()?; let h2 = db.allocate(b)?;   // h2 == h
+```
+
+`HandleEntry` carries no generation or epoch field, so the re-minted id is indistinguishable from the original. The engine's behaviour is right — a rolled-back allocate never happened — but it means a handle is only safe to embed in a long-lived external reference *after the transaction that created it has committed*. Handing an uncommitted handle to a log line, an external index, or another process and reading it back after a rollback is a use-after-free at the handle level, and nothing in the format will catch it. (`src/recovery_tests.rs` pins the crash-recovery half of this: after recovery a fresh allocate reuses the lost transaction's id.)
+
+Making uncommitted handles safe to embed would require a generation counter in `HandleEntry` — an on-disk format change, not something the current format provides.
 
 The radix-tree indirection means values can move freely on disk — `update()` to a larger value, `defrag()` consolidation, future page-format upgrades — without changing the handle the caller holds.
 
@@ -578,13 +591,19 @@ The no-spill commit cost is **3 fsyncs**: pre-drain flush (I28) + main-pages flu
 
 ### Slot packing and overflow
 
-Values up to `MAX_INLINE_VALUE` (~`PAGE_BODY_SIZE`) are stored inline in a data-page slot. Larger values get an overflow chain; the slot directory entry then points at the first chain page id with `HandleFlags::Overflow` set, and the data-page slot contains the chain head pointer rather than the value itself.
+Values up to `MAX_INLINE_VALUE` (~`PAGE_BODY_SIZE`) are stored inline in a data-page slot. Larger values get an overflow chain, and that path allocates **no data page and no slot at all**: the `HandleEntry` itself carries `HandleFlags::Overflow`, with `page_id` pointing directly at the first chain page and `slot_index = 0` (an unused placeholder, not a real slot). `HandleFlags` is a field of the handle-table entry, not of a data-page slot-directory entry — the slot directory has no flag but `SLOT_FLAG_LIVE`.
 
-Slot packing (R1) means a single data page can hold many small values; freed slots become tombstones until `compact()` reclaims the space. Compact is invoked by `defrag()` (R3), which selectively rewrites pages whose live-slot count falls below a threshold.
+This matters to the R1 live-slot accounting: overflow entries contribute nothing to it. `open_existing` counts only entries with `flags == HandleFlags::Live`, and `update`/`delete` release an overflow value by walking the chain into `txn_freed_pages` while deliberately *not* calling `release_data_slot`. Adding slot accounting for the phantom overflow slot would decrement a count that was never incremented, and a still-referenced page would then be pushed to `txn_freed_pages`.
+
+Slot packing (R1) means a single data page can hold many small values. Freeing a slot decrements the page's live-slot count in `SlotPacker` and nothing more — the on-page directory entry is untouched, and `insert()` never reuses the space. Reclamation is whole-page: when a page's live count reaches zero, `SlotPacker::release` pushes the page id to `txn_freed_pages` and it returns to the freemap on commit.
+
+`defrag()` (R3) is what drives a sparse page to that point. It does not compact anything in place; it relocates the page's remaining live values via `update`, which writes them into other pages, until the source page's live count drains to zero and the whole page is freed.
 
 ### Freemap reclamation
 
-Free pages enter the freemap during commit's `persist_freemap`: the transaction's `txn_freed_pages` (collected from `delete()` calls) are marked free in the COW radix tree, touching (and COW-rewriting) only the leaves and spine nodes that cover the freed ids. Subsequent transactions then prefer freemap-reuse over file extension when allocating new data pages — `allocate_data_page` tries `FreeMapTree::allocate_first` first, falls back to `cache.new_page` if the freemap is empty or exhausted.
+Free pages enter the freemap during commit's `persist_freemap`: the transaction's `txn_freed_pages` (collected from `delete()` calls) are marked free in the COW radix tree, touching (and COW-rewriting) only the leaves and spine nodes that cover the freed ids. Subsequent transactions then prefer freemap-reuse over file extension — `freemap::cow_alloc`, reached through `FreemapRecycle::cow_alloc_into`, tries `FreeMapTree::allocate_first` first and falls back to `cache.new_page` if the freemap is empty or exhausted.
+
+`cow_alloc` is the single freemap-aware allocator, and it is not just for data pages. Data-page inserts reach it through `insert_into_data_page`; handle-table COW and membership-index COW reach it by injecting `|c| self.freemap.cow_alloc_into(c, &mut tree, reuse)` as the `alloc` closure that `HandleTable::insert` / `delete` and the membership-index mutators call. Routing those structures through the freemap rather than the monotonic `new_page` is what lets them reach a bounded steady-state page count instead of leaking one page per mutation.
 
 **Structural COW pages.** The freemap's own interior/leaf COW copies and newly-materialized nodes are allocated out-of-band — from an in-memory one-commit-deferred recycle pool of dead freemap pages, falling back to file extension — NEVER from the freemap's own bitmap. Sourcing from the bitmap would recurse: clearing a bit COWs a leaf, which needs a structural page, which clears another bit, and so on without bound. The recycle pool has a one-commit defer: a page superseded in transaction T is not reusable until T commits (it is still referenced by the pre-T superblock). In steady state each commit supersedes and consumes a similar small number of structural pages, so the file's high-water stays flat under sustained churn.
 
@@ -592,9 +611,9 @@ Free pages enter the freemap during commit's `persist_freemap`: the transaction'
 
 **Session-COW dedup.** Within one transaction, each freemap node is COW'd at most once. A second mutation to an already-COW'd node edits it in place (no new `extend`, no new supersede). Without this, K frees into one leaf would extend and supersede K intermediate leaf copies. The `session_owned` set in the transient `FreeMapTree` handle records every page this transaction has COW'd or materialized; re-encounters are in-place edits. It is transient working state, never serialized.
 
-There is one carve-out for data allocation: freemap-reuse is disabled while any savepoint is active (`allocate_data_page` checks `savepoints.is_empty()`). A `rollback_to` would need a per-savepoint freemap snapshot to restore data-reuse decisions; the v1 simplification is "no reuse during savepoint scopes," which keeps the rollback path simple.
+Freemap-reuse is disabled entirely while any savepoint is active. This is not a data-page carve-out: `reuse = self.savepoints.is_empty()` is computed at every `cow_alloc_into` call site and gates reuse for data pages, handle-table COW and membership-index COW alike. A `rollback_to` would need a per-savepoint freemap snapshot to restore reuse decisions; the v1 simplification is "no reuse during savepoint scopes," which keeps the rollback path simple.
 
-Overflow pages and handle-table COW pages do *not* go through `allocate_data_page` (they call `cache.new_page` directly and always extend), but their *frees* still feed the freemap on commit, so delete-heavy workloads still reach equilibrium via data-page reuse.
+Overflow-chain pages are the one allocation site that still bypasses the freemap allocator — they call `cache.new_page` directly and always extend. Their *frees* still feed the freemap on commit, so delete-heavy workloads reach equilibrium through reuse by the other allocation sites.
 
 ### Named roots
 
@@ -606,7 +625,7 @@ The fixed table size (8 entries × 32-byte slots) is intentional: it keeps the s
 
 `defrag()` consolidates sparse data pages: it identifies pages whose live-slot count falls below a threshold and re-inserts their live values, freeing the source pages for reclamation. Defrag runs *inside* an active transaction so it composes with other work and is atomic on commit.
 
-The cap parameter (`DefragOptions::max_pages`) bounds the number of *values* relocated in one pass, despite the legacy name (kept for API stability; see C4 in ISSUES.md).
+The cap parameter (`DefragOptions::max_values`) bounds the number of values relocated in one pass; `0` means no cap.
 
 ### Poison model
 
@@ -708,9 +727,9 @@ Bulk DEK rotation (re-encrypting every page under a fresh DEK) is deferred; see 
 - **Poison** — the state a `TransactionManager` enters after any fatal error. Every subsequent call returns `Poisoned` until the handle is dropped and the database reopened.
 - **Shadow paging** — the durability technique Chisel uses: writes go to new pages; commit swaps a superblock pointer; old state stays intact for crash recovery.
 - **Slot packing (R1)** — multiple values per data page. Each value occupies one slot; the slot directory grows forward and value data grows backward from the page's checksum.
-- **Slot tombstone** — a slot directory entry with `SLOT_FLAG_DEAD`. Reclaimed by `compact()`, not reused by `insert()`.
+- **Dead slot** — a data-page slot whose handle-table entry has been tombstoned. Nothing marks it on the page (it keeps `SLOT_FLAG_LIVE`); it is dead only in `SlotPacker`'s live-slot count. Never reused by `insert()`, and reclaimed only when the entire page is freed.
 - **Stride** — the on-disk unit size read/written per page: `PAGE_SIZE` (8192) plaintext, `ENC_PAGE_SIZE` (8232) encrypted. Recorded in the crypto-header; set on `PageIo` via `set_stride`.
 - **Superblock** — the page (one of N slots at the file head) that names the current handle-table root, freemap root, membership-index root, named roots, and durability metadata. Picked by `Superblock::select` on open.
-- **Tombstone (handle)** — a `HandleEntry` with `HandleFlags::Deleted`. The slot stays allocated; the handle is permanently retired (never reused). See "permanent-burn policy" in [Handle stability](#handle-stability).
+- **Tombstone (handle)** — a `HandleEntry` with `HandleFlags::Deleted`. The slot stays allocated; the handle is permanently retired and never reused. Applies to committed handles: an id minted by a transaction that rolls back is re-minted, since `next_handle` rewinds with the rest of `Roots`. See "permanent-burn policy" in [Handle stability](#handle-stability).
 - **txn_counter** — monotonically-increasing u64 in every committed superblock. Used by `select` to pick the winner across slots and by the round-robin to decide which slot to write next.
 - **Watermark rollback (I3)** — the rollback strategy: cache + file are truncated to `committed_roots.total_pages`. Pages allocated during the transaction (id ≥ watermark) get dropped; freemap-reused pages (id < watermark) get their dirty cache entries discarded. No undo log. Rollback also re-derives the handle-table and membership-index depths from the restored roots (those in-memory radix depths are not part of the snapshot; I99 / C1).

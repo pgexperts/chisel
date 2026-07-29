@@ -136,8 +136,12 @@ pub struct DefragStats {
 ///   1. Short-circuit if the handle-table root is empty — nothing to do.
 ///   2. Compute the set of SPARSE data pages up front via
 ///      `txm.sparse_data_pages(sparse_threshold)`. A page is sparse if
-///      its live-slot count is at or below `threshold × max_observed`.
-///      Dense pages are left alone.
+///      `live_slots / stored_slots < sparse_threshold` — a per-page density
+///      against the page's OWN stored-slot count, not against the densest
+///      page in the database. (The older relative-to-densest rule was
+///      abandoned because a lone sparse page scores 1.0 against itself and
+///      was never collected; see `sparse_data_pages`.) Dense pages are
+///      left alone.
 ///   3. Snapshot the initial set of data-page IDs (not a count) so we can
 ///      report `pages_freed` at the end as the set difference against the
 ///      final set — a net count delta is the wrong metric here, see the
