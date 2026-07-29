@@ -140,6 +140,13 @@ pub enum SuperblockDefect {
     BadChecksum,
     BadMagic,
     BadCount(u32), // the out-of-range superblock_count value
+    // The file is too short to contain this slot at all. Distinct from
+    // BadMagic: there are no bytes to have magic, so the slot was never
+    // read. Raised by `Chisel::open` for a file that has content but is
+    // shorter than one page — `page_count()` floors such a file to zero
+    // pages, and without a distinct defect the create path could not tell
+    // it apart from an absent file.
+    TooShort,
 }
 
 impl fmt::Display for SuperblockDefect {
@@ -148,6 +155,7 @@ impl fmt::Display for SuperblockDefect {
             SuperblockDefect::BadChecksum => write!(f, "bad checksum"),
             SuperblockDefect::BadMagic => write!(f, "bad magic"),
             SuperblockDefect::BadCount(n) => write!(f, "bad superblock_count {n}"),
+            SuperblockDefect::TooShort => write!(f, "file too short to contain this slot"),
         }
     }
 }

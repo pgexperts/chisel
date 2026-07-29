@@ -522,6 +522,21 @@ impl PageIo {
         Ok(self.cached_page_count.get())
     }
 
+    /// Byte length of the backing store, measured now.
+    ///
+    /// `page_count()` is `len / stride`, so it floors every file shorter than
+    /// one stride-unit to zero and cannot distinguish "empty" from "has bytes
+    /// but not a whole page". `Chisel::open` needs exactly that distinction:
+    /// an empty file is a legitimate create target, a short non-empty one is
+    /// somebody else's data. Unlike `page_count()` this costs a seek, so it is
+    /// for the open path only — not for anything on a hot path.
+    pub fn byte_len(&mut self) -> Result<u64> {
+        match &mut self.backing {
+            Backing::File { file } => Ok(file.seek(SeekFrom::End(0))?),
+            Backing::Memory { bytes } => Ok(bytes.len() as u64),
+        }
+    }
+
     /// Truncate (or extend) the file to exactly `n` stride-units (pages).
     ///
     /// File length is `n * stride` bytes. Used by defrag/truncate paths.

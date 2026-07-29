@@ -329,12 +329,17 @@ pub struct Chisel {
 impl Chisel {
     /// Open or create a Chisel database at `path`.
     ///
-    /// The "exists" check deliberately treats a zero-length file as
+    /// The "exists" check deliberately treats a **zero-length** file as
     /// nonexistent: a freshly-created-but-unwritten file (e.g. from a crash
     /// between `creat(2)` and the first superblock write, or from a user
     /// `touch`) has no valid superblock and must go through the
     /// `create_new` path. Without this, `open_existing` would try to parse
     /// an empty file and fail with a corruption error.
+    ///
+    /// A file that is non-empty but shorter than one page is *not* treated
+    /// as nonexistent. It cannot be a valid database, but it is somebody's
+    /// data, so `open` refuses with `CorruptSuperblock` rather than creating
+    /// over it — regardless of `create_if_missing`.
     ///
     /// Acquires an exclusive `flock` on the file before any parsing, so a
     /// second concurrent `open()` on the same path fails fast with
@@ -343,7 +348,9 @@ impl Chisel {
     /// # Errors
     /// `InvalidSuperblockCount` (the `superblock_count` option is out of
     /// range), `FileNotFound` (no file at `path` and `create_if_missing` is
-    /// false), or `LockFailed` (another handle holds the exclusive flock).
+    /// false), `CorruptSuperblock` (the file has content but is shorter than
+    /// one page, so it cannot be a database and must not be created over),
+    /// or `LockFailed` (another handle holds the exclusive flock).
     /// For an encrypted database: `NoEncryptionKey` (file is encrypted but
     /// no `encryption_key` given), `InvalidEncryptionKey` (key unwraps no
     /// key slot), or `EncryptionNotSupported` (key given for a plaintext
@@ -372,7 +379,7 @@ impl Chisel {
             return Err(ChiselError::FileNotFound);
         }
 
-        let io = PageIo::open(path, options.read_only)?;
+        let mut io = PageIo::open(path, options.read_only)?;
         // I143: decide create-vs-open from the file length observed AFTER the
         // flock is held (page_count() returns the count cached from the post-lock
         // length), NOT from the pre-lock `file_exists` stat. The pre-lock stat
@@ -382,6 +389,37 @@ impl Chisel {
         // stays above only for the create_if_missing gate, which must remain
         // pre-lock so a refused open never materializes an empty file.
         let existed = io.page_count()? > 0;
+        if !existed {
+            // `existed` is `len / stride > 0`, so it is false for BOTH an empty
+            // file and a file that has content but is shorter than one page.
+            // Those two need opposite answers, and only a post-lock length can
+            // tell them apart — the `file_exists` stat above is length-based
+            // but must stay pre-lock, so it cannot serve here.
+            //
+            // Creating over a short non-empty file destroys its contents
+            // irrecoverably, and nothing shorter than a page can be a valid
+            // database, so refuse. A mistyped path that lands on a small user
+            // file is the motivating case.
+            let len = io.byte_len()?;
+            if len > 0 {
+                return Err(ChiselError::CorruptSuperblock {
+                    defects: vec![SlotDefect {
+                        slot: 0,
+                        defect: SuperblockDefect::TooShort,
+                    }],
+                });
+            }
+            // Empty file. The pre-lock gate already refused this when
+            // `create_if_missing` is false, so reaching here with it false
+            // means the file was removed between that stat and our lock —
+            // honour the option rather than creating anyway. (Our own
+            // `.create(true)` has materialized an empty file by now; that is
+            // the pre-existing cost of deciding after the lock, and it is
+            // strictly better than adopting a file we were told not to create.)
+            if !options.create_if_missing {
+                return Err(ChiselError::FileNotFound);
+            }
+        }
         let cache = PageCache::new(
             io,
             options.cache_max_bytes,
