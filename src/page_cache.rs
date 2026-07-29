@@ -21,11 +21,19 @@
 // - `new_page()` allocates a FRESH page_id past the current EOF. It never
 //   overwrites a live page. This is what makes copy-on-write safe: the old
 //   committed page remains untouched on disk until the superblock swap.
-// - `next_page_id` is a monotonic allocator. It is seeded from the file's
-//   page count at open time, and is bumped on every `new_page()`. Rollback
-//   does NOT rewind it (see the note in `discard`); orphaned page IDs are
-//   acceptable because they are reclaimed by the freemap after commit or
-//   simply re-truncated.
+// - `next_page_id` is a monotonic allocator WITHIN a transaction: seeded from
+//   the file's page count at open, bumped on every `new_page()`, and never
+//   rewound while a transaction is in flight. It IS rewound across a
+//   transaction boundary — `truncate()` sets it back to the truncation point
+//   (see its doc), and both `rollback` and `rollback_to` call `truncate` with
+//   the last-committed page count.
+//
+//   So a page id handed out before a rollback is NOT burned: allocate page
+//   100, roll back to a committed total of 90, allocate again, and `new_page`
+//   returns 100 a second time. Any new allocation path must therefore treat a
+//   post-rollback id as potentially aliasing a pre-rollback one and invalidate
+//   cache / spillway / freemap state for the reissued range, exactly as
+//   `truncate` already does.
 // - The cache is a STRICT bound with sidecar overflow. `load_page` evicts
 //   before insertion; `new_page` evicts after insertion. When every page
 //   in the cache is dirty, `maybe_evict` spills the LRU-tail dirty page
@@ -595,10 +603,13 @@ impl PageCache {
     /// committed pages — there is nothing to "undo" on disk, only cached
     /// garbage to throw away.
     ///
-    /// Note: `next_page_id` is deliberately NOT rewound. If rollback freed
-    /// IDs back to the allocator, two concurrent savepoint rollbacks could
-    /// hand the same ID to two different allocations. Leaving `next_page_id`
-    /// monotonic sacrifices a tiny amount of address space for correctness.
+    /// Note: this per-page path does not touch `next_page_id`, but that is a
+    /// property of `discard` alone — it is not the rollback contract. The
+    /// production rollback goes through `truncate`, which DOES rewind the
+    /// allocator; see the module header. (The rationale previously given here
+    /// — that rewinding would let "two concurrent savepoint rollbacks" hand
+    /// the same id to two allocations — never applied: the engine is
+    /// deliberately single-threaded and single-client.)
     ///
     /// `#[allow(dead_code)]`: the original rollback path called this
     /// per-page. Post-I3 (watermark rollback) the production path uses
@@ -1678,6 +1689,33 @@ mod tests {
         assert_eq!(cache.spillway.as_ref().unwrap().slot_count(), 2);
         cache.discard_all_dirty();
         assert_eq!(cache.spillway.as_ref().unwrap().slot_count(), 0);
+    }
+
+    #[test]
+    /// PAGE-IO-1: the module header used to assert that rollback never
+    /// rewinds `next_page_id`, so a page id handed out before a rollback could
+    /// never be reissued. `truncate` — which is what `rollback` and
+    /// `rollback_to` call — does rewind it, and the very next `new_page`
+    /// hands the same id out again. Pinned here because the false version
+    /// invited callers to skip invalidation for a reissued range.
+    fn truncate_rewinds_the_allocator_so_ids_are_reissued() {
+        let (_dir, mut cache) = fresh_cache(16);
+        for _ in 0..6 {
+            cache.new_page().unwrap();
+        }
+        assert_eq!(cache.next_page_id(), 6);
+
+        // What rollback does: truncate back to the last committed page count.
+        cache.truncate(3).unwrap();
+        assert_eq!(
+            cache.next_page_id(),
+            3,
+            "truncate must rewind the allocator, not leave it monotonic"
+        );
+
+        // And the ids really do come back around.
+        assert_eq!(cache.new_page().unwrap(), 3);
+        assert_eq!(cache.new_page().unwrap(), 4);
     }
 
     #[test]

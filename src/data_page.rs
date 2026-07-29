@@ -159,10 +159,17 @@ impl DataPage {
     // The returned slot index is always the pre-insertion slot_count, making
     // indices monotonically increasing and stable for the page's lifetime.
     //
-    // Note (v1 simplification per ARCHITECTURE.md): the transaction layer calls
-    // PageCache::new_page() for every insert rather than scanning existing
-    // pages for free slots. Intentional, not a bug — this function itself is
-    // correct; it's just underutilized.
+    // The multi-slot machinery here is load-bearing, not spare capacity. Under
+    // R1 packing the transaction layer keeps an insert cursor — a data page
+    // allocated earlier in the SAME transaction that still has room — and every
+    // value is appended to it through this function. `PageCache::new_page` is
+    // called only when the cursor fills (this returns None) or when packing is
+    // disabled because a savepoint is active. See `transaction::packing`.
+    //
+    // This comment previously said the opposite: that the transaction layer
+    // allocated a fresh page per insert and that this function was "correct,
+    // just underutilized". Do not simplify the slot-directory append path on
+    // that basis — it now runs for every non-first insert in a transaction.
     pub fn insert(buf: &mut [u8; PAGE_SIZE], value: &[u8]) -> Option<u16> {
         let (free_start, free_end, slot_count) = Self::validate_header(buf)?;
         let needed = SLOT_ENTRY_SIZE + value.len();
