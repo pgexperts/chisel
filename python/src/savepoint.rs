@@ -97,11 +97,18 @@ impl PySavepoint {
     }
 
     // Explicit rollback_to(): same idempotency-as-error policy as
-    // release(). The engine pops the savepoint stack down to AND
-    // including this savepoint, so the mark itself is gone after
-    // one successful call — a second call would fail at the engine
-    // layer with SavepointNotFound regardless. The guard here turns
-    // that into a cleaner, more specific AlreadyFinishedError.
+    // release(). Note that the engine does NOT remove this savepoint —
+    // `rollback_to_inner` ends with `savepoints.truncate(idx + 1)`, which
+    // pops only the savepoints layered ON TOP and deliberately retains
+    // this one so it can be rolled back to again or released
+    // (src/transaction/savepoints.rs:47-49). So a second engine-level
+    // rollback_to would SUCCEED, not fail with SavepointNotFound.
+    //
+    // The guard is therefore load-bearing, not a re-labelling of an error
+    // the engine would raise anyway: it is the only thing enforcing the
+    // Python contract that a Savepoint object is single-use, which is what
+    // makes `with`-block exit and an explicit call unambiguous. Removing it
+    // would silently turn repeated rollback_to into a working operation.
     fn rollback_to(&self, py: Python<'_>) -> PyResult<()> {
         if self.finished.load(Ordering::SeqCst) {
             return Err(already_finished_err());
