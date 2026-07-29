@@ -273,7 +273,7 @@ fn parse_sample_json(path: &Path) -> Result<Option<TimingStats>, Box<dyn std::er
 /// browsing; the archive's job is reproducibility (so the markdown
 /// numbers can be regenerated from the archive if target/ is wiped).
 ///
-/// 165 cells × 2 small JSON files ≈ 330 KB total archive size.
+/// 230 cells × 2 small JSON files ≈ 460 KB total archive size.
 pub fn copy_raw_archive(criterion_dir: &Path, raw_out_dir: &Path) -> std::io::Result<()> {
     for entry in walkdir::WalkDir::new(criterion_dir)
         .into_iter()

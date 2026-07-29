@@ -142,8 +142,15 @@ fn render_methodology_footer() -> &'static str {
      [`summary.md`](summary.md) in the same directory for the full per-cell\n\
      detail (p50, p95, total wall clock, file-size delta, and Chisel-internal\n\
      counter snapshots) and [the architecture doc](../../../ARCHITECTURE.md#benchmark-infrastructure)\n\
-     for the bench-suite layout and workload definitions. Each engine takes\n\
-     a single fsync per commit through the disk write cache; numbers depend\n\
+     for the bench-suite layout and workload definitions.\n\
+     \n\
+     The three engines do not perform equal work per commit, and the\n\
+     throughput numbers should be read against that. Chisel's shadow-paging\n\
+     protocol performs **three** fsyncs per commit (pre-drain flush, data\n\
+     pages, then the superblock swap); redb commits at\n\
+     `Durability::Immediate`; SQLite runs in WAL mode with\n\
+     `synchronous=FULL`, plus `fullfsync=ON` so that on macOS it issues the\n\
+     same `F_FULLFSYNC` Chisel does rather than a plain fsync. Numbers depend\n\
      on the platform's storage stack and are not portable across machine\n\
      classes.\n"
 }
