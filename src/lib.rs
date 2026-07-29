@@ -874,9 +874,11 @@ impl Chisel {
 
     /// Summary statistics derived by scanning the current handle table and
     /// querying the underlying file length. `file_size_bytes` is computed
-    /// from `page_count * PAGE_SIZE` rather than `stat(2)` so it reflects
+    /// from `page_count * stride` rather than `stat(2)` so it reflects
     /// the page-aligned view the engine has, not any trailing partial page
-    /// that might exist mid-extend.
+    /// that might exist mid-extend. `stride` is the on-disk unit size —
+    /// `PAGE_SIZE` for a plaintext database, `ENC_PAGE_SIZE` (8232) for an
+    /// encrypted one, whose per-page nonce and tag make every unit larger.
     ///
     /// # Errors
     /// Only on poisoning — a fatal `IoError` while scanning the handle table or
@@ -904,7 +906,7 @@ impl Chisel {
             // behaviour is the right semantic here: "as big as a u64
             // can represent" is closer to truth than "wrapped to a
             // small number".
-            file_size_bytes: page_count.saturating_mul(PAGE_SIZE as u64),
+            file_size_bytes: page_count.saturating_mul(self.txm.file_stride() as u64),
             spillway_logical_bytes: spillway_cap.map(|(logical, _)| logical),
             spillway_max_bytes: spillway_cap.map(|(_, max)| max),
         })
@@ -924,9 +926,10 @@ impl Chisel {
     }
 
     /// Page-aligned on-disk size of the database, computed as
-    /// `page_count × PAGE_SIZE`. Same number `stats().file_size_bytes`
-    /// returns, but without the handle-table scan that `stats()` does
-    /// to populate `handle_count`.
+    /// `page_count × stride` — where `stride` is `PAGE_SIZE` for a plaintext
+    /// database and `ENC_PAGE_SIZE` (8232) for an encrypted one. Same number
+    /// `stats().file_size_bytes` returns, but without the handle-table scan
+    /// that `stats()` does to populate `handle_count`.
     ///
     /// I53 (ISSUES.md, 2026-05-22): broken out for the bench harness,
     /// which calls this per measurement cell — `stats()` walks all
@@ -940,7 +943,7 @@ impl Chisel {
     /// Only on poisoning (a fatal `IoError` reading the file length).
     pub fn file_size_bytes(&self) -> Result<u64> {
         let page_count = self.txm.file_page_count()?;
-        Ok(page_count.saturating_mul(PAGE_SIZE as u64))
+        Ok(page_count.saturating_mul(self.txm.file_stride() as u64))
     }
 
     /// Returns true if this database handle has been poisoned by a

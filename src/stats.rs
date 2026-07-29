@@ -20,8 +20,11 @@ pub struct Stats {
     pub handle_count: u64,
     /// Total allocated pages in the file, matching Superblock.total_pages.
     pub total_pages: u64,
-    /// Raw size of the database file on disk. May exceed
-    /// `total_pages * PAGE_SIZE` when a previous crash left orphan
+    /// Raw size of the database file on disk: `page_count × stride`, where
+    /// `stride` is `PAGE_SIZE` for a plaintext database and `ENC_PAGE_SIZE`
+    /// (8232) for an encrypted one — an encrypted page carries a 24-byte
+    /// nonce and a 16-byte tag on top of its 8192 plaintext bytes. May exceed
+    /// `total_pages * stride` when a previous crash left orphan
     /// pages in the file tail — the last-durable superblock's
     /// `total_pages` is authoritative, anything beyond it is dead
     /// weight that the next allocation will overwrite (see I4).
