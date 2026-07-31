@@ -18,15 +18,23 @@
 pub struct Stats {
     /// Number of live handles (u64 ids currently mapped in the handle table).
     pub handle_count: u64,
-    /// Total allocated pages in the file, matching Superblock.total_pages.
+    /// PHYSICAL page count: how many whole stride-units the file currently
+    /// holds, from `PageIo::page_count`. This is NOT `Superblock.total_pages`,
+    /// which is the last-durable *logical* count. The two diverge when a
+    /// previous crash left orphan pages in the file tail: those pages are
+    /// counted here but are dead weight the next allocation will overwrite,
+    /// and the superblock's figure remains the authoritative one for what the
+    /// database actually contains.
     pub total_pages: u64,
-    /// Raw size of the database file on disk. May exceed
-    /// `total_pages * PAGE_SIZE` when a previous crash left orphan
-    /// pages in the file tail — the last-durable superblock's
-    /// `total_pages` is authoritative, anything beyond it is dead
-    /// weight that the next allocation will overwrite (see I4).
-    /// Chisel is single-writer, so there is no concurrent commit
-    /// that could cause a transient divergence.
+    /// Raw size of the database file on disk, as `total_pages × stride` —
+    /// `stride` being `PAGE_SIZE` for a plaintext database and
+    /// `ENC_PAGE_SIZE` (8232) for an encrypted one, whose pages each carry a
+    /// 24-byte nonce and a 16-byte tag on top of their 8192 plaintext bytes.
+    ///
+    /// Since both fields come from the same physical page count, this is
+    /// exactly `total_pages × stride` and never diverges from it. It is a
+    /// page-aligned figure rather than a `stat(2)` call, so it will not
+    /// reflect a trailing partial page mid-extend.
     pub file_size_bytes: u64,
     /// I74 (ISSUES.md, 2026-05-22): current spillway logical-bytes in
     /// flight (`PAGE_SIZE` × LIVE resident spilled pages — a page read back

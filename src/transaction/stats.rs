@@ -80,6 +80,20 @@ impl TransactionManager {
         self.poison_on_fatal(result)
     }
 
+    /// On-disk bytes per page-unit: `PAGE_SIZE` (8192) for a plaintext
+    /// database, `ENC_PAGE_SIZE` (8232) for an encrypted one. The counts
+    /// returned by `file_page_count` are in these units, so any caller
+    /// converting pages to bytes must multiply by THIS, not by the
+    /// hardcoded `PAGE_SIZE` — see `open_existing`'s FileSizeMismatch
+    /// arithmetic, which has always used the live stride.
+    ///
+    /// Infallible and poison-independent: the stride is fixed for the life
+    /// of the file and read from memory, so there is no I/O to fail and
+    /// nothing a fatal error could invalidate.
+    pub fn file_stride(&self) -> usize {
+        self.cache.borrow().io().stride()
+    }
+
     // --- Selective defragmentation support (ISSUES.md R3 + I17) ---
     //
     // These methods expose just enough of the R1 live-slot tracking

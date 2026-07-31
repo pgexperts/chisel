@@ -141,3 +141,56 @@ dual_backing_test!(test_nested_savepoints, test_nested_savepoints_body);
 // under the I35 pub→pub(crate) reshape. The Chisel-public-API equivalent
 // (open path + commit + reopen + read) is covered by `test_chisel_reopen`
 // in tests/basic_ops.rs.
+
+// A handle's "never reused" guarantee covers COMMITTED handles only. The
+// counter that mints them (`next_handle`) lives in the roots snapshot, so
+// every rewind path restores it and the id is handed out again — for
+// different bytes, with nothing in the entry to distinguish the two.
+//
+// This is correct behaviour (a rolled-back allocate never happened), but it
+// is the exact thing ARCHITECTURE.md's "Handle stability" section and
+// `Chisel::allocate`'s rustdoc now warn callers about, so it is pinned here.
+// The crash-recovery arm of the same property is pinned by
+// `src/recovery_tests.rs`; this covers the two in-process rewind paths.
+fn test_uncommitted_handle_is_reminted_body(b: &Backing) {
+    let mut db = open_chisel(b);
+
+    // Rewind path 1: rollback.
+    db.begin().unwrap();
+    let h = db.allocate(b"rolled-back").unwrap();
+    db.rollback().unwrap();
+
+    db.begin().unwrap();
+    let h2 = db.allocate(b"different-bytes").unwrap();
+    db.commit().unwrap();
+
+    assert_eq!(
+        h, h2,
+        "next_handle rewinds with the roots snapshot, so a rolled-back id is re-minted"
+    );
+    assert_eq!(
+        db.read(h).unwrap(),
+        b"different-bytes",
+        "the re-minted handle resolves to the NEW value — a caller holding the old \
+         id reads unrelated data with no error"
+    );
+
+    // Rewind path 2: rollback_to a savepoint.
+    db.begin().unwrap();
+    db.savepoint("sp").unwrap();
+    let h3 = db.allocate(b"inside-savepoint").unwrap();
+    db.rollback_to("sp").unwrap();
+    let h4 = db.allocate(b"after-rollback-to").unwrap();
+    db.commit().unwrap();
+
+    assert_eq!(
+        h3, h4,
+        "rollback_to restores the savepoint's roots, next_handle included"
+    );
+    assert_eq!(db.read(h3).unwrap(), b"after-rollback-to");
+}
+
+dual_backing_test!(
+    test_uncommitted_handle_is_reminted,
+    test_uncommitted_handle_is_reminted_body
+);

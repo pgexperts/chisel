@@ -229,10 +229,17 @@ impl Engine for SqliteEngine {
     // Switching journal_mode to DELETE is the bulletproof variant: the
     // PRAGMA refuses to return until the WAL is fully drained into the
     // main .db AND the -wal/-shm siblings are deleted. The .db file
-    // becomes a genuinely self-contained rollback-journal-mode database
-    // that file-copies cleanly. Each cell-runner re-enters WAL mode via
-    // open_file's existing PRAGMA on open, so no behavioral change
-    // downstream of this call.
+    // becomes a genuinely self-contained database that file-copies
+    // cleanly.
+    //
+    // The mode is then flipped straight back to WAL before returning (see
+    // the body). Leaving it in DELETE and relying on each cell-runner to
+    // re-enter WAL via open_file's PRAGMA — which is what this code did
+    // until the 2026-07-29 review — is only free when the open happens in
+    // setup. The cold-read row opens inside the timed routine, so it
+    // charged every sqlite iteration for a DELETE->WAL conversion that no
+    // other engine performs and no real deployment would perform: pure
+    // harness artifact, inflating the row by orders of magnitude.
     //
     // synchronous=FULL is set first so the DELETE switch's final I/O is
     // fsync'd even when the engine was opened in Unsafe mode
@@ -273,6 +280,42 @@ impl Engine for SqliteEngine {
             )
             .into());
         }
+        // The DELETE flip above has done its job — the WAL is drained and the
+        // siblings are gone — so put the file back in the mode a real SQLite
+        // deployment (and every other harness open) runs in. This is the
+        // snapshot's resting state, and it is the only chance to pay for the
+        // conversion outside a timed region: the cold-read row opens the
+        // engine INSIDE `b.iter_batched`'s routine, where `open_file`'s
+        // unconditional `PRAGMA journal_mode = WAL` would otherwise charge
+        // every iteration for an exclusive lock, a header rewrite and an
+        // fsync — an F_FULLFSYNC under `fullfsync=ON` on macOS — on top of
+        // the single read the row claims to measure.
+        //
+        // Nothing is written after this point, so the freshly re-enabled WAL
+        // stays empty and the clean connection close removes the -wal/-shm
+        // siblings again. The main .db keeps every byte the DELETE flip
+        // consolidated into it and stays self-contained under file-copy; only
+        // its header's format version changes.
+        //
+        // `execute_batch`, not `query_row`, and then a SEPARATE read-back.
+        // `query_row("PRAGMA journal_mode = WAL")` reports "wal" while
+        // leaving the file in DELETE: it stops at the first row rather than
+        // stepping the statement to completion, and entering WAL needs the
+        // exclusive lock held to the end of the statement to rewrite the
+        // header. The DELETE direction above tolerates the same call shape,
+        // which is exactly why trusting a pragma's return value is the wrong
+        // check here — verify against the mode the file actually reports.
+        self.conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        let restored: String = self
+            .conn
+            .query_row("PRAGMA journal_mode;", [], |row| row.get(0))?;
+        if restored != "wal" {
+            return Err(format!(
+                "flush_for_snapshot: journal_mode restore left the file in {restored:?}, \
+                 expected \"wal\" (every cold-read iteration would time a mode conversion)"
+            )
+            .into());
+        }
         Ok(())
     }
 }
@@ -304,5 +347,67 @@ mod tests {
             .query_row("PRAGMA fullfsync;", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, 0, "Unsafe mode must NOT enable fullfsync");
+    }
+
+    /// A snapshot must come out of `flush_for_snapshot` with BOTH properties
+    /// the harness depends on, not one at the expense of the other:
+    ///
+    ///   1. self-contained — no sibling journal files, so `std::fs::copy` of
+    ///      the .db alone yields a re-openable database (why the DELETE flip
+    ///      exists at all); and
+    ///   2. already in WAL mode — so the cold-read row's timed `open_file`,
+    ///      which runs inside `b.iter_batched`'s routine, finds the mode it
+    ///      wants and does no conversion (BENCH-3).
+    ///
+    /// Property 2 is what regressed: the DELETE flip satisfied 1 and left 2
+    /// to `open_file`, which is free only when the open is in setup.
+    #[test]
+    fn flush_for_snapshot_leaves_a_self_contained_wal_mode_file() {
+        let tmp = NamedTempFile::new().unwrap();
+        let value = vec![7u8; 512];
+
+        let id = {
+            let mut engine =
+                SqliteEngine::open_file(tmp.path(), 64, DurabilityMode::Strict).unwrap();
+            engine.begin().unwrap();
+            // Enough rows to put real content in the WAL, so the DELETE flip
+            // has something to drain rather than trivially succeeding.
+            let mut first = None;
+            for _ in 0..256 {
+                let id = engine.allocate(&value).unwrap();
+                first.get_or_insert(id);
+            }
+            engine.commit().unwrap();
+            engine.flush_for_snapshot().unwrap();
+            first.unwrap()
+        }; // drop closes the connection
+
+        // Property 1: nothing but the .db survives.
+        for ext in ["-wal", "-shm"] {
+            let sibling = PathBuf::from(format!("{}{}", tmp.path().display(), ext));
+            assert!(
+                !sibling.exists(),
+                "{} must not survive flush_for_snapshot",
+                sibling.display()
+            );
+        }
+
+        // Property 2: queried on a bare connection, so `open_file`'s own
+        // `PRAGMA journal_mode = WAL` cannot be what makes this pass.
+        let probe = Connection::open(tmp.path()).unwrap();
+        let mode: String = probe
+            .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+            .unwrap();
+        drop(probe);
+        assert_eq!(
+            mode, "wal",
+            "snapshot left in {mode:?}; a timed cold-read open would pay for the conversion"
+        );
+
+        // Both properties together: the file-copy still re-opens and reads.
+        let copy = NamedTempFile::new().unwrap();
+        std::fs::copy(tmp.path(), copy.path()).unwrap();
+        let engine = SqliteEngine::open_file(copy.path(), 64, DurabilityMode::Strict).unwrap();
+        assert_eq!(engine.read(id).unwrap(), value);
     }
 }

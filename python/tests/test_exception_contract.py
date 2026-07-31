@@ -23,15 +23,17 @@ import pytest
 
 
 def test_savepoint_not_found_via_rollback_to(mem_db):
-    # Build a stack [sp1, sp2], then use sp1.rollback_to() which pops BOTH
-    # sp1 and sp2 from the engine.  The sp2 Python object still exists and
-    # its guard is NOT set (we never called sp2.release/rollback_to), so
-    # sp2.release() goes to the engine which no longer knows "sp2" →
-    # SavepointNotFoundError.
+    # Build a stack [sp1, sp2], then use sp1.rollback_to(), which pops
+    # everything layered ON TOP of sp1 — so sp2 goes and sp1 stays (the
+    # engine retains the named savepoint so it can be rolled back to again;
+    # src/transaction/savepoints.rs:47-49).  The sp2 Python object still
+    # exists and its guard is NOT set (we never called
+    # sp2.release/rollback_to), so sp2.release() goes to the engine, which
+    # no longer knows "sp2" → SavepointNotFoundError.
     with mem_db.transaction() as tx:
         sp1 = tx.savepoint("sp1")
         sp2 = tx.savepoint("sp2")
-        sp1.rollback_to()  # pops both sp1 and sp2 from the engine stack
+        sp1.rollback_to()  # pops sp2; sp1 itself remains on the engine stack
         # sp2's guard is still clear → this reaches the engine → not found
         with pytest.raises(chisel.SavepointNotFoundError) as exc_info:
             sp2.release()
@@ -43,7 +45,7 @@ def test_savepoint_not_found_via_release(mem_db):
     with mem_db.transaction() as tx:
         sp1 = tx.savepoint("sp1")
         sp2 = tx.savepoint("sp2")
-        sp1.rollback_to()  # pops sp1 and sp2
+        sp1.rollback_to()  # pops sp2; sp1 itself remains on the engine stack
         with pytest.raises(chisel.SavepointNotFoundError) as exc_info:
             sp2.rollback_to()
     assert isinstance(exc_info.value, chisel.OperationalError)

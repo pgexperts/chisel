@@ -329,10 +329,19 @@ impl Superblock {
         buf
     }
 
-    /// Build the AAD that binds the sealed body and each key-slot's DEK wrap to
-    /// this superblock's plaintext identity. The four bootstrap fields that stay
-    /// cleartext in both encrypted and plaintext DBs are included; this prevents
-    /// transplanting a sealed body from a different DB or a different txn_counter.
+    /// Build the AAD that binds THE SEALED BODY to this superblock's plaintext
+    /// identity. The four bootstrap fields that stay cleartext in both
+    /// encrypted and plaintext DBs are included; this prevents transplanting a
+    /// sealed body from a different DB or a different txn_counter.
+    ///
+    /// Scope note: this covers the body and nothing else. The key-slot DEK
+    /// wraps do NOT use it — `wrap_dek`/`unwrap_dek` authenticate against
+    /// `KeySlot::aad()`, which is slot-local (state, kdf_id, Argon2 params,
+    /// salt, wrap_nonce) and carries no superblock identity or generation.
+    /// A key slot is therefore not cryptographically pinned to the superblock
+    /// generation it was written in. Do not read this function's existence as
+    /// evidence that it is; binding wraps to the superblock generation would
+    /// mean extending the wrap AAD, not reusing this one.
     ///
     /// These four MUST stay cleartext even in an encrypted DB precisely because
     /// they are the AAD: slot selection (`max_by_key` on `txn_counter`) and this

@@ -39,5 +39,5 @@ python-source = "."
 features = ["pyo3/extension-module"]
 include = [
     { path = "chisel/py.typed", format = "wheel" },
-    { path = "chisel/chisel.pyi", format = "wheel" },
+    { path = "chisel/__init__.pyi", format = "wheel" },
 ]

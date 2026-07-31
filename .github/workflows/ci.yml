@@ -176,3 +176,22 @@ jobs:
         run: |
           . .venv/bin/activate
           pytest -v
+
+      # Type-check the stub. Until this job existed the stub was inert —
+      # it was named `chisel/chisel.pyi`, which PEP 561 resolves to the
+      # nonexistent module `chisel.chisel`, so no checker ever read it and
+      # stub/impl drift accumulated undetected. Renaming it to
+      # `__init__.pyi` makes it live; this step is what keeps it that way.
+      #
+      # Pinned to --python-version 3.13 rather than the matrix version: the
+      # stub uses `collections.abc.Buffer` (PEP 688), which only exists from
+      # 3.12, so a 3.11 checker would fail on the stub's own imports even
+      # though the package runs fine on 3.11 (PyO3 accepts any
+      # buffer-protocol object at runtime). One pinned check is enough —
+      # the stub's content does not vary by interpreter.
+      - name: Type-check the public stub
+        working-directory: python
+        run: |
+          . .venv/bin/activate
+          pip install mypy
+          mypy --strict --python-version 3.13 chisel/__init__.pyi

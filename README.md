@@ -19,8 +19,8 @@ Chisel is designed for single-writer embedded use: one process holds the file vi
 - **Crash durability** — N configurable superblocks (2–16) with round-robin writes ensure committed data survives crashes. Every page carries an XXH3 checksum for torn-write and bit-rot detection.
 - **Transactions** — begin / commit / rollback with shadow-paging durability (all data pages fsync'd before the superblock fsync; three fsyncs per commit).
 - **Savepoints** — PostgreSQL-style named savepoints with `rollback_to` (savepoint preserved for retry) and `release` (merges into the enclosing scope).
-- **Handles** — store a value, get back a `u64` handle. Read, update, or delete by handle. Handles are stable across updates, defrag, and reopens.
-- **Chunk tags** — attach an immutable `u32` tag to a chunk at allocation time; a reverse membership index maps each tag back to its handles. Enumerate a tag's members, delete with a tag-match assertion, or bulk-drop a whole tagged relation in bounded passes. Tag `0` means untagged.
+- **Handles** — store a value, get back a `Handle` (a `u64` newtype). Read, update, or delete by handle. Handles are stable across updates, defrag, and reopens.
+- **Chunk tags** — attach an immutable `Tag` (a non-zero `u32` newtype) to a chunk at allocation time; a reverse membership index maps each tag back to its handles. Enumerate a tag's members, delete with a tag-match assertion, or bulk-drop a whole tagged relation in bounded passes. Untagged is the absence of a tag, not a zero value: `tag()` returns `None`.
 - **Value packing** — slotted data pages pack multiple small values per 8 KB page; values over ~8 KB transparently overflow into chained pages.
 - **Named roots** — a small fixed table in the superblock mapping string names to handles. Survives commit / rollback transactionally.
 - **Defragmentation** — explicit `defrag()` consolidates sparse pages and returns a count-based stats record.
@@ -44,7 +44,7 @@ The published crate is named `chisel-storage` (plain `chisel` was already taken)
 
 ## Quick Start
 
-```rust
+```rust,no_run
 use chisel::{Chisel, Options};
 use std::path::Path;
 
@@ -126,17 +126,22 @@ The macOS APFS runtime gap is real: Chisel uses `fcntl(F_FULLFSYNC)` (durable th
 
 ### Handles
 
-A handle is a stable `u64` returned by `allocate()`. It maps through a radix-tree **handle table** rooted in the superblock to a `(page, slot)` location in a slotted data page. This indirection means values can move internally — during `update()` to a larger value, or during `defrag()` — without changing the handle. Deleted handles are retired and never reused within a database's lifetime.
+A handle is a stable `u64` returned by `allocate()`. It maps through a radix-tree **handle table** rooted in the superblock to a `(page, slot)` location in a slotted data page. This indirection means values can move internally — during `update()` to a larger value, or during `defrag()` — without changing the handle. A handle that reached a commit is retired on delete and never reused. One minted by a transaction that rolls back (or is lost to crash recovery) *is* re-minted, because the counter rewinds with the rest of the roots snapshot — so commit before recording a handle outside the database.
 
 ### Transactions
 
 All mutations require an active transaction. `begin()` opens one, `commit()` makes it durable, `rollback()` discards it. Only one transaction is active at a time — Chisel has savepoints, not nested transactions.
 
 ```rust
+# fn main() -> chisel::Result<()> {
+# use chisel::Chisel;
+# let mut db = Chisel::open_in_memory()?;
 db.begin()?;
 let h1 = db.allocate(b"a")?;
 let h2 = db.allocate(b"b")?;
 db.commit()?;  // both h1 and h2 become durable atomically
+# Ok(())
+# }
 ```
 
 Rollback is effectively free: pages written during the transaction were never linked from a superblock, so they are simply abandoned. There is no undo log to replay.
@@ -150,6 +155,9 @@ Savepoints are named marks within a transaction.
 - `rollback()` (full rollback) and `commit()` both clear the entire savepoint stack.
 
 ```rust
+# fn main() -> chisel::Result<()> {
+# use chisel::Chisel;
+# let mut db = Chisel::open_in_memory()?;
 db.begin()?;
 let keep = db.allocate(b"keep")?;
 db.savepoint("experiment")?;
@@ -157,6 +165,8 @@ let _ = db.allocate(b"maybe discard")?;
 db.rollback_to("experiment")?;  // discards the _ handle; keep remains; sp still open
 db.release("experiment")?;
 db.commit()?;
+# Ok(())
+# }
 ```
 
 ### Named roots
@@ -164,6 +174,9 @@ db.commit()?;
 A small fixed-size table in the superblock mapping short string names to handles, intended for long-lived entry points such as a meta-B-tree root. Changes are transactional: `set_root_name` takes effect on commit and reverts on rollback.
 
 ```rust
+# fn main() -> chisel::Result<()> {
+# use chisel::Chisel;
+# let mut db = Chisel::open_in_memory()?;
 db.begin()?;
 let meta = db.allocate(b"meta-root-payload")?;
 db.set_root_name("meta", meta)?;
@@ -171,6 +184,8 @@ db.commit()?;
 
 // Later, possibly after reopen:
 let meta = db.get_root_name("meta")?.expect("meta root should be set");
+# Ok(())
+# }
 ```
 
 Names are bounded in length and must be valid UTF-8 without embedded NUL; the table has a small fixed capacity. See `TransactionManager::set_root_name` for exact limits.
@@ -180,39 +195,58 @@ Names are bounded in length and must be valid UTF-8 without embedded NUL; the ta
 `defrag()` consolidates sparse data pages: it re-inserts values from pages whose live-slot count falls below a threshold so those pages become fully free and can be reclaimed. It runs inside an active transaction so it composes with other work and commits atomically.
 
 ```rust
-use chisel::defrag::DefragOptions;
+# fn main() -> chisel::Result<()> {
+# use chisel::Chisel;
+# let mut db = Chisel::open_in_memory()?;
+use chisel::DefragOptions;
 
 db.begin()?;
-let stats = db.defrag(DefragOptions {
-    sparse_threshold: 0.25,
-    max_pages: 0,  // 0 = no cap on values relocated
-})?;
+// DefragOptions is #[non_exhaustive]; build it with the chained setters
+// rather than a struct literal.
+let stats = db.defrag(
+    DefragOptions::default()
+        .sparse_threshold(0.25)  // relocate pages under 25% full, per page
+        .max_values(0),          // 0 = no cap on values relocated
+)?;
 db.commit()?;
+# Ok(())
+# }
 ```
 
 ### Chunk tags
 
-`allocate_tagged(value, tag)` attaches an immutable `u32` tag to a chunk and registers it in a reverse membership index. The tag is fixed at allocation: `update` preserves it, and retagging means delete + re-allocate. Tag `0` is the untagged sentinel and is never indexed — use plain `allocate` for untagged values. Plain `delete` is self-maintaining (it drops the handle from the index automatically); `delete_tagged` is the verified variant that errors with `TagMismatch` if the stored tag differs.
+`allocate_tagged(value, tag)` attaches an immutable tag to a chunk and registers it in a reverse membership index. The tag is fixed at allocation: `update` preserves it, and retagging means delete + re-allocate. Plain `delete` is self-maintaining (it drops the handle from the index automatically); `delete_tagged` is the verified variant that errors with `TagMismatch` if the stored tag differs.
+
+A tag is a `Tag`, not a bare `u32` — `Tag` wraps a `NonZeroU32`, so zero is unrepresentable rather than being an "untagged" sentinel you could pass by accident. Untagged means *no tag at all*: allocate with plain `allocate()`, and `tag()` returns `None` for such a handle.
 
 ```rust
+# fn main() -> chisel::Result<()> {
+# use chisel::Chisel;
+# let mut db = Chisel::open_in_memory()?;
+use chisel::Tag;
+
+let tag = Tag::new(42).expect("42 is non-zero");   // or Tag::try_from(42u32)?
+
 db.begin()?;
-let a = db.allocate_tagged(b"row-a", 42)?;
-let _b = db.allocate_tagged(b"row-b", 42)?;
+let a = db.allocate_tagged(b"row-a", tag)?;
+let _b = db.allocate_tagged(b"row-b", tag)?;
 db.commit()?;
 
-assert_eq!(db.tag(a)?, 42);
-let members = db.handles_with_tag(42)?; // both handles; order unspecified, but repeatable within a session
+assert_eq!(db.tag(a)?, Some(tag));      // None for a handle allocated untagged
+let members = db.handles_with_tag(tag)?; // both handles; order unspecified, but repeatable within a session
 assert_eq!(members.len(), 2);
 
 // Bounded relation-drop: loop until the tag is fully drained.
 loop {
     db.begin()?;
-    let progress = db.delete_with_tag(42, 256)?; // up to 256 chunks per pass
+    let progress = db.delete_with_tag(tag, 256)?; // up to 256 chunks per pass
     db.commit()?;
     if progress.complete {
         break;
     }
 }
+# Ok(())
+# }
 ```
 
 ### In-memory mode
@@ -220,8 +254,12 @@ loop {
 `Chisel::open_in_memory()` creates a memory-backed database using a `Vec<u8>`-backed `PageIo`. Same code path, same guarantees except durability — no filesystem, no `flock`, and all data is lost on drop.
 
 ```rust
+# fn main() -> chisel::Result<()> {
+# use chisel::Chisel;
 let mut db = Chisel::open_in_memory()?;
 // ... same API as a file-backed Chisel ...
+# Ok(())
+# }
 ```
 
 For tuned options (cache size, superblock count), use `Chisel::open_in_memory_with_options(options)`.
@@ -235,7 +273,8 @@ Encryption is opt-in and driven entirely through `Options::encryption_key`. A ke
 
 Both variants zeroize their material on drop.
 
-```rust
+```rust,no_run
+# fn main() -> chisel::Result<()> {
 use chisel::{Chisel, Key, Options};
 use std::path::Path;
 use zeroize::Zeroizing;
@@ -246,6 +285,8 @@ let mut db = Chisel::open(
     Path::new("secret.db"),
     Options::default().encryption_key(key),
 )?;
+# Ok(())
+# }
 ```
 
 On create, Chisel generates a random data-encryption key (DEK), encrypts every page under it with XChaCha20-Poly1305, and wraps the DEK under a key-encryption key derived from your supplied key. On reopen, the supplied key must unwrap one of the on-disk key slots or `open` fails with `InvalidEncryptionKey`. Supplying a key to a plaintext DB returns `EncryptionNotSupported`; omitting it on an encrypted DB returns `NoEncryptionKey`.
@@ -269,13 +310,13 @@ See [ARCHITECTURE.md#on-disk-encryption](ARCHITECTURE.md#on-disk-encryption) for
 | `savepoint(name)` | Create a named savepoint |
 | `rollback_to(name)` | Undo to savepoint (savepoint preserved) |
 | `release(name)` | Merge savepoint into enclosing scope |
-| `allocate(value)` | Store a value; returns a `u64` handle |
-| `allocate_tagged(value, tag)` | Store a value with an immutable `u32` tag; returns a `u64` handle |
+| `allocate(value)` | Store a value; returns a `Handle` |
+| `allocate_tagged(value, tag)` | Store a value with an immutable `Tag` (non-zero); returns a `Handle` |
 | `read(handle)` | Retrieve a value (takes `&self`) |
 | `update(handle, value)` | Replace a value (handle preserved) |
 | `delete(handle)` | Remove a handle |
 | `delete_many(handles)` | Batch-delete in the current transaction |
-| `tag(handle)` | Read a handle's tag, `0` if untagged (takes `&self`) |
+| `tag(handle)` | Read a handle's tag as `Option<Tag>`; `None` if untagged (takes `&self`) |
 | `handles_with_tag(tag)` | Enumerate live handles carrying `tag`; repeatable within a session, order unspecified (takes `&self`) |
 | `client_byte(handle)` | Read the handle's opaque client byte, `0` if unset (takes `&self`) |
 | `set_client_byte(handle, byte)` | Set the opaque client byte; mutable, transactional; `update()` preserves it |
@@ -295,22 +336,23 @@ See [ARCHITECTURE.md#on-disk-encryption](ARCHITECTURE.md#on-disk-encryption) for
 
 ## Options
 
+`Options` is `#[non_exhaustive]`, so a downstream crate cannot build one with a struct literal. Start from `Options::default()` and use the chained setters — every field has one:
+
 ```rust
-use chisel::Options;
+# fn main() {
+use chisel::{DrainInsertion, Options};
 
-let options = Options {
-    cache_max_bytes: 8 * 1024 * 1024,           // in-memory LRU cap, default 8 MiB
-    spillway_max_bytes: 1024 * 8 * 1024 * 1024, // sidecar overflow file cap, default 8 GiB
-    drain_insertion: chisel::DrainInsertion::LruTail, // default; use Mru to drain at insertion
-    create_if_missing: true,
-    read_only: false,
-    superblock_count: 2,                         // 2..=16; only consulted on create
-    encryption_key: None,                        // Some(key) to create/open an encrypted DB
-    argon2_params: None,                          // None = OWASP defaults; only used on create
-};
+let options = Options::default()
+    .cache_max_bytes(8 * 1024 * 1024)             // in-memory LRU cap, default 8 MiB
+    .spillway_max_bytes(1024 * 8 * 1024 * 1024)   // sidecar overflow file cap, default 8 GiB
+    .drain_insertion(DrainInsertion::LruTail)     // default; use Mru to drain at insertion
+    .create_if_missing(true)
+    .read_only(false)
+    .superblock_count(2);                         // 2..=16; only consulted on create
+// .encryption_key(key) to create/open an encrypted DB;
+// .argon2_params(params) to override the OWASP defaults (create only).
+# }
 ```
-
-`Options` is `#[non_exhaustive]`, so build a customized value with the chained setters rather than a struct literal from another crate: `Options::default().cache_max_bytes(N).encryption_key(key)`. Every field has a matching setter, including `Options::encryption_key(key)` and `Options::argon2_params(params)`.
 
 `cache_max_bytes` is a strict cap on the in-memory LRU cache. When the cache is full and a dirty page cannot be evicted, overflow dirty pages spill to a sidecar `Spillway` file rather than returning an error. The spillway file is bounded by `spillway_max_bytes` (default 8 GiB). Setting `spillway_max_bytes = 0` disables the spillway entirely, restoring the pre-spillway `CacheFull` semantics at the strict cache cap: the operational error `CacheFull` fires when the cache is full and no eviction is possible. With the spillway enabled, exhausting both the cache and the spillway returns `SpillwayFull { limit_bytes }` (also operational; caller recovers by committing or rolling back).
 
@@ -330,26 +372,38 @@ let options = Options {
 
 **Fatal errors** — storage integrity is in question. Drop the handle and reopen.
 
-`IoError`, `ChecksumMismatch`, `CorruptSuperblock`, `FileSizeMismatch`, `LockFailed`, `UnsupportedFormatVersion`, `UnsupportedPageSize`, `CorruptPage`, `InvalidPageId`, `DecryptionFailed`, `Poisoned`.
+`IoError`, `ChecksumMismatch`, `CorruptSuperblock`, `FileSizeMismatch`, `LockFailed`, `UnsupportedFormatVersion`, `UnsupportedPageSize`, `CorruptPage`, `InvalidPageId`, `DecryptionFailed`.
 
 `DecryptionFailed { page_id }` is fatal: an AEAD authentication failure while decrypting an already-read page means the ciphertext or session key can no longer be trusted, so it poisons the handle exactly like `ChecksumMismatch` (see the poison model below). It is distinct from the operational `InvalidEncryptionKey`, which fires at open time when the supplied key unwraps no key slot — before any data page is served.
 
 Use `ChiselError::is_fatal()` to classify at runtime.
 
+**`Poisoned` is in neither tier**, and `is_fatal()` returns `false` for it. That is deliberate: `is_fatal()` answers "should this error poison the handle?", and by the time you see `Poisoned` the handle already is — re-poisoning is meaningless. But it also means `Poisoned` is *not* recoverable-and-continue either: it is terminal, and the only response is the same drop-and-reopen a fatal error calls for. Match it explicitly alongside `is_fatal()`, as the snippet below does; routing it into an "operational, keep going" arm produces a loop where every call returns `Poisoned` forever.
+
 ### Poison model
 
 On any fatal error — including a failed commit-protocol fsync — the `Chisel` handle becomes **poisoned**. Every subsequent call returns `ChiselError::Poisoned`, regardless of whether it is a read or a write. The only legal recovery is to drop the handle and call `Chisel::open` again; the shadow-paging recovery path then restores the database to the last durable state.
 
-```rust
+`commit` is the one method where the operational/fatal split above does not apply. Its only non-poisoning error is `NoActiveTransaction`, checked before the protocol starts. Once `cache.flush()` has run the manager is in a partial-commit state, so *every* error it can then return poisons the handle — including `CacheFull` and `SpillwayFull`, which are operational anywhere else. Do not catch those from `commit` and call `rollback` to recover: the handle is already poisoned and `rollback` will tell you so.
+
+```rust,no_run
+# fn main() -> chisel::Result<()> {
+# use chisel::{Chisel, ChiselError, Options};
+# let path = std::path::Path::new("db.chisel");
+# let mut db = Chisel::open(path, Options::default())?;
 match db.commit() {
     Ok(()) => (),
-    Err(e) if e.is_fatal() => {
+    // `Poisoned` is matched explicitly: is_fatal() is false for it, so it
+    // would otherwise fall into the operational arm and loop forever.
+    Err(e) if e.is_fatal() || matches!(e, ChiselError::Poisoned) => {
         drop(db);
         db = Chisel::open(path, Options::default())?;
         // Chisel is now at its last-committed state; retry the work if needed.
     }
     Err(e) => return Err(e),  // operational — handle per your caller's policy
 }
+# Ok(())
+# }
 ```
 
 The poison model is mandatory because Linux `fsync` semantics (post-2018 "fsyncgate") do not permit safely retrying a failed fsync: the kernel may have discarded the dirty pages before reporting the error. macOS `F_FULLFSYNC` has similar semantics. PostgreSQL `PANIC`s on fsync failure for exactly this reason.

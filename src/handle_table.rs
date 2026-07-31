@@ -45,10 +45,17 @@
 //        swap in phase 2 — this is what makes shadow paging crash-safe.
 //
 // Handle allocation policy (enforced by transaction.rs, not this module):
-// handles are monotonic from `next_handle` and never reused, starting at 1
-// (handle 0 is reserved as the "no handle" sentinel). Delete writes
-// a tombstone entry (HandleFlags::Deleted) in place; the leaf slot is not
-// freed. This keeps handles stable forever but means the tree only grows.
+// handles are monotonic from `next_handle`, starting at 1 (handle 0 is
+// reserved as the "no handle" sentinel), and are never reused ONCE
+// COMMITTED. Delete writes a tombstone entry (HandleFlags::Deleted) in
+// place; the leaf slot is not freed. This keeps committed handles stable
+// forever but means the tree only grows.
+//
+// The "once committed" qualifier is not pedantry: `next_handle` is a field
+// of `Roots`, so rollback, rollback_to and crash recovery all rewind it
+// along with everything else, and an id minted by a transaction that never
+// commits is handed out again. HandleEntry has no generation field, so the
+// re-minted id is indistinguishable from the original.
 
 use crate::error::{ChiselError, Result};
 use crate::page::{
@@ -82,10 +89,17 @@ const MAX_DEPTH: u32 = 6;
 
 // Page flags byte (buf[1]): distinguishes leaf from interior. Stored in the
 // page header so `open_existing` can walk the tree to recover depth without
-// needing the depth to be persisted separately in the superblock. Currently
-// forensic-only — no live code reads it (the depth walk uses child-pointer
-// presence); kept because a hex-dump reader can tell leaf from interior at
-// a glance.
+// needing the depth to be persisted separately in the superblock.
+//
+// This byte is READ AT RUNTIME and is load-bearing: `recover_depth` below
+// uses `buf[1] != FLAG_INTERIOR` as the primary terminator of its left-spine
+// walk, with the zero-child check only as the secondary terminator. The walk
+// runs on every open and every rollback, and its result is the descent depth
+// for all subsequent lookups — so stop writing the flag in `grow`, or
+// repurpose byte 1 for something else, and `recover_depth` returns 0 for a
+// depth-N tree: every committed handle mis-descends and `lookup` reports
+// Ok(None) for live data, with no checksum or type-tag error to signal it.
+// (It is also legible in a hex dump, which is a bonus, not the reason.)
 //
 // NOTE on per-page version byte (I31): handle-table pages keep the flag at
 // byte 1 and put the I31 per-page format version at byte 2. Every other
@@ -100,8 +114,10 @@ pub(crate) const FLAG_INTERIOR: u8 = 0x02;
 
 /// Per-entry state tag. `Deleted` functions as a tombstone — the slot stays
 /// allocated in the leaf, so the corresponding handle value is permanently
-/// burned (never reused). `Overflow` signals that `page_id` points to the
-/// first page of an overflow chain rather than a data page slot.
+/// burned and never reused (see the module header for why that guarantee
+/// covers committed handles only). `Overflow` signals that `page_id` points
+/// to the first page of an overflow chain rather than a data page slot; such
+/// an entry owns no data-page slot at all, and `slot_index` is an unused 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandleFlags {
     Live,

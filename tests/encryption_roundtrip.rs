@@ -118,3 +118,46 @@ fn in_memory_plaintext_roundtrip_baseline() {
     db.commit().expect("commit");
     assert_eq!(db.read(h).expect("read"), b"plain");
 }
+
+#[test]
+fn file_size_bytes_matches_stat_for_both_strides() {
+    // CRYPTO-5: `file_size_bytes()` / `stats().file_size_bytes` used to
+    // multiply the page count by the hardcoded PAGE_SIZE. Page counts are in
+    // stride-units, and an encrypted DB's stride is ENC_PAGE_SIZE (8232), so
+    // every encrypted database under-reported its own size by 0.49%.
+    //
+    // Asserting against stat(2) rather than a hardcoded expected size is what
+    // makes this test fail on the bug: PAGE_SIZE arithmetic can only match
+    // stat for the plaintext case, so the encrypted arm is the real check and
+    // the plaintext arm guards against over-correcting in the other direction.
+    for (name, key) in [("plain.db", None), ("enc.db", Some(raw_key(0x5C)))] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(name);
+
+        let mut options = Options::default();
+        if let Some(k) = key {
+            options = options.encryption_key(k);
+        }
+        let mut db = Chisel::open(&path, options).expect("open");
+
+        // Force the file past the superblock region so a stride error is
+        // several pages' worth of bytes, not a rounding coincidence.
+        db.begin().expect("begin");
+        for i in 0..64u32 {
+            db.allocate(&vec![i as u8; 4096]).expect("allocate");
+        }
+        db.commit().expect("commit");
+
+        let on_disk = std::fs::metadata(&path).expect("stat").len();
+        assert_eq!(
+            db.file_size_bytes().expect("file_size_bytes"),
+            on_disk,
+            "{name}: file_size_bytes() disagrees with stat(2)"
+        );
+        assert_eq!(
+            db.stats().expect("stats").file_size_bytes,
+            on_disk,
+            "{name}: stats().file_size_bytes disagrees with stat(2)"
+        );
+    }
+}

@@ -1,8 +1,12 @@
 // Filesystem discovery layer for the summary post-processor. Walks
-// target/criterion/<row>/<mode>/<size>/sample.json files, parses
+// target/criterion/<row>/<mode>/<size>/new/sample.json files, parses
 // aux_metrics.jsonl, joins them by (row, mode, size) key into Cell
 // values. Cells with missing-on-one-side data carry None for the
 // missing field — renderers handle the partial-state cases explicitly.
+//
+// The `new/` component is Criterion's own, not ours: it writes the
+// just-finished run to `new/` and retains the previous one under `base/`.
+// Only `new/` is read here; see the walk in `discover_cells`.
 
 use crate::runner::ChiselCountersDelta;
 use crate::summary::format::percentile_linear_interp;
@@ -146,23 +150,37 @@ pub fn discover_cells(
     }
 
     // Step 2: walk criterion_dir to find sample.json leaves.
-    // Each leaf is at depth 4 (criterion_dir/row/mode/size/sample.json).
+    //
+    // Each leaf is at depth 5: criterion_dir/row/mode/size/{new,base}/sample.json.
+    // Criterion 0.5 interposes that last directory — `new/` is the run that just
+    // finished, `base/` is the previous run kept for its own change-detection.
+    // We want `new/` only: `base/` is a stale duplicate under the same
+    // (row, mode, size) key, and counting it would emit two Cells per cell.
+    //
+    // The `new` check is the load-bearing filter; the depth bounds only
+    // restate the grid's shape (a row/mode/size triple is exactly what the
+    // path walk-back below needs, and what a Cell is keyed by).
     let mut cells: Vec<Cell> = Vec::new();
     let mut sample_paths_seen = 0usize;
 
     for entry in walkdir::WalkDir::new(criterion_dir)
-        .min_depth(4)
-        .max_depth(4)
+        .min_depth(5)
+        .max_depth(5)
         .into_iter()
         .filter_map(|e| e.ok())
     {
         if entry.file_name() != "sample.json" {
             continue;
         }
+
+        // Walk the path back: file -> new dir -> size dir -> mode dir -> row dir.
+        let run_dir = entry.path().parent().unwrap();
+        if run_dir.file_name().unwrap_or_default() != "new" {
+            continue;
+        }
         sample_paths_seen += 1;
 
-        // Walk the path back: file -> size dir -> mode dir -> row dir.
-        let size_dir = entry.path().parent().unwrap();
+        let size_dir = run_dir.parent().unwrap();
         let mode_dir = size_dir.parent().unwrap();
         let row_dir = mode_dir.parent().unwrap();
 
@@ -255,7 +273,7 @@ fn parse_sample_json(path: &Path) -> Result<Option<TimingStats>, Box<dyn std::er
 /// browsing; the archive's job is reproducibility (so the markdown
 /// numbers can be regenerated from the archive if target/ is wiped).
 ///
-/// 165 cells × 2 small JSON files ≈ 330 KB total archive size.
+/// 230 cells × 2 small JSON files ≈ 460 KB total archive size.
 pub fn copy_raw_archive(criterion_dir: &Path, raw_out_dir: &Path) -> std::io::Result<()> {
     for entry in walkdir::WalkDir::new(criterion_dir)
         .into_iter()
@@ -371,6 +389,21 @@ mod tests {
             cells.len() >= 2,
             "expected at least 2 cells, got {}",
             cells.len()
+        );
+
+        // The chisel-strict 32B fixture has BOTH a new/ and a base/ sample.json,
+        // mirroring a real Criterion tree after a second run. Exactly one cell
+        // must come out of it, and its numbers must be new/'s (base/ carries
+        // times 10x larger, so a wrong pick shows up as p50 30000).
+        assert_eq!(
+            cells
+                .iter()
+                .filter(|c| c.row == "allocate-1pertx"
+                    && c.mode == "chisel-strict"
+                    && c.size == "32B")
+                .count(),
+            1,
+            "base/ must not produce a second cell under the same key"
         );
 
         let chisel_cell = cells

@@ -1,8 +1,20 @@
-// Bench binary: the 270-cell micro grid. Iterates EngineMode::ALL × SIZES
-// × the 9 row groups, registering each cell as a Criterion benchmark
+// Bench binary: the micro grid. Iterates EngineMode::ALL (5) × SIZES (6)
+// × 8 row groups, registering each cell as a Criterion benchmark
 // inside a per-row BenchmarkGroup with Throughput::Elements(N) for
 // per-op normalization. Aux metrics (file-size delta + Chisel internal
 // counter deltas) are captured per cell into bench/results/aux_metrics.jsonl.
+//
+// 230 cells, not the 5 × 6 × 8 = 240 the dimensions suggest: the two
+// 1000-per-tx write rows skip their 1MB column on the bench-runtime budget
+// (see TX_BUDGET_BYTES). Rows and their cell counts:
+//
+//   allocate-1pertx     30    read-warm          30    update-1pertx     30
+//   allocate-1000pertx  25    read-cold          30    update-1000pertx  25
+//   delete-1pertx       30    delete-1000pertx   30
+//
+// The count is worth keeping honest: a reader checking that a run completed
+// compares against it, and it feeds the raw-archive size estimate in
+// summary/discover.rs.
 //
 // The three Criterion-shaped cell-runner helpers (run_*_cell) live here
 // rather than in src/runner.rs because Criterion is in [dev-dependencies]
@@ -47,11 +59,30 @@ const SIZES: [(usize, &str, usize); 6] = [
     (1_048_576, "1MB", 25),
 ];
 
-/// Per-transaction byte budget. Cells where `ops_per_tx * size_bytes` exceeds
-/// this are skipped to avoid Chisel's CacheFull at large 1000-per-tx writes
-/// (cache hard ceiling is ~16 MB; 8 MB leaves headroom for COW overhead).
-/// Affects allocate-1000pertx and update-1000pertx at sizes ≥ 16KB.
-const TX_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+/// Per-transaction byte budget for the 1000-per-tx rows. Cells where
+/// `ops_per_tx * size_bytes` exceeds this are skipped.
+///
+/// This is a BENCH-RUNTIME budget, not a Chisel capacity limit. It used to be
+/// the latter — 8 MiB, justified as avoiding "Chisel's CacheFull ... cache
+/// hard ceiling is ~16 MB" — but that ceiling was removed when the bench
+/// engines gained the spillway at production-default scale (1024 × the cache
+/// budget; see `ChiselEngine::open_file` and `POPULATE_TX_BUDGET_BYTES`).
+/// Measured against the current engine at `CACHE_SIZE_PAGES`, every cell the
+/// old budget excluded completes:
+///
+///   allocate-1000pertx  16KB (16 MB/tx)    0.71 s
+///   allocate-1000pertx 128KB (128 MB/tx)   2.70 s
+///   allocate-1000pertx   1MB (1 GB/tx)    18.51 s
+///
+/// So capacity is no longer the constraint; wall clock is. 128 MiB admits the
+/// 16KB and 128KB columns, which were losing real coverage for no reason, and
+/// still excludes 1MB × 1000 — at ~18.5 s per iteration that one cell would
+/// add hours to every micro-grid run across the five engine modes.
+///
+/// Affects allocate-1000pertx and update-1000pertx at 1MB only.
+/// delete-1000pertx does not consult this: deleting frees rather than writes
+/// `ops * size` bytes, and it clamps its op count to `prepop_count` anyway.
+const TX_BUDGET_BYTES: usize = 128 * 1024 * 1024;
 
 /// Hardcoded per-row seeds for workload determinism. Hardcoded rather
 /// than derived from row names because Rust's DefaultHasher randomizes
@@ -171,7 +202,7 @@ fn bench_row_allocate_n_per_tx(
 
     for (size_bytes, size_label, _) in SIZES {
         if ops_per_tx * size_bytes > TX_BUDGET_BYTES {
-            continue; // skip cells too large to fit in Chisel's cache
+            continue; // over the bench-runtime budget; see TX_BUDGET_BYTES
         }
         let workload = gen_allocate(ops_per_tx, size_bytes);
         for mode in EngineMode::ALL {
@@ -298,7 +329,7 @@ fn bench_row_update_n_per_tx(
 
     for (size_bytes, size_label, prepop_count) in SIZES {
         if ops_per_tx * size_bytes > TX_BUDGET_BYTES {
-            continue; // skip cells too large to fit in Chisel's cache
+            continue; // over the bench-runtime budget; see TX_BUDGET_BYTES
         }
         let workload =
             gen_update_random(seed_for(group_name), prepop_count, ops_per_tx, size_bytes);
@@ -409,12 +440,18 @@ fn micro_grid(c: &mut Criterion) {
     bench_row_read_warm(c, &mut aux);
     bench_row_read_cold(c, &mut aux);
     bench_row_update_n_per_tx(c, &mut aux, "update-1pertx", 1);
-    // update-1000pertx and delete-1000pertx skipped: 1000 random
-    // updates/deletes pin ~1000 distinct dirty data pages, exceeding
-    // Chisel's 2048-page cache ceiling. The cells are not measurable
-    // under default cache settings; revisit with a larger
-    // CACHE_SIZE_PAGES in a future PR.
+    // update-1000pertx and delete-1000pertx were previously not registered at
+    // all, on the rationale that "1000 random updates/deletes pin ~1000
+    // distinct dirty data pages, exceeding Chisel's 2048-page cache ceiling"
+    // and so "are not measurable under default cache settings". Both halves of
+    // that are stale: CACHE_SIZE_PAGES is 256, not 2048, and the strict cache
+    // ceiling itself is gone now that the bench engines run with the spillway
+    // at production-default scale. Measured at 1000 ops per tx, largest size
+    // each row admits: update 1.27 s, delete 0.80 s. They are measurable, so
+    // they are registered.
+    bench_row_update_n_per_tx(c, &mut aux, "update-1000pertx", 1000);
     bench_row_delete_n_per_tx(c, &mut aux, "delete-1pertx", 1);
+    bench_row_delete_n_per_tx(c, &mut aux, "delete-1000pertx", 1000);
 }
 
 criterion_group!(benches, micro_grid);

@@ -137,9 +137,12 @@ To drop chunks by tag instead of by explicit handle list, see [Tags](#tags) -- `
 
 Each chunk can carry an immutable `u32` *tag* assigned at allocation. The engine
 keeps a reverse membership index (tag -> handles), so you can enumerate or
-bulk-drop every chunk sharing a tag without scanning. Tag `0` is the "untagged"
-sentinel: it is never indexed, so `handles_with_tag(0)` is always empty -- use
-plain `allocate()` for untagged values.
+bulk-drop every chunk sharing a tag without scanning.
+
+Tags are **non-zero**: every tagged method raises `ValueError: tag must be
+non-zero` when given `0`, including `handles_with_tag(0)`. "Untagged" is not a
+tag value -- it is the absence of one. Allocate with plain `allocate()` to leave
+a chunk untagged, and `tag()` returns `None` (not `0`) for such a handle.
 
 Tags are **immutable**. They are fixed at `allocate_tagged()` time; `update()`
 preserves the tag while replacing the value. There is no "set tag" operation.
@@ -150,7 +153,7 @@ context manager:
 ```python
 with db.transaction() as tx:
     h = tx.allocate_tagged(b"row-payload", tag=42)
-    assert tx.tag(h) == 42                     # 0 if untagged
+    assert tx.tag(h) == 42                     # None if untagged
     assert tx.handles_with_tag(42) == [h]      # reverse-index lookup
 
     tx.update(h, b"new-payload")               # tag stays 42
@@ -246,13 +249,13 @@ s = db.stats()
 # Stats(handle_count=1234, total_pages=567, file_size_bytes=4644864)
 
 with db.transaction() as tx:
-    # defrag lives on the Chisel object, not the Transaction object;
-    # it runs against whichever transaction is currently active.
-    result = db.defrag(chisel.DefragOptions(sparse_threshold=0.25, max_pages=0))
+    # defrag is available on both objects; `tx.defrag(...)` is the same call.
+    # Either way it runs against the currently active transaction.
+    result = db.defrag(chisel.DefragOptions(sparse_threshold=0.25, max_values=0))
 # DefragStats(pages_examined=..., pages_freed=..., values_moved=...)
 ```
 
-`defrag()` requires an active transaction so it composes with other work and is atomic on commit. `max_pages = 0` means "no cap"; otherwise it bounds how many values get relocated in one pass (the name is a legacy carry-over — see `DefragOptions.max_pages`'s docstring).
+`defrag()` requires an active transaction so it composes with other work and is atomic on commit. `max_values = 0` means "no cap"; otherwise it bounds how many values get relocated in one pass, which is the knob for keeping a single pass's cost predictable.
 
 ## Engine counters
 
@@ -294,6 +297,7 @@ chisel.open(
     create_if_missing=True,
     read_only=False,
     superblock_count=2,                          # 2..=16, only consulted on create
+    encryption_key=None,                         # bytes = raw key, str = passphrase; see Encryption
 )
 ```
 
@@ -334,6 +338,56 @@ with chisel.open("db.chisel") as db:
 Each setter operates ONLY on between-transactions state: calling any of them while a transaction is active raises `TransactionInProgressError`. The engine guards this because shrinking the cache or spillway mid-transaction would either need to reject pinned dirty pages or silently overflow them, neither of which is a clean story — commit or roll back first.
 
 The setters take effect immediately after they return. A subsequent `db.transaction()` uses the new caps and policy; the previous transaction (already committed or rolled back) was unaffected.
+
+## Encryption
+
+Pass `encryption_key` to `chisel.open()` to create or open an encrypted database. Every page is encrypted at rest; the key never touches the file, only a wrapped copy of the data key does.
+
+The key argument accepts exactly two Python types, and the type *is* the meaning:
+
+- **`bytes`** — a raw key: the bytes are used as HKDF input keying material. Any non-empty length is accepted (32 bytes is the conventional choice); empty is rejected.
+- **`str`** — a passphrase, run through Argon2id to derive the key. Slow by design (that is the point of a passphrase); expect a noticeable delay on both create and open.
+
+Anything else raises `TypeError`. The choice is made when the slot is written: the slot records which KDF produced it, and a later open uses that record. Key material is zeroized when dropped and is never logged or included in a repr.
+
+```python
+# Create encrypted. The FIRST open of a new path fixes it as encrypted.
+with chisel.open("secret.chisel", encryption_key=b"\x00" * 32) as db:
+    with db.transaction() as tx:
+        h = tx.allocate(b"private")
+
+# Reopen with the same key.
+with chisel.open("secret.chisel", encryption_key=b"\x00" * 32) as db:
+    assert db.read(h) == b"private"
+```
+
+Mismatches between the key you pass and the file you open are all distinct errors, so they can be told apart:
+
+| Situation | Raises |
+|---|---|
+| Encrypted file, no `encryption_key` given | `NoEncryptionKeyError` |
+| Encrypted file, key unlocks no slot | `InvalidEncryptionKeyError` |
+| Plaintext file, `encryption_key` given | `EncryptionNotSupportedError` |
+
+There is no way to encrypt a database after the fact, or to decrypt one: whether a file is encrypted is decided when it is created. To convert, create a new database and copy the values across.
+
+### Managing keys
+
+A database carries a key-slot table with **8 slots**. Each slot holds the same data key wrapped under a different user key, so several keys can open the same database and a key can be replaced without re-encrypting a single page.
+
+```python
+db.add_key(existing, new)   # wrap the data key under `new` as well; needs a key that already works
+db.rotate_key(old, new)     # replace `old`'s slot with `new` in one step
+db.remove_key(key)          # free the slot `key` unlocks
+```
+
+All three are **between-transaction** operations: calling one while a transaction is active raises `TransactionInProgressError`. Each argument is a key in the same `bytes`-or-`str` vocabulary as `encryption_key`.
+
+The failure modes worth planning for:
+
+- `add_key` / `rotate_key` raise `NoFreeKeySlotError` when all 8 slots are occupied — `remove_key` a stale one first.
+- `remove_key` raises `LastKeySlotError` rather than removing the only remaining key, which would leave the database permanently unopenable.
+- All three raise `InvalidEncryptionKeyError` if the `existing` / `old` / `key` argument unlocks no slot.
 
 ## Errors
 
@@ -409,7 +463,11 @@ if db.is_poisoned:
 
 ## Thread safety
 
-A `Chisel` instance is **not** safe for concurrent use from multiple threads. It *can* be handed from one thread to another (the underlying Rust `Chisel` is `Send`), but two threads must never call into the same `Chisel` at the same time. Use one instance per thread, or serialize access externally.
+Calls into a `Chisel` instance are **serialized**, not concurrent. Every per-operation method holds the GIL for its whole duration and takes an internal `Mutex`, so two threads calling the same instance at once cannot corrupt memory or interleave partway through an operation — a concurrent `read()` from several threads is safe and is covered by the test suite.
+
+What is *not* safe is sharing **transaction state** across threads. There is one active transaction per instance, so two threads must not interleave transactions on the same `Chisel`: thread A's `commit()` will commit thread B's writes, and a `Savepoint` or `Transaction` object is not meaningful outside the thread that is driving it. Either confine a transaction to one thread, or use one instance per thread (the underlying Rust `Chisel` is `Send`, so an instance can also be handed from one thread to another).
+
+The consequence to plan for is **latency, not safety**: only `chisel.open()` releases the GIL. Every other call holds it, so a long-running engine operation — a large commit's three fsyncs, a big `defrag()` — blocks *all* other Python threads in the process for its duration, not just threads touching this database. If that matters, keep such operations off threads that are servicing latency-sensitive work.
 
 ## In-memory mode
 

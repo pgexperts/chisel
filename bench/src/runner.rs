@@ -402,8 +402,10 @@ pub fn populate_snapshot(
     Ok(PopulatedSnapshot { file, ids })
 }
 
-/// Capture per-cell aux metrics for the snapshot-restore-style rows
-/// (8 of 9 rows: rows 1, 2, 4–9). One calibration iteration: copy
+/// Capture per-cell aux metrics for the snapshot-restore-style rows —
+/// every row except read-warm, which reuses one engine across iterations
+/// and so has its own `capture_aux_metrics_warm_read`. One calibration
+/// iteration: copy
 /// the snapshot, open the engine, snapshot counters + file size,
 /// drive the workload, snapshot again, return deltas.
 ///

@@ -605,3 +605,43 @@ fn open_still_creates_over_a_zero_length_file() {
     drop(db);
     assert!(std::fs::metadata(tmp.path()).unwrap().len() > 0);
 }
+
+// PUBLIC-API-5: `get_root_name` and `clear_root_name` both run the same name
+// validation `set_root_name` does, so an unrepresentable name is an
+// InvalidRootName error rather than a miss. Their `# Errors` sections said
+// otherwise ("Only on poisoning" / "NoActiveTransaction if no transaction is
+// open"), which invites a caller to treat any Err from a *lookup* as a fatal
+// drop-and-reopen condition and tear down a healthy handle over a 25-byte
+// name. This pins the corrected contract, including the part that is easy to
+// over-correct: a valid-but-unbound name is still Ok, not an error.
+#[test]
+fn root_name_validation_applies_to_the_read_and_clear_paths_too() {
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let mut db = Chisel::open(tmp.path(), Options::default()).expect("open");
+
+    let unrepresentable = ["", &"x".repeat(25), "nul\0byte"];
+
+    for name in unrepresentable {
+        assert!(
+            matches!(db.get_root_name(name), Err(ChiselError::InvalidRootName)),
+            "get_root_name({name:?}) must reject an unrepresentable name"
+        );
+    }
+    assert!(
+        db.get_root_name("unbound").expect("valid name").is_none(),
+        "a valid but unbound name is Ok(None), not an error"
+    );
+
+    db.begin().expect("begin");
+    for name in unrepresentable {
+        assert!(
+            matches!(db.clear_root_name(name), Err(ChiselError::InvalidRootName)),
+            "clear_root_name({name:?}) must reject an unrepresentable name"
+        );
+    }
+    assert!(
+        db.clear_root_name("unbound").is_ok(),
+        "clearing a valid but unbound name is a no-op, not an error"
+    );
+    db.commit().expect("commit");
+}
