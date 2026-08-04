@@ -21,3 +21,4 @@
 | [0014](0014-client-byte-spending-the-last-reserved-entry-byte.md) | Client byte — spending the last reserved entry byte | Accepted | 2026-06-05 |  |
 | [0015](0015-on-disk-encryption-xchacha20-poly1305-envelope-keys.md) | On-disk encryption (XChaCha20-Poly1305, envelope keys) | Accepted | 2026-06-30 |  |
 | [0016](0016-swift-binding-via-uniffi.md) | Swift binding via UniFFI | Accepted | 2026-07-19 | The iOS/macOS Swift binding is a UniFFI-generated FFI over an Arc<Mutex<Chisel>> wrapper crate, with the engine crate left unchanged. |
+| [0017](0017-github-issues-replace-tracked-issues-md.md) | Track issues in GitHub, not a tracked ISSUES.md | Accepted | 2026-08-03 | The 1868-line ISSUES.md decision log was retired; open entries were migrated to GitHub issues and the file deleted. |

@@ -1,6 +1,8 @@
 # Chisel — Architecture and On-Disk Format
 
-This document is the cold-start reference for someone (human or AI) picking up the Chisel codebase in a context-free session. It is a compressed map of the layers, the exact on-disk byte format, the load-bearing invariants, and the landmines. Read it whole at the start of a session. For *what Chisel does* and how to use it, see [`README.md`](README.md). For the running decision log — open issues, closed issues, every design tradeoff with date-stamped rationale — see [`ISSUES.md`](ISSUES.md).
+This document is the cold-start reference for someone (human or AI) picking up the Chisel codebase in a context-free session. It is a compressed map of the layers, the exact on-disk byte format, the load-bearing invariants, and the landmines. Read it whole at the start of a session. For *what Chisel does* and how to use it, see [`README.md`](README.md). For the design decisions and their rejected alternatives, see [`docs/adr/`](docs/adr/); for the open work, see [GitHub issues](https://github.com/pgexperts/chisel/issues).
+
+> **On `I<number>` markers.** Comments throughout the source cite issue ids like `I61 (ISSUES.md, 2026-05-22)`. Until 2026-08-03 the project tracked its issues in a git-tracked `ISSUES.md`; that file was retired in favour of GitHub issues, and its open entries were migrated there. The markers were deliberately left in place rather than rewritten across ~167 sites — they are dated provenance, and the retired file is still readable in git history (`git show 0ffe3bc:ISSUES.md`). Treat an `I<number>` as "see the decision log as it stood on that date", not as a live link.
 
 For the theory of operation and the rationale behind these decisions — why shadow-paging over WAL, the rejected alternatives, the implementation history — see [`THEORY.md`](THEORY.md).
 
