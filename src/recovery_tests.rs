@@ -2179,3 +2179,73 @@ fn a_forged_txn_counter_in_one_slot_loses_to_its_healthy_sibling() {
     db.allocate(b"and it still commits").unwrap();
     db.commit().unwrap();
 }
+
+#[test]
+fn a_database_forged_at_the_boundary_refuses_to_commit_rather_than_writing_past_it() {
+    // The read-side bound alone is only half an invariant, and the half it
+    // leaves open is worse than the hole it closed.
+    //
+    // MAX_TXN_COUNTER itself is VALID — the check is `>`, not `>=` — so a file
+    // forged at exactly the boundary opens cleanly, with `diagnose` silent.
+    // Without a matching write-side check, the commits that follow are
+    // acknowledged and fsynced at MAX+1, MAX+2 … producing superblocks this
+    // same binary refuses to read. One commit past the bound is silently
+    // discarded on the next open (selection falls back to an older valid slot);
+    // once every slot has been written past it, the database is permanently
+    // unopenable. Both outcomes are strictly worse than the original forged-
+    // u64::MAX panic, which at least failed loudly and immediately.
+    //
+    // So: refuse the commit, before any I/O, and leave the last durable state
+    // exactly as it was.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    let handle;
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        handle = db.allocate(b"still here afterwards").unwrap();
+        db.commit().unwrap();
+    }
+
+    // Forge only the WINNING slot. Forging both would tie their counters, and
+    // `max_by_key` returns the last maximum — so selection would pick the
+    // create-seed slot and the database would come back empty for reasons that
+    // have nothing to do with what this test is about.
+    let newest = {
+        let mut f = fs::File::open(&path).unwrap();
+        let mut best = (0u64, 0u64);
+        for slot in 0..2u64 {
+            let mut buf = [0u8; PAGE_SIZE];
+            f.seek(SeekFrom::Start(slot * PAGE_SIZE as u64)).unwrap();
+            f.read_exact(&mut buf).unwrap();
+            let sb = Superblock::deserialize(&buf).expect("slot must be valid");
+            if sb.txn_counter >= best.1 {
+                best = (slot, sb.txn_counter);
+            }
+        }
+        best.0
+    };
+    forge_txn_counter(&path, newest, crate::superblock::MAX_TXN_COUNTER);
+
+    // Opens: the boundary value is legal.
+    let mut db = Chisel::open(&path, Default::default())
+        .expect("MAX_TXN_COUNTER is inside the accepted range and must open");
+
+    db.begin().unwrap();
+    db.allocate(b"this commit cannot be represented").unwrap();
+    match db.commit() {
+        Err(ChiselError::TxnCounterExhausted { current }) => {
+            assert_eq!(current, crate::superblock::MAX_TXN_COUNTER);
+        }
+        Ok(()) => panic!("committing past MAX_TXN_COUNTER must be refused, not persisted"),
+        Err(other) => panic!("expected TxnCounterExhausted, got {other:?}"),
+    }
+    drop(db);
+
+    // The refusal wrote nothing: the database still opens and still holds the
+    // last durable state. This is the assertion that actually distinguishes
+    // "refused" from "wrote a superblock nobody can read".
+    let db = Chisel::open(&path, Default::default())
+        .expect("a refused commit must leave the file exactly as it was");
+    assert_eq!(db.read(handle).unwrap(), b"still here afterwards");
+}

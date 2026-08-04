@@ -32,6 +32,15 @@ pub(super) struct CommitCtx<'a> {
 }
 
 pub(super) fn run_commit(ctx: &mut CommitCtx<'_>) -> Result<()> {
+    // Refuse a commit that could not be read back BEFORE doing any work. The
+    // counter this commit will stamp is decided here, at the top, so exhausting
+    // the range costs no I/O and leaves the last durable state exactly as it
+    // was. See `superblock::next_txn_counter` for why writing past the bound is
+    // worse than refusing: it produces superblocks this binary rejects on the
+    // next open, silently discarding an acknowledged commit or bricking the file
+    // outright once every slot has been written past it.
+    let next_counter = crate::superblock::next_txn_counter(*ctx.txn_counter)?;
+
     // I27: flatten every still-active savepoint's `freed_pages`
     // back into `txn_freed_pages` before persist_freemap consumes
     // it. savepoint_inner moves `txn_freed_pages` INTO the
@@ -123,14 +132,15 @@ pub(super) fn run_commit(ctx: &mut CommitCtx<'_>) -> Result<()> {
     // What makes it unreachable now is an actual invariant rather than an
     // argument about counting: `Superblock::validate` rejects any slot whose
     // counter exceeds MAX_TXN_COUNTER, so a file that opened at all has at least
-    // TXN_COUNTER_RESERVE (2^32) increments of headroom. Exhausting that takes
-    // 4.3 billion commits in one session, since a reopen re-validates.
-    // The `expect` therefore stays: it now documents a guarded invariant rather
-    // than asserting an unguarded hope.
-    *ctx.txn_counter = ctx
-        .txn_counter
-        .checked_add(1)
-        .expect("txn_counter overflowed u64 (2^64 commits) — unreachable");
+    // TXN_COUNTER_RESERVE (2^32) increments of headroom.
+    //
+    // `next_txn_counter` was computed at the TOP of this function, before any
+    // I/O, so the refusal case costs nothing and leaves the last durable state
+    // untouched. Bounding only what we ACCEPT and not what we WRITE would let a
+    // file forged at exactly MAX_TXN_COUNTER (which validates, and opens
+    // cleanly) take acknowledged, fsynced commits at MAX+1, MAX+2 — superblocks
+    // this same binary then refuses to read. There is no panic left here at all.
+    *ctx.txn_counter = next_counter;
     let total_pages = cache.file_page_count()?;
     let sb = Superblock {
         magic: page::MAGIC,

@@ -61,17 +61,18 @@ impl TransactionManager {
         // future changes.
         cache.flush()?;
 
-        // I119: use checked_add, not `+= 1`. A wrapped counter corrupts
-        // Superblock::select's "highest counter wins" rule on recovery.
+        // I119: a wrapped counter corrupts Superblock::select's "highest counter
+        // wins" rule on recovery. This used to be `checked_add(1).expect(...)`
+        // justified by a "structurally unreachable" claim that was wrong — the
+        // counter is read from the file at open, so a forged value made it
+        // reachable. See the matching site in commit.rs for the full story.
         //
-        // Reachable from a forged superblock until `Superblock::validate` grew
-        // its MAX_TXN_COUNTER bound; see the long note at the matching site in
-        // commit.rs for why the old "structurally unreachable" claim was wrong
-        // and what actually guarantees the headroom now.
-        self.txn_counter = self
-            .txn_counter
-            .checked_add(1)
-            .expect("txn_counter overflowed u64 (2^64 commits) — unreachable");
+        // Bounded rather than panicking now, and bounded on the WRITE side so
+        // this never persists a header the next open would reject. Note this
+        // rewrite is metadata-only but still consumes a counter, so key rotation
+        // draws from the same headroom pool as commit.
+        let next_counter = crate::superblock::next_txn_counter(self.txn_counter)?;
+        self.txn_counter = next_counter;
 
         let total_pages = cache.file_page_count()?;
         let r = &self.committed_roots;

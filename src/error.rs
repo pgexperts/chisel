@@ -176,6 +176,23 @@ pub enum ChiselError {
         stored: u32,
         max: u32,
     },
+    // Raised when a commit (or a crypto-header rewrite) would push
+    // `txn_counter` past `MAX_TXN_COUNTER`, the bound `Superblock::validate`
+    // enforces on the read side.
+    //
+    // Fatal, and refused BEFORE any commit I/O, because the alternative is
+    // writing a superblock this same binary would refuse to read: the database
+    // would either lose an acknowledged commit on the next open (silent
+    // fallback to an older valid slot) or become permanently unopenable once
+    // every slot has been written past the bound.
+    //
+    // Legitimately unreachable — a file that opens has 2^32 increments of
+    // headroom, and a reopen re-validates. It IS reachable adversarially, on
+    // the first commit after opening a file forged at exactly MAX_TXN_COUNTER,
+    // which is precisely the case this exists to make clean.
+    TxnCounterExhausted {
+        current: u64,
+    },
 
     // Operational — the caller supplied the wrong key material or none, or
     // asked an unencrypted-only build to open an encrypted DB. The on-disk
@@ -241,6 +258,7 @@ impl ChiselError {
                 | ChiselError::InvalidPageId { .. }
                 | ChiselError::UnsupportedPageSize { .. }
                 | ChiselError::InvalidFreemapDepth { .. }
+                | ChiselError::TxnCounterExhausted { .. }
                 | ChiselError::DecryptionFailed { .. }
         )
     }
@@ -330,6 +348,10 @@ impl fmt::Display for ChiselError {
             ChiselError::UnsupportedPageSize { stored, compiled } => write!(
                 f,
                 "page size mismatch: file was written with {stored}-byte pages, this build uses {compiled}-byte pages"
+            ),
+            ChiselError::TxnCounterExhausted { current } => write!(
+                f,
+                "txn_counter {current} is at the maximum this format supports; the database can accept no further commits"
             ),
             ChiselError::InvalidFreemapDepth { stored, max } => write!(
                 f,
@@ -594,6 +616,7 @@ mod tests {
                 | ChiselError::InvalidPageId { .. }
                 | ChiselError::UnsupportedPageSize { .. }
                 | ChiselError::InvalidFreemapDepth { .. }
+                | ChiselError::TxnCounterExhausted { .. }
                 | ChiselError::DecryptionFailed { .. } => true,
             }
         }
@@ -640,6 +663,7 @@ mod tests {
                 compiled: 0,
             },
             ChiselError::InvalidFreemapDepth { stored: 0, max: 0 },
+            ChiselError::TxnCounterExhausted { current: 0 },
             ChiselError::NoEncryptionKey,
             ChiselError::InvalidEncryptionKey,
             ChiselError::EncryptionNotSupported,
@@ -654,13 +678,15 @@ mod tests {
                 "is_fatal() disagrees with the documented Fatal/Operational block for {e:?}"
             );
         }
-        // Tripwire: exactly 11 variants are fatal today. If this count moves, the
+        // Tripwire: exactly 12 variants are fatal today. If this count moves, the
         // Fatal/Operational split changed — confirm that was intentional (it is a
         // breaking change for callers doing error-class matching, per the header).
-        // Last moved 10 -> 11 by InvalidFreemapDepth, which is fatal because a
-        // superblock field outside its representable range cannot be resolved by
-        // retrying: every sibling slot carries the same value.
-        assert_eq!(all.iter().filter(|e| e.is_fatal()).count(), 11);
+        // Last moved 11 -> 12 by TxnCounterExhausted (a database that cannot
+        // accept another commit is terminal for the handle); before that,
+        // 10 -> 11 by InvalidFreemapDepth, fatal because a superblock field
+        // outside its representable range cannot be resolved by retrying —
+        // every sibling slot carries the same value.
+        assert_eq!(all.iter().filter(|e| e.is_fatal()).count(), 12);
     }
 
     // Phase 4: the three operational encryption errors are recoverable (the
