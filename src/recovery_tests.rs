@@ -1716,3 +1716,199 @@ fn tampered_key_slot_cost_params_do_not_reach_the_allocator() {
         "expected InvalidEncryptionKey (the slot is skipped as non-matching), got {err:?}"
     );
 }
+
+// ── SECURITY-SWEEP hardening (2026-07-29 review) ────────────────────────
+//
+// These three model the review's stated threat: the attacker controls the
+// on-disk bytes and can recompute the XXH3 page checksum, which is
+// non-cryptographic and publicly computable. Each previously reached a
+// process-level failure — an allocator abort, a stack overflow — that the
+// poison model cannot intercept, because neither is a Rust error. The
+// assertions are therefore "returns a typed error" rather than any
+// particular value: the property under test is that the process survives.
+
+#[test]
+fn forged_overflow_total_length_is_corrupt_page_not_an_allocation_abort() {
+    // SECURITY-SWEEP-2. `Overflow::read` sized a Vec directly from the u64 at
+    // bytes 16..24 of an Overflow-typed page. A forged u64::MAX either panics
+    // with "capacity overflow" or reaches handle_alloc_error and ABORTS —
+    // from a plain Chisel::read on an untrusted file.
+    //
+    // The old comment claimed the preceding guards made this unreachable, but
+    // they only reject a page that is not Overflow-typed. A crafted file keeps
+    // the type tag valid, which is exactly the case that was unguarded.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+
+    let handle;
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        handle = db.allocate(&vec![0xAB; 20_000]).unwrap();
+        db.commit().unwrap();
+    }
+
+    let overflow_page = find_page_of_type(&path, PageType::Overflow);
+    {
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut buf = [0u8; PAGE_SIZE];
+        f.seek(SeekFrom::Start(overflow_page * PAGE_SIZE as u64))
+            .unwrap();
+        f.read_exact(&mut buf).unwrap();
+        // Keep the type tag intact; forge only the length, then re-stamp the
+        // checksum so the page passes validation exactly as an attacker's would.
+        buf[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+        page::stamp_checksum(&mut buf);
+        f.seek(SeekFrom::Start(overflow_page * PAGE_SIZE as u64))
+            .unwrap();
+        f.write_all(&buf).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    let db = Chisel::open(&path, Default::default()).expect("open reads no overflow page");
+    match db.read(handle) {
+        Err(ChiselError::CorruptPage { .. }) => {}
+        other => panic!("expected CorruptPage for a forged total_length, got {other:?}"),
+    }
+}
+
+#[test]
+fn forged_freemap_depth_is_rejected_at_open() {
+    // SECURITY-SWEEP-3. `freemap_depth` was copied from the superblock into
+    // FreeMapTree::from_roots with no bound, while the handle table and the
+    // membership index both cap theirs at MAX_DEPTH. A forged depth drives
+    // scan_node's per-level recursion into a stack overflow (SIGSEGV) and
+    // cow_descend into an O(depth^2) loop that extends the file per absent
+    // child — the latter on the ordinary commit path.
+    //
+    // Rewriting the superblock through Superblock::serialize keeps magic,
+    // checksum and every other field valid, so `freemap_depth` is the single
+    // variable under test.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        db.allocate(b"payload").unwrap();
+        db.commit().unwrap();
+    }
+
+    // Rewrite every superblock slot so slot selection cannot dodge the forgery.
+    let sb_count = {
+        let mut f = fs::File::open(&path).unwrap();
+        let mut buf = [0u8; PAGE_SIZE];
+        f.read_exact(&mut buf).unwrap();
+        Superblock::deserialize(&buf)
+            .map(|sb| sb.superblock_count)
+            .unwrap_or(2)
+    };
+    {
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        for slot in 0..sb_count as u64 {
+            let mut buf = [0u8; PAGE_SIZE];
+            f.seek(SeekFrom::Start(slot * PAGE_SIZE as u64)).unwrap();
+            if f.read_exact(&mut buf).is_err() {
+                continue;
+            }
+            if let Some(mut sb) = Superblock::deserialize(&buf) {
+                sb.freemap_depth = 500_000;
+                f.seek(SeekFrom::Start(slot * PAGE_SIZE as u64)).unwrap();
+                f.write_all(&sb.serialize()).unwrap();
+            }
+        }
+        f.sync_all().unwrap();
+    }
+
+    match Chisel::open(&path, Default::default()) {
+        Err(ChiselError::CorruptSuperblock { .. }) => {}
+        Ok(_) => panic!("a freemap_depth of 500_000 must not open"),
+        Err(other) => panic!("expected CorruptSuperblock, got {other:?}"),
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_new_database_file_is_created_private_to_its_owner() {
+    // SECURITY-SWEEP-4. The file was created at 0666 & ~umask — typically
+    // 0644 — so on a shared host every value in a plaintext database was
+    // world-readable. `mode` applies only on creation, so an existing
+    // database's permissions are left exactly as its owner set them.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("perm.db");
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        db.allocate(b"private").unwrap();
+        db.commit().unwrap();
+    }
+
+    let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "a freshly created database must not be group- or world-readable (got {mode:o})"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlinked_spillway_path_is_refused_rather_than_followed() {
+    // SECURITY-SWEEP-4, the sharp half. The sidecar path is fully derived from
+    // the database path, so it is predictable; it is created lazily mid
+    // transaction under cache pressure; and it is opened with truncate(true) on
+    // the assumption that anything already there is garbage from a crashed
+    // prior run. That assumption fails for a symlink: a local user who can
+    // create entries in the database's directory could plant <db>.spillway
+    // pointing at a file the owner can write, and the first spill would
+    // truncate it to zero.
+    //
+    // O_NOFOLLOW turns that into a failed open. The engine surfaces it as an
+    // error and poisons, which is the right answer to "someone is tampering
+    // with my sidecar path" — the point of the test is that the victim file is
+    // still intact afterwards.
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("spill.db");
+    let victim = dir.path().join("victim.txt");
+    fs::write(&victim, b"important contents that must survive").unwrap();
+
+    // Plant the sidecar as a symlink to the victim before it is ever opened.
+    symlink(&victim, dir.path().join("spill.db.spillway")).unwrap();
+
+    // Tiny cache so a modest transaction is forced to spill.
+    let opts = Options::default()
+        .cache_max_bytes(16 * PAGE_SIZE as u64)
+        .spillway_max_bytes(64 * PAGE_SIZE as u64);
+    let mut db = Chisel::open(&db_path, opts).unwrap();
+    db.begin().unwrap();
+    let mut spill_attempted = false;
+    for _ in 0..400 {
+        if db.allocate(&vec![0x5A; PAGE_SIZE + 64]).is_err() {
+            spill_attempted = true;
+            break;
+        }
+    }
+    let _ = db.rollback();
+    drop(db);
+
+    assert!(
+        spill_attempted,
+        "expected the spill to be refused; if this stops firing the workload no \
+         longer reaches ensure_spillway and the test has stopped testing anything"
+    );
+    assert_eq!(
+        fs::read(&victim).unwrap(),
+        b"important contents that must survive",
+        "the symlink target must not have been truncated"
+    );
+}

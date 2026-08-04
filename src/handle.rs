@@ -26,11 +26,20 @@ use std::num::NonZeroU32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Handle(u64);
 
-// Pin the layout the bench adapter's `&[u64]` -> `&[Handle]` transmute depends
-// on (bench/src/chisel_engine.rs). With this, dropping `#[repr(transparent)]` or
-// adding a field fails THIS crate's build with a clear message, instead of
-// turning the cross-crate transmute into silent UB the bench can't detect
-// (review 2026-06-22). const assertions are evaluated at compile time.
+// Layout tripwire for `#[repr(transparent)]` above, which the FFI surfaces
+// depend on.
+//
+// Be precise about what these catch, because the previous comment was not:
+// they fire if a field is ADDED (size changes) or alignment shifts. They do
+// NOT catch removal of `#[repr(transparent)]` itself — a `#[repr(Rust)]
+// struct Handle(u64)` has the same size and align, so both assertions still
+// pass. Rust offers no stable way to assert `repr(transparent)`, so treat the
+// attribute as the contract and these as a partial backstop.
+//
+// The bench adapter's `&[Identifier]` -> `&[Handle]` transmute, which these
+// were originally written to guard, has been replaced with a safe collect
+// (bench/src/chisel_engine.rs) precisely because that gap was unclosable — so
+// no unsafe code currently rests on them.
 const _: () = {
     assert!(
         core::mem::size_of::<Handle>() == core::mem::size_of::<u64>(),

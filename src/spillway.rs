@@ -130,13 +130,36 @@ impl Spillway {
         // in-flight cache state, not a "fix your path and retry" condition, so it
         // must poison rather than mislead the caller into continuing (review
         // 2026-06-22).
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .map_err(ChiselError::IoError)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(true);
+        // The sidecar needs BOTH guards, and for a sharper reason than the main
+        // database file does.
+        //
+        // Its path is fully derived from the database path, so it is predictable
+        // to anyone who can see the database. It is created lazily, mid
+        // transaction, whenever cache pressure forces a spill — not at open,
+        // where a caller might notice something wrong. And it is opened with
+        // `truncate(true)`, on the documented assumption that any pre-existing
+        // content is garbage from a crashed prior process.
+        //
+        // That assumption does not hold for a pre-existing SYMLINK. A local user
+        // who can create entries in the database's directory can plant
+        // `<db>.spillway` pointing at any file the database owner can write; the
+        // next spill would then follow it and truncate the victim's file to
+        // zero. O_NOFOLLOW makes that open fail (ELOOP) instead — a poisoned
+        // handle, which is the correct outcome for "someone is tampering with my
+        // sidecar path". Encryption does not help here: the hazard is the
+        // truncate, not the contents.
+        //
+        // 0600 for the same reason as the main file, and it matters more here:
+        // spilled pages are uncommitted user data written without the caller
+        // ever asking for a second file to exist.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = opts.open(&path).map_err(ChiselError::IoError)?;
         Ok(Spillway {
             backing: Backing::File { file },
             slots: HashMap::new(),

@@ -58,9 +58,14 @@ const PTRS_PER_INTERIOR: usize = (CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE) / PTR
 // The leaf fans out to 2^16 and each level multiplies by ~2^10, so depth 5
 // already covers 2^16 * 2^50 = 2^66 > u64::MAX page ids — the bound is 5
 // (distinct from the membership tree's 6, which has no 2^16 leaf factor). A
-// spine or stored depth claiming deeper is corrupt; capacity() saturates so a
-// bad on-disk depth fails closed (rejects the descent) rather than overflowing.
-const MAX_DEPTH: u32 = 5;
+// spine or stored depth claiming deeper is corrupt. capacity() saturates, but
+// saturation only prevents arithmetic overflow — on its own it rejects nothing
+// and does NOT make a bad on-disk depth fail closed. The actual rejection is
+// the `freemap_depth > MAX_DEPTH` gate in `open_existing`, which is what keeps
+// `scan_node`'s per-level recursion and `cow_descend`'s O(depth^2) loop from
+// being driven by a hostile superblock. `pub(crate)` so that gate can name the
+// constant instead of repeating the literal.
+pub(crate) const MAX_DEPTH: u32 = 5;
 
 fn read_child(buf: &[u8; PAGE_SIZE], index: usize) -> u64 {
     let off = DATA_PAGE_HEADER_SIZE + index * PTR_SIZE;
@@ -189,11 +194,37 @@ impl FreeMapTree {
         span
     }
 
+    // Reject an out-of-range `depth` before any traversal begins. `open_existing`
+    // already gates `freemap_depth > MAX_DEPTH` at the trust boundary, so this is
+    // defense in depth — it matches what HandleTable::recover_depth and
+    // RadixU64/MembershipIndex already do at every entry point, and it means a
+    // future path that builds a tree from roots WITHOUT passing through the open
+    // gate (a savepoint rewind, a rollback to a restored root) cannot resurrect
+    // the hazard.
+    //
+    // It must run BEFORE the first `cache.get`, not merely before the recursion:
+    // the traversals happen to fail type validation first for some root shapes,
+    // which is luck, not a guarantee. A FreeMapInterior root with a
+    // self-referential child pointer passes every type check and is precisely the
+    // shape that drives scan_node into a stack overflow and cow_descend into its
+    // O(depth^2) page-materializing loop.
+    //
+    // Note the saturating arithmetic above does NOT stand in for this: saturation
+    // keeps `capacity()`/`child_span()` from overflowing, but a saturated span
+    // simply yields child index 0 — it rejects nothing.
+    fn check_depth(&self) -> Result<()> {
+        if self.depth > MAX_DEPTH {
+            return Err(ChiselError::CorruptPage { page_id: self.root });
+        }
+        Ok(())
+    }
+
     /// Descend (read-only) to the leaf covering `id`. Returns the leaf page id,
     /// or `None` if `id` is past the tree's reach OR any subtree on the path is
     /// absent (a zero child pointer = "that whole range is all in use"). Every
     /// page read is type-validated.
     fn find_leaf(&self, cache: &mut PageCache, id: u64) -> Result<Option<u64>> {
+        self.check_depth()?;
         // Reject ids past the tree's reach. When capacity saturated to u64::MAX
         // (depth where the real capacity exceeds u64), every id is in reach, so
         // skip the guard — otherwise id == u64::MAX would be wrongly rejected.
@@ -285,6 +316,7 @@ impl FreeMapTree {
         extend: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
         leaf_op: &mut dyn FnMut(&mut [u8; PAGE_SIZE], u64),
     ) -> Result<()> {
+        self.check_depth()?;
         // COW the root first; the new root replaces self.root and the old one is
         // superseded. (grow has already ensured depth covers id, if needed.)
         // The root's position type follows depth exactly as the read paths see it:
@@ -484,6 +516,7 @@ impl FreeMapTree {
     /// subtrees. Returns the global id (not leaf-local). Every page is type-
     /// validated on the way down.
     fn scan_from(&self, cache: &mut PageCache, lo: u64) -> Result<Option<u64>> {
+        self.check_depth()?;
         self.scan_node(cache, self.root, self.depth, 0, lo)
     }
 
@@ -547,6 +580,7 @@ impl FreeMapTree {
         &self,
         cache: &mut PageCache,
     ) -> Result<rustc_hash::FxHashSet<u64>> {
+        self.check_depth()?;
         let mut set = rustc_hash::FxHashSet::default();
         if self.root != crate::page::PAGE_ID_NONE {
             self.collect_reachable(cache, self.root, self.depth, &mut set)?;
@@ -881,5 +915,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Defense in depth for the SECURITY-SWEEP-3 hazard. `open_existing` rejects
+    // an over-deep `freemap_depth` at the trust boundary; this pins the tree's
+    // own entry-point guards, so a path that builds a tree from roots without
+    // passing through that gate cannot reach the recursion.
+    //
+    // The root here is a page id that was never allocated, which is what makes
+    // the test meaningful: the ONLY way to get a typed error rather than a
+    // read failure is for check_depth to run before the first cache.get. That
+    // also keeps the test terminating — an unguarded traversal at this depth is
+    // a stack overflow, not a failure the harness could report.
+    #[test]
+    fn an_over_deep_depth_is_rejected_before_any_page_is_read() {
+        let mut c = make_cache(256);
+        let phantom_root = 4_242;
+        let bad_depth = MAX_DEPTH + 1;
+
+        let assert_rejected = |label: &str, r: Result<()>| {
+            match r {
+                Err(ChiselError::CorruptPage { page_id }) => assert_eq!(
+                    page_id, phantom_root,
+                    "{label}: the guard must blame the tree root it refused to descend"
+                ),
+                other => panic!("{label}: expected CorruptPage, got {other:?}"),
+            };
+        };
+
+        // Read paths.
+        let t = FreeMapTree::from_roots(phantom_root, bad_depth);
+        assert_rejected("is_free", t.is_free(&mut c, 7).map(|_| ()));
+        assert_rejected("reachable_pages", t.reachable_pages(&mut c).map(|_| ()));
+
+        // Allocation path (scan_from), and the commit-path writer (cow_descend).
+        let mut t = FreeMapTree::from_roots(phantom_root, bad_depth);
+        let mut hint = 0u64;
+        assert_rejected(
+            "allocate_first",
+            t.allocate_first(&mut c, &mut hint, &mut extend).map(|_| ()),
+        );
+        assert_rejected("mark_free", t.mark_free(&mut c, 7, &mut extend));
+
+        // A depth AT the bound is legal and must still be accepted — the guard
+        // is `>`, not `>=`. It fails on the phantom page instead, which proves
+        // it got past check_depth to the read.
+        let t = FreeMapTree::from_roots(phantom_root, MAX_DEPTH);
+        assert!(
+            !matches!(
+                t.is_free(&mut c, 7),
+                Err(ChiselError::CorruptPage { page_id }) if page_id == phantom_root
+            ),
+            "MAX_DEPTH itself must not be rejected by the depth guard"
+        );
     }
 }

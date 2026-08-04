@@ -89,15 +89,21 @@ impl Engine for ChiselEngine {
     }
 
     fn delete_many(&mut self, ids: &[Identifier]) -> EngineResult<()> {
-        // SAFETY: Identifier and chisel::Handle are both
-        // #[repr(transparent)] over u64, so a slice of Identifier and a
-        // slice of Handle have identical layout. The borrow ends with
-        // this call; no aliasing concern; no 'static lifetime escapes.
-        // Saves the per-call Vec allocation that the safe-collect form
-        // would require (audit F5).
-        let handles: &[chisel::Handle] =
-            unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const chisel::Handle, ids.len()) };
-        Ok(self.db.delete_many(handles)?)
+        // This used to reinterpret `&[Identifier]` as `&[chisel::Handle]`
+        // through `slice::from_raw_parts`, on the strength of both types being
+        // `#[repr(transparent)]` over u64. The layout guarantee is real, but
+        // nothing enforced it across the crate boundary: chisel's const
+        // assertions check only size and align, which a `#[repr(Rust)]
+        // struct Handle(u64)` also satisfies. Deleting `#[repr(transparent)]`
+        // would have left both crates building green while this line became UB.
+        //
+        // The transmute bought one Vec allocation per `delete_many` call,
+        // against an operation that performs three fsyncs. That is far below the
+        // floor this harness can measure, so the safe form costs nothing real
+        // and removes an unsafe block that no compiler check was guarding.
+        let handles: Vec<chisel::Handle> =
+            ids.iter().map(|id| chisel::Handle::from(id.0)).collect();
+        Ok(self.db.delete_many(&handles)?)
     }
 
     fn file_size_bytes(&self) -> EngineResult<u64> {

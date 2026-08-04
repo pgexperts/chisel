@@ -174,12 +174,42 @@ impl Overflow {
                 page_id: first_page,
             });
         }
+        // `total_length` is disk-controlled and, at this point, unauthenticated:
+        // the page checksum is XXH3, which is non-cryptographic and publicly
+        // recomputable, so an attacker with byte-level control over the file
+        // chooses this value freely. The type and zero-length guards above do
+        // NOT constrain it — they only reject a page that isn't Overflow-typed
+        // at all, which is exactly the case a crafted file avoids.
+        //
+        // Bound it against what the file could physically hold before it is
+        // used for anything. This single check covers both hazards:
+        //
+        //   * the `Vec::with_capacity` below, which on a forged u64::MAX either
+        //     panics with "capacity overflow" or reaches `handle_alloc_error`
+        //     and ABORTS the process — bypassing the poison model entirely, from
+        //     a plain `Chisel::read` on an untrusted file; and
+        //   * `max_pages`, derived from the same value, which is the loop's only
+        //     termination bound. A self-referential next_page link under a
+        //     forged length would otherwise spin ~2^51 cache-hit iterations.
+        //
+        // The ceiling is the allocator's high-water mark, NOT the file length.
+        // A chain cannot span more pages than have ever been allocated, and
+        // `next_page_id` counts pages allocated in the current transaction
+        // too — pages that live in the cache and have not extended the file
+        // yet. Using `file_page_count` here instead would reject a perfectly
+        // valid read-your-own-writes of a large value inside the transaction
+        // that wrote it.
+        //
+        // Generous (it ignores the superblock, handle-table and data pages
+        // that must also be in there) but bounded by something an attacker
+        // cannot inflate without actually supplying the bytes.
+        let ceiling = (cache.next_page_id() as usize).saturating_mul(OVERFLOW_PAYLOAD);
+        if total_length > ceiling {
+            return Err(ChiselError::CorruptPage {
+                page_id: first_page,
+            });
+        }
         let max_pages = total_length.div_ceil(OVERFLOW_PAYLOAD);
-        // Ordering matters: the wrong-type and zero-length guards above run
-        // BEFORE this allocation, so an untrusted `total_length` (e.g. a
-        // stale handle pointing at a non-overflow page whose bytes 16..24
-        // read as u64::MAX) can never drive a speculative giant allocation
-        // here. The per-page loop guard alone would be too late.
         let mut result = Vec::with_capacity(total_length);
 
         let mut current_page = first_page;
