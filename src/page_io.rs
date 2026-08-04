@@ -157,7 +157,30 @@ impl PageIo {
             // ones.
             #[cfg(unix)]
             std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-            opts.open(path)?
+            let f = opts.open(path)?;
+            // `mode` above applies only when the open CREATES the file, which
+            // leaves one gap in the contract this function documents. Since a
+            // zero-length file is a legitimate create target, another local user
+            // can pre-plant an empty world-readable file at the database path;
+            // Chisel would then adopt it and write every value into a file the
+            // planter can read, with the promised 0600 never applied.
+            //
+            // Close it by tightening any zero-length file we adopt. A file with
+            // no bytes is not yet a database, so there are no permissions its
+            // owner has deliberately set on a database to preserve. If the file
+            // belongs to someone else the fchmod fails EPERM and the open fails
+            // — the correct outcome for "something is squatting on my path".
+            //
+            // Non-empty files are untouched, exactly as documented: reopening an
+            // existing database never alters its permissions.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if f.metadata()?.len() == 0 {
+                    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                }
+            }
+            f
         };
         Self::try_lock(&file)?;
         // I51: seed the page-count cache from the current file length.

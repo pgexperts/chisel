@@ -19,15 +19,15 @@ use std::num::NonZeroU32;
 
 /// A stable, opaque chunk handle. Newtype over the engine's `u64` id.
 ///
-/// `#[repr(transparent)]` is load-bearing, not decoration: the bench adapter
-/// reinterprets a `&[u64]` slice as `&[Handle]` without copying, which is sound
-/// only because `Handle` has identical layout to `u64`.
+/// `#[repr(transparent)]` is kept deliberately so the type stays layout-
+/// identical to `u64`, which is what lets a future FFI or zero-copy adapter
+/// depend on it. Nothing does today — see the tripwire below for exactly what
+/// the const assertions can and cannot enforce.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Handle(u64);
 
-// Layout tripwire for `#[repr(transparent)]` above, which the FFI surfaces
-// depend on.
+// Layout tripwire for `#[repr(transparent)]` above.
 //
 // Be precise about what these catch, because the previous comment was not:
 // they fire if a field is ADDED (size changes) or alignment shifts. They do
@@ -43,11 +43,11 @@ pub struct Handle(u64);
 const _: () = {
     assert!(
         core::mem::size_of::<Handle>() == core::mem::size_of::<u64>(),
-        "Handle must stay layout-identical to u64 (bench transmute relies on repr(transparent))"
+        "Handle must stay layout-identical to u64 (repr(transparent) is the contract)"
     );
     assert!(
         core::mem::align_of::<Handle>() == core::mem::align_of::<u64>(),
-        "Handle must stay layout-identical to u64 (bench transmute relies on repr(transparent))"
+        "Handle must stay layout-identical to u64 (repr(transparent) is the contract)"
     );
 };
 

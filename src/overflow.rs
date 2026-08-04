@@ -293,6 +293,23 @@ impl Overflow {
                 page_id: first_page,
             });
         }
+        // The SAME disk-controlled `total_length` that `read` bounds, reached
+        // from `Chisel::delete` and `Chisel::update` instead of `Chisel::read`.
+        // It needs the identical ceiling and for the identical reason: it is the
+        // sole source of `max_pages`, which is this loop's only termination
+        // bound. A forged u64::MAX yields max_pages ~2.26e15, so a chain whose
+        // `next_page` points at itself pushes into `freed` until the allocator
+        // aborts — the process-killing outcome the poison model cannot intercept.
+        //
+        // See `read` for why the ceiling is `next_page_id` (the allocator
+        // high-water mark) rather than the file length: it must not reject a
+        // read-your-own-writes of a large value inside the writing transaction.
+        let ceiling = (cache.next_page_id() as usize).saturating_mul(OVERFLOW_PAYLOAD);
+        if total_length > ceiling {
+            return Err(ChiselError::CorruptPage {
+                page_id: first_page,
+            });
+        }
         let max_pages = total_length.div_ceil(OVERFLOW_PAYLOAD);
 
         let mut freed = Vec::new();

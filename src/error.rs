@@ -159,6 +159,23 @@ pub enum ChiselError {
         stored: u32,
         compiled: u32,
     },
+    // Raised at open time when the superblock's `freemap_depth` exceeds the
+    // depth the freemap radix can represent. Depth 5 already spans every u64
+    // page id, so a larger value cannot have been written by any correct
+    // binary — it is a corrupt or forged field.
+    //
+    // Deliberately NOT `CorruptSuperblock`: that variant means "no readable
+    // superblock at all" and is documented as recoverable by reopening,
+    // because slot selection may pick a different slot next time. Here the
+    // superblock parsed and validated fine apart from this one field, and
+    // every sibling slot carries the same rejected depth — so a reopen
+    // returns the same error forever. It carries the offending value for the
+    // same reason `UnsupportedPageSize` does: a bare "corrupt" tells an
+    // operator nothing about which field to look at.
+    InvalidFreemapDepth {
+        stored: u32,
+        max: u32,
+    },
 
     // Operational — the caller supplied the wrong key material or none, or
     // asked an unencrypted-only build to open an encrypted DB. The on-disk
@@ -223,6 +240,7 @@ impl ChiselError {
                 | ChiselError::CorruptPage { .. }
                 | ChiselError::InvalidPageId { .. }
                 | ChiselError::UnsupportedPageSize { .. }
+                | ChiselError::InvalidFreemapDepth { .. }
                 | ChiselError::DecryptionFailed { .. }
         )
     }
@@ -312,6 +330,10 @@ impl fmt::Display for ChiselError {
             ChiselError::UnsupportedPageSize { stored, compiled } => write!(
                 f,
                 "page size mismatch: file was written with {stored}-byte pages, this build uses {compiled}-byte pages"
+            ),
+            ChiselError::InvalidFreemapDepth { stored, max } => write!(
+                f,
+                "superblock declares freemap depth {stored}, which exceeds the maximum {max} (corrupt or forged superblock)"
             ),
             ChiselError::NoEncryptionKey => write!(
                 f,
@@ -571,6 +593,7 @@ mod tests {
                 | ChiselError::CorruptPage { .. }
                 | ChiselError::InvalidPageId { .. }
                 | ChiselError::UnsupportedPageSize { .. }
+                | ChiselError::InvalidFreemapDepth { .. }
                 | ChiselError::DecryptionFailed { .. } => true,
             }
         }
@@ -616,6 +639,7 @@ mod tests {
                 stored: 0,
                 compiled: 0,
             },
+            ChiselError::InvalidFreemapDepth { stored: 0, max: 0 },
             ChiselError::NoEncryptionKey,
             ChiselError::InvalidEncryptionKey,
             ChiselError::EncryptionNotSupported,
@@ -630,10 +654,13 @@ mod tests {
                 "is_fatal() disagrees with the documented Fatal/Operational block for {e:?}"
             );
         }
-        // Tripwire: exactly 10 variants are fatal today. If this count moves, the
+        // Tripwire: exactly 11 variants are fatal today. If this count moves, the
         // Fatal/Operational split changed — confirm that was intentional (it is a
         // breaking change for callers doing error-class matching, per the header).
-        assert_eq!(all.iter().filter(|e| e.is_fatal()).count(), 10);
+        // Last moved 10 -> 11 by InvalidFreemapDepth, which is fatal because a
+        // superblock field outside its representable range cannot be resolved by
+        // retrying: every sibling slot carries the same value.
+        assert_eq!(all.iter().filter(|e| e.is_fatal()).count(), 11);
     }
 
     // Phase 4: the three operational encryption errors are recoverable (the

@@ -480,6 +480,13 @@ impl FreeMapTree {
         id: u64,
         extend: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
     ) -> Result<()> {
+        // Depth-check FIRST. The `while` condition below evaluates `capacity()`
+        // before it evaluates `self.depth < MAX_DEPTH`, and `capacity()` loops
+        // `depth` times — so a forged depth of u32::MAX spins ~4.3e9 saturating
+        // multiplies (tens of seconds) before the guard inside `mark_free` ever
+        // runs. It does eventually fail closed, but "eventually" is not what the
+        // other entry points promise, and this is the manager-facing one.
+        self.check_depth()?;
         // Grow until capacity covers id. MAX_DEPTH covers all of u64, so the loop
         // terminates; grow() no-ops at MAX_DEPTH and capacity() saturates to
         // u64::MAX, breaking the loop.
@@ -956,6 +963,19 @@ mod tests {
             t.allocate_first(&mut c, &mut hint, &mut extend).map(|_| ()),
         );
         assert_rejected("mark_free", t.mark_free(&mut c, 7, &mut extend));
+        // The manager-facing entry point, and the one the first version of this
+        // guard missed. Its `while` condition evaluates `capacity()` — which
+        // loops `depth` times — BEFORE it evaluates `depth < MAX_DEPTH`, so at
+        // u32::MAX it spun ~4.3e9 saturating multiplies before the guard inside
+        // mark_free fired. It reached the same verdict, but only after tens of
+        // seconds; a bounded-but-absurd delay is not what the other entry points
+        // promise. `u32::MAX` rather than `MAX_DEPTH + 1` is deliberate: at the
+        // small over-bound the missing check is invisible.
+        let mut t = FreeMapTree::from_roots(phantom_root, u32::MAX);
+        assert_rejected(
+            "mark_free_growing",
+            t.mark_free_growing(&mut c, 7, &mut extend),
+        );
 
         // A depth AT the bound is legal and must still be accepted — the guard
         // is `>`, not `>=`. It fails on the phantom page instead, which proves

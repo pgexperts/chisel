@@ -1828,9 +1828,16 @@ fn forged_freemap_depth_is_rejected_at_open() {
     }
 
     match Chisel::open(&path, Default::default()) {
-        Err(ChiselError::CorruptSuperblock { .. }) => {}
+        // Not CorruptSuperblock: that variant means "no readable superblock at
+        // all" and is documented as reopen-recoverable via slot selection. This
+        // superblock parsed fine apart from one field, and every sibling slot
+        // carries the same rejected depth, so the error must name the field.
+        Err(ChiselError::InvalidFreemapDepth { stored, max }) => {
+            assert_eq!(stored, 500_000);
+            assert_eq!(max, crate::freemap_tree::MAX_DEPTH);
+        }
         Ok(_) => panic!("a freemap_depth of 500_000 must not open"),
-        Err(other) => panic!("expected CorruptSuperblock, got {other:?}"),
+        Err(other) => panic!("expected InvalidFreemapDepth, got {other:?}"),
     }
 }
 
@@ -1852,10 +1859,15 @@ fn a_new_database_file_is_created_private_to_its_owner() {
         db.commit().unwrap();
     }
 
+    // Assert the security property, not the exact bits. The kernel applies
+    // `mode & ~umask`, so a developer running with umask 0277 gets 0400 here —
+    // still private, but not equal to 0600. Testing `mode == 0o600` would fail
+    // for them on a file that is if anything MORE restrictive than required.
     let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(
-        mode, 0o600,
-        "a freshly created database must not be group- or world-readable (got {mode:o})"
+        mode & 0o077,
+        0,
+        "a freshly created database must not be group- or world-accessible (got {mode:o})"
     );
 }
 
@@ -1911,4 +1923,140 @@ fn a_symlinked_spillway_path_is_refused_rather_than_followed() {
         b"important contents that must survive",
         "the symlink target must not have been truncated"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_planted_regular_file_at_the_spillway_path_is_not_adopted() {
+    // The other half of SECURITY-SWEEP-4, missed by the first fix. O_NOFOLLOW
+    // closes the truncate direction (a planted SYMLINK) but not the disclosure
+    // direction: a planted REGULAR file is not a symlink, so the open succeeds,
+    // and `mode(0600)` applies only when the open creates the file. The planter
+    // keeps ownership and their permissive mode, and the engine then writes
+    // spilled pages — uncommitted user values — into a file they can read.
+    //
+    // The fix creates the sidecar exclusively and only unlinks a pre-existing
+    // entry that is a plain file we own. A foreign-owned plant cannot be
+    // distinguished from ours in a portable test (both are owned by the test
+    // user), so this asserts the property that IS observable and that the bug
+    // violated: whatever the engine ends up writing to must not carry the
+    // planted permissive mode.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("plant.db");
+    let sidecar = dir.path().join("plant.db.spillway");
+
+    fs::write(&sidecar, b"planted").unwrap();
+    fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o666)).unwrap();
+
+    let opts = Options::default()
+        .cache_max_bytes(16 * PAGE_SIZE as u64)
+        .spillway_max_bytes(64 * PAGE_SIZE as u64);
+    let mut db = Chisel::open(&db_path, opts).unwrap();
+    db.begin().unwrap();
+    for _ in 0..400 {
+        if db.allocate(&vec![0x5A; PAGE_SIZE + 64]).is_err() {
+            break;
+        }
+    }
+    let _ = db.rollback();
+    drop(db);
+
+    let mode = fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode & 0o077,
+        0,
+        "the spillway must not inherit a planted file's group/world bits (got {mode:o})"
+    );
+    // And the planted bytes must be gone — the sidecar in use is a new file,
+    // not the planted one reused.
+    assert_ne!(
+        fs::read(&sidecar).unwrap(),
+        b"planted",
+        "the planted file must have been replaced, not adopted"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_database_created_over_a_planted_empty_file_is_still_private() {
+    // `mode` on OpenOptions applies only when the open CREATES the file, and a
+    // zero-length file is a legitimate create target (that boundary is pinned
+    // by the PR #127 regression test). So a local user could pre-plant an empty
+    // world-readable file at the database path and Chisel would adopt it,
+    // writing every stored value into a file the planter can read while the
+    // promised 0600 was never applied.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("planted.db");
+    fs::write(&path, b"").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        db.allocate(b"private").unwrap();
+        db.commit().unwrap();
+    }
+
+    let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode & 0o077,
+        0,
+        "adopting an empty file must not leave the database group/world-accessible (got {mode:o})"
+    );
+}
+
+#[test]
+fn a_forged_overflow_length_cannot_run_the_delete_path_out_of_memory() {
+    // SECURITY-SWEEP-2 reached through `delete`/`update` instead of `read`.
+    // `Overflow::collect_chain_pages` reads the same disk-controlled
+    // total_length at bytes 16..24 and derives `max_pages` from it. The first
+    // fix bounded the value in `read` only, so a forged u64::MAX still yielded
+    // max_pages ~2.26e15 here — and with a self-referential next_page link the
+    // loop pushes into an unbounded Vec until the allocator aborts the process,
+    // which is exactly the poison-model bypass the fix set out to close.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+
+    let handle;
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        handle = db.allocate(&vec![0xC3; 20_000]).unwrap();
+        db.commit().unwrap();
+    }
+
+    let overflow_page = find_page_of_type(&path, PageType::Overflow);
+    {
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut buf = [0u8; PAGE_SIZE];
+        f.seek(SeekFrom::Start(overflow_page * PAGE_SIZE as u64))
+            .unwrap();
+        f.read_exact(&mut buf).unwrap();
+        // Forge the length AND point next_page at this same page: the
+        // self-reference is what turns an unbounded max_pages into an unbounded
+        // walk rather than a chain that simply ends.
+        buf[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+        buf[24..32].copy_from_slice(&overflow_page.to_le_bytes());
+        page::stamp_checksum(&mut buf);
+        f.seek(SeekFrom::Start(overflow_page * PAGE_SIZE as u64))
+            .unwrap();
+        f.write_all(&buf).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    let mut db = Chisel::open(&path, Default::default()).unwrap();
+    db.begin().unwrap();
+    match db.delete(handle) {
+        Err(ChiselError::CorruptPage { .. }) => {}
+        Ok(()) => panic!("a forged overflow length must not delete cleanly"),
+        Err(other) => panic!("expected CorruptPage, got {other:?}"),
+    }
 }

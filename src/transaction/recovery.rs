@@ -434,8 +434,9 @@ impl TransactionManager {
         // claimed `capacity()` saturation "fails closed (rejects the descent)",
         // but saturation only prevents arithmetic overflow — it rejects nothing.
         if sb.freemap_depth > crate::freemap_tree::MAX_DEPTH {
-            return Err(ChiselError::CorruptSuperblock {
-                defects: Vec::new(),
+            return Err(ChiselError::InvalidFreemapDepth {
+                stored: sb.freemap_depth,
+                max: crate::freemap_tree::MAX_DEPTH,
             });
         }
 

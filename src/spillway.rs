@@ -6,9 +6,13 @@
 // allocation would push it past its strict cap.
 //
 // Lifecycle (spec 2026-05-03-chisel-spillway-design.md, "Lifecycle"):
-//   open       file is created (or reused) and truncated to zero. Any
-//              pre-existing content is garbage from a crashed prior
-//              process and unconditionally discarded.
+//   open       file is created fresh (O_EXCL | O_NOFOLLOW, mode 0600). Any
+//              pre-existing content is garbage from a crashed prior process
+//              and is discarded — but only after the entry is confirmed to be
+//              a plain file this user owns. The path is derived from the
+//              database path and is therefore predictable, so a symlink or a
+//              foreign-owned file there is a plant, not debris, and is refused
+//              (see `reclaim_stale_sidecar`).
 //   spill      page_id allocates a slot (or overwrites its existing
 //              one), bytes + per-slot checksum are written.
 //              Writes are deliberately NOT fsynced: spillway content never
@@ -104,11 +108,56 @@ pub struct Spillway {
     payload_size: usize,
 }
 
+/// Remove a pre-existing sidecar entry, but ONLY when it is plausibly debris
+/// from a crashed run of this same user — a plain file, owned by us, with
+/// exactly one link. Anything else (a symlink, a file owned by someone else, a
+/// hard link into a directory we do not control) is a plant at a predictable
+/// path, and is refused rather than cleaned up.
+///
+/// The distinction matters because the two cases want opposite handling. Debris
+/// is expected and must not break an open; a plant is an active attempt to
+/// redirect or read uncommitted user data and must surface. `IoError` is fatal,
+/// so a plant poisons the handle.
+#[cfg(unix)]
+fn reclaim_stale_sidecar(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // symlink_metadata, not metadata: the whole point is to inspect the entry
+    // itself rather than whatever it may point at.
+    let md = std::fs::symlink_metadata(path).map_err(ChiselError::IoError)?;
+    // SAFETY: geteuid() is a pure read of process credentials. It cannot fail
+    // and touches no memory we own.
+    let ours =
+        md.file_type().is_file() && md.nlink() == 1 && md.uid() == unsafe { libc::geteuid() };
+    if !ours {
+        return Err(ChiselError::IoError(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "spillway sidecar path is occupied by an entry this process did not create \
+             (symlink, foreign owner, or extra hard link) — refusing to use it",
+        )));
+    }
+    std::fs::remove_file(path).map_err(ChiselError::IoError)
+}
+
+/// Non-unix fallback. Without `st_uid`/`st_nlink` there is nothing to
+/// discriminate on, so keep the historical behaviour: treat a pre-existing
+/// entry as crash debris and discard it.
+#[cfg(not(unix))]
+fn reclaim_stale_sidecar(path: &Path) -> Result<()> {
+    std::fs::remove_file(path).map_err(ChiselError::IoError)
+}
+
 impl Spillway {
-    /// Open (or create + truncate) a file-backed spillway alongside the
-    /// main database. The path is `<db_path>.spillway`. Any pre-existing
-    /// content is discarded — no superblock can possibly point at
-    /// spillway bytes, so this is always safe.
+    /// Open a fresh file-backed spillway alongside the main database. The path
+    /// is `<db_path>.spillway`.
+    ///
+    /// Any pre-existing entry at that path is REMOVED, not adopted: the sidecar
+    /// is created exclusively (`O_EXCL | O_NOFOLLOW`, mode 0600). No superblock
+    /// can point at spillway bytes, so discarding old content is always safe —
+    /// but reusing the old file is not, because the path is predictable and
+    /// another local user may have planted something there. A losing race for
+    /// the create (someone re-planted between the unlink and the open) is a hard
+    /// error that poisons the handle, which is the correct outcome for "someone
+    /// is tampering with my sidecar path".
     ///
     /// `payload_size` is `PAGE_SIZE` for plaintext DBs and `ENC_PAGE_SIZE`
     /// for encrypted DBs. It determines the slot size and capacity accounting.
@@ -130,36 +179,62 @@ impl Spillway {
         // in-flight cache state, not a "fix your path and retry" condition, so it
         // must poison rather than mislead the caller into continuing (review
         // 2026-06-22).
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create(true).truncate(true);
-        // The sidecar needs BOTH guards, and for a sharper reason than the main
-        // database file does.
+        // The sidecar needs sharper handling than the main database file.
         //
         // Its path is fully derived from the database path, so it is predictable
         // to anyone who can see the database. It is created lazily, mid
         // transaction, whenever cache pressure forces a spill — not at open,
-        // where a caller might notice something wrong. And it is opened with
-        // `truncate(true)`, on the documented assumption that any pre-existing
-        // content is garbage from a crashed prior process.
+        // where a caller might notice something wrong. And it used to be opened
+        // `create(true).truncate(true)`, on the documented assumption that any
+        // pre-existing content is garbage from a crashed prior process.
         //
-        // That assumption does not hold for a pre-existing SYMLINK. A local user
-        // who can create entries in the database's directory can plant
-        // `<db>.spillway` pointing at any file the database owner can write; the
-        // next spill would then follow it and truncate the victim's file to
-        // zero. O_NOFOLLOW makes that open fail (ELOOP) instead — a poisoned
-        // handle, which is the correct outcome for "someone is tampering with my
-        // sidecar path". Encryption does not help here: the hazard is the
-        // truncate, not the contents.
+        // That assumption fails against a local user who can create entries in
+        // the database's directory, in TWO directions:
         //
-        // 0600 for the same reason as the main file, and it matters more here:
-        // spilled pages are uncommitted user data written without the caller
-        // ever asking for a second file to exist.
+        //   * a planted SYMLINK pointing at any file the database owner can
+        //     write would be followed and the victim's file truncated to zero;
+        //   * a planted REGULAR file, owned by the attacker and mode 0666, would
+        //     simply be adopted — `truncate` empties it but does not change its
+        //     owner or mode, and `mode(0600)` applies only when the open itself
+        //     CREATES the file. Chisel would then write spilled pages, which are
+        //     uncommitted user values, into a file the attacker can read.
+        //
+        // Closing only the first direction leaves a data-disclosure hole behind
+        // a fix labelled as closing the hazard. So: unlink whatever is there,
+        // then create EXCLUSIVELY. `create_new` sets O_EXCL, which makes the
+        // open fail rather than adopt anything that reappears between the two
+        // syscalls, so the attacker cannot win the race by re-planting — the
+        // worst they achieve is a denial of service, which a local user who can
+        // write to this directory already has by other means.
+        //
+        // Encryption does not help with either direction: the hazards are the
+        // truncate and the file's ownership, not the contents.
+        //
+        // Crash debris is still discarded, as the lifecycle doc promises — but
+        // only after `reclaim_stale_sidecar` confirms it really is debris this
+        // user could have left, rather than another user's plant. That keeps the
+        // documented behaviour for the case it was written for (a prior run of
+        // ours died) and fails closed for the case it was not.
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
-        let file = opts.open(&path).map_err(ChiselError::IoError)?;
+        let file = match opts.open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                reclaim_stale_sidecar(Path::new(&path))?;
+                // Exclusive again on the retry: if the planter re-created the
+                // entry between the unlink and this open, we must fail rather
+                // than adopt it. A local user who can win that race can already
+                // deny service by other means, so a hard error is the correct
+                // trade — it never adopts a file we did not create.
+                opts.open(&path).map_err(ChiselError::IoError)?
+            }
+            Err(e) => return Err(ChiselError::IoError(e)),
+        };
         Ok(Spillway {
             backing: Backing::File { file },
             slots: HashMap::new(),
