@@ -63,6 +63,11 @@ impl TransactionManager {
 
         // I119: use checked_add, not `+= 1`. A wrapped counter corrupts
         // Superblock::select's "highest counter wins" rule on recovery.
+        //
+        // Reachable from a forged superblock until `Superblock::validate` grew
+        // its MAX_TXN_COUNTER bound; see the long note at the matching site in
+        // commit.rs for why the old "structurally unreachable" claim was wrong
+        // and what actually guarantees the headroom now.
         self.txn_counter = self
             .txn_counter
             .checked_add(1)
