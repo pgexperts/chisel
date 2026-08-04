@@ -7,7 +7,9 @@ status: Accepted
 
 # 0000. Decision register (overview)
 
-Chisel is a single-writer embedded transactional storage engine in Rust. The decisions below are the ones that, if reversed, would require rewriting substantial parts of the engine. Smaller decisions (specific bit layouts, error message wording, individual issue resolutions) live in `ISSUES.md`.
+Chisel is a single-writer embedded transactional storage engine in Rust. The decisions below are the ones that, if reversed, would require rewriting substantial parts of the engine. Smaller decisions (specific bit layouts, error message wording, individual issue resolutions) are tracked as [GitHub issues](https://github.com/pgexperts/chisel/issues); before 2026-08-03 they lived in a tracked `ISSUES.md`, which ADR [0017](0017-github-issues-replace-tracked-issues-md.md) retired.
+
+**Reading `ISSUES.md` citations.** Records 0006, 0007, 0012, 0013 and 0015 predate that retirement and cite `ISSUES.md` entries by `I<number>`. Those bodies are left as written — an Accepted record is superseded, not edited, and the citations are accurate as dated provenance. Resolve one with `git show 0ffe3bc:ISSUES.md`, the last commit carrying the file.
 
 | # | Decision | Status | Reversibility |
 |---|---|---|---|

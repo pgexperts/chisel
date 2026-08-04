@@ -94,3 +94,12 @@ how to retrieve the retired file.
   for. This is the real cost of this decision.
 - Offline work loses the issue list. Anyone working without network access can
   no longer read the open issues from the checkout.
+- The decision log itself now contains dead citations. Records 0006, 0007,
+  0012, 0013 and 0015 were written while `ISSUES.md` was live and cite it by
+  `I<number>`; those bodies are Accepted and are superseded rather than edited,
+  so the citations stay. This is the same trade made for the ~167 code comments
+  above, and it lands in a worse place — README.md and ARCHITECTURE.md now route
+  readers to `docs/adr/` as *the* decision log, so a reader following that
+  pointer can hit a citation with no way to resolve it. Record 0000 carries the
+  breadcrumb (`git show 0ffe3bc:ISSUES.md`) for the whole log rather than
+  repeating it in each affected record.
