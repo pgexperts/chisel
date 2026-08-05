@@ -364,6 +364,24 @@ impl PageCipher {
     /// blob: `ciphertext(8192) ‖ tag(16) ‖ nonce(24)`. AAD = page_id LE bytes
     /// (anti-relocation). A fresh random 192-bit nonce per call (spec §2.1) —
     /// safe under shadow-paging page reuse, and stored in the clear.
+    ///
+    /// The AAD is page_id and nothing else, and that is a documented boundary
+    /// rather than an oversight — but be precise about what it means, because
+    /// "anti-relocation" is easy to read as more than it is. A sealed page
+    /// authenticates WHERE it belongs, not WHEN. An attacker holding an older
+    /// copy of the file can splice INDIVIDUAL stale pages into the current one:
+    /// each verifies, at the right page id, under the current DEK. The engine
+    /// then may walk a mixed state that never existed at any commit — a stale
+    /// freemap or tree page beside current siblings — corrupting structure
+    /// instead of raising `DecryptionFailed`. The positional page-type checks
+    /// (I148) catch this whenever the stale page's type differs from the one
+    /// expected at that position, so it is silent only for a same-type splice.
+    ///
+    /// So the guarantee here is spatial, not temporal. Adding a commit epoch to
+    /// this AAD would close it, at the cost of rewriting every reachable page on
+    /// each epoch bump. See issue #142 and spec §9; `Chisel::rekey` bounds the
+    /// exposure by invalidating every image sealed under the old DEK, without
+    /// making the splice detectable.
     pub fn seal(&self, page_id: u64, plaintext: &[u8; 8192]) -> [u8; ENC_PAGE_SIZE] {
         let nonce = random_array::<NONCE_LEN>();
         let aad = page_id.to_le_bytes();

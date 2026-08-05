@@ -37,5 +37,36 @@ status: Accepted
 
 Spec: `docs/specs/2026-06-29-on-disk-encryption-design.md`. Plan: `docs/plans/2026-06-29-on-disk-encryption.md`. Implemented 2026-06-30 across 6 phases (crypto core → superblock/key-flow → page-I/O + cache + spillway → public API + Python → key rotation → docs/version). See ARCHITECTURE.md "On-disk encryption" and ISSUES.md I142 (deferred bulk DEK rotation). Public API is deliberately narrow: only `Key`, `Argon2Params`, and the encryption error variants are public; the crypto/superblock internals are `pub(crate)`.
 
----
+## Addendum (2026-08-04)
 
+Two statements in the record above have been overtaken, and are corrected here
+rather than in place — an Accepted record's body is superseded or annotated, not
+rewritten.
+
+**Bulk DEK rotation is no longer deferred.** The Alternatives-considered bullet
+and the closing paragraph describe full DEK rotation as deferred to `ISSUES.md`
+I142. It shipped as `Chisel::rekey` — see ADR
+[0018](0018-bulk-dek-rotation-via-copy-and-rename.md) for the design (offline,
+path-taking, copy-then-atomic-rename, collapses the key-slot table to the
+supplied credential). `ISSUES.md` itself was retired in favour of GitHub issues;
+I142 is now
+[issue #140](https://github.com/pgexperts/chisel/issues/140).
+
+**The replay boundary is stronger than this record states.** The Consequences
+bullet says there is "no rollback/replay protection (an attacker substituting a
+wholly older, validly-signed image is undetectable...)". That describes only the
+coarse case. Page AAD is `page_id` and nothing else, so a sealed page
+authenticates *where* it belongs but not *when*: an attacker holding an older
+copy can splice INDIVIDUAL stale pages into a current file, each verifying at
+the correct page id under the current DEK. The result is a mixed state that
+never existed at any commit.
+
+That is strictly stronger than "wholly older image", and it is not covered by
+the anti-relocation property — relocation is about the wrong *place*, replay
+about the wrong *time*. The boundary is stated properly in the design spec §9
+and THEORY.md, and tracked as
+[issue #142](https://github.com/pgexperts/chisel/issues/142). `rekey` bounds the
+exposure (it invalidates every image sealed under the old DEK) without making a
+splice detectable.
+
+---
