@@ -293,7 +293,7 @@ On create, Chisel generates a random data-encryption key (DEK), encrypts every p
 
 The wrapped DEK lives in an **8-slot key table**. Because the DEK itself never changes, credential rotation only re-wraps the DEK in a slot — it is O(1), independent of database size. `add_key` stages a second credential (both open the DB), `rotate_key` replaces one credential in place, and `remove_key` retires one (refusing the last remaining slot with `LastKeySlot`). A full table returns `NoFreeKeySlot`.
 
-See [ARCHITECTURE.md#on-disk-encryption](ARCHITECTURE.md#on-disk-encryption) for the on-disk layout (crypto header, key slots, per-page nonce stride) and [THEORY.md](THEORY.md) for the rationale behind the envelope scheme and the shadow-paging nonce discipline (with [ISSUES.md](ISSUES.md) as the dated decision log).
+See [ARCHITECTURE.md#on-disk-encryption](ARCHITECTURE.md#on-disk-encryption) for the on-disk layout (crypto header, key slots, per-page nonce stride) and [THEORY.md](THEORY.md) for the rationale behind the envelope scheme and the shadow-paging nonce discipline (with [`docs/adr/`](docs/adr/) as the dated decision log).
 
 ## API reference
 
@@ -473,7 +473,8 @@ db.remove_key("correct horse battery staple")                          # retire 
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — living architecture overview: layer model, commit protocol, recovery, full on-disk format byte-by-byte, and cross-cutting concepts. Start here if you're reading the codebase to *act* on it.
 - [`THEORY.md`](THEORY.md) — theory of operation: *why* the design is what it is — the load-bearing decisions, the rejected alternatives, and the implementation history. Read this to build a durable model before changing the engine.
-- [`ISSUES.md`](ISSUES.md) — running decision log: open issues, closed issues, and every design tradeoff with date-stamped rationale.
+- [`docs/adr/`](docs/adr/) — architecture decision records: one file per decision, with the context and the alternatives that were rejected.
+- [GitHub issues](https://github.com/pgexperts/chisel/issues) — the running issue log. This replaced a tracked `ISSUES.md` on 2026-08-03; `I<number>` markers in code comments refer to entries in that retired file, which remains readable in git history.
 
 ## License
 
