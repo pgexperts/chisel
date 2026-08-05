@@ -17,6 +17,7 @@ from chisel._chisel import (
     Savepoint,
     DrainInsertion,
     open,
+    rekey,
     ChiselError,
     OperationalError,
     FatalError,
@@ -130,7 +131,7 @@ class DefragStats:
 
 __all__ = [
     "__version__",
-    "Chisel", "Transaction", "Savepoint", "DrainInsertion", "open",
+    "Chisel", "Transaction", "Savepoint", "DrainInsertion", "open", "rekey",
     "Stats", "Counters", "DefragOptions", "DefragStats",
     "ChiselError", "OperationalError", "FatalError",
     "InvalidHandleError", "NoActiveTransactionError",

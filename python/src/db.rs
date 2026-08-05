@@ -681,9 +681,45 @@ fn closed_err() -> PyErr {
     crate::errors::ClosedError::new_err("database handle has been closed")
 }
 
+/// Bulk DEK rotation — re-encrypt an entire database under a fresh data key.
+///
+/// A module-level function rather than a `Chisel` method because it operates on
+/// a PATH, not an open handle: it rewrites the whole file and replaces it by
+/// rename, so any handle opened beforehand would afterwards refer to the
+/// original, now-unlinked inode. Mirrors `chisel.open()` in shape for that same
+/// reason — both name a database by path rather than assuming one is open.
+///
+/// I156: the GIL is released for the duration. This is O(total_pages) I/O plus
+/// an Argon2id derivation for a passphrase credential; holding the GIL across
+/// it would freeze every other Python thread for the length of a whole-file
+/// rewrite, which is the worst case of exactly the problem I156 describes.
+#[pyfunction]
+#[pyo3(signature = (path, key))]
+pub fn rekey(py: Python<'_>, path: Py<PyAny>, key: Py<PyAny>) -> PyResult<()> {
+    // Coerce both arguments under the GIL, before detaching, so a bad type
+    // raises a synchronous Python TypeError — same discipline as open().
+    let path_buf: PathBuf = {
+        let bound = path.bind(py);
+        let s: String = if let Ok(py_str) = bound.cast::<PyString>() {
+            py_str.to_str()?.to_owned()
+        } else {
+            let os = py.import("os")?;
+            os.call_method1("fspath", (path,))?.extract()?
+        };
+        PathBuf::from(s)
+    };
+    // Zeroizing on coercion, before any engine call, so key material never
+    // reaches an error message, traceback, or repr.
+    let key = py_key(key.bind(py))?;
+
+    py.detach(|| chisel::Chisel::rekey(&path_buf, &key, None))
+        .map_err(to_py_err)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyChisel>()?;
     m.add_class::<PyDrainInsertion>()?;
     m.add_function(wrap_pyfunction!(open, m)?)?;
+    m.add_function(wrap_pyfunction!(rekey, m)?)?;
     Ok(())
 }

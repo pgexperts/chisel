@@ -142,6 +142,36 @@ def open(
 ) -> Chisel: ...
 
 
+def rekey(path: str | os.PathLike[str], key: bytes | str) -> None:
+    """Re-encrypt an entire database under a freshly generated data key.
+
+    Takes a path rather than an open handle, and mirrors :func:`open` for that
+    reason: it rewrites the whole file and replaces it by rename, so a handle
+    opened beforehand would afterwards refer to the original, now-unlinked
+    inode. Close any open database first, call this, then reopen.
+
+    Use this only when the DATA key itself is believed compromised. If a
+    credential leaked, :meth:`Chisel.rotate_key` is the right tool -- it is
+    O(1) and touches only the superblock.
+
+    Every credential other than ``key`` is revoked, because each key slot's
+    wrapping key is derived from its own credential and only ``key`` was
+    supplied. Add the others back with :meth:`Chisel.add_key` afterwards.
+
+    For a passphrase credential the Argon2 cost parameters are INHERITED from
+    the slot ``key`` currently unlocks, so a deliberately hardened database is
+    not silently downgraded to the defaults by the rotation.
+
+    Crash-safe: the rotated database is built beside the original and published
+    with an atomic rename, so the path only ever names a complete file.
+
+    Raises:
+        DatabaseFileNotFoundError: no database at ``path``.
+        EncryptionNotSupportedError: the database is not encrypted.
+        InvalidEncryptionKeyError: ``key`` unlocks no key slot.
+    """
+
+
 class Chisel:
     @property
     def is_poisoned(self) -> bool: ...

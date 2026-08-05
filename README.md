@@ -25,7 +25,7 @@ Chisel is designed for single-writer embedded use: one process holds the file vi
 - **Named roots** — a small fixed table in the superblock mapping string names to handles. Survives commit / rollback transactionally.
 - **Defragmentation** — explicit `defrag()` consolidates sparse pages and returns a count-based stats record.
 - **In-memory mode** — same engine, `Vec<u8>`-backed I/O, no file and no lock. For tests, benchmarks, and ephemeral work.
-- **At-rest encryption** — optional, off by default. Every page is sealed with XChaCha20-Poly1305 AEAD under a client-supplied key (raw 32-byte or Argon2id passphrase). An 8-slot envelope table wraps the data-encryption key, so credential rotation is O(1) — no bulk re-encryption.
+- **At-rest encryption** — optional, off by default. Every page is sealed with XChaCha20-Poly1305 AEAD under a client-supplied key (raw 32-byte or Argon2id passphrase). An 8-slot envelope table wraps the data-encryption key, so credential rotation is O(1) — no bulk re-encryption. `rekey()` performs the heavy alternative when the data key itself is compromised: a crash-safe whole-file re-encryption under a fresh key.
 - **Poison model** — any fatal error (I/O failure, checksum mismatch, commit-protocol failure) poisons the handle; recovery is drop-and-reopen. Mirrors `std::sync::Mutex` poisoning.
 - **Single-writer** — exclusive `flock` at the filesystem level; `&mut self` on every mutating method.
 
@@ -293,6 +293,12 @@ On create, Chisel generates a random data-encryption key (DEK), encrypts every p
 
 The wrapped DEK lives in an **8-slot key table**. Because the DEK itself never changes, credential rotation only re-wraps the DEK in a slot — it is O(1), independent of database size. `add_key` stages a second credential (both open the DB), `rotate_key` replaces one credential in place, and `remove_key` retires one (refusing the last remaining slot with `LastKeySlot`). A full table returns `NoFreeKeySlot`.
 
+Rotating a *credential* is not the same as rotating the *data key*. Because the DEK never changes, `rotate_key` and `remove_key` deny a credential a way in — they do not cut it off from data it has already seen, and they cannot help if the DEK itself leaked (a process memory dump, a core file). `Chisel::rekey(path, key, argon2_params)` is the operation for that case: it generates a fresh DEK, re-encrypts every page, and replaces the file atomically.
+
+`rekey` takes a **path, not an open handle**, and that is deliberate: it replaces the file by `rename`, so a descriptor opened beforehand would afterwards refer to the original, now-unlinked inode. Close the database, rekey, reopen. It is crash-safe — the rotated database is built in a scratch file beside the original and published atomically, so the path only ever names a complete file — and it costs O(total_pages) I/O plus a transient second copy on disk.
+
+It also **collapses the key-slot table to the single credential you supply**. That is forced rather than chosen: each slot's KEK is derived from its own credential, so wrapping the new DEK for a slot requires the credential that slot belongs to. Re-add the others with `add_key` afterwards. It is the safer default anyway — if you are rotating because the DEK leaked, preserving every credential that could reach it is not the goal.
+
 See [ARCHITECTURE.md#on-disk-encryption](ARCHITECTURE.md#on-disk-encryption) for the on-disk layout (crypto header, key slots, per-page nonce stride) and [THEORY.md](THEORY.md) for the rationale behind the envelope scheme and the shadow-paging nonce discipline (with [`docs/adr/`](docs/adr/) as the dated decision log).
 
 ## API reference
@@ -332,6 +338,7 @@ See [ARCHITECTURE.md#on-disk-encryption](ARCHITECTURE.md#on-disk-encryption) for
 | `defrag(options)` | Consolidate sparse pages |
 | `add_key(existing, new)` | Stage a second credential; both `existing` and `new` then open the DB. `Result<()>` |
 | `rotate_key(old, new)` | Replace credential `old` with `new` in place. `Result<()>` |
+| `Chisel::rekey(path, key, argon2)` | Re-encrypt the whole database under a fresh DEK. Associated function, not a method — takes a path. `Result<()>` |
 | `remove_key(key)` | Retire credential `key`; `LastKeySlot` if it is the only one. `Result<()>` |
 
 ## Options
@@ -468,6 +475,12 @@ db.remove_key("correct horse battery staple")                          # retire 
 ```
 
 `add_key` / `rotate_key` raise `NoFreeKeySlotError` when the 8-slot table is full; `remove_key` raises `LastKeySlotError` rather than leaving the DB with no usable credential.
+
+```python
+chisel.rekey("my.db", key=b"\x00" * 32)   # whole-file re-encryption under a fresh data key
+```
+
+`chisel.rekey` is a module-level function, like `chisel.open`, because it names a database by path rather than assuming one is open — it replaces the file, so any handle held across the call would be stale. Every credential other than the one supplied is revoked; re-add them with `add_key`.
 
 ## Design documents
 
