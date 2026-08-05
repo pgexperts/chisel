@@ -55,6 +55,27 @@ pub const MIN_SUPERBLOCKS: u32 = 2;
 pub const MAX_SUPERBLOCKS: u32 = 16;
 pub const DEFAULT_SUPERBLOCK_COUNT: u32 = 2;
 
+// Headroom the commit path is guaranteed at open, reserved off the top of
+// `txn_counter`'s range. `validate` rejects any slot claiming a counter above
+// `MAX_TXN_COUNTER`, so a file that opens is always at least this far from
+// overflowing.
+//
+// This exists because `commit` and `rewrite_crypto_header` both do
+// `txn_counter.checked_add(1).expect(...)`, justified by a comment calling
+// overflow "structurally unreachable". That argument assumed the counter could
+// only ever be produced by this binary's own increments. It is in fact read
+// from a file the threat model says an attacker controls, so a forged
+// `txn_counter = u64::MAX` made the "unreachable" panic reachable from the
+// first commit after open — bypassing the poison-and-reopen contract and, in
+// the PyO3 binding, surfacing as a PanicException rather than a mapped error.
+//
+// 2^32 is chosen to be unreachable from the other direction too: exhausting it
+// requires 4.3 billion commits within a SINGLE session (a reopen re-validates),
+// at three fsyncs each. A database that legitimately climbed past
+// MAX_TXN_COUNTER would be refused, but reaching it needs ~1.8e19 commits.
+pub const TXN_COUNTER_RESERVE: u64 = 1 << 32;
+pub const MAX_TXN_COUNTER: u64 = u64::MAX - TXN_COUNTER_RESERVE;
+
 // Byte offset of the superblock_count field within the serialized
 // superblock page. Placed AFTER the named-root table (which ends at
 // NAMED_ROOTS_END = 308). Deserialization rejects any value outside
@@ -140,6 +161,13 @@ pub enum SuperblockDefect {
     BadChecksum,
     BadMagic,
     BadCount(u32), // the out-of-range superblock_count value
+    // The slot's txn_counter leaves less than TXN_COUNTER_RESERVE of headroom
+    // before u64 overflow. Treated as a torn-slot rule rather than an open-time
+    // gate precisely because the counter is PER-SLOT: a forged slot should lose
+    // to a healthy sibling under the normal "highest counter wins" selection,
+    // which is exactly what returning a defect here achieves. Only if EVERY
+    // slot is bad does this surface, and then `diagnose` names the slot.
+    BadTxnCounter(u64),
     // The file is too short to contain this slot at all. Distinct from
     // BadMagic: there are no bytes to have magic, so the slot was never
     // read. Raised by `Chisel::open` for a file that has content but is
@@ -155,6 +183,9 @@ impl fmt::Display for SuperblockDefect {
             SuperblockDefect::BadChecksum => write!(f, "bad checksum"),
             SuperblockDefect::BadMagic => write!(f, "bad magic"),
             SuperblockDefect::BadCount(n) => write!(f, "bad superblock_count {n}"),
+            SuperblockDefect::BadTxnCounter(n) => {
+                write!(f, "txn_counter {n} is too close to u64 overflow")
+            }
             SuperblockDefect::TooShort => write!(f, "file too short to contain this slot"),
         }
     }
@@ -258,6 +289,10 @@ fn validate(buf: &[u8; PAGE_SIZE]) -> Result<(), SuperblockDefect> {
     );
     if !(MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS).contains(&count) {
         return Err(SuperblockDefect::BadCount(count));
+    }
+    let txn_counter = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    if txn_counter > MAX_TXN_COUNTER {
+        return Err(SuperblockDefect::BadTxnCounter(txn_counter));
     }
     Ok(())
 }

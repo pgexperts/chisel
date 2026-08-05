@@ -3,8 +3,14 @@ name: CI
 on:
   push:
     branches: [main]
+  # Deliberately NOT filtered to `branches: [main]`. That filter matches the
+  # PR's BASE, so a stacked PR — one based on its predecessor rather than on
+  # main, which is how a chain of dependent fixes stays individually
+  # reviewable — got no CI at all. The gap was silent: the PR simply showed no
+  # checks, which reads like "nothing to run" rather than "never triggered",
+  # and the work only met CI after being retargeted to main at merge time,
+  # i.e. after review had already happened against an unverified diff.
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always

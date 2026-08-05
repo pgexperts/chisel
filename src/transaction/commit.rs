@@ -110,10 +110,23 @@ pub(super) fn run_commit(ctx: &mut CommitCtx<'_>) -> Result<()> {
     //
     // I119 (ISSUES.md, 2026-06-21): checked, not `+= 1`. A wrapped counter
     // would corrupt `Superblock::select`'s "highest counter wins" (release
-    // wrap to 0) — far worse than the loud, controlled panic here. Overflow
-    // needs 2^64 commits, so it is structurally unreachable; a dedicated
-    // fatal error variant for an impossible event would be speculative
-    // public surface, so the `expect` on the invariant is proportionate.
+    // wrap to 0) — far worse than the loud, controlled panic here.
+    //
+    // The original rationale for the `expect` was "overflow needs 2^64 commits,
+    // so it is structurally unreachable". That was WRONG, and worth spelling out
+    // because it is the sentence a future maintainer would trust: the counter is
+    // not only produced by this binary's increments, it is also READ FROM THE
+    // FILE at open (`recovery.rs`, `txn_counter: sb.txn_counter`). A superblock
+    // forged with `txn_counter = u64::MAX` and a recomputed XXH3 checksum made
+    // the panic fire on the first commit after open.
+    //
+    // What makes it unreachable now is an actual invariant rather than an
+    // argument about counting: `Superblock::validate` rejects any slot whose
+    // counter exceeds MAX_TXN_COUNTER, so a file that opened at all has at least
+    // TXN_COUNTER_RESERVE (2^32) increments of headroom. Exhausting that takes
+    // 4.3 billion commits in one session, since a reopen re-validates.
+    // The `expect` therefore stays: it now documents a guarded invariant rather
+    // than asserting an unguarded hope.
     *ctx.txn_counter = ctx
         .txn_counter
         .checked_add(1)

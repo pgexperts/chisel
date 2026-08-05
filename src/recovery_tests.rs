@@ -2060,3 +2060,122 @@ fn a_forged_overflow_length_cannot_run_the_delete_path_out_of_memory() {
         Err(other) => panic!("expected CorruptPage, got {other:?}"),
     }
 }
+
+// Helper for the two txn_counter tests below. Patches bytes 8..16 of one
+// superblock slot and re-stamps the XXH3 checksum, which is exactly what an
+// attacker with byte-level file access does — the checksum is non-cryptographic
+// and publicly recomputable. Going through `Superblock::serialize` would not
+// work here: `deserialize` now rejects the forged value, so the round-trip
+// cannot produce the bytes under test.
+#[cfg(test)]
+fn forge_txn_counter(path: &std::path::Path, slot: u64, value: u64) {
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let mut buf = [0u8; PAGE_SIZE];
+    f.seek(SeekFrom::Start(slot * PAGE_SIZE as u64)).unwrap();
+    f.read_exact(&mut buf).unwrap();
+    buf[8..16].copy_from_slice(&value.to_le_bytes());
+    page::stamp_checksum(&mut buf);
+    f.seek(SeekFrom::Start(slot * PAGE_SIZE as u64)).unwrap();
+    f.write_all(&buf).unwrap();
+    f.sync_all().unwrap();
+}
+
+#[test]
+fn a_forged_txn_counter_in_every_slot_is_refused_at_open() {
+    // SECURITY-SWEEP-6. `open_existing` adopted `txn_counter` verbatim from the
+    // superblock, and `deserialize` read it with no bound. commit.rs then did
+    // `txn_counter.checked_add(1).expect("...unreachable")` on the strength of
+    // a comment arguing overflow needs 2^64 commits — an argument that only
+    // holds if the counter can ONLY come from this binary's own increments.
+    // It cannot: it comes off disk. A forged u64::MAX panicked on the first
+    // commit after open, bypassing the poison-and-reopen contract entirely and
+    // reaching Python as a PanicException rather than a mapped error class.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        db.allocate(b"payload").unwrap();
+        db.commit().unwrap();
+    }
+
+    for slot in 0..2u64 {
+        forge_txn_counter(&path, slot, u64::MAX);
+    }
+
+    // Every slot is bad, so selection has nothing to fall back to and the open
+    // fails with a per-slot diagnosis rather than reaching a commit at all.
+    match Chisel::open(&path, Default::default()) {
+        Err(ChiselError::CorruptSuperblock { defects }) => {
+            assert!(
+                defects
+                    .iter()
+                    .any(|d| matches!(d.defect, crate::superblock::SuperblockDefect::BadTxnCounter(n) if n == u64::MAX)),
+                "the diagnosis must name the offending field, got {defects:?}"
+            );
+        }
+        Ok(_) => panic!("a txn_counter of u64::MAX in every slot must not open"),
+        Err(other) => panic!("expected CorruptSuperblock, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_forged_txn_counter_in_one_slot_loses_to_its_healthy_sibling() {
+    // The reason this bound lives in `validate` (the shared torn-slot rule)
+    // rather than at the open-time gate next to page_size/freemap_depth: the
+    // counter is PER-SLOT. Shadow paging's whole point is that a damaged slot
+    // loses to a good one, so a forged counter must be discarded the same way a
+    // bad checksum is — not fail the entire open. Without that, the forged slot
+    // would win selection outright, since selection is "highest counter wins".
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    let first;
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        first = db.allocate(b"from the first commit").unwrap();
+        db.commit().unwrap();
+        // A second commit so BOTH slots hold a real state; the newest one is
+        // the forgery target below.
+        db.begin().unwrap();
+        db.allocate(b"from the second commit").unwrap();
+        db.commit().unwrap();
+    }
+
+    // Forge whichever slot currently wins selection. u64::MAX would outrank
+    // every sibling, so without the bound this slot is guaranteed to be chosen
+    // and its adopted counter would then panic the next commit.
+    let newest = {
+        let mut f = fs::File::open(&path).unwrap();
+        let mut best = (0u64, 0u64);
+        for slot in 0..2u64 {
+            let mut buf = [0u8; PAGE_SIZE];
+            f.seek(SeekFrom::Start(slot * PAGE_SIZE as u64)).unwrap();
+            f.read_exact(&mut buf).unwrap();
+            let sb = Superblock::deserialize(&buf).expect("slot must be valid");
+            if sb.txn_counter >= best.1 {
+                best = (slot, sb.txn_counter);
+            }
+        }
+        best.0
+    };
+    forge_txn_counter(&path, newest, u64::MAX);
+
+    let mut db = Chisel::open(&path, Default::default())
+        .expect("a healthy sibling slot must still open the database");
+    // Discarding the newest slot rewinds to the previous commit — that is the
+    // correct and unavoidable consequence of "a damaged slot loses to a good
+    // one", since the good one is by definition older. What matters is that the
+    // open SUCCEEDS from the sibling instead of failing outright or adopting
+    // the forged counter.
+    assert_eq!(db.read(first).unwrap(), b"from the first commit");
+    // And the engine is fully usable: the counter it adopted came from the
+    // sibling, so the commit path has its full headroom and does not panic.
+    db.begin().unwrap();
+    db.allocate(b"and it still commits").unwrap();
+    db.commit().unwrap();
+}
