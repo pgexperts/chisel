@@ -153,7 +153,12 @@ impl TransactionManager {
         let free = header.free_slot().ok_or(ChiselError::NoFreeKeySlot)?;
         let mut new_header = *header;
         new_header
-            .wrap_into(free, new, &dek)
+            // `None` = the OWASP defaults, which is what this path has always
+            // used and what `Options::argon2_params` documents ("No effect ...
+            // on reopen"). `wrap_into` now takes the override because the create
+            // path needs it; threading a caller-chosen cost into add_key/
+            // rotate_key would be a public API change, not a cleanup.
+            .wrap_into(free, new, &dek, None)
             .map_err(|_| ChiselError::InvalidEncryptionKey)?;
         self.rewrite_crypto_header(new_header)
     }
@@ -183,7 +188,12 @@ impl TransactionManager {
         let free = header.free_slot().ok_or(ChiselError::NoFreeKeySlot)?;
         let mut new_header = *header;
         new_header
-            .wrap_into(free, new, &dek)
+            // `None` = the OWASP defaults, which is what this path has always
+            // used and what `Options::argon2_params` documents ("No effect ...
+            // on reopen"). `wrap_into` now takes the override because the create
+            // path needs it; threading a caller-chosen cost into add_key/
+            // rotate_key would be a public API change, not a cleanup.
+            .wrap_into(free, new, &dek, None)
             .map_err(|_| ChiselError::InvalidEncryptionKey)?;
         // Clear the old slot in the same header snapshot — single atomic rewrite.
         new_header.slots[old_idx] = crate::superblock::KeySlot::EMPTY;
@@ -333,7 +343,7 @@ mod tests {
             .unlock(&raw(0x11))
             .expect("slot 0 unlocks with key 0x11");
         new_hdr
-            .wrap_into(1, &raw(0x22), &dek)
+            .wrap_into(1, &raw(0x22), &dek, None)
             .expect("wrap_into with valid key must succeed");
 
         db.rewrite_crypto_header(new_hdr).unwrap();
@@ -435,7 +445,7 @@ mod tests {
         let mut new_hdr = db.crypto_header.unwrap();
         let (_, dek) = new_hdr.unlock(&raw(0x11)).unwrap();
         new_hdr
-            .wrap_into(1, &raw(0x22), &dek)
+            .wrap_into(1, &raw(0x22), &dek, None)
             .expect("wrap_into with valid key must succeed");
         db.rewrite_crypto_header(new_hdr).unwrap();
         // Drop to flush OS buffers (fsync already called).

@@ -34,6 +34,7 @@
 use crate::crypto::{CryptoError, NONCE_LEN, TAG_LEN};
 use crate::page::{self, MAGIC, PAGE_SIZE};
 use std::fmt;
+use zeroize::Zeroizing;
 
 mod crypto_header;
 // Re-export the crypto-header API for consumers (open/create code in later
@@ -418,8 +419,19 @@ impl Superblock {
 
     /// Assemble the plaintext body for sealing: all sensitive fields in the
     /// canonical order defined by BODY_LEN. Called only for encrypted DBs.
-    fn body_plaintext(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(BODY_LEN);
+    /// Zeroizing for the same reason `open_body` returns one: this buffer holds
+    /// root page pointers, `total_pages`, `next_handle`, `freemap_depth` and the
+    /// full `named_roots` table — user-chosen names that THEORY.md calls out as
+    /// real user data and gives as the reason the body is sealed at all.
+    ///
+    /// The read side was fixed first (CRYPTO-8), but the write side leaks the
+    /// identical plaintext and does it more often: `serialize_encrypted` calls
+    /// this on EVERY superblock write, so every commit of an encrypted database
+    /// left a copy in freed, un-wiped heap. `seal_detached` itself is fine — it
+    /// encrypts in place, overwriting the plaintext with ciphertext — but the
+    /// buffer handed to it was a plain `Vec` dropped as a temporary.
+    fn body_plaintext(&self) -> Zeroizing<Vec<u8>> {
+        let mut b = Zeroizing::new(Vec::with_capacity(BODY_LEN));
         b.extend_from_slice(&self.root_handle_table_page.to_le_bytes());
         b.extend_from_slice(&self.root_freemap_page.to_le_bytes());
         b.extend_from_slice(&self.root_membership_index_page.to_le_bytes());

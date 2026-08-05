@@ -182,9 +182,18 @@ impl CryptoHeader {
     /// dek)` for the first slot whose AEAD tag verifies. If no slot matches,
     /// returns `Err(InvalidEncryptionKey)`.
     ///
-    /// This is byte-identical to the inline trial in `recovery.rs`
-    /// (`unwrap_first_matching_slot`) — both call `slot.aad()` on the
-    /// fully-populated slot before passing it to `unwrap_dek`.
+    /// This is the ONLY unwrap-trial implementation: the open path
+    /// (`recovery.rs`) and the key-management paths (`keys.rs`) both call it.
+    ///
+    /// `recovery.rs` used to carry a second copy, whose doc asserted the two
+    /// were "byte-identical". They did in fact behave identically — the copies
+    /// differed only in spelling (`1 =>` / `2 =>` against `x if x == KdfId::Hkdf
+    /// as u8`, and the discriminants are 1 and 2). The reason to collapse them
+    /// was not that this pair had drifted but that the WRAP pair already had:
+    /// `build_create_cipher` wrote the OWASP argon2 defaults into HKDF slots
+    /// where `wrap_into` wrote the zeros the format documents (CRYPTO-6). A
+    /// comment asserting two implementations agree is not a mechanism for
+    /// keeping them agreeing, and the wrap side is the proof.
     ///
     /// # Errors
     /// Returns `ChiselError::InvalidEncryptionKey` if no active slot's tag
@@ -238,8 +247,20 @@ impl CryptoHeader {
         slot: usize,
         key: &crate::crypto::Key,
         dek: &crate::crypto::Dek,
+        argon2_override: Option<Argon2Params>,
     ) -> Result<(), crate::crypto::CryptoError> {
         use crate::crypto::{self, KdfId};
+        // HKDF slots write ZERO cost params, which is what the on-disk layout
+        // doc (and ARCHITECTURE.md) promise: "argon2 params ... (zero for
+        // HKDF)". The create path used to write `Argon2Params::default()` here
+        // instead, so a database created with `Key::Raw` carried m=19456,t=2,p=1
+        // in a slot whose kdf_id said HKDF, while a second raw credential added
+        // later through `add_key` carried zeros for identical semantics. Both
+        // paths now run through this function, so they cannot drift again.
+        //
+        // `argon2_override` is the caller's `Options::argon2_params`. It only
+        // has effect on the Argon2id branch — a raw key uses HKDF regardless,
+        // and HKDF never reads these fields.
         let (kdf_id, argon2) = match key {
             crate::crypto::Key::Raw(_) => (
                 KdfId::Hkdf,
@@ -249,7 +270,9 @@ impl CryptoHeader {
                     p_cost: 0,
                 },
             ),
-            crate::crypto::Key::Passphrase(_) => (KdfId::Argon2id, Argon2Params::default()),
+            crate::crypto::Key::Passphrase(_) => {
+                (KdfId::Argon2id, argon2_override.unwrap_or_default())
+            }
         };
         let salt: [u8; SALT_LEN] = crypto::random_array();
         let wrap_nonce: [u8; NONCE_LEN] = crypto::random_array();
@@ -293,7 +316,7 @@ mod crypto_header_tests {
             stride: crypto::ENC_PAGE_SIZE as u32,
             slots: [KeySlot::EMPTY; KEY_SLOT_COUNT],
         };
-        h.wrap_into(0, key, dek)
+        h.wrap_into(0, key, dek, None)
             .expect("wrap_into with valid key must succeed");
         h
     }
@@ -306,7 +329,7 @@ mod crypto_header_tests {
 
         // Add a second credential into slot 3 wrapping the SAME dek.
         let k1 = raw(0xB2);
-        h.wrap_into(3, &k1, &dek)
+        h.wrap_into(3, &k1, &dek, None)
             .expect("wrap_into with valid key must succeed");
 
         let (idx0, d0) = h.unlock(&k0).expect("k0 must unlock");
@@ -349,7 +372,7 @@ mod crypto_header_tests {
 
         // Fill every remaining slot.
         for i in 1..KEY_SLOT_COUNT {
-            h.wrap_into(i, &raw(i as u8 + 1), &dek)
+            h.wrap_into(i, &raw(i as u8 + 1), &dek, None)
                 .expect("wrap_into with valid key must succeed");
         }
         assert_eq!(h.active_count(), KEY_SLOT_COUNT);
@@ -367,7 +390,7 @@ mod crypto_header_tests {
             stride: crypto::ENC_PAGE_SIZE as u32,
             slots: [KeySlot::EMPTY; KEY_SLOT_COUNT],
         };
-        h.wrap_into(5, &key, &dek)
+        h.wrap_into(5, &key, &dek, None)
             .expect("wrap_into with valid key must succeed");
         let (idx, recovered) = h.unlock(&key).expect("wrap_into then unlock must succeed");
         assert_eq!(idx, 5);
