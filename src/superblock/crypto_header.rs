@@ -164,6 +164,43 @@ impl CryptoHeader {
         })
     }
 
+    /// Overwrite ONLY the key-slot table inside an already-serialized superblock
+    /// image, leaving every other field — counter, roots, sealed body — exactly
+    /// as it was, and re-stamp the page checksum.
+    ///
+    /// This exists for credential revocation. `rewrite_crypto_header` writes a
+    /// full new superblock into one slot; the other N-1 slots keep their own
+    /// (older, still-valid) state, and that state includes their copy of the
+    /// key-slot table. Since the table is CLEARTEXT and the DEK never changes,
+    /// a revoked credential's wrapped DEK stayed readable in a sibling slot of
+    /// the live file: an adversary holding the revoked key needed only read
+    /// access to recover the DEK that still seals every current page. No
+    /// tampering, no older file image, no rollback — the stale credential lived
+    /// inside the current file, and for an idle database it lived there forever,
+    /// since the residue only clears when N-1 further commits happen to
+    /// overwrite every sibling.
+    ///
+    /// Patching just the table is what makes this safe to apply to a sibling:
+    /// the body's AAD (`sb_identity_aad`) covers magic, format_version,
+    /// txn_counter and superblock_count — NOT the crypto header — so the
+    /// sibling's sealed body still authenticates afterwards, and its value as a
+    /// shadow-paging fallback is untouched.
+    ///
+    /// Returns false if `unit` does not currently hold a parseable encrypted
+    /// superblock (a torn or never-written slot), in which case there is no
+    /// stale table in it to scrub.
+    pub fn overwrite_slot_table(&self, unit: &mut [u8; PAGE_SIZE]) -> bool {
+        if super::Superblock::deserialize(unit).is_none() {
+            return false;
+        }
+        for (i, slot) in self.slots.iter().enumerate() {
+            let base = SLOT_TABLE_OFFSET + i * KEY_SLOT_SIZE;
+            slot.write_into(&mut unit[base..base + KEY_SLOT_SIZE]);
+        }
+        page::stamp_checksum(unit);
+        true
+    }
+
     /// Count how many slots currently hold a wrapped DEK (state == active).
     /// Used by `remove_key` (Task 5.4) to guard against removing the last
     /// credential and locking the caller out of their own database.

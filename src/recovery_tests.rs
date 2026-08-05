@@ -2397,3 +2397,81 @@ fn a_raw_key_database_writes_zero_argon2_params_as_the_format_documents() {
         "expected to inspect both key slots; only saw {checked}"
     );
 }
+
+#[test]
+fn a_revoked_credentials_wrapped_dek_survives_in_no_slot() {
+    // CRYPTO-1. `rewrite_crypto_header` wrote the new key-slot table into
+    // exactly ONE superblock slot; the other N-1 kept their own state, table
+    // included. Because the table is CLEARTEXT (bytes 332..1356 of every
+    // superblock page) and the per-DB DEK never changes, the revoked
+    // credential's wrapped DEK stayed sitting in the LIVE file.
+    //
+    // The attack needed no tampering, no older file image and no rollback:
+    // an adversary holding the revoked credential and mere READ access parses
+    // the sibling slot's 128-byte record, runs derive_kek + unwrap_dek with
+    // slot.aad(), and recovers the DEK that still seals every current page.
+    // `Chisel::open` refusing the old key is not protection when the material
+    // to bypass it is in the same file. And the residue only cleared when N-1
+    // further commits happened to overwrite every sibling — for an idle
+    // database, never.
+    //
+    // This asserts the property directly on the bytes: after revocation, the
+    // old credential's wrap_tag must appear in NO slot of the file.
+    use crate::superblock::{CRYPTO_HEADER_OFFSET, KEY_SLOT_SIZE};
+
+    let tmp = NamedTempFile::new().unwrap();
+    let old = || Key::Raw(Zeroizing::new(vec![0xA1u8; 32]));
+    let new = || Key::Raw(Zeroizing::new(vec![0xB2u8; 32]));
+
+    let mut db = Chisel::open(tmp.path(), Options::default().encryption_key(old())).unwrap();
+    db.begin().unwrap();
+    db.allocate(b"sealed under a DEK that never changes")
+        .unwrap();
+    db.commit().unwrap();
+
+    // Capture the old credential's wrapped DEK + tag before revoking, so we can
+    // look for those exact bytes afterwards.
+    let slot0_record = {
+        let mut f = fs::File::open(tmp.path()).unwrap();
+        let mut unit = [0u8; crate::crypto::ENC_PAGE_SIZE];
+        f.read_exact(&mut unit).unwrap();
+        let base = CRYPTO_HEADER_OFFSET + 8;
+        let mut rec = [0u8; KEY_SLOT_SIZE];
+        rec.copy_from_slice(&unit[base..base + KEY_SLOT_SIZE]);
+        rec
+    };
+    // wrapped_dek is at 54..86 within the record — the bytes that must vanish.
+    let old_wrapped: Vec<u8> = slot0_record[54..86].to_vec();
+    assert_ne!(old_wrapped, vec![0u8; 32], "fixture must have a real wrap");
+
+    db.rotate_key(&old(), &new()).unwrap();
+    drop(db);
+
+    // Scan EVERY superblock slot's EVERY key slot.
+    let mut f = fs::File::open(tmp.path()).unwrap();
+    let mut unit = [0u8; crate::crypto::ENC_PAGE_SIZE];
+    for sb_slot in 0..crate::DEFAULT_SUPERBLOCK_COUNT as u64 {
+        f.seek(SeekFrom::Start(
+            sb_slot * crate::crypto::ENC_PAGE_SIZE as u64,
+        ))
+        .unwrap();
+        f.read_exact(&mut unit).unwrap();
+        for key_slot in 0..crate::superblock::KEY_SLOT_COUNT {
+            let base = CRYPTO_HEADER_OFFSET + 8 + key_slot * KEY_SLOT_SIZE;
+            assert_ne!(
+                &unit[base + 54..base + 86],
+                old_wrapped.as_slice(),
+                "the revoked credential's wrapped DEK is still readable in \
+                 superblock slot {sb_slot}, key slot {key_slot}"
+            );
+        }
+    }
+
+    // And the documented contract still holds in both directions.
+    assert!(
+        Chisel::open(tmp.path(), Options::default().encryption_key(old())).is_err(),
+        "the revoked credential must not open the database"
+    );
+    let db = Chisel::open(tmp.path(), Options::default().encryption_key(new())).unwrap();
+    drop(db);
+}
