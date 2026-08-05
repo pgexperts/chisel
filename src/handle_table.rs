@@ -734,6 +734,20 @@ impl HandleTable {
             remaining %= child_span;
 
             let buf = cache.get(current)?;
+            // I148: positional type check on the descent, matching what
+            // `recover_depth` already does on the left spine and what
+            // membership_index now does at every level.
+            //
+            // The handle table tags position with a FLAG byte rather than a
+            // distinct PageType, so BOTH bytes matter: `buf[0]` proves this is a
+            // handle-table page at all, and `buf[1] == FLAG_INTERIOR` proves it
+            // belongs at this level rather than being a leaf reached one level
+            // too early. Reading a leaf's ENTRY words as child pointers is
+            // exactly the structurally-wrong-but-checksum-valid case the rest of
+            // this fix is about — XXH3 certifies neither.
+            if buf[0] != PageType::HandleTable as u8 || buf[1] != FLAG_INTERIOR {
+                return Err(ChiselError::CorruptPage { page_id: current });
+            }
             let offset = DATA_PAGE_HEADER_SIZE + child_idx * CHILD_PTR_SIZE;
             let child = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
             if child == 0 {
