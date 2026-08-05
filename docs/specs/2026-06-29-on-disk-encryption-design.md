@@ -25,11 +25,16 @@ In scope:
 
 Out of scope (documented as known boundaries, see §9):
 
-- Full **Data Encryption Key (DEK) rotation** / bulk re-encryption (deferred; a heavy
-  whole-file operation reserved for "the DEK itself is compromised").
-- **Rollback / replay** resistance against an attacker who can substitute a wholly
-  older, validly-signed database image (needs an external trust anchor; impossible for
-  a self-contained file).
+- **Rollback / replay** resistance. Originally written as "an attacker who can
+  substitute a wholly older, validly-signed database image"; §9 now states the
+  boundary in its true, stronger form, which also covers splicing individual stale
+  pages into a current file.
+
+Formerly out of scope, now implemented:
+
+- Full **Data Encryption Key (DEK) rotation** / bulk re-encryption. Shipped as
+  `Chisel::rekey` (ADR 0018) — still a heavy whole-file operation reserved for
+  "the DEK itself is compromised", but no longer absent.
 
 ---
 
@@ -291,11 +296,46 @@ Provided (under the AEAD model):
 
 Not provided (documented boundaries):
 
-- **Rollback / replay resistance**: an attacker with file access who substitutes a
-  wholly older, validly-signed database image (or an older valid A/B superblock slot)
-  cannot be detected by self-contained authentication. Defeating this requires an
-  external monotonic trust anchor (e.g., TPM), which is out of scope for a file-based
-  embedded store.
+- **Rollback / replay resistance**, at two granularities. The coarse one was always
+  documented: an attacker with file access who substitutes a wholly older,
+  validly-signed database image (or an older valid A/B superblock slot) cannot be
+  detected by self-contained authentication.
+
+  The finer one is **per-page temporal replay**, and it is strictly stronger — this
+  wording is the correction the original text needed. Page AAD is `page_id` and
+  nothing else (`PageCipher::seal`, `AAD = page_id.to_le_bytes()`), so a sealed page
+  authenticates *where* it belongs but not *when*. An attacker holding an old copy of
+  the file can therefore splice INDIVIDUAL stale pages into the current one: each
+  spliced page passes AEAD verification, at the correct page id, under the current
+  DEK. The result is a mixed state that never existed at any commit — a stale freemap
+  or interior tree page next to current siblings, which the engine then walks as
+  though it were consistent, potentially corrupting structure silently rather than
+  surfacing `DecryptionFailed`.
+
+  This is NOT covered by the "wholly older image" wording, and it is not covered by
+  the anti-relocation property above: relocation is about moving a page to the wrong
+  *place*, replay is about moving it to the wrong *time*. Both the "cryptographic
+  tamper-detection" and "anti-relocation" claims in the Provided list should be read
+  with this in mind — they are spatial guarantees, not temporal ones.
+
+  Defeating either granularity requires binding pages to a notion of *now* that the
+  attacker cannot forge. The options, none of which are implemented:
+
+  1. an external monotonic trust anchor (e.g. a TPM), which is out of scope for a
+     self-contained file-based embedded store;
+  2. a commit epoch in the page AAD, which makes every epoch bump rewrite every
+     reachable page. Note the framing: shadow paging already ACCEPTS write
+     amplification as the price of crash-safety-by-inspection (ADR 0001 lists it
+     as a negative consequence, and THEORY.md says the cost is taken with eyes
+     open). The objection here is not amplification as such, but amplification
+     well beyond what that trade already buys;
+  3. hash-chaining page tags into the sealed superblock body, which turns every
+     commit into an update of a structure covering the whole file.
+
+  What DOES bound the exposure in practice is `Chisel::rekey` (ADR 0018). It does not
+  make splicing *detectable*, but it invalidates every page image sealed under the
+  old DEK, so pages captured before a rotation can no longer be spliced into the file
+  after one. An operator who suspects file-level access has a way to draw a line.
 - **In-memory protection**: the page cache and the DEK are plaintext in process memory
   during an open session (mitigated by zeroize-on-drop, not by encryption).
 - **Traffic-analysis / size**: file size, page count, and access patterns are not
