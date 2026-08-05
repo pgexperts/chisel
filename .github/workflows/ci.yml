@@ -63,11 +63,39 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
-  # I54 (ISSUES.md, 2026-05-22): supply-chain advisory check via cargo-audit.
-  # Runs against the RustSec advisory database. Currently the root crate
-  # ships with only `xxhash-rust` and `libc` as production deps — both
-  # well-maintained — so the practical risk surface is small. Catches any
-  # vulnerable transitive dep that creeps in via a future change.
+  # I54 (ISSUES.md, 2026-05-22): supply-chain advisory check via cargo-audit,
+  # run against the RustSec advisory database.
+  #
+  # This comment is the recorded reason the repo runs this much supply-chain
+  # tooling and no more, so it has to describe the tree that actually exists.
+  # It used to say the root crate ships "only `xxhash-rust` and `libc` as
+  # production deps — both well-maintained — so the practical risk surface is
+  # small". That stopped being true when on-disk encryption landed. The root
+  # `[dependencies]` block now lists NINE direct production deps:
+  #
+  #   xxhash-rust, libc, rustc-hash,
+  #   chacha20poly1305, argon2, hkdf, sha2, zeroize, getrandom
+  #
+  # Six of those are cryptographic, and they are unconditional — the seal/open
+  # code is always compiled, there is no `encryption` feature gate. So the
+  # audit surface is the whole RustCrypto AEAD/KDF stack plus its transitives,
+  # not two leaf utilities.
+  #
+  # Two of the pins are held BELOW their current releases to preserve the 1.82
+  # MSRV that the `msrv` job enforces:
+  #
+  #   * `zeroize = "~1.8"`      — 1.9.0 went edition2024 (needs 1.85+)
+  #   * `base64ct = "~1.6"`     — 1.7+ went edition2024; floor-pinned because
+  #                               argon2 0.5.3 depends on it transitively
+  #
+  # Deliberately held back means deliberately not receiving upstream fixes, so
+  # both are items to re-check whenever this job flags an advisory, and to lift
+  # when the MSRV floor moves past 1.85 (both Cargo.toml comments say so too).
+  #
+  # Still worth a decision: `cargo audit` covers advisories only. There is no
+  # deny.toml, so nothing gates on licenses, duplicate versions, or banned
+  # crates. That was a defensible call for a two-dependency tree; it is a more
+  # substantial one now that the crate pulls a full crypto stack.
   #
   # Permissions notes:
   #   * `pull-requests: write` lets the action post per-line annotations
