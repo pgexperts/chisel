@@ -113,6 +113,42 @@ impl TransactionManager {
             cache.io_mut().write_page_unit(inactive, &unit)?;
         }
 
+        // CRYPTO-1: scrub the key-slot table out of every OTHER slot too.
+        //
+        // Writing only the target slot left the PRE-revocation table intact in
+        // its siblings. The table is cleartext and the DEK never changes, so a
+        // revoked credential's wrapped DEK stayed recoverable from the LIVE file
+        // by anyone with read access — `Chisel::open` correctly refused the old
+        // key, but the bytes needed to bypass that were still sitting at offset
+        // 332 of a sibling slot. The public contract says the opposite: "After
+        // this returns, `key` no longer opens the database."
+        //
+        // Only the table region is patched (see `overwrite_slot_table`), so each
+        // sibling keeps its own counter, roots and sealed body and remains a
+        // valid shadow-paging fallback.
+        //
+        // Crash window: these writes share the target slot's fsync below, so a
+        // crash mid-way can leave a sibling un-scrubbed. That is no worse than
+        // the steady state this replaces, and the next key operation clears it.
+        // Ordering the scrubs after the target write means the revocation itself
+        // is never the thing lost to a partial write.
+        {
+            use crate::crypto::ENC_PAGE_SIZE;
+            let mut unit = [0u8; ENC_PAGE_SIZE];
+            for slot in 0..self.superblock_count as u64 {
+                if slot == inactive {
+                    continue;
+                }
+                cache.io_mut().read_page_unit_into(slot, &mut unit)?;
+                let mut image = [0u8; PAGE_SIZE];
+                image.copy_from_slice(&unit[..PAGE_SIZE]);
+                if new_header.overwrite_slot_table(&mut image) {
+                    unit[..PAGE_SIZE].copy_from_slice(&image);
+                    cache.io_mut().write_page_unit(slot, &unit)?;
+                }
+            }
+        }
+
         // Durability linearization point: the rewrite is crash-safe only after
         // this fsync returns. A crash before this leaves the old superblock
         // intact in the other slot; recovery picks it by highest txn_counter.

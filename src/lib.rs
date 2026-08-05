@@ -1060,6 +1060,27 @@ impl Chisel {
     /// database and `new` does. O(1) — the data key is unchanged, no page is
     /// re-encrypted.
     ///
+    /// # This is revocation, not cryptographic erasure
+    ///
+    /// The data-encryption key does not change, so `old` is being denied a way
+    /// IN — it is not being cut off from data it has already seen. Two limits
+    /// follow, and neither is a defect:
+    ///
+    /// * Anyone who captured the DEK while `old` was valid (a process memory
+    ///   dump, say) keeps the ability to read every page, including pages
+    ///   written afterwards. Recovering from a compromised DEK needs a full
+    ///   re-encryption pass, which is not implemented — see the tracking issue
+    ///   for bulk DEK rotation.
+    /// * An OLD COPY of the file — a backup taken before the revocation — is
+    ///   still fully readable with `old`. Revocation rewrites the live file, not
+    ///   copies of it.
+    ///
+    /// What this DOES guarantee, as of the fix for CRYPTO-1, is that no slot of
+    /// the live file still carries `old`'s wrapped DEK. Previously the
+    /// pre-revocation key-slot table survived verbatim in the sibling superblock
+    /// slots, so the revoked credential could recover the current DEK from the
+    /// current file with nothing but read access.
+    ///
     /// # Errors
     /// `EncryptionNotSupported` if the database has no encryption;
     /// `InvalidEncryptionKey` if `old` unlocks no slot; `NoFreeKeySlot` if all 8
@@ -1073,6 +1094,10 @@ impl Chisel {
     /// the database; any other credentials are unaffected. Refuses to remove
     /// the only remaining credential. O(1) — the data key is unchanged, no
     /// page is re-encrypted.
+    ///
+    /// Read the "This is revocation, not cryptographic erasure" section on
+    /// [`Chisel::rotate_key`] before relying on this for incident response: the
+    /// DEK is unchanged, so this closes a door rather than re-keying the data.
     ///
     /// # Errors
     /// `EncryptionNotSupported` if the database has no encryption;
