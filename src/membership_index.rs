@@ -55,6 +55,34 @@ fn init_page(
     Ok(id)
 }
 
+/// The page type a node at `level` MUST carry: leaves at level 0, interiors
+/// above. Checking the type against the POSITION (rather than merely checking
+/// it is one of the two membership types) is what catches a structurally wrong
+/// but checksum-valid page — a leaf spliced where an interior belongs reads its
+/// value words as child pointers, and vice versa.
+fn expected_type_at(level: u32) -> PageType {
+    if level == 0 {
+        PageType::MembershipLeaf
+    } else {
+        PageType::MembershipInterior
+    }
+}
+
+/// Validate a node's type before its bytes are interpreted as structure.
+///
+/// I148. The crate's three radixes disagreed about this: `freemap_tree`,
+/// `overflow` and `data_page` fail closed with a typed `CorruptPage`, while
+/// `handle_table` and `membership_index` failed OPEN — against exactly the
+/// threat model the repo tests everywhere else, a page whose checksum is valid
+/// (XXH3 is non-cryptographic and publicly recomputable) but whose structure is
+/// wrong.
+fn check_type_at(buf: &[u8; PAGE_SIZE], page_id: u64, level: u32) -> Result<()> {
+    if buf[0] != expected_type_at(level) as u8 {
+        return Err(ChiselError::CorruptPage { page_id });
+    }
+    Ok(())
+}
+
 /// Free every page of the now-empty inner tree rooted at `root` (depth `depth`)
 /// — the whole orphaned structure, not just the root. Used when a tag is dropped
 /// (I118): `RadixU64::delete` does not shrink depth or prune empty children, so
@@ -77,6 +105,22 @@ fn free_subtree(cache: &mut PageCache, root: u64, depth: u32, freed: &mut Vec<u6
     if root == PAGE_ID_NONE {
         return Ok(());
     }
+    // Validate at EVERY level, including 0 — which means a leaf is now read
+    // rather than pushed sight-unseen. That read is the whole point, and it is
+    // the sharpest instance of I148: at the depth-1 boundary the old code took
+    // an interior's child pointers and pushed them straight into `freed` with
+    // no read and no validation. A corrupt-but-checksummed child pointer
+    // therefore became a page id marked REUSABLE at commit — so a live data
+    // page, or superblock slot 1, could be handed back to the allocator. That
+    // is corruption amplification: a single bad pointer turns into arbitrary
+    // overwriting later.
+    //
+    // Cost: freeing a subtree now reads its leaves as well as its interiors.
+    // For a bulk drop that is O(leaves) extra cache lookups on an operation
+    // that is already O(n) and whose pages are typically resident. Paying it is
+    // the only way the guard can exist at all — you cannot type-check a page
+    // you never read.
+    check_type_at(cache.get(root)?, root, depth)?;
     if depth > 0 {
         // Collect child pointers first so the read borrow is released before
         // recursing (each recursion re-borrows the cache mutably).
@@ -179,7 +223,11 @@ impl RadixU64 {
                 return Ok(None);
             }
             remaining %= span;
-            let child = read_slot(cache.get(current)?, child_idx);
+            // I148: validate the node's type against its level before reading a
+            // child pointer out of it.
+            let buf = cache.get(current)?;
+            check_type_at(buf, current, level)?;
+            let child = read_slot(buf, child_idx);
             if child == 0 {
                 return Ok(None);
             }
@@ -199,7 +247,11 @@ impl RadixU64 {
         let Some((leaf, idx)) = self.find_leaf(cache, root, key)? else {
             return Ok(0);
         };
-        Ok(read_slot(cache.get(leaf)?, idx))
+        // I148: the leaf find_leaf landed on must actually BE a leaf, or its
+        // value words are something else reinterpreted.
+        let buf = cache.get(leaf)?;
+        check_type_at(buf, leaf, 0)?;
+        Ok(read_slot(buf, idx))
     }
 
     // `old_root` is reparented as child 0 (not cloned), so it is NOT
@@ -259,6 +311,23 @@ impl RadixU64 {
         alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
         freed: &mut Vec<u64>,
     ) -> Result<u64> {
+        // I148: validate BEFORE the COW, not after — and at every level,
+        // including 0.
+        //
+        // Ordering is the whole point. `freed.push(page)` below hands this page
+        // to the reclamation candidate list, so validating afterwards means a
+        // page that turns out to be the wrong type has ALREADY been queued. And
+        // the level-0 branch never read the page's type at all, so an insert
+        // that descended onto a foreign page (via a corrupt-but-checksummed
+        // child pointer, or a corrupt packed outer-leaf value whose depth bits
+        // read as 0) SUCCEEDED silently — pushing that page into `freed`, which
+        // commit then marks reusable. That is the same corruption amplification
+        // `free_subtree` was fixed for, on the insert path, and it is worse
+        // there because nothing fails: `delete` at least returns CorruptPage.
+        //
+        // `delete_recursive` already checks the page at the top of its frame;
+        // matching that ordering here closes both branches at once.
+        check_type_at(cache.get(page)?, page, level)?;
         let new_page = alloc(cache)?;
         debug_assert_ne!(new_page, 0);
         cache.copy_page(page, new_page)?;
@@ -337,7 +406,10 @@ impl RadixU64 {
     ) -> Result<(u64, u64)> {
         if level == 0 {
             let idx = (key % SLOTS_PER_PAGE as u64) as usize;
-            let prev = read_slot(cache.get(page)?, idx);
+            // I148: level 0 here, so this must be a leaf.
+            let pbuf = cache.get(page)?;
+            check_type_at(pbuf, page, 0)?;
+            let prev = read_slot(pbuf, idx);
             if prev == 0 {
                 return Ok((page, 0));
             }
@@ -355,7 +427,12 @@ impl RadixU64 {
         } else {
             let span = self.span_at_level(level);
             let child_idx = (key / span) as usize;
-            let child = read_slot(cache.get(page)?, child_idx);
+            // I148. This is the descent free_subtree's siblings share: without
+            // it, delete walks a bogus depth and the remove() path can end up
+            // freeing leaf VALUES as page ids.
+            let pbuf = cache.get(page)?;
+            check_type_at(pbuf, page, level)?;
+            let child = read_slot(pbuf, child_idx);
             if child == 0 {
                 return Ok((page, 0));
             }
@@ -403,6 +480,8 @@ impl RadixU64 {
     ) -> Result<()> {
         if level == 0 {
             let buf = cache.get(page)?;
+            // I148: positional type check on every descent read.
+            check_type_at(buf, page, 0)?;
             for i in 0..SLOTS_PER_PAGE {
                 let v = read_slot(buf, i);
                 if v != 0 {
@@ -413,6 +492,7 @@ impl RadixU64 {
             let span = self.span_at_level(level);
             let children: Vec<(usize, u64)> = {
                 let buf = cache.get(page)?;
+                check_type_at(buf, page, level)?;
                 (0..SLOTS_PER_PAGE)
                     .map(|i| (i, read_slot(buf, i)))
                     .filter(|(_, c)| *c != 0)
@@ -459,6 +539,8 @@ impl RadixU64 {
         }
         if level == 0 {
             let buf = cache.get(page)?;
+            // I148: positional type check on every descent read.
+            check_type_at(buf, page, 0)?;
             for i in 0..SLOTS_PER_PAGE {
                 if out.len() >= limit {
                     break;
@@ -472,6 +554,7 @@ impl RadixU64 {
             let span = self.span_at_level(level);
             let children: Vec<(usize, u64)> = {
                 let buf = cache.get(page)?;
+                check_type_at(buf, page, level)?;
                 (0..SLOTS_PER_PAGE)
                     .map(|i| (i, read_slot(buf, i)))
                     .filter(|(_, c)| *c != 0)
@@ -505,6 +588,8 @@ impl RadixU64 {
     fn any_recursive(&self, cache: &mut PageCache, page: u64, level: u32) -> Result<bool> {
         if level == 0 {
             let buf = cache.get(page)?;
+            // I148: positional type check on every descent read.
+            check_type_at(buf, page, 0)?;
             for i in 0..SLOTS_PER_PAGE {
                 if read_slot(buf, i) != 0 {
                     return Ok(true);
@@ -514,6 +599,8 @@ impl RadixU64 {
         } else {
             let children: Vec<u64> = {
                 let buf = cache.get(page)?;
+                // I148: positional type check on every descent read.
+                check_type_at(buf, page, level)?;
                 (0..SLOTS_PER_PAGE)
                     .map(|i| read_slot(buf, i))
                     .filter(|c| *c != 0)
@@ -964,6 +1051,97 @@ mod tests {
         assert!(!t.any_present(&mut c, r2).unwrap());
     }
 
+    // I148, the sharpest instance: a corrupt interior CHILD pointer at the
+    // depth-1 boundary used to be pushed into `freed` with no read and no
+    // validation at all. Whatever page id those bytes happened to name became a
+    // page marked REUSABLE at commit — a live data page, or superblock slot 1,
+    // handed back to the allocator. One bad pointer amplifies into arbitrary
+    // overwriting later, which is why this is worse than a plain read failure.
+    //
+    // The tree here is well-formed except that one depth-1 child points at a
+    // page that is NOT a membership leaf. Pre-fix, free_subtree returns Ok and
+    // `freed` contains that foreign page id.
+    #[test]
+    fn free_subtree_refuses_to_free_a_child_that_is_not_a_leaf() {
+        let mut c = cache(64);
+
+        // A page that has nothing to do with this tree — stands in for a live
+        // data page the bogus pointer might name.
+        let foreign = c.new_page().unwrap();
+        {
+            let buf = c.get_mut(foreign).unwrap();
+            buf.fill(0);
+            buf[0] = PageType::Data as u8;
+            buf[1] = page::current_version(PageType::Data);
+            page::stamp_checksum(buf);
+        }
+
+        // Depth-1 interior whose child 0 points at `foreign`.
+        let root = c.new_page().unwrap();
+        {
+            let buf = c.get_mut(root).unwrap();
+            buf.fill(0);
+            buf[0] = PageType::MembershipInterior as u8;
+            buf[1] = page::current_version(PageType::MembershipInterior);
+            write_slot(buf, 0, foreign);
+            page::stamp_checksum(buf);
+        }
+
+        let mut freed = Vec::new();
+        match free_subtree(&mut c, root, 1, &mut freed) {
+            Err(ChiselError::CorruptPage { page_id }) => assert_eq!(page_id, foreign),
+            other => panic!("expected CorruptPage for a non-leaf child, got {other:?}"),
+        }
+        assert!(
+            !freed.contains(&foreign),
+            "a page that is not part of this tree must never reach the freemap"
+        );
+    }
+
+    // The insert-path twin of the free_subtree case, and the more dangerous of
+    // the two: `delete` at least returns CorruptPage on a foreign child, but
+    // `insert` used to SUCCEED — COWing the foreign page, pushing the original
+    // into `freed`, and letting commit mark a live page reusable. Nothing
+    // failed, so nothing surfaced.
+    //
+    // Validating at the top of the frame (before the alloc/copy/push) is what
+    // closes it: the old code pushed first and never checked at level 0 at all.
+    #[test]
+    fn insert_refuses_to_cow_a_child_that_is_not_a_leaf() {
+        let mut c = cache(64);
+
+        let foreign = c.new_page().unwrap();
+        {
+            let buf = c.get_mut(foreign).unwrap();
+            buf.fill(0);
+            buf[0] = PageType::Data as u8;
+            buf[1] = page::current_version(PageType::Data);
+            page::stamp_checksum(buf);
+        }
+
+        let root = c.new_page().unwrap();
+        {
+            let buf = c.get_mut(root).unwrap();
+            buf.fill(0);
+            buf[0] = PageType::MembershipInterior as u8;
+            buf[1] = page::current_version(PageType::MembershipInterior);
+            write_slot(buf, 0, foreign);
+            page::stamp_checksum(buf);
+        }
+
+        let mut t = RadixU64 { depth: 1 };
+        let mut freed = Vec::new();
+        let mut alloc = |c: &mut PageCache| c.new_page();
+        match t.insert(&mut c, root, 0, 1, &mut alloc, &mut freed) {
+            Err(ChiselError::CorruptPage { page_id }) => assert_eq!(page_id, foreign),
+            other => panic!("expected CorruptPage for a non-leaf child, got {other:?}"),
+        }
+        assert!(
+            !freed.contains(&foreign),
+            "a page that is not part of this tree must never be queued for reclamation"
+        );
+    }
+
     // I118 deep-tree completion: a tree grown past one leaf page (depth >= 1) is
     // a multi-page structure, and `delete` does not shrink depth, so an emptied
     // multi-level tree keeps ALL its pages. `free_subtree` (called by
@@ -1093,8 +1271,23 @@ mod tests {
             page::stamp_checksum(buf);
         }
         let t = RadixU64 { depth: MAX_DEPTH };
-        // Pre-fix: `20 * span_at_level(6)` overflow-panics. Post-fix: saturates.
-        let _ = t.iter_bounded(&mut c, id, 8).unwrap();
+        // Two properties, in order.
+        //
+        // The original one: `20 * span_at_level(6)` used to overflow-panic; the
+        // prefix accumulation saturates instead. That still runs here — the
+        // descent computes `next_base` at level 6 before going any deeper, so a
+        // regression to non-saturating arithmetic still panics this test.
+        //
+        // The new one (I148): this page is a self-referential MembershipInterior,
+        // so the descent arrives at level 0 holding a page whose type says
+        // interior. That is a structurally impossible tree, and it is now
+        // refused as CorruptPage rather than having its child pointers read as
+        // leaf values. The test previously asserted this walk SUCCEEDED, which
+        // is precisely the fail-open behaviour the issue is about.
+        match t.iter_bounded(&mut c, id, 8) {
+            Err(ChiselError::CorruptPage { page_id }) => assert_eq!(page_id, id),
+            other => panic!("expected CorruptPage for an interior at level 0, got {other:?}"),
+        }
     }
 
     #[test]
