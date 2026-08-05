@@ -64,6 +64,45 @@ fn rewrite_page_with_valid_checksum(
     f.sync_all().unwrap();
 }
 
+/// The same, for a superblock slot of an ENCRYPTED database.
+///
+/// `rewrite_page_with_valid_checksum` above seeks at `page_id * PAGE_SIZE`,
+/// which is wrong for an encrypted file: every unit — superblock slots included
+/// — sits at the 8232-byte ENC_PAGE_SIZE stride. Slot 0 lands at offset 0
+/// either way, so a test that forges "every slot" with the plaintext helper
+/// silently forges only slot 0 and CORRUPTS the rest: the write lands 40 bytes
+/// per slot too early, inside the previous unit, and the checksum restamp over
+/// a misaligned window leaves that slot unable to deserialize at all.
+///
+/// Such a test still passes, because the collaterally-torn siblings can never
+/// win selection — but it is testing torn-slot fallback rather than whatever it
+/// claims to test, and it would keep passing if the guard under test were
+/// removed and slot 0 stopped being the winner.
+///
+/// The superblock IMAGE is 8192 bytes at the start of its 8232-byte unit; the
+/// trailing 40 bytes stay zero (they are the seal footprint a data page would
+/// use). So read/write 8192 bytes AT the stride-derived offset.
+fn rewrite_encrypted_superblock_slot(
+    path: &std::path::Path,
+    slot: u64,
+    mutate: impl FnOnce(&mut [u8; PAGE_SIZE]),
+) {
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let off = slot * crate::crypto::ENC_PAGE_SIZE as u64;
+    let mut buf = [0u8; PAGE_SIZE];
+    f.seek(SeekFrom::Start(off)).unwrap();
+    f.read_exact(&mut buf).unwrap();
+    mutate(&mut buf);
+    page::stamp_checksum(&mut buf);
+    f.seek(SeekFrom::Start(off)).unwrap();
+    f.write_all(&buf).unwrap();
+    f.sync_all().unwrap();
+}
+
 /// Read the superblock slots (default layout: 2) and return the winning one,
 /// so a corruption test can target the LIVE root page rather than a stale COW
 /// copy that `find_page_of_type` might return.
@@ -1695,7 +1734,10 @@ fn tampered_key_slot_cost_params_do_not_reach_the_allocator() {
     // the tampered header wins regardless of which slot recovery selects.
     let m_cost_at = CRYPTO_HEADER_OFFSET + 8 + 2;
     for sb_slot in 0..crate::DEFAULT_SUPERBLOCK_COUNT as u64 {
-        rewrite_page_with_valid_checksum(tmp.path(), sb_slot, |buf| {
+        // Stride-aware: this is an ENCRYPTED file, so slots sit at 8232 apart.
+        // The plaintext helper used to be used here and silently forged only
+        // slot 0 while tearing slot 1 — see rewrite_encrypted_superblock_slot.
+        rewrite_encrypted_superblock_slot(tmp.path(), sb_slot, |buf| {
             // u32::MAX KiB = 4 TiB. Nothing legitimate is anywhere near this.
             buf[m_cost_at..m_cost_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         });
@@ -2248,4 +2290,110 @@ fn a_database_forged_at_the_boundary_refuses_to_commit_rather_than_writing_past_
     let db = Chisel::open(&path, Default::default())
         .expect("a refused commit must leave the file exactly as it was");
     assert_eq!(db.read(handle).unwrap(), b"still here afterwards");
+}
+
+#[test]
+fn an_unknown_crypto_algorithm_is_refused_rather_than_decrypted_as_xchacha20() {
+    // CRYPTO-4 / SUPERBLOCK-RECOVERY-3. The algorithm byte was written at create
+    // and never read back: `CryptoHeader::deserialize` gates only on zero
+    // ("plaintext"), so ANY nonzero value was accepted and every page was fed to
+    // PageCipher, which is hardcoded to XChaCha20-Poly1305.
+    //
+    // The DEK unwrap is a separate primitive that does not depend on the page
+    // algorithm, so the open SUCCEEDED — and the failure surfaced later as
+    // DecryptionFailed, which is_fatal() and poisons the handle. A future
+    // algorithm id, or a forged byte, was therefore reported to the user as
+    // unrecoverable data corruption rather than "this build cannot read that".
+    use crate::superblock::CRYPTO_HEADER_OFFSET;
+
+    let tmp = NamedTempFile::new().unwrap();
+    let raw = || Key::Raw(Zeroizing::new(vec![0x7Au8; 32]));
+
+    let mut db = Chisel::open(tmp.path(), Options::default().encryption_key(raw())).unwrap();
+    db.begin().unwrap();
+    db.allocate(b"payload").unwrap();
+    db.commit().unwrap();
+    drop(db);
+
+    // Stamp a future algorithm id into every slot so the forgery wins whichever
+    // slot recovery selects. 2 is "some cipher this build does not have".
+    for sb_slot in 0..crate::DEFAULT_SUPERBLOCK_COUNT as u64 {
+        rewrite_encrypted_superblock_slot(tmp.path(), sb_slot, |buf| {
+            buf[CRYPTO_HEADER_OFFSET] = 2;
+        });
+    }
+
+    match Chisel::open(tmp.path(), Options::default().encryption_key(raw())) {
+        // Operational, not fatal: the file is intact, this build just cannot
+        // read it. That distinction is the entire point of the fix.
+        Err(e @ ChiselError::EncryptionNotSupported) => {
+            assert!(!e.is_fatal(), "an algorithm mismatch must not poison");
+        }
+        Ok(_) => panic!("an unknown algorithm id must not open"),
+        Err(other) => panic!("expected EncryptionNotSupported, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_raw_key_database_writes_zero_argon2_params_as_the_format_documents() {
+    // CRYPTO-6, and the reason CRYPTO-7's dedup was worth doing. The on-disk
+    // layout is documented twice — crypto_header.rs and ARCHITECTURE.md — as
+    // "argon2 params ... (zero for HKDF)". `wrap_into` honoured that;
+    // `build_create_cipher` was a second, hand-maintained implementation of the
+    // same operation and wrote Argon2Params::default() instead.
+    //
+    // So a database created with Key::Raw carried m=19456,t=2,p=1 in a slot
+    // whose kdf_id said HKDF, while a second raw credential added later through
+    // add_key carried zeros for identical semantics: two paths, different bytes,
+    // neither matching the format doc. Now both run through wrap_into.
+    use crate::superblock::{CRYPTO_HEADER_OFFSET, KEY_SLOT_SIZE};
+
+    let tmp = NamedTempFile::new().unwrap();
+    let first = || Key::Raw(Zeroizing::new(vec![0x11u8; 32]));
+    let second = || Key::Raw(Zeroizing::new(vec![0x22u8; 32]));
+
+    let mut db = Chisel::open(tmp.path(), Options::default().encryption_key(first())).unwrap();
+    db.begin().unwrap();
+    db.allocate(b"payload").unwrap();
+    db.commit().unwrap();
+    // Slot 1 comes from add_key — the path that was always correct. Both slots
+    // must now agree, which is the property that stops the two implementations
+    // drifting apart again.
+    db.add_key(&first(), &second()).unwrap();
+    drop(db);
+
+    let mut f = fs::File::open(tmp.path()).unwrap();
+    let mut unit = [0u8; crate::crypto::ENC_PAGE_SIZE];
+    // Read every superblock slot and check whichever ones carry an active key
+    // slot; the header is cleartext in all of them.
+    let mut checked = 0;
+    for sb_slot in 0..crate::DEFAULT_SUPERBLOCK_COUNT as u64 {
+        f.seek(SeekFrom::Start(
+            sb_slot * crate::crypto::ENC_PAGE_SIZE as u64,
+        ))
+        .unwrap();
+        f.read_exact(&mut unit).unwrap();
+        for key_slot in 0..2usize {
+            let base = CRYPTO_HEADER_OFFSET + 8 + key_slot * KEY_SLOT_SIZE;
+            if unit[base] != 1 {
+                continue; // slot not active
+            }
+            assert_eq!(
+                unit[base + 1],
+                1,
+                "both credentials are raw, so kdf_id=HKDF"
+            );
+            assert_eq!(
+                &unit[base + 2..base + 14],
+                &[0u8; 12],
+                "superblock slot {sb_slot} key slot {key_slot}: HKDF slots must \
+                 carry zero argon2 params, as the format doc states"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 2,
+        "expected to inspect both key slots; only saw {checked}"
+    );
 }

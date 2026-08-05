@@ -1031,8 +1031,27 @@ impl PageCache {
 
         let plaintext: [u8; PAGE_SIZE] = match &self.cipher {
             Some(c) => {
-                // The on-disk unit is exactly ENC_PAGE_SIZE at this stride;
-                // the try_into is infallible (ENC_PAGE_SIZE == 8232 == stride).
+                // The pairing invariant — cipher installed implies the stride was
+                // switched to ENC_PAGE_SIZE — was stated only in prose, here and
+                // in `set_cipher`'s doc, and checked nowhere. Assert it, because
+                // the failure mode is badly misleading: `read_page_unit_into`
+                // above fills only `stride` bytes of this 8232-byte stack buffer,
+                // so a cipher installed while the stride was still 8192 leaves
+                // the last 40 bytes as the buffer's zero-init rather than the
+                // real tag and nonce. `PageCipher::open` then fails, the caller
+                // gets `DecryptionFailed`, and `is_fatal()` poisons the handle —
+                // reporting a configuration mistake as unrecoverable ciphertext
+                // corruption.
+                //
+                // (The comment that used to sit here explained why a `try_into`
+                // was infallible. There is no `try_into`; the line below is a
+                // plain move of a Copy array, and the stale reference removed the
+                // one hint a reader had that a length check ever guarded this.)
+                debug_assert_eq!(
+                    stride, ENC_PAGE_SIZE,
+                    "cipher is installed but the IO stride is {stride}, not ENC_PAGE_SIZE — \
+                     set_cipher's contract was violated and the tag/nonce bytes are unread"
+                );
                 let unit: [u8; ENC_PAGE_SIZE] = on_disk;
                 c.open(page_id, &unit)
                     .map_err(|_| ChiselError::DecryptionFailed { page_id })?

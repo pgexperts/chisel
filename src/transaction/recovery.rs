@@ -332,14 +332,49 @@ impl TransactionManager {
         // For an encrypted DB we must decrypt the sealed body (which holds
         // total_pages, named_roots, etc.) BEFORE the page-size and
         // total_pages checks that read those fields.
+        // Checked BEFORE the key-presence match, so an unopenable-algorithm file
+        // says so whether or not a key was supplied. Inside the match it would
+        // sit behind `(Some(_), None) => NoEncryptionKey`, telling the user to
+        // go find a key for a file that no key can open, and only revealing the
+        // real reason once they produced one.
+        if let Some(header) = &sb.encryption {
+            if header.algorithm != crate::superblock::ALGO_XCHACHA20POLY1305 {
+                return Err(ChiselError::EncryptionNotSupported);
+            }
+        }
         let cipher = match (&sb.encryption, &key) {
             (None, None) => None,
             (Some(_), None) => return Err(ChiselError::NoEncryptionKey),
             (None, Some(_)) => return Err(ChiselError::EncryptionNotSupported),
             (Some(header), Some(k)) => {
+                // CRYPTO-4 / SUPERBLOCK-RECOVERY-3: the algorithm byte was
+                // written but never read back. `deserialize` gates only on
+                // zero ("not encrypted"), so ANY nonzero value was accepted and
+                // fed to `PageCipher`, which is hardcoded to XChaCha20-Poly1305.
+                //
+                // The field exists precisely to prevent that. Without this check
+                // a file stamped `algorithm = 2` — a future cipher, or a forged
+                // byte — opens, and every page read then fails as
+                // `DecryptionFailed`, which `is_fatal()` and poisons: an
+                // algorithm mismatch reported to the user as data corruption.
+                //
+                // `EncryptionNotSupported` is the right variant rather than a new
+                // one: its doc already covers "an encrypted DB is opened by a
+                // build that the on-disk crypto-header algorithm id is unknown
+                // to". It is operational, not fatal, which is correct — the file
+                // is intact, this build simply cannot read it. (The check itself
+                // now runs just above, before the key-presence match.)
                 // `raw` is provably the buffer the winner was deserialized from —
                 // correct regardless of create-seed vs commit write-slot ordering.
-                let dek = unwrap_first_matching_slot(header, k)?;
+                //
+                // `unlock` is the same trial loop `add_key`/`rotate_key`/
+                // `remove_key` use. This site used to carry a second copy
+                // (`unwrap_first_matching_slot`) that behaved identically but was
+                // separately maintained; see `unlock`'s doc for why that was
+                // worth collapsing even though this particular pair had not
+                // drifted. The slot index is discarded here — the open path only
+                // needs the DEK.
+                let (_slot, dek) = header.unlock(k)?;
                 let cipher = crate::crypto::PageCipher::new(dek);
                 // decrypt_body fills total_pages, named_roots, etc.
                 // A tag failure here means corruption, not a wrong key
@@ -591,107 +626,35 @@ struct CreateCrypto {
 }
 
 /// Build the session PageCipher for a freshly-created encrypted DB: generate a
-/// random DEK + slot-0 salt, derive the KEK from the client key, wrap the DEK
-/// into slot 0, and assemble the crypto-header. Returns the live PageCipher and
-/// the header to stamp into every superblock slot.
+/// random DEK, wrap it into slot 0 under a KEK derived from the client key, and
+/// assemble the crypto-header. Returns the live PageCipher and the header to
+/// stamp into every superblock slot.
 ///
-/// The AAD passed to `wrap_dek` is `slot.aad()` — the same bytes that Task 2.4
-/// reconstructs at unwrap time from the persisted slot fields. Keeping the AAD
-/// construction in one place (`KeySlot::aad`) ensures wrap and unwrap agree.
+/// The wrap itself is `CryptoHeader::wrap_into`, the same function `add_key`
+/// and `rotate_key` use. It used to be a second, hand-maintained implementation
+/// here — and the duplication had already produced a real divergence (CRYPTO-6:
+/// this copy wrote the OWASP argon2 defaults into HKDF slots, which the format
+/// doc says must be zero, while `wrap_into` correctly wrote zeros). A comment
+/// asserting two copies agree is not a mechanism that keeps them agreeing; one
+/// function is.
 fn build_create_cipher(
     key: &crate::crypto::Key,
     argon2_override: Option<crate::crypto::Argon2Params>,
 ) -> Result<CreateCrypto> {
-    use crate::crypto::{
-        derive_kek, random_array, random_dek, wrap_dek, Argon2Params, KdfId, NONCE_LEN, SALT_LEN,
-    };
     use crate::superblock::{CryptoHeader, KeySlot, ALGO_XCHACHA20POLY1305, KEY_SLOT_COUNT};
 
-    let dek = random_dek();
-    let salt: [u8; SALT_LEN] = random_array();
-    let wrap_nonce: [u8; NONCE_LEN] = random_array();
-
-    // KDF choice: Raw → HKDF (fast, key-material quality); Passphrase → Argon2id
-    // (memory-hard, brute-force resistant). The argon2_override is the
-    // caller-supplied cost params from Options::argon2_params; falls back to the
-    // OWASP baseline default. Raw keys use HKDF regardless, so the override only
-    // has effect for Passphrase.
-    let (kdf, params) = match key {
-        crate::crypto::Key::Raw(_) => (KdfId::Hkdf, Argon2Params::default()),
-        crate::crypto::Key::Passphrase(_) => (KdfId::Argon2id, argon2_override.unwrap_or_default()),
-    };
-    let kek = derive_kek(key, kdf, &salt, &params)?;
-
-    // Populate slot 0: state=active, KDF metadata, the wrapped DEK.
-    // slot.aad() is the canonical AAD bytes; it MUST be the same value
-    // used by Task 2.4 to unwrap — both sides call KeySlot::aad() on
-    // the populated-but-pre-wrap slot so the bytes are identical.
-    let mut slot = KeySlot::EMPTY;
-    slot.state = 1; // active
-    slot.kdf_id = kdf as u8;
-    slot.argon2 = params;
-    slot.salt = salt;
-    slot.wrap_nonce = wrap_nonce;
-    let aad = slot.aad();
-    let (wrapped, tag) = wrap_dek(&kek, &dek, &wrap_nonce, &aad);
-    slot.wrapped_dek = wrapped;
-    slot.wrap_tag = tag;
-
-    let mut slots = [KeySlot::EMPTY; KEY_SLOT_COUNT];
-    slots[0] = slot;
-    let header = CryptoHeader {
+    let dek = crate::crypto::random_dek();
+    let mut header = CryptoHeader {
         algorithm: ALGO_XCHACHA20POLY1305,
-        stride: 8232,
-        slots,
+        stride: crate::crypto::ENC_PAGE_SIZE as u32,
+        slots: [KeySlot::EMPTY; KEY_SLOT_COUNT],
     };
+    header.wrap_into(0, key, &dek, argon2_override)?;
 
     Ok(CreateCrypto {
         page_cipher: crate::crypto::PageCipher::new(dek),
         header,
     })
-}
-
-/// Try every ACTIVE key-slot in turn: derive the KEK from `key` + the slot's
-/// salt/params, then attempt to unwrap the DEK. The first slot whose AEAD tag
-/// verifies yields the DEK. If no slot matches, the caller's key is wrong.
-///
-/// Trying every active slot (rather than a slot-index hint) is what makes
-/// multi-key support possible: a DB may have the same DEK wrapped under
-/// several KEKs (one per trusted key), and the caller's key matches exactly
-/// one of them.
-///
-/// The AAD passed to `unwrap_dek` is `slot.aad()` — the identical bytes
-/// that `build_create_cipher` used at wrap time. Both sides call
-/// `KeySlot::aad()` on the fully populated (but pre-wrap) slot, so the
-/// bytes agree even if the slot layout changes in a future format version.
-fn unwrap_first_matching_slot(
-    header: &crate::superblock::CryptoHeader,
-    key: &crate::crypto::Key,
-) -> Result<crate::crypto::Dek> {
-    use crate::crypto::{derive_kek, unwrap_dek, KdfId};
-
-    for slot in header.slots.iter().filter(|s| s.is_active()) {
-        let kdf = match slot.kdf_id {
-            1 => KdfId::Hkdf,
-            2 => KdfId::Argon2id,
-            _ => continue, // unknown KDF id: skip, treat as non-matching
-        };
-        let kek = match derive_kek(key, kdf, &slot.salt, &slot.argon2) {
-            Ok(k) => k,
-            Err(_) => continue,
-        };
-        let aad = slot.aad();
-        if let Ok(dek) = unwrap_dek(
-            &kek,
-            &slot.wrapped_dek,
-            &slot.wrap_tag,
-            &slot.wrap_nonce,
-            &aad,
-        ) {
-            return Ok(dek);
-        }
-    }
-    Err(ChiselError::InvalidEncryptionKey)
 }
 
 #[cfg(test)]

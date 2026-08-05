@@ -424,8 +424,19 @@ impl PageCipher {
         nonce: &[u8; NONCE_LEN],
         tag: &[u8; TAG_LEN],
         ct: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
-        open_detached(self.dek.as_bytes(), nonce, aad, ct, tag).map(|z| z.to_vec())
+    ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+        // Return the Zeroizing buffer `open_detached` produced rather than
+        // `.to_vec()`-ing out of it. The old code allocated a fresh plain Vec and
+        // copied the plaintext in; the Zeroizing original was then dropped and
+        // wiped while the copy — the one the caller actually keeps — was freed
+        // un-scrubbed. That defeated the exact guarantee `open_detached`'s doc
+        // claims, one call later, and it is the only variable-length caller.
+        //
+        // What is in this buffer is the decrypted superblock body: root page
+        // pointers, total_pages, next_handle, freemap_depth, and the full
+        // named_roots table — user-chosen names that THEORY.md identifies as
+        // real user data and gives as the reason the body is sealed at all.
+        open_detached(self.dek.as_bytes(), nonce, aad, ct, tag)
     }
 }
 
@@ -695,7 +706,7 @@ mod tests {
         let (nonce, tag, ct) = pc.seal_body(aad, &body);
         assert_eq!(ct.len(), body.len(), "body cipher is length-preserving");
         let out = pc.open_body(aad, &nonce, &tag, &ct).unwrap();
-        assert_eq!(out, body);
+        assert_eq!(out.as_slice(), body);
     }
 
     #[test]
