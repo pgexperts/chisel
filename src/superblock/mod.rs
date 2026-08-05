@@ -76,6 +76,29 @@ pub const DEFAULT_SUPERBLOCK_COUNT: u32 = 2;
 pub const TXN_COUNTER_RESERVE: u64 = 1 << 32;
 pub const MAX_TXN_COUNTER: u64 = u64::MAX - TXN_COUNTER_RESERVE;
 
+/// The counter the next superblock write should carry, or a typed error if
+/// bumping would leave the reserved band.
+///
+/// This exists because the read-side bound in `validate` is only half an
+/// invariant. Bounding what we ACCEPT without bounding what we WRITE lets the
+/// engine persist a superblock it will later refuse to read: forge a slot at
+/// exactly `MAX_TXN_COUNTER` (which validates, and opens cleanly), and the next
+/// commits are acknowledged and fsynced at MAX+1, MAX+2 — after which every
+/// slot fails `validate` and the database is permanently unopenable. One commit
+/// past the bound is quieter and worse: the reopen silently falls back to an
+/// older valid slot, discarding an acknowledged commit.
+///
+/// So the rule is: never write a superblock we would not read back. Callers
+/// must consult this BEFORE doing any commit I/O, so a refusal costs nothing
+/// and leaves the last durable state untouched.
+pub fn next_txn_counter(current: u64) -> Result<u64, crate::error::ChiselError> {
+    let next = current.saturating_add(1);
+    if next > MAX_TXN_COUNTER {
+        return Err(crate::error::ChiselError::TxnCounterExhausted { current });
+    }
+    Ok(next)
+}
+
 // Byte offset of the superblock_count field within the serialized
 // superblock page. Placed AFTER the named-root table (which ends at
 // NAMED_ROOTS_END = 308). Deserialization rejects any value outside
@@ -805,6 +828,48 @@ mod tests {
             .copy_from_slice(&99u32.to_le_bytes());
         page::stamp_checksum(&mut bad_count);
         assert_eq!(validate(&bad_count), Err(SuperblockDefect::BadCount(99)));
+
+        // The bound is `>`, so MAX_TXN_COUNTER itself must be accepted. Pinning
+        // both sides matters here: a database forged at exactly the boundary is
+        // the case that opens cleanly and then exercises the write-side guard.
+        let mut at_bound = good;
+        at_bound[8..16].copy_from_slice(&MAX_TXN_COUNTER.to_le_bytes());
+        page::stamp_checksum(&mut at_bound);
+        assert_eq!(validate(&at_bound), Ok(()));
+
+        let mut over_bound = good;
+        over_bound[8..16].copy_from_slice(&(MAX_TXN_COUNTER + 1).to_le_bytes());
+        page::stamp_checksum(&mut over_bound);
+        assert_eq!(
+            validate(&over_bound),
+            Err(SuperblockDefect::BadTxnCounter(MAX_TXN_COUNTER + 1))
+        );
+    }
+
+    // The write side of the same invariant. Bounding what we ACCEPT without
+    // bounding what we WRITE lets the engine persist superblocks it will refuse
+    // to read back, which is worse than refusing the commit: one commit past the
+    // bound is silently discarded on the next open (fallback to an older valid
+    // slot), and two make the file permanently unopenable.
+    #[test]
+    fn next_txn_counter_refuses_to_leave_the_readable_range() {
+        assert_eq!(next_txn_counter(0).unwrap(), 1);
+        assert_eq!(
+            next_txn_counter(MAX_TXN_COUNTER - 1).unwrap(),
+            MAX_TXN_COUNTER
+        );
+        assert!(matches!(
+            next_txn_counter(MAX_TXN_COUNTER),
+            Err(crate::error::ChiselError::TxnCounterExhausted {
+                current
+            }) if current == MAX_TXN_COUNTER
+        ));
+        // Saturating, not wrapping: u64::MAX must not roll over to 0 and be
+        // mistaken for a fresh database by "highest counter wins".
+        assert!(matches!(
+            next_txn_counter(u64::MAX),
+            Err(crate::error::ChiselError::TxnCounterExhausted { .. })
+        ));
     }
 
     #[test]
@@ -1206,7 +1271,11 @@ mod tests {
     proptest::proptest! {
         #[test]
         fn prop_serialize_deserialize_roundtrip(
-            txn_counter in 0u64..u64::MAX,
+            // Same reasoning as superblock_count below: values above
+            // MAX_TXN_COUNTER make deserialize() return None by design, so
+            // sampling the full u64 range would fail the round-trip property
+            // roughly once in 2^32 draws — a landmine rather than a signal.
+            txn_counter in 0u64..=MAX_TXN_COUNTER,
             root_handle_table_page in 0u64..u64::MAX,
             root_freemap_page in 0u64..u64::MAX,
             total_pages in 0u64..u64::MAX,
