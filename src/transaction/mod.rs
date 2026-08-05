@@ -154,7 +154,7 @@ pub struct TransactionManager {
     // `borrow_mut()`; reborrowing for downstream `&mut PageCache` parameters
     // (e.g., handle_table methods) is done via `&mut *cache` on a single
     // RefMut held for the duration of the operation.
-    cache: RefCell<PageCache>,
+    pub(crate) cache: RefCell<PageCache>,
     // Roots that match the superblock currently on disk. Safe to read at any time.
     committed_roots: Roots,
     // Roots under construction. Equals committed_roots when no txn is active;
@@ -167,14 +167,14 @@ pub struct TransactionManager {
     // Monotonically increasing. Written into each new superblock; the higher value
     // wins on recovery. Also used to pick the inactive slot on commit via
     // `txn_counter % superblock_count`.
-    txn_counter: u64,
+    pub(crate) txn_counter: u64,
     // Number of superblock slots occupying pages 0..superblock_count
     // (ISSUES.md R4). Set at open time from the winning superblock's
     // own `superblock_count` field; cached here so commit doesn't have
     // to re-fetch it. Must equal every slot's self-reported value in a
     // healthy database; divergence would indicate mid-flight reconfig
     // or corruption.
-    superblock_count: u32,
+    pub(crate) superblock_count: u32,
     active_txn: bool,
     savepoints: Vec<Savepoint>,
     // Pages whose contents are no longer reachable from the new roots.
@@ -221,12 +221,12 @@ pub struct TransactionManager {
     /// seal/open. The manager's copy is also threaded through CommitCtx for the
     /// superblock body seal on every commit. The DEK inside PageCipher is
     /// zeroizing and is cleared on drop.
-    cipher: Option<crate::crypto::PageCipher>,
+    pub(crate) cipher: Option<crate::crypto::PageCipher>,
     /// The crypto-header (algorithm id + key-slot table) for an encrypted database.
     /// Written verbatim into every committed superblock. `None` for plaintext DBs.
     /// The key-slot contents never change after create or open: the slots hold the
     /// DEK wrapped under KEKs from each user key and are opaque to the commit path.
-    crypto_header: Option<crate::superblock::CryptoHeader>,
+    pub(crate) crypto_header: Option<crate::superblock::CryptoHeader>,
 
     // Test-only fault injection consolidated off the production type (review
     // 2026-06-22 SMELL #4): the four BUG#2 atomic-staging arming flags live in

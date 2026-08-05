@@ -60,6 +60,7 @@ pub(crate) mod overflow;
 pub(crate) mod page;
 pub(crate) mod page_cache;
 pub(crate) mod page_io;
+pub(crate) mod rekey;
 mod spillway;
 pub(crate) mod stats;
 pub(crate) mod superblock;
@@ -1107,6 +1108,70 @@ impl Chisel {
     /// failure is fatal and poisons the handle.
     pub fn remove_key(&mut self, key: &crypto::Key) -> Result<()> {
         self.txm.remove_key(key)
+    }
+
+    /// Re-encrypt the entire database under a freshly generated data-encryption
+    /// key. The heavy sibling of [`Chisel::rotate_key`].
+    ///
+    /// Reach for this only when the DEK ITSELF is believed compromised — a
+    /// process memory dump, a core file, a debugger session. If what leaked was
+    /// a *credential*, [`Chisel::rotate_key`] is the right tool: it is O(1),
+    /// touches only the superblock, and is the common operational need
+    /// (password change, key rollover, adding a second credential).
+    ///
+    /// # Why this is an offline operation on a path
+    ///
+    /// It takes a path rather than `&mut self` because it rewrites the whole
+    /// file and replaces it by `rename`. After a successful rotation, any file
+    /// descriptor opened before the call refers to the ORIGINAL, now-unlinked
+    /// inode — reads and writes through it would silently target a deleted
+    /// file. Handing back a live handle would be handing back that hazard, so
+    /// there is no handle to misuse: close any open `Chisel` first, call this,
+    /// then [`Chisel::open`] again.
+    ///
+    /// The exclusive `flock` is held for the whole rotation, so no other
+    /// process can open the database while it is in flight.
+    ///
+    /// # Crash safety
+    ///
+    /// The rotated database is built in a scratch file beside the original and
+    /// published with an atomic `rename`. The database path therefore only ever
+    /// names a complete file — the fully-rotated one, or the untouched
+    /// original. A crash at any point leaves one or the other, never a mix.
+    ///
+    /// In-place rotation would NOT be safe, and shadow paging does not rescue
+    /// it: shadow paging protects writes that go to *new* pages, while this
+    /// rewrites pages where they are. A crash halfway would leave some pages
+    /// under the new DEK and some under the old, with no way to tell which.
+    ///
+    /// # This collapses the key-slot table to `key` alone
+    ///
+    /// Every other credential is revoked. That is not a shortcut — it is
+    /// forced: each slot's KEK is derived from its own credential, so re-wrapping
+    /// the new DEK for a slot requires the credential that slot belongs to, and
+    /// only `key` was supplied. Add the others back with [`Chisel::add_key`]
+    /// afterwards.
+    ///
+    /// It is also the safer default for the situation this exists for. If you
+    /// are rotating because the DEK leaked, quietly preserving every credential
+    /// that could reach it is not what you want.
+    ///
+    /// # Cost
+    ///
+    /// O(total_pages) I/O and, transiently, a second copy of the database on
+    /// disk. Not something to schedule routinely.
+    ///
+    /// # Errors
+    /// `FileNotFound` if `path` does not exist; `EncryptionNotSupported` if the
+    /// database is plaintext; `InvalidEncryptionKey` if `key` unlocks no slot;
+    /// `IoError` for any failure building or publishing the replacement — in
+    /// which case the original file is untouched and the scratch file removed.
+    pub fn rekey(
+        path: &Path,
+        key: &crypto::Key,
+        argon2_params: Option<crypto::Argon2Params>,
+    ) -> Result<()> {
+        rekey::rekey(path, key, argon2_params)
     }
 }
 

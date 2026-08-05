@@ -712,9 +712,11 @@ The DEK wrapping uses detached XChaCha20-Poly1305 with AAD bound to the slot's K
 
 - `add_key(old_key, new_key)`: derives a new KEK, wraps the same DEK into a free slot, then commits.
 - `rotate_key(old_key, new_key)`: `add_key` followed by clearing the old slot in the same commit.
+- Every key-slot rewrite also scrubs the key-slot region of the OTHER superblock slots (`CryptoHeader::overwrite_slot_table`). Without that, a revoked credential's wrapped DEK survived verbatim in a sibling slot of the live file — cleartext at bytes 332..1356, wrapping a DEK that never changes — so read access plus the revoked credential was enough to recover the current DEK. Only the table region is patched, so each sibling keeps its own counter, roots and sealed body; the body's AAD covers magic/format_version/txn_counter/superblock_count, not the crypto header.
+- `Chisel::rekey(path, key, argon2)` (ADR 0018) is the bulk alternative: a fresh DEK, every page re-sealed, the file replaced by atomic rename. It is an associated function on a path rather than a method because the rename invalidates any descriptor opened beforehand, and it collapses the key-slot table to the supplied credential because a slot's KEK cannot be re-derived without its own credential.
 - `remove_key(key)`: clears the matching slot, refusing to clear the last active slot (which would make the database permanently unreadable).
 
-Bulk DEK rotation (re-encrypting every page under a fresh DEK) is deferred; see I142.
+Bulk DEK rotation is implemented as `Chisel::rekey` (ADR 0018) — the operation for a compromised DEK, as opposed to a compromised credential. It is offline and takes a path, builds the rotated database in a scratch file, and publishes it with an atomic rename; it collapses the key-slot table to the single supplied credential, because a slot's KEK cannot be re-derived without its own credential.
 
 **Spillway.** For encrypted databases the in-memory spillway carries sealed blobs: pages are encrypted exactly once on eviction (`seal` on evict-to-spillway) and copied verbatim — no decryption or re-encryption — on drain to the main file. Rehydration decrypts the blob back into the cache. No plaintext page content is ever written to disk by an encrypted database, even during spill.
 
