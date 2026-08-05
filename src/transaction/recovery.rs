@@ -410,6 +410,36 @@ impl TransactionManager {
             });
         }
 
+        // Same trust boundary, same reasoning: `freemap_depth` comes off the
+        // superblock unvalidated (`deserialize` reads the field, `validate`
+        // checks only checksum/magic/superblock_count) and is then handed
+        // verbatim to `FreeMapTree::from_roots`. Depth 5 already covers every
+        // u64 page id, so anything larger is corrupt by construction.
+        //
+        // This bound is load-bearing, not tidiness. Without it a hostile file
+        // reaches two process-killing paths that the poison model cannot
+        // intercept, because neither is a Rust error:
+        //
+        //   * `scan_node` recurses once per level. A forged depth of ~500k plus
+        //     one self-referential FreeMapInterior page overflows the stack —
+        //     SIGSEGV — from any allocation that consults the freemap, and from
+        //     `defrag`'s `collect_reachable`.
+        //   * `cow_descend` loops over the depth and calls `child_span`, itself
+        //     O(level), inside — O(depth^2), ~10^19 operations at u32::MAX —
+        //     while materializing a page per absent child, extending the file
+        //     without bound. That one fires on the ordinary commit path.
+        //
+        // The handle table and the membership index both already cap their
+        // depth this way; the freemap was the odd one out. Its own comment
+        // claimed `capacity()` saturation "fails closed (rejects the descent)",
+        // but saturation only prevents arithmetic overflow — it rejects nothing.
+        if sb.freemap_depth > crate::freemap_tree::MAX_DEPTH {
+            return Err(ChiselError::InvalidFreemapDepth {
+                stored: sb.freemap_depth,
+                max: crate::freemap_tree::MAX_DEPTH,
+            });
+        }
+
         // I29 write-gate: a file whose MINOR exceeds this binary's may contain
         // version-requiring page layouts we cannot safely write — we would
         // stamp pages at our older minor and drop the newer fields. Reads ARE

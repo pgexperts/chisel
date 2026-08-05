@@ -372,7 +372,7 @@ let options = Options::default()
 
 **Fatal errors** — storage integrity is in question. Drop the handle and reopen.
 
-`IoError`, `ChecksumMismatch`, `CorruptSuperblock`, `FileSizeMismatch`, `LockFailed`, `UnsupportedFormatVersion`, `UnsupportedPageSize`, `CorruptPage`, `InvalidPageId`, `DecryptionFailed`.
+`IoError`, `ChecksumMismatch`, `CorruptSuperblock`, `FileSizeMismatch`, `LockFailed`, `UnsupportedFormatVersion`, `UnsupportedPageSize`, `InvalidFreemapDepth`, `CorruptPage`, `InvalidPageId`, `DecryptionFailed`.
 
 `DecryptionFailed { page_id }` is fatal: an AEAD authentication failure while decrypting an already-read page means the ciphertext or session key can no longer be trusted, so it poisons the handle exactly like `ChecksumMismatch` (see the poison model below). It is distinct from the operational `InvalidEncryptionKey`, which fires at open time when the supplied key unwraps no key slot — before any data page is served.
 

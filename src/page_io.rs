@@ -125,6 +125,14 @@ impl PageIo {
     /// read-write path, so read-only opens of a missing file correctly fail
     /// rather than materializing an empty file.
     ///
+    /// On unix, a newly created database file is created with mode `0600`
+    /// (owner read/write only) rather than the process umask's default. This is
+    /// part of the contract, not an implementation detail: a caller may rely on
+    /// a database it creates not being readable by other users on the host.
+    /// The mode applies ONLY at creation — reopening an existing file never
+    /// alters permissions its owner has deliberately set, so widening access is
+    /// the owner's call to make with `chmod`.
+    ///
     /// The exclusive flock is taken even for `read_only` opens. This is
     /// intentional: even a reader needs to block concurrent writers, because
     /// shadow paging means a writer could be mid-commit (old superblock
@@ -135,12 +143,44 @@ impl PageIo {
         let mut file = if read_only {
             OpenOptions::new().read(true).open(path)?
         } else {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(path)?
+            let mut opts = OpenOptions::new();
+            opts.read(true).write(true).create(true).truncate(false);
+            // Create at 0600 rather than 0666 & ~umask (typically 0644). A
+            // storage engine's file holds whatever the caller stored in it; on
+            // a shared host the default made every value in a plaintext
+            // database world-readable, which is a surprising default for a
+            // crate that also ships at-rest encryption.
+            //
+            // `mode` applies ONLY when the file is created, so reopening an
+            // existing database never changes permissions the owner has
+            // deliberately set — this tightens new files without migrating old
+            // ones.
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+            let f = opts.open(path)?;
+            // `mode` above applies only when the open CREATES the file, which
+            // leaves one gap in the contract this function documents. Since a
+            // zero-length file is a legitimate create target, another local user
+            // can pre-plant an empty world-readable file at the database path;
+            // Chisel would then adopt it and write every value into a file the
+            // planter can read, with the promised 0600 never applied.
+            //
+            // Close it by tightening any zero-length file we adopt. A file with
+            // no bytes is not yet a database, so there are no permissions its
+            // owner has deliberately set on a database to preserve. If the file
+            // belongs to someone else the fchmod fails EPERM and the open fails
+            // — the correct outcome for "something is squatting on my path".
+            //
+            // Non-empty files are untouched, exactly as documented: reopening an
+            // existing database never alters its permissions.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if f.metadata()?.len() == 0 {
+                    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                }
+            }
+            f
         };
         Self::try_lock(&file)?;
         // I51: seed the page-count cache from the current file length.
