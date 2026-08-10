@@ -171,3 +171,63 @@ def test_non_io_error_does_not_carry_errno(tmp_db):
     # class in future, but today it should be absent from non-IoError.
     assert not hasattr(e, "kind"), \
         f"unexpected .kind attribute on {type(e).__name__}"
+
+
+# --- PYTHON-7 (issue #105): exception classes must be importable ------------
+#
+# Every binding exception was declared with `create_exception!(_chisel, ...)`,
+# which sets __module__ to the bare "_chisel". maturin installs the extension
+# as the SUBMODULE chisel._chisel, so "_chisel" is not importable, and pickle
+# resolves an exception class by importing __module__ and looking up __name__
+# there. An exception raised in a ProcessPoolExecutor / multiprocessing worker
+# is pickled to be re-raised in the parent, so the original ChiselError was
+# being replaced by a PicklingError — destroying the two-tier
+# operational/fatal contract exactly where it matters most.
+
+import importlib
+import pickle
+
+_EXCEPTION_CLASSES = sorted(
+    name
+    for name in chisel.__all__
+    if isinstance(getattr(chisel, name, None), type)
+    and issubclass(getattr(chisel, name), Exception)
+)
+
+
+def test_exception_sweep_covers_every_class_the_module_defines():
+    """Guard the guard, by equality rather than by a loose floor.
+
+    If `__all__` or the filter above stops matching, the two parametrized tests
+    silently become no-ops — a `> 20` threshold would tolerate fifteen classes
+    vanishing. Comparing against module introspection instead means a class
+    added to the extension but forgotten in `__all__` fails HERE, which is also
+    the bug that would keep it unpicklable.
+    """
+    from_module = sorted(
+        name
+        for name in dir(chisel._chisel)
+        if isinstance(getattr(chisel._chisel, name), type)
+        and issubclass(getattr(chisel._chisel, name), Exception)
+    )
+    assert _EXCEPTION_CLASSES == from_module
+
+
+@pytest.mark.parametrize("cls_name", _EXCEPTION_CLASSES)
+def test_exception_module_is_importable(cls_name):
+    cls = getattr(chisel, cls_name)
+    assert cls.__module__ == "chisel._chisel", (
+        f"{cls_name}.__module__ is {cls.__module__!r}, which is not importable"
+    )
+    # The assertion that makes this a real test rather than a string compare:
+    # the class must actually be findable at that path, which is precisely
+    # what pickle does.
+    mod = importlib.import_module(cls.__module__)
+    assert getattr(mod, cls.__name__) is cls
+
+
+@pytest.mark.parametrize("cls_name", _EXCEPTION_CLASSES)
+def test_exceptions_pickle_roundtrip(cls_name):
+    cls = getattr(chisel, cls_name)
+    revived = pickle.loads(pickle.dumps(cls("boom")))
+    assert type(revived) is cls
