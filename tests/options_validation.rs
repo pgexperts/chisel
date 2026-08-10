@@ -289,3 +289,134 @@ fn test_second_open_on_same_file_fails_with_lock_error() {
     let err = expect_err(Chisel::open(&path, Options::default()));
     assert!(matches!(err, ChiselError::LockFailed));
 }
+
+// --- argon2_params validation (PUBLIC-API-8, issue #106) ---
+//
+// Same negative-path dual-open pattern as the superblock_count cases above,
+// and for the same reason: the Options are rejected before any I/O, so both
+// constructors take the identical path.
+//
+// What these pin is not just "bad input is rejected" but WHICH error names it.
+// Before the fix these values reached `Params::new` deep inside the create
+// path, failed as `CryptoError::Kdf`, and were collapsed by the blanket
+// `From<CryptoError> for ChiselError` into `InvalidEncryptionKey` — whose
+// documented meaning is "a key was supplied but no key-slot's wrapped DEK
+// could be unwrapped". On a database being CREATED there is no key slot to
+// mismatch, so the reported cause was not merely unhelpful, it was impossible.
+
+/// Options with a passphrase key and the given cost parameters. A passphrase
+/// (not a raw key) is required for the Argon2 path to be selected at all —
+/// `wrap_into` picks HKDF for raw keys and never reads these fields.
+fn argon2_opts(m_cost: u32, t_cost: u32, p_cost: u32) -> Options {
+    Options::default()
+        .cache_max_bytes(16 * chisel::PAGE_SIZE as u64)
+        .encryption_key(chisel::Key::Passphrase(zeroize::Zeroizing::new(
+            "correct horse battery".to_string(),
+        )))
+        .argon2_params(chisel::Argon2Params {
+            m_cost,
+            t_cost,
+            p_cost,
+        })
+}
+
+fn assert_rejected(m_cost: u32, t_cost: u32, p_cost: u32) {
+    let bad = argon2_opts(m_cost, t_cost, p_cost);
+
+    let f = NamedTempFile::new().unwrap();
+    let err = expect_err(Chisel::open(f.path(), bad.clone()));
+    assert!(
+        matches!(
+            err,
+            ChiselError::InvalidArgon2Params { m_cost: m, t_cost: t, p_cost: p }
+                if m == m_cost && t == t_cost && p == p_cost
+        ),
+        "({m_cost}, {t_cost}, {p_cost}) should be InvalidArgon2Params, got {err:?}"
+    );
+
+    let err = expect_err(Chisel::open_in_memory_with_options(bad));
+    assert!(
+        matches!(err, ChiselError::InvalidArgon2Params { .. }),
+        "({m_cost}, {t_cost}, {p_cost}) should be InvalidArgon2Params in memory mode, got {err:?}"
+    );
+}
+
+#[test]
+fn test_argon2_zero_m_cost_rejected() {
+    // The exact reproducer from the issue: m_cost 0 used to return
+    // InvalidEncryptionKey on a database that was being created.
+    assert_rejected(0, 1, 1);
+}
+
+#[test]
+fn test_argon2_zero_t_cost_rejected() {
+    assert_rejected(19456, 0, 1);
+}
+
+#[test]
+fn test_argon2_zero_p_cost_rejected() {
+    assert_rejected(19456, 2, 0);
+}
+
+#[test]
+fn test_argon2_m_cost_below_lanes_times_eight_rejected() {
+    // argon2 requires 8 KiB of memory per lane. Each field is individually in
+    // range here — this is the cross-field constraint, which is the one a
+    // caller violates by accident when raising p_cost alone.
+    assert_rejected(8, 2, 2);
+}
+
+#[test]
+fn test_argon2_m_cost_above_cap_rejected() {
+    // The upper caps already existed but were enforced inside derive_kek and
+    // reported as InvalidEncryptionKey. This asserts the boundary check now
+    // names them, end to end.
+    assert_rejected(chisel::MAX_ARGON2_M_COST + 1, 2, 1);
+}
+
+#[test]
+fn test_argon2_t_cost_above_cap_rejected() {
+    assert_rejected(19456, chisel::MAX_ARGON2_T_COST + 1, 1);
+}
+
+#[test]
+fn test_argon2_boundary_values_accepted() {
+    // The exact minimums must be ACCEPTED — an off-by-one in the comparison
+    // would make the engine refuse parameters the KDF is perfectly happy with,
+    // and no rejection test can catch that.
+    let f = NamedTempFile::new().unwrap();
+    let ok = argon2_opts(
+        chisel::MIN_ARGON2_M_COST,
+        chisel::MIN_ARGON2_T_COST,
+        chisel::MIN_ARGON2_P_COST,
+    );
+    Chisel::open(f.path(), ok).expect("minimum legal argon2 params must be accepted");
+}
+
+#[test]
+fn test_argon2_maximum_values_accepted() {
+    // The other accept-side boundary. A `>` mistyped as `>=` in the cap checks
+    // would falsely reject the documented maximum, and no rejection test can
+    // catch that. m_cost stays modest so the KDF work is trivial — the caps are
+    // independent, so exercising t/p at MAX is what matters here.
+    let f = NamedTempFile::new().unwrap();
+    let ok = argon2_opts(
+        chisel::MIN_ARGON2_M_COST * chisel::MAX_ARGON2_P_COST,
+        chisel::MAX_ARGON2_T_COST,
+        chisel::MAX_ARGON2_P_COST,
+    );
+    Chisel::open(f.path(), ok).expect("maximum legal argon2 params must be accepted");
+}
+
+#[test]
+fn test_argon2_params_none_is_always_valid() {
+    // No explicit params means "use the OWASP default on create, or the
+    // per-slot stored params on reopen". The validator must not reject it.
+    let f = NamedTempFile::new().unwrap();
+    let opts = Options::default()
+        .cache_max_bytes(16 * chisel::PAGE_SIZE as u64)
+        .encryption_key(chisel::Key::Passphrase(zeroize::Zeroizing::new(
+            "correct horse battery".to_string(),
+        )));
+    Chisel::open(f.path(), opts).expect("absent argon2_params must be accepted");
+}

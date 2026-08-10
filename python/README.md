@@ -410,6 +410,7 @@ Catch and continue.
 | `InvalidRootNameError` | Named-root name is empty, too long, or not valid UTF-8 |
 | `RootNameTableFullError` | All named-root slots are in use |
 | `InvalidSuperblockCountError` | `superblock_count` outside `2..=16` |
+| `InvalidArgon2ParamsError` | `argon2_params` carries cost values the KDF cannot use (checked before the file is touched, so it is never a wrong-key problem) |
 | `CacheFullError` | Page cache hit its strict `cache_max_bytes` cap with every cached page dirty (no clean page available for eviction) AND the spillway is disabled (`spillway_max_bytes=0`); commit or roll back to drain. When the spillway is enabled (default), the cache overflows into it instead and you'll see `SpillwayFullError` only if the spillway also fills. |
 | `SpillwayFullError` | Spillway sidecar's `spillway_max_bytes` cap was reached during a transaction; commit or roll back to drain the spillway. Database is intact. |
 | `NoEncryptionKeyError` | Opened an encrypted database without supplying `encryption_key` |

@@ -367,7 +367,7 @@ let options = Options::default()
 
 `superblock_count` is set at create time and stored on disk; reopening discovers it from the winning superblock. Higher N increases durability against consecutive torn writes at the cost of N × 8 KB of file space: N = 3 survives one torn commit plus a torn retry, N = 4 survives two retries.
 
-`encryption_key` defaults to `None` (plaintext). `Some(key)` creates a new encrypted database (sealing a fresh random data-encryption key under the supplied key) or reopens one (unwrapping the stored key). `argon2_params` defaults to `None`, which uses the OWASP-recommended Argon2id cost (19 MiB / t=2 / p=1) when deriving a key from a `Key::Passphrase` on create; it is ignored for raw keys and on reopen (the stored slot carries its own params). See the [Encryption](#encryption) concept below.
+`encryption_key` defaults to `None` (plaintext). `Some(key)` creates a new encrypted database (sealing a fresh random data-encryption key under the supplied key) or reopens one (unwrapping the stored key). `argon2_params` defaults to `None`, which uses the OWASP-recommended Argon2id cost (19 MiB / t=2 / p=1) when deriving a key from a `Key::Passphrase` on create; it is ignored for raw keys and on reopen (the stored slot carries its own params). An explicitly supplied value is range-checked at the API boundary — before the file is opened — and anything the KDF cannot use fails with `InvalidArgon2Params` carrying all three costs, rather than being reported as a credential problem. See the [Encryption](#encryption) concept below.
 
 ## Error handling
 
@@ -375,7 +375,7 @@ let options = Options::default()
 
 **Operational errors** — the database is healthy; the caller made a mistake. Catch and continue.
 
-`InvalidHandle`, `TagMismatch`, `NoActiveTransaction`, `TransactionAlreadyActive`, `TransactionInProgress`, `SavepointNotFound`, `DuplicateSavepoint`, `ReadOnlyMode`, `FileNotFound`, `InvalidRootName`, `RootNameTableFull`, `InvalidSuperblockCount`, `CacheFull`, `SpillwayFull`, `NoEncryptionKey`, `InvalidEncryptionKey`, `EncryptionNotSupported`, `NoFreeKeySlot`, `LastKeySlot`.
+`InvalidHandle`, `TagMismatch`, `NoActiveTransaction`, `TransactionAlreadyActive`, `TransactionInProgress`, `SavepointNotFound`, `DuplicateSavepoint`, `ReadOnlyMode`, `FileNotFound`, `InvalidRootName`, `RootNameTableFull`, `InvalidSuperblockCount`, `InvalidArgon2Params`, `CacheFull`, `SpillwayFull`, `NoEncryptionKey`, `InvalidEncryptionKey`, `EncryptionNotSupported`, `NoFreeKeySlot`, `LastKeySlot`.
 
 **Fatal errors** — storage integrity is in question. Drop the handle and reopen.
 
