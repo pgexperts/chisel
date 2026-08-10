@@ -37,6 +37,23 @@ impl TransactionManager {
         // read-view root is `current_roots` — read-your-own-writes.
         let entry = self.lookup_live(handle)?;
 
+        // Test-only injection (see `force_deleted_old_entry`). The Deleted arm of
+        // the OldRelease match below is unreachable by construction — `lookup_live`
+        // never yields a tombstone — so this shadow binding is the only way to
+        // cover its I45 escalation. Shadowing rather than mutating keeps the
+        // production binding immutable and leaves the non-test build byte-identical
+        // — the whole block is absent, so `entry` is still `lookup_live`'s result.
+        // Same discipline as `delete_inner`'s `let res` injection.
+        #[cfg(test)]
+        let entry = if self.fault.force_deleted_old_entry.replace(false) {
+            HandleEntry {
+                flags: HandleFlags::Deleted,
+                ..entry
+            }
+        } else {
+            entry
+        };
+
         // Atomic staging (same discipline as delete_inner): do NOT retire the
         // OLD value's storage until the NEW entry is durably installed. The
         // previous "free old first" ordering meant a non-fatal CacheFull during
@@ -116,13 +133,15 @@ impl TransactionManager {
 
         // PREPARE: compute the OLD location's free set without applying it. For
         // Overflow this is a read-only walk of the old chain (a fallible
-        // cold-page load); for Live the page id is released in the install phase;
-        // Deleted carries no storage. On the overflow-walk failure, unwind the
-        // new inline slot — the old chain is untouched (the walk frees nothing).
+        // cold-page load); for Live the page id is released in the install phase.
+        // A Deleted old entry is impossible here — `lookup_live` above already
+        // mapped tombstones to InvalidHandle — and is rejected as CorruptPage
+        // rather than carried as a third variant. On the overflow-walk failure,
+        // unwind the new inline slot — the old chain is untouched (the walk frees
+        // nothing).
         enum OldRelease {
             Inline(u64),
             Overflow(Vec<u64>),
-            Nothing,
         }
         let old_release = match entry.flags {
             HandleFlags::Live => OldRelease::Inline(entry.page_id),
@@ -145,7 +164,41 @@ impl TransactionManager {
                     }
                 }
             }
-            HandleFlags::Deleted => OldRelease::Nothing,
+            HandleFlags::Deleted => {
+                // I45 (ISSUES.md, 2026-05-22), same policy as `delete_inner`'s
+                // Deleted arm below: `lookup_live` resolves tombstones to
+                // InvalidHandle (handle_table::lookup returns None for Deleted,
+                // and read.rs turns that None into the typed error), so a Deleted
+                // entry arriving here means the liveness funnel itself broke —
+                // an in-memory contradiction, not a caller error. This is NOT an
+                // I1 reclassification: I1 forbids escalating OPERATIONAL errors
+                // (CacheFull, SpillwayFull, InvalidHandle) to fatal, and this is
+                // none of those.
+                //
+                // This arm used to be a silent no-op that retired nothing and let
+                // the install below write a fresh HandleEntry over the tombstone —
+                // resurrecting a deleted handle whose membership-index entry was
+                // never re-added. Quietly producing a corrupt cross-map is the
+                // worse of the two failure modes; `delete_inner` already decided
+                // the loud one is correct.
+                //
+                // No PREPARE unwind is needed (matching `delete_inner`'s I45 arm,
+                // which also returns without undoing its prepare): CorruptPage is
+                // fatal, so `poison_on_fatal` retires the manager and nothing will
+                // consume the bookkeeping an unwind would restore.
+                //
+                // Note this is NOT "nothing has been installed yet". The
+                // handle-table install below has not run, but PREPARE already
+                // called `handle_table_insert_candidate`, which unconditionally
+                // `put_tree`s freemap COW growth into `current_roots.freemap_page`
+                // (staging.rs) — so when that candidate drew a reuse page from a
+                // non-empty committed freemap, the freemap half of `current_roots`
+                // HAS advanced by the time we return here. Poisoning is what makes
+                // that unobservable, not an absence of installed state.
+                return Err(ChiselError::CorruptPage {
+                    page_id: entry.page_id,
+                });
+            }
         };
 
         // INSTALL phase (infallible): install the NEW entry first so the handle
@@ -158,7 +211,6 @@ impl TransactionManager {
         match old_release {
             OldRelease::Inline(page_id) => self.release_data_slot(page_id),
             OldRelease::Overflow(freed) => self.txn_freed_pages.extend_from_slice(&freed),
-            OldRelease::Nothing => {}
         }
 
         Ok(())
@@ -250,8 +302,14 @@ impl TransactionManager {
                 // handles and the ok_or above converts None into the typed
                 // error, so reaching this arm signals a broken cross-module
                 // contract (most likely a future refactor of delete). Surface
-                // it typed rather than aborting the caller's process. Returned
-                // BEFORE any install, so current_roots stays untouched.
+                // it typed rather than aborting the caller's process.
+                //
+                // The handle-table install below has not run, but this is not
+                // "current_roots is untouched": PREPARE's candidate step already
+                // `put_tree`s freemap COW growth into `current_roots.freemap_page`
+                // (staging.rs), which can have advanced by the time we return.
+                // CorruptPage is fatal, so poisoning is what makes the residue
+                // unobservable — not an absence of installed state.
                 return Err(ChiselError::CorruptPage {
                     page_id: entry.page_id,
                 });

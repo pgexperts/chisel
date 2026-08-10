@@ -28,14 +28,31 @@
 //   - The superblock on disk still points at committed_roots; current_roots lives
 //     only in memory. A crash mid-transaction discards all dirty pages from cache
 //     and the on-disk superblock still references the prior committed snapshot.
-//   - NOTE: `new_page()` (file extension) extends the underlying file immediately;
-//     data-page allocation (via `cow_alloc`) prefers reuse from the committed
-//     freemap tree but also calls through to `new_page()` when the freemap is
-//     empty. Either way, any pages
-//     extended-but-uncommitted before a crash are harmless because nothing in the
-//     committed superblock references them, and the rollback path
-//     (`cache.truncate(committed_roots.total_pages)` — I3) actively shrinks the
-//     file on a clean rollback so they don't accumulate at all.
+//   - NOTE: `new_page()` performs NO I/O. It reserves the next id, inserts a
+//     zeroed DIRTY cache entry, and returns; the file grows only when that page
+//     is finally written (`flush()` at commit — a spill sends it to the SPILLWAY,
+//     not to the main file). Data-page allocation (via `cow_alloc`) prefers reuse
+//     from the committed freemap tree and falls back to `new_page()` when the
+//     freemap has no id to hand out.
+//   - Two consequences that are easy to get exactly backwards:
+//     (1) there is NO "the physical file covers every allocated id" invariant.
+//     `next_page_id()` can exceed `file_page_count()` for the whole life of a
+//     transaction that allocates but never flushes, so never use the physical
+//     length to reason about which ids are live.
+//     (2) `PageCache::truncate(n)` is `set_len(n * stride)`, so it EXTENDS as
+//     readily as it shrinks. `rollback_to` truncates to a savepoint watermark
+//     taken from `next_page_id()`, which can therefore leave the file physically
+//     LONGER, with a zero tail. That is harmless: any id in that tail range that
+//     this transaction actually wrote is still held dirty — in the cache, or
+//     spilled to the spillway, which the commit flush drains back — so the commit
+//     overwrites the zeroes. Ids the transaction never wrote are committed pages,
+//     already correct on disk and never zeroed by a `set_len` that only grows. And
+//     `open_existing` rejects only a file SHORTER than the superblock's
+//     `total_pages` — never a longer one.
+//   - Pages extended-but-uncommitted before a crash are harmless because nothing
+//     in the committed superblock references them, and the full rollback path
+//     (`cache.truncate(committed_roots.total_pages)` — I3) shrinks the file so
+//     they don't accumulate across clean rollbacks.
 //
 // In-memory mode: `TransactionManager::create_new` and `open_existing` are
 // backend-agnostic — whether the underlying PageIo is backed by a file (with
@@ -118,10 +135,27 @@ struct Roots {
 /// truncates the file back to the watermark — cleanly discarding every
 /// page the transaction allocated after the savepoint (ISSUES.md I3).
 ///
-/// `freed_pages` is still tracked per-savepoint so a future freemap
-/// reclamation pass (R2) can restore freed-but-not-yet-reclaimed pages
-/// if a savepoint is rolled back to. It is a distinct concern from the
-/// cache-level rollback that the watermark handles.
+/// `freed_pages` holds the frees the ENCLOSING scope accumulated BEFORE
+/// this savepoint was pushed: `savepoint_inner` `mem::take`s
+/// `txn_freed_pages` into the record. That is precisely why `rollback_to`
+/// keeps `savepoints[idx]`'s list intact while discarding everything above
+/// it — those frees predate the savepoint and survive a rewind to it.
+///
+/// Three consumers depend on the field; deleting it breaks all three:
+///   - `release_inner` merges released records' lists back up into
+///     `txn_freed_pages`, so a flattened scope's frees are not lost.
+///   - `run_commit` (I27) flattens every STILL-ACTIVE savepoint's list into
+///     `txn_freed_pages` before `FreemapRecycle::persist` consumes it.
+///     Without that, step 5's `savepoints.clear()` drops those frees
+///     permanently — a freemap leak, pinned by
+///     `commit_with_active_savepoint_returns_freed_pages_to_freemap`.
+///   - `rollback_to` deliberately DISCARDS the DISCARDED savepoints' lists and
+///     `txn_freed_pages`. Correct: those frees never became durable, and the
+///     pages they describe were rewound with the roots and the cache
+///     truncate.
+///
+/// (The R2 reclamation pass this comment used to forward-reference has
+/// landed; the merge point is `FreemapRecycle::persist`.)
 ///
 /// `live_slots` snapshots the R1 packing state (live slot counts per data
 /// page). `rollback_to` restores it so a savepoint rewind leaves the packer
@@ -189,8 +223,16 @@ pub struct TransactionManager {
     active_txn: bool,
     savepoints: Vec<Savepoint>,
     // Pages whose contents are no longer reachable from the new roots.
-    // Merged into `current_freemap` at commit time so subsequent
-    // transactions can reuse the space (ISSUES.md I9 / I10 / I11 / R2).
+    // `FreemapRecycle::persist` marks each one free in the COW freemap tree at
+    // commit time so subsequent transactions can reuse the space (ISSUES.md
+    // I9 / I10 / I11 / R2). There is no `current_freemap` field to merge into:
+    // the committed freemap IS the `Roots.{freemap_page, freemap_depth}` pair,
+    // which rides in `current_roots` during the transaction and is promoted to
+    // `committed_roots` when the superblock lands. (`current_freemap_root_page()`
+    // in stats.rs is just an accessor for the `current_roots` half of that pair,
+    // not a separate structure.) This vector carries DATA
+    // frees only — freemap-page frees ride the separate structural recycle
+    // stream (see the TWO FREE-STREAMS note on `persist`).
     // During the transaction itself these pages are NOT reusable —
     // their old contents must stay readable via `committed_roots` until
     // commit promotes the new roots.
@@ -240,9 +282,10 @@ pub struct TransactionManager {
     pub(crate) crypto_header: Option<crate::superblock::CryptoHeader>,
 
     // Test-only fault injection consolidated off the production type (review
-    // 2026-06-22 SMELL #4): the four BUG#2 atomic-staging arming flags live in
-    // their own `#[cfg(test)]` struct so they carry no production scaffolding
-    // fields here. See `fault.rs` for each Cell's precise divergence window.
+    // 2026-06-22 SMELL #4): the BUG#2 atomic-staging arming flags, plus the
+    // impossible-state forgers for arms no public call can reach, live in their
+    // own `#[cfg(test)]` struct so they carry no production scaffolding fields
+    // here. See `fault.rs` for each Cell's precise divergence window.
     #[cfg(test)]
     fault: fault::FaultInjector,
 }
