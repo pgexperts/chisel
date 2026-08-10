@@ -49,9 +49,16 @@ impl TransactionManager {
         // retire the old location together in an infallible INSTALL phase. A
         // mid-prepare failure is a complete no-op.
         //
-        // `update` replaces an EXISTING handle, so handle_table.insert never
-        // grows (handle < capacity) — no in-memory depth save is needed (unlike
-        // allocate_inner).
+        // Depth: `HandleTable::insert` unwinds its own eager grow-bump when IT
+        // fails (HANDLES-INDEX-3, issue #107), so the candidate-computation
+        // failure below is covered. The overflow-walk failure further down is
+        // the other case — `insert` returned Ok, so a grow may really have
+        // happened, and we then discard the candidate root. `update` replaces
+        // an EXISTING handle, which `lookup_live` has already resolved, so
+        // `handle < capacity()` and no grow can occur; but that is an
+        // inter-module argument, and the same shape of prose argument is what
+        // let this bug exist in the first place. The save/restore below makes it
+        // structural for two lines, matching `abort_allocate_prepare`.
 
         // Test-only injection (see `fail_next_update_value_write`): now the FIRST
         // fallible step, so a simulated failure here retires nothing.
@@ -95,6 +102,7 @@ impl TransactionManager {
         // consistent with the un-installed root (overflow new-value pages are the
         // bounded commit-after-error leak class); the OLD location is untouched.
         let mut ht_freed: Vec<u64> = Vec::new();
+        let saved_ht_depth = self.handle_table.depth();
         let ht_new_root =
             match self.handle_table_insert_candidate(handle, &new_entry, &mut ht_freed) {
                 Ok(r) => r,
@@ -129,6 +137,10 @@ impl TransactionManager {
                         if let Some(page_id) = new_inline_page {
                             self.release_data_slot(page_id);
                         }
+                        // The candidate root computed above is being discarded.
+                        // If computing it grew the tree, the eager depth bump
+                        // must go with it — see the depth note at the top.
+                        self.handle_table.set_depth(saved_ht_depth);
                         return Err(e);
                     }
                 }

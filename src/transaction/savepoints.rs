@@ -24,12 +24,13 @@ impl TransactionManager {
             return Err(ChiselError::DuplicateSavepoint(name.to_string()));
         }
         let watermark = self.cache_watermark();
-        // R1: snapshot the live-slot map and the cursor. Also drop the
-        // cursor in the active scope — once a savepoint exists, the
-        // insert path stops packing into the cursor (same posture as
-        // freemap reuse: savepoints disable the optimization so the
-        // rollback_to semantics stay simple).
-        let (live_slots, insert_cursor) = self.packer.snapshot();
+        // R1: snapshot the live-slot map. The cursor is NOT snapshotted — it
+        // is simply dropped, here and again on restore, because once a
+        // savepoint exists the insert path must stop packing into it (same
+        // posture as freemap reuse: savepoints disable the optimization so the
+        // rollback_to semantics stay simple). Snapshotting it is what
+        // TXN-COMMIT-1 was; see `SlotPacker::restore`.
+        let live_slots = self.packer.snapshot();
         self.packer.clear_cursor();
         self.savepoints.push(Savepoint {
             name: name.to_string(),
@@ -37,7 +38,9 @@ impl TransactionManager {
             watermark,
             freed_pages: std::mem::take(&mut self.txn_freed_pages),
             live_slots,
-            insert_cursor,
+            // GAP-1: capture the freemap recycle's savepoint-scoped state too.
+            // rollback_to was the only rewind path that never rewound it.
+            freemap: self.freemap.savepoint_mark(),
         });
         Ok(())
     }
@@ -90,16 +93,21 @@ impl TransactionManager {
                 HandleTable::recover_depth(&mut cache, self.current_roots.handle_table_page)?;
             self.handle_table.set_depth(depth);
         }
-        // R1: restore live-slot counts and cursor from the savepoint
-        // snapshot. The cursor was force-cleared when the savepoint was
-        // created, so this sets the cursor back to whatever value it
-        // held BEFORE the savepoint was taken (typically also None,
-        // since savepoint-bearing transactions disable packing).
-        let snap = (
-            self.savepoints[idx].live_slots.clone(),
-            self.savepoints[idx].insert_cursor,
-        );
-        self.packer.restore(snap);
+        // R1: restore live-slot counts from the savepoint snapshot.
+        // `SlotPacker::restore` also clears the insert cursor — the savepoint
+        // below survives this rewind (`truncate(idx + 1)`), and packing into a
+        // below-watermark page while a savepoint is live is exactly what
+        // TXN-COMMIT-1 was. See `SlotPacker::restore`.
+        self.packer.restore(self.savepoints[idx].live_slots.clone());
+        // GAP-1: rewind the freemap recycle's savepoint-scoped streams. The
+        // restored roots re-reference the pages `structural_superseded` names,
+        // and the cache truncate above destroyed the COW targets in
+        // `session_owned`; leaving either standing is the live-page overwrite
+        // that `FreemapRecycle::rollback`'s doc forbids.
+        // Cloned, not moved: the savepoint survives the truncate below and can
+        // be rolled back to again, so its mark has to stay intact.
+        let mark = self.savepoints[idx].freemap.clone();
+        self.freemap.rollback_to_mark(mark);
         self.savepoints.truncate(idx + 1);
         self.txn_freed_pages.clear();
 
