@@ -170,6 +170,47 @@ pub const MAX_ARGON2_T_COST: u32 = 16;
 /// Maximum Argon2id parallelism (lanes).
 pub const MAX_ARGON2_P_COST: u32 = 16;
 
+// Lower bounds, mirroring what `argon2::Params::new` itself enforces
+// (argon2 0.5.3, params.rs): m_cost >= 8, m_cost >= p_cost * 8, t_cost >= 1,
+// p_cost >= 1. They are restated here rather than left to `Params::new`
+// because PUBLIC-API-8 (issue #106) is precisely that letting `Params::new`
+// be the enforcer produces the wrong error at the wrong place: it fails deep
+// inside `open`, as `CryptoError::Kdf`, which the blanket
+// `From<CryptoError> for ChiselError` collapses to `InvalidEncryptionKey` —
+// a variant documented as "key unwraps no key slot", which on a database
+// being CREATED is not a thing that can happen. Checking at the boundary lets
+// `Chisel::open` name the actual problem before it touches the file.
+/// Minimum Argon2id memory cost in KiB.
+pub const MIN_ARGON2_M_COST: u32 = 8;
+/// Minimum Argon2id iteration count.
+pub const MIN_ARGON2_T_COST: u32 = 1;
+/// Minimum Argon2id parallelism (lanes).
+pub const MIN_ARGON2_P_COST: u32 = 1;
+
+/// True if these cost parameters would be rejected by the KDF.
+///
+/// Covers both directions: the upper caps above (which exist because the
+/// parameters are attacker-controlled — see the block comment there) and the
+/// lower bounds the argon2 crate enforces, including the cross-field
+/// `m_cost >= p_cost * 8` constraint that is easy to violate accidentally by
+/// raising `p_cost` alone.
+///
+/// This is a predicate, not a `Result`, so the caller owns the error type.
+/// `Chisel::open` turns it into `ChiselError::InvalidArgon2Params` carrying
+/// the offending values; `derive_kek` keeps its own inline cap check, because
+/// that one guards untrusted bytes read from a key slot rather than a caller's
+/// `Options` and must stay on the hot path regardless of what callers do.
+pub(crate) fn argon2_params_out_of_range(p: &Argon2Params) -> bool {
+    p.m_cost < MIN_ARGON2_M_COST
+        || p.m_cost > MAX_ARGON2_M_COST
+        || p.t_cost < MIN_ARGON2_T_COST
+        || p.t_cost > MAX_ARGON2_T_COST
+        || p.p_cost < MIN_ARGON2_P_COST
+        || p.p_cost > MAX_ARGON2_P_COST
+        // argon2 requires at least 8 KiB of memory per lane.
+        || p.m_cost < p.p_cost.saturating_mul(8)
+}
+
 /// Derive a 256-bit KEK from the client key and a slot's salt/params.
 ///
 /// Dispatch is on `kdf`, NOT on the `Key` variant: the slot records which KDF

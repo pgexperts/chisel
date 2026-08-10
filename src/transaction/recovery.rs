@@ -411,20 +411,42 @@ impl TransactionManager {
         // binary (FORMAT_MAJOR_VERSION=1) rejects MAJOR=2 as unsupported,
         // which is correct. A new binary accepts either, gated on whether
         // the encryption header is present.
-        let expected_major = if sb.encryption.is_some() {
-            page::FORMAT_MAJOR_VERSION_ENCRYPTED
+        //
+        // SUPERBLOCK-RECOVERY-2 (issue #106): the MINOR expectation is derived
+        // HERE, in the same branch, and not read off the plaintext constant
+        // further down. The two MINOR series are independent — page.rs says so
+        // outright: "A new MAJOR series starts its MINOR count at 0, so
+        // encrypted DBs stamp (2, 0) — NOT (2, FORMAT_MINOR_VERSION)". The
+        // write-gate below used to compare an encrypted file's minor against
+        // the PLAINTEXT FORMAT_MINOR_VERSION (currently 1), so the first
+        // encrypted minor bump — a file stamped (2, 1) by a newer binary —
+        // evaluated `1 > 1` as false, the gate did not fire, and this binary
+        // would have opened it read-write and committed superblocks stamped at
+        // its own (2, 0), silently dropping every field the newer minor added.
+        // That is exactly the data loss the gate exists to prevent; it failed
+        // safe only by the accident of the encrypted minor being 0 today.
+        //
+        // Deriving all three expectations from one predicate is the point.
+        // Three separate `if sb.encryption.is_some()` copies is how the minor
+        // one came to be missed in the first place.
+        let (expected_major, expected_minor, expected_version) = if sb.encryption.is_some() {
+            (
+                page::FORMAT_MAJOR_VERSION_ENCRYPTED,
+                page::FORMAT_MINOR_VERSION_ENCRYPTED,
+                page::format_version_encrypted(),
+            )
         } else {
-            page::FORMAT_MAJOR_VERSION
+            (
+                page::FORMAT_MAJOR_VERSION,
+                page::FORMAT_MINOR_VERSION,
+                page::FORMAT_VERSION,
+            )
         };
         if page::format_major(sb.format_version) != expected_major {
-            // Report the version the caller should expect for THIS kind of DB
-            // (encrypted = MAJOR 2, plaintext = MAJOR 1). Using the plaintext
-            // FORMAT_VERSION for an encrypted file would be misleading.
-            let expected_version = if sb.encryption.is_some() {
-                page::format_version_encrypted()
-            } else {
-                page::FORMAT_VERSION
-            };
+            // `expected_version` reports the version the caller should expect
+            // for THIS kind of DB (encrypted = MAJOR 2, plaintext = MAJOR 1);
+            // reporting the plaintext FORMAT_VERSION for an encrypted file
+            // would be misleading.
             return Err(ChiselError::UnsupportedFormatVersion {
                 found: sb.format_version,
                 expected: expected_version,
@@ -483,7 +505,12 @@ impl TransactionManager {
         // mutations then return ReadOnlyMode. The complementary I31 per-page
         // read-dispatch lets a newer binary read these older pages.
         // See docs/specs/2026-06-21-per-page-format-versioning-design.md.
-        if page::format_minor(sb.format_version) > page::FORMAT_MINOR_VERSION {
+        //
+        // `expected_minor` comes from the encryption-aware branch above, NOT
+        // from page::FORMAT_MINOR_VERSION — the plaintext and encrypted MINOR
+        // series are independent counts and must never be cross-compared.
+        // See SUPERBLOCK-RECOVERY-2 there for what cross-comparing cost.
+        if page::format_minor(sb.format_version) > expected_minor {
             cache.io_mut().force_read_only();
         }
 
@@ -720,5 +747,124 @@ mod tests {
             }
             other => panic!("expected UnsupportedFormatVersion, got {other:?}"),
         }
+    }
+
+    /// SUPERBLOCK-RECOVERY-2 (issue #106): the I29 write-gate must compare an
+    /// encrypted file's MINOR against the ENCRYPTED minor series, not the
+    /// plaintext one.
+    ///
+    /// The two series are independent counts — page.rs: "A new MAJOR series
+    /// starts its MINOR count at 0, so encrypted DBs stamp (2, 0) — NOT
+    /// (2, FORMAT_MINOR_VERSION)". The gate used to test against the plaintext
+    /// `FORMAT_MINOR_VERSION`, currently 1, so a file stamped (2, 1) by a newer
+    /// binary evaluated `1 > 1` as false: the gate did not fire, the file
+    /// opened READ-WRITE, and this binary would have committed superblocks
+    /// stamped at its own (2, 0) — silently dropping every field the newer
+    /// minor added. That is the data loss the gate exists to prevent. It failed
+    /// safe only by the accident of the encrypted minor being 0 today, which is
+    /// why this test exercises minor 1 specifically: it is the very next bump,
+    /// and the only value at which the old comparison was wrong.
+    ///
+    /// The superblock has to be BUILT with the bumped minor and then sealed —
+    /// byte-patching `format_version` the way the plaintext sibling test does
+    /// would not work here, because those bytes are part of `sb_identity_aad`.
+    /// Patching them invalidates the sealed body, so `decrypt_body` fails with
+    /// `CryptoError::Auth` and the open dies as `InvalidEncryptionKey` long
+    /// before reaching the gate.
+    #[test]
+    fn encrypted_file_with_newer_encrypted_minor_is_forced_read_only() {
+        use crate::crypto::{Key, ENC_PAGE_SIZE};
+        use zeroize::Zeroizing;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enc_minor.chsl");
+
+        // Raw (not passphrase) key: `wrap_into` selects HKDF for raw keys, so
+        // this avoids a 19 MiB Argon2id derivation in a debug-profile test.
+        let key = Key::Raw(Zeroizing::new(vec![0x5au8; 32]));
+
+        // Create a real encrypted database, then borrow its cipher and crypto
+        // header to seal a superblock this binary would otherwise never write.
+        let (header, sealed_slots) = {
+            let io = crate::page_io::PageIo::open(&path, false).unwrap();
+            let cache = PageCache::new(
+                io,
+                1024 * PAGE_SIZE as u64,
+                0,
+                crate::DrainInsertion::LruTail,
+                crate::SpillwayLocation::InMemory,
+            );
+            let tm = TransactionManager::create_new(cache, 2, Some(key.clone()), None).unwrap();
+            let header = tm.crypto_header.expect("encrypted DB has a crypto header");
+            let cipher = tm.cipher.as_ref().expect("encrypted DB has a cipher");
+
+            let mut sb = Superblock::new_empty_encrypted(2, header);
+            sb.format_version = page::pack_format_version(
+                page::FORMAT_MAJOR_VERSION_ENCRYPTED,
+                page::FORMAT_MINOR_VERSION_ENCRYPTED + 1,
+            );
+            // Seal one image per slot; each slot carries its own counter, and
+            // the counter is inside the AAD, so they cannot share an image.
+            // Counters mirror create_new's seeding (slot i gets N-1-i).
+            let mut slots = Vec::new();
+            for i in 0..2u64 {
+                sb.txn_counter = 1 - i;
+                slots.push(sb.serialize_encrypted(cipher));
+            }
+            (header, slots)
+        }; // TransactionManager dropped here, releasing the flock.
+        let _ = header;
+
+        // Rewrite the file at the encrypted stride (8232), zero-padding each
+        // 8192-byte image out to a full unit exactly as commit.rs does.
+        let mut bytes = vec![0u8; 2 * ENC_PAGE_SIZE];
+        for (i, image) in sealed_slots.iter().enumerate() {
+            bytes[i * ENC_PAGE_SIZE..i * ENC_PAGE_SIZE + PAGE_SIZE].copy_from_slice(image);
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        // The file must still OPEN — a newer minor within a known MAJOR is
+        // readable, which is the whole premise of the gate (reject writes,
+        // allow reads).
+        let mut db =
+            crate::Chisel::open(&path, crate::Options::default().encryption_key(key.clone()))
+                .expect("a newer-minor encrypted file must still open for reading");
+
+        // ...but every mutation must be refused.
+        assert!(
+            matches!(db.begin(), Err(ChiselError::ReadOnlyMode)),
+            "encrypted minor {} exceeds this binary's encrypted minor {}; \
+             the write-gate must force read-only",
+            page::FORMAT_MINOR_VERSION_ENCRYPTED + 1,
+            page::FORMAT_MINOR_VERSION_ENCRYPTED,
+        );
+    }
+
+    /// The complement of the test above: a file at THIS binary's encrypted
+    /// minor must NOT be forced read-only. Without this, a gate that simply
+    /// fired on every encrypted database would pass the test above while
+    /// making encryption unusable.
+    #[test]
+    fn encrypted_file_at_current_encrypted_minor_is_writable() {
+        use crate::crypto::Key;
+        use zeroize::Zeroizing;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enc_minor_ok.chsl");
+        let key = Key::Raw(Zeroizing::new(vec![0x5au8; 32]));
+
+        {
+            let mut db =
+                crate::Chisel::open(&path, crate::Options::default().encryption_key(key.clone()))
+                    .expect("create encrypted DB");
+            db.begin()
+                .expect("a current-minor encrypted DB must be writable");
+            db.commit().expect("commit");
+        }
+
+        let mut db = crate::Chisel::open(&path, crate::Options::default().encryption_key(key))
+            .expect("reopen encrypted DB");
+        db.begin()
+            .expect("reopened current-minor encrypted DB must still be writable");
     }
 }

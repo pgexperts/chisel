@@ -92,8 +92,11 @@ const _: () = assert!(COMMON_HEADER_SIZE == COMMON_RESERVED_OFFSET + COMMON_RESE
 const _: () = assert!(COMMON_HEADER_SIZE == DATA_PAGE_HEADER_SIZE);
 const _: () = assert!(2 < COMMON_RESERVED_OFFSET);
 
-// "CHSL" in ASCII, stored little-endian so it appears as C-H-S-L when you
-// hexdump the first 4 bytes of the file. Used to reject non-Chisel files
+// "CHSL" in ASCII as a u32, written little-endian — so the first four bytes of
+// the file hexdump as 4C 53 48 43, i.e. "LSHC", NOT "CHSL". This comment used
+// to claim the latter; `superblock::tests::sb_identity_aad_is_frozen_for_major_2`
+// pins the actual bytes. Byte-order matters here because these four bytes are
+// also the head of the superblock identity AAD. Used to reject non-Chisel files
 // before we even look at the checksum.
 pub const MAGIC: u32 = 0x4348534C; // "CHSL"
 

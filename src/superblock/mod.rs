@@ -407,13 +407,32 @@ impl Superblock {
     /// AAD derivation both run BEFORE any DEK is available, so the fields cannot
     /// live in the DEK-sealed body — the engine must read them to pick the live
     /// slot and rebuild the AAD before it can open that body.
+    ///
+    /// **The 24-byte layout is FROZEN for format MAJOR 2.** GAP-4 (issue #106):
+    /// bytes 20..24 used to be labelled "reserved for future AAD fields", which
+    /// reads as an extension point and is in fact a format trap. Every
+    /// superblock ever written sealed its body against this exact byte string,
+    /// so populating those bytes changes the AAD for all of them and
+    /// `open_body` returns `CryptoError::Auth` on every existing encrypted
+    /// database. That surfaces to the user as `InvalidEncryptionKey` — i.e. an
+    /// upgraded binary reports every CORRECT passphrase as wrong, rather than
+    /// reporting a format break. The encrypted-MINOR write-gate cannot catch it
+    /// either, since a MINOR bump does not force read-only for a file this
+    /// binary believes it understands.
+    ///
+    /// Adding an AAD field therefore requires a MAJOR bump
+    /// (`FORMAT_MAJOR_VERSION_ENCRYPTED` 2 -> 3) plus an offline rewrap pass
+    /// that re-seals every body under the new AAD — not an edit here.
+    /// `sb_identity_aad_is_frozen_for_major_2` pins these bytes; if you are
+    /// reading this because that test failed, it is telling you that the change
+    /// you just made would brick every deployed encrypted database.
     pub fn sb_identity_aad(&self) -> [u8; 24] {
         let mut a = [0u8; 24];
         a[0..4].copy_from_slice(&self.magic.to_le_bytes());
         a[4..8].copy_from_slice(&self.format_version.to_le_bytes());
         a[8..16].copy_from_slice(&self.txn_counter.to_le_bytes());
         a[16..20].copy_from_slice(&self.superblock_count.to_le_bytes());
-        // bytes 20..24 are reserved (zero) for future AAD fields.
+        // Bytes 20..24 stay zero. FROZEN for MAJOR 2 — see the doc above.
         a
     }
 
@@ -763,6 +782,69 @@ impl Superblock {
 mod tests {
     use super::*;
     use proptest::prop_assert_eq;
+
+    /// GAP-4 (issue #106): pin the exact 24 AAD bytes.
+    ///
+    /// `sb_identity_aad` is the AAD for every sealed superblock body ever
+    /// written. Changing its layout — including populating the trailing four
+    /// zero bytes, which the code used to advertise as "reserved for future
+    /// AAD fields" — makes `open_body` fail with `CryptoError::Auth` on every
+    /// existing encrypted database, surfacing as `InvalidEncryptionKey`, i.e.
+    /// indistinguishable from a wrong passphrase. Nothing else in the crate
+    /// enforces the layout: there is no scheme byte, no branch on
+    /// format_version, and the MINOR write-gate does not fire for it. This
+    /// fixture is the enforcement, and it fails at test time rather than at a
+    /// user's `open`.
+    ///
+    /// The counter is deliberately 0x0807_0605_0403_0201 rather than a small
+    /// number: with `txn_counter = 1` the little-endian byte order is invisible
+    /// (byte 8 is 0x01 either way), so a byte-order regression would slip past.
+    #[test]
+    fn sb_identity_aad_is_frozen_for_major_2() {
+        let mut sb = Superblock::new_empty(DEFAULT_SUPERBLOCK_COUNT);
+        sb.format_version = page::format_version_encrypted();
+        sb.txn_counter = 0x0807_0605_0403_0201;
+
+        assert_eq!(
+            sb.sb_identity_aad(),
+            [
+                // magic: MAGIC = 0x4348534C, little-endian
+                0x4c, 0x53, 0x48, 0x43, //
+                // format_version: pack(2, 0) = 0x0002_0000, little-endian
+                0x00, 0x00, 0x02, 0x00, //
+                // txn_counter: u64 little-endian
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, //
+                // superblock_count: 2, little-endian
+                0x02, 0x00, 0x00, 0x00, //
+                // FROZEN reserved bytes — populating these bricks every
+                // existing encrypted database. See sb_identity_aad's doc.
+                0x00, 0x00, 0x00, 0x00,
+            ],
+            "sb_identity_aad layout changed; this AAD is frozen for MAJOR 2"
+        );
+    }
+
+    /// Companion to the above for the plaintext series, so a change to
+    /// `pack_format_version` itself trips a test rather than only a change to
+    /// `sb_identity_aad`'s body. Plaintext bodies are not sealed, but the
+    /// packing is shared and a regression here would reach the encrypted path.
+    #[test]
+    fn sb_identity_aad_is_frozen_for_major_1() {
+        let mut sb = Superblock::new_empty(DEFAULT_SUPERBLOCK_COUNT);
+        sb.txn_counter = 0x0807_0605_0403_0201;
+
+        assert_eq!(
+            sb.sb_identity_aad(),
+            [
+                0x4c, 0x53, 0x48, 0x43, // magic
+                0x01, 0x00, 0x01, 0x00, // pack(1, 1) = 0x0001_0001
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // txn_counter
+                0x02, 0x00, 0x00, 0x00, // superblock_count
+                0x00, 0x00, 0x00, 0x00, // frozen reserved
+            ],
+            "sb_identity_aad layout changed for the plaintext series"
+        );
+    }
 
     #[test]
     fn new_empty_reserves_handle_zero() {

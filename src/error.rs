@@ -47,6 +47,25 @@ pub enum ChiselError {
     InvalidSuperblockCount {
         value: u32,
     },
+    // Options.argon2_params carries cost values the KDF cannot use
+    // (PUBLIC-API-8, issue #106). Raised at open/rekey time, before the
+    // file is touched, when a value is outside [MIN_ARGON2_*, MAX_ARGON2_*]
+    // or violates argon2's cross-field `m_cost >= p_cost * 8` rule.
+    // Operational — the caller fixes their Options and tries again; nothing
+    // has been written.
+    //
+    // This variant exists because the failure used to surface as
+    // InvalidEncryptionKey, whose documented meaning ("a key was supplied but
+    // no key-slot's wrapped DEK could be unwrapped") is impossible on a
+    // database being CREATED — there is no key slot yet to mismatch. The
+    // values are carried for the same reason InvalidSuperblockCount carries
+    // its own: a bare "invalid" does not tell an operator which field to look
+    // at, and all three are supplied together in one struct literal.
+    InvalidArgon2Params {
+        m_cost: u32,
+        t_cost: u32,
+        p_cost: u32,
+    },
     // The page cache has reached its strict cap (`max_pages`) with
     // every cached entry dirty and the spillway disabled
     // (`spillway_max_bytes == 0`), so there is no clean page available
@@ -287,6 +306,22 @@ impl fmt::Display for ChiselError {
             ChiselError::InvalidSuperblockCount { value } => {
                 write!(f, "invalid superblock_count {value}; must be in 2..=16")
             }
+            ChiselError::InvalidArgon2Params {
+                m_cost,
+                t_cost,
+                p_cost,
+            } => write!(
+                f,
+                "invalid argon2_params (m_cost {m_cost}, t_cost {t_cost}, p_cost {p_cost}); \
+                 requires m_cost in {}..={}, t_cost in {}..={}, p_cost in {}..={}, \
+                 and m_cost >= p_cost * 8",
+                crate::crypto::MIN_ARGON2_M_COST,
+                crate::crypto::MAX_ARGON2_M_COST,
+                crate::crypto::MIN_ARGON2_T_COST,
+                crate::crypto::MAX_ARGON2_T_COST,
+                crate::crypto::MIN_ARGON2_P_COST,
+                crate::crypto::MAX_ARGON2_P_COST,
+            ),
             ChiselError::CacheFull { limit } => write!(
                 f,
                 "page cache full: {limit} dirty pages held; commit or roll back to free cache"
@@ -591,6 +626,7 @@ mod tests {
                 | ChiselError::InvalidRootName
                 | ChiselError::RootNameTableFull
                 | ChiselError::InvalidSuperblockCount { .. }
+                | ChiselError::InvalidArgon2Params { .. }
                 | ChiselError::CacheFull { .. }
                 | ChiselError::SpillwayFull { .. }
                 | ChiselError::TransactionInProgress
@@ -635,6 +671,11 @@ mod tests {
             ChiselError::InvalidRootName,
             ChiselError::RootNameTableFull,
             ChiselError::InvalidSuperblockCount { value: 0 },
+            ChiselError::InvalidArgon2Params {
+                m_cost: 0,
+                t_cost: 0,
+                p_cost: 0,
+            },
             ChiselError::CacheFull { limit: 0 },
             ChiselError::SpillwayFull { limit_bytes: 0 },
             ChiselError::TransactionInProgress,

@@ -94,11 +94,14 @@ pub use page::format_major;
 // Key and Argon2Params are public API (callers need them to open encrypted DBs).
 // Crypto internals (PageCipher, CryptoError, raw constants) are pub(crate) in
 // their source modules and not re-exported here.
-// The MAX_ARGON2_* caps are public because exceeding them is now a hard
-// failure: `Options::argon2_params` above any of them makes `open` return
-// InvalidEncryptionKey at create time. A caller tuning cost parameters needs to
-// be able to see the ceiling rather than discover it by failing.
-pub use crypto::{Argon2Params, Key, MAX_ARGON2_M_COST, MAX_ARGON2_P_COST, MAX_ARGON2_T_COST};
+// The MIN/MAX_ARGON2_* bounds are public because falling outside them is a
+// hard failure: `Options::argon2_params` outside the range makes `open` return
+// `InvalidArgon2Params` before the file is touched. A caller tuning cost
+// parameters needs to see the range rather than discover it by failing.
+pub use crypto::{
+    Argon2Params, Key, MAX_ARGON2_M_COST, MAX_ARGON2_P_COST, MAX_ARGON2_T_COST, MIN_ARGON2_M_COST,
+    MIN_ARGON2_P_COST, MIN_ARGON2_T_COST,
+};
 
 use std::path::Path;
 
@@ -286,11 +289,18 @@ impl Options {
     /// passphrase on database creation. No effect for raw keys or on reopen
     /// (the stored slot carries its own params). See [`Options::argon2_params`].
     ///
-    /// Values are capped at [`MAX_ARGON2_M_COST`], [`MAX_ARGON2_T_COST`] and
-    /// [`MAX_ARGON2_P_COST`]; exceeding any of them makes `open` fail with
-    /// `InvalidEncryptionKey` rather than creating a database. The same cap is
-    /// what stops a hostile file's key slot from driving the Argon2 allocator
-    /// at open time, so it is enforced for both directions.
+    /// Values must lie within [`MIN_ARGON2_M_COST`]..=[`MAX_ARGON2_M_COST`],
+    /// [`MIN_ARGON2_T_COST`]..=[`MAX_ARGON2_T_COST`] and
+    /// [`MIN_ARGON2_P_COST`]..=[`MAX_ARGON2_P_COST`], and must additionally
+    /// satisfy argon2's own `m_cost >= p_cost * 8` (8 KiB of memory per lane).
+    /// Anything else makes `open`, `open_in_memory_with_options` and `rekey`
+    /// fail with `InvalidArgon2Params` — carrying all three values — before the
+    /// file is opened or created.
+    ///
+    /// The upper caps do double duty: they are also what stops a hostile file's
+    /// key slot from driving the Argon2 allocator at open time, which is why
+    /// `derive_kek` re-checks them on the read path regardless of what any
+    /// caller passed here.
     pub fn argon2_params(mut self, params: Argon2Params) -> Self {
         self.argon2_params = Some(params);
         self
@@ -368,7 +378,10 @@ impl Chisel {
     ///
     /// # Errors
     /// `InvalidSuperblockCount` (the `superblock_count` option is out of
-    /// range), `FileNotFound` (no file at `path` and `create_if_missing` is
+    /// range), `InvalidArgon2Params` (the `argon2_params` option carries cost
+    /// values the KDF cannot use — checked before the file is touched, so it
+    /// is never confused with a credential failure),
+    /// `FileNotFound` (no file at `path` and `create_if_missing` is
     /// false), `CorruptSuperblock` (the file has content but is shorter than
     /// one page, so it cannot be a database and must not be created over),
     /// or `LockFailed` (another handle holds the exclusive flock).
@@ -390,6 +403,11 @@ impl Chisel {
                 value: options.superblock_count,
             });
         }
+        // PUBLIC-API-8: same treatment for argon2_params, and for the same
+        // reason — a malformed Options must be named here, before the file is
+        // touched, not diagnosed from whatever error the KDF happens to raise
+        // several layers down.
+        validate_argon2_params(options.argon2_params)?;
 
         let file_exists = path.exists()
             && std::fs::metadata(path)
@@ -493,7 +511,9 @@ impl Chisel {
     /// # Errors
     /// `ReadOnlyMode` if `options.read_only` is set (a fresh memory database
     /// must be writable to bootstrap), `InvalidSuperblockCount` if
-    /// `options.superblock_count` is out of range, or a bootstrap `IoError`.
+    /// `options.superblock_count` is out of range, `InvalidArgon2Params` if
+    /// `options.argon2_params` carries cost values the KDF cannot use, or a
+    /// bootstrap `IoError`.
     pub fn open_in_memory_with_options(options: Options) -> Result<Chisel> {
         if options.read_only {
             // Fail fast rather than bootstrapping and then blocking the
@@ -508,6 +528,7 @@ impl Chisel {
                 value: options.superblock_count,
             });
         }
+        validate_argon2_params(options.argon2_params)?;
 
         let io = PageIo::open_in_memory()?;
         let cache = PageCache::new(
@@ -1162,6 +1183,7 @@ impl Chisel {
     /// disk. Not something to schedule routinely.
     ///
     /// # Errors
+    /// `InvalidArgon2Params` if `argon2_params` carries unusable cost values;
     /// `FileNotFound` if `path` does not exist; `EncryptionNotSupported` if the
     /// database is plaintext; `InvalidEncryptionKey` if `key` unlocks no slot;
     /// `IoError` for any failure building or publishing the replacement — in
@@ -1171,7 +1193,39 @@ impl Chisel {
         key: &crypto::Key,
         argon2_params: Option<crypto::Argon2Params>,
     ) -> Result<()> {
+        // Checked here rather than inside rekey(): rekey builds a whole
+        // replacement file before publishing it, so a parameter that the KDF
+        // will reject should stop the operation before any of that work — and
+        // before the caller has to distinguish "bad params" from "wrong key".
+        validate_argon2_params(argon2_params)?;
         rekey::rekey(path, key, argon2_params)
+    }
+}
+
+/// Reject `Options::argon2_params` values the KDF cannot use, at the API
+/// boundary, before any file is opened or created.
+///
+/// PUBLIC-API-8 (issue #106): these values used to reach `Params::new` deep
+/// inside `open`, fail as `CryptoError::Kdf`, and be collapsed by the blanket
+/// `From<CryptoError> for ChiselError` into `InvalidEncryptionKey` — a variant
+/// whose documented meaning is "a key was supplied but no key-slot's wrapped
+/// DEK could be unwrapped". On a database being CREATED there is no key slot,
+/// so that diagnosis was not merely unhelpful but impossible, and the actual
+/// cause (a rejected cost parameter) appeared nowhere in the error.
+///
+/// `None` means "use the per-slot stored params on open, or the OWASP default
+/// on create" and is always valid; only an explicitly supplied value is
+/// checked.
+fn validate_argon2_params(params: Option<Argon2Params>) -> Result<()> {
+    match params {
+        Some(p) if crypto::argon2_params_out_of_range(&p) => {
+            Err(ChiselError::InvalidArgon2Params {
+                m_cost: p.m_cost,
+                t_cost: p.t_cost,
+                p_cost: p.p_cost,
+            })
+        }
+        _ => Ok(()),
     }
 }
 

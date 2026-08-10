@@ -33,6 +33,7 @@
 //         InvalidRootNameError
 //         RootNameTableFullError
 //         InvalidSuperblockCountError
+//         InvalidArgon2ParamsError
 //         CacheFullError
 //         SpillwayFullError
 //         TransactionInProgressError
@@ -109,6 +110,20 @@ create_exception!(_chisel, DatabaseFileNotFoundError, OperationalError);
 create_exception!(_chisel, InvalidRootNameError, OperationalError);
 create_exception!(_chisel, RootNameTableFullError, OperationalError);
 create_exception!(_chisel, InvalidSuperblockCountError, OperationalError);
+// PUBLIC-API-8 (issue #106): Options.argon2_params carries cost values the
+// KDF cannot use. Raised before the file is touched, so it is never a
+// credential failure — the Rust variant it maps to used to surface as
+// InvalidEncryptionKeyError, which on a database being CREATED cannot be true
+// (no key slot exists yet to mismatch).
+//
+// NOT REACHABLE FROM PYTHON TODAY: `chisel.open()` exposes `encryption_key`
+// but not `argon2_params`, so no Python caller can supply the values that
+// raise it. It is registered anyway so the mapping is complete at the point
+// the Rust variant was added — `to_py_err`'s catchall routes unmapped
+// variants by `is_fatal()` alone, so a missing arm is not a compile error
+// here, just a silent downgrade to the generic OperationalError. Wiring an
+// `argon2_params` kwarg later then needs no error-plumbing work.
+create_exception!(_chisel, InvalidArgon2ParamsError, OperationalError);
 create_exception!(_chisel, CacheFullError, OperationalError);
 // Byte-budget analogue of CacheFull: raised when the spillway sidecar's
 // byte limit is reached during a transaction. Database intact; commit or
@@ -215,6 +230,10 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "InvalidSuperblockCountError",
         py.get_type::<InvalidSuperblockCountError>(),
     )?;
+    m.add(
+        "InvalidArgon2ParamsError",
+        py.get_type::<InvalidArgon2ParamsError>(),
+    )?;
     m.add("CacheFullError", py.get_type::<CacheFullError>())?;
     m.add("SpillwayFullError", py.get_type::<SpillwayFullError>())?;
     m.add(
@@ -311,6 +330,7 @@ pub fn to_py_err(err: RustChiselError) -> PyErr {
         RustChiselError::InvalidRootName => InvalidRootNameError::new_err(msg),
         RustChiselError::RootNameTableFull => RootNameTableFullError::new_err(msg),
         RustChiselError::InvalidSuperblockCount { .. } => InvalidSuperblockCountError::new_err(msg),
+        RustChiselError::InvalidArgon2Params { .. } => InvalidArgon2ParamsError::new_err(msg),
         RustChiselError::CacheFull { .. } => CacheFullError::new_err(msg),
         // SpillwayFull is the byte-budget analogue of CacheFull: both are
         // operational "buffer full, commit or roll back to free space"

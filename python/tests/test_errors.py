@@ -19,6 +19,7 @@ def test_operational_hierarchy():
         "InvalidRootNameError",
         "RootNameTableFullError",
         "InvalidSuperblockCountError",
+        "InvalidArgon2ParamsError",
         "CacheFullError",
         "ClosedError",
         "AlreadyFinishedError",
