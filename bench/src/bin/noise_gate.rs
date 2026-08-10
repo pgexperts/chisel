@@ -54,9 +54,9 @@ struct Cli {
 /// Both used to print "Noise gate PASSED" and exit 0 — on the one tool whose
 /// entire purpose is to refuse hardware that cannot hold a stable number.
 fn parse_runs(s: &str) -> Result<usize, String> {
-    let n: usize = s
-        .parse()
-        .map_err(|_| format!("`{s}` is not a non-negative whole number"))?;
+    let n: usize = s.parse().map_err(|_| {
+        format!("`{s}` is not a run count (expected a whole number that fits in a usize)")
+    })?;
     if n < MIN_SAMPLES_PER_CELL {
         return Err(format!(
             "must be at least {MIN_SAMPLES_PER_CELL}; a coefficient of variation \
@@ -66,6 +66,14 @@ fn parse_runs(s: &str) -> Result<usize, String> {
     }
     Ok(n)
 }
+
+/// One cell's identity: (scenario, engine, durability mode).
+type CellKey = (String, String, String);
+/// One observation of a cell: which run produced it, its throughput, its p99.
+/// The run index is carried so a cell's sample count can be the number of
+/// distinct RUNS that contributed, not the number of JSONL rows that mentioned
+/// it — see the collection site in `run`.
+type CellSample = (usize, f64, f64);
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -88,7 +96,12 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> Result<bool, Box<dyn std::error::Error>> {
     // Collect per-run cell metrics: keyed by (scenario, engine, mode).
-    let mut samples: BTreeMap<(String, String, String), Vec<(f64, f64)>> = BTreeMap::new();
+    // Tagged with the run index, not just appended: a cell's sample count must
+    // be how many RUNS contributed to it, not how many JSONL rows mentioned it.
+    // Counting rows would let a single run that emitted a cell twice look like
+    // two independent observations, which is exactly the "COV computed from no
+    // run-to-run variance" failure this gate exists to refuse.
+    let mut samples: BTreeMap<CellKey, Vec<CellSample>> = BTreeMap::new();
 
     for run_idx in 0..cli.runs {
         eprintln!("Run {} of {} ...", run_idx + 1, cli.runs);
@@ -160,7 +173,7 @@ fn run(cli: &Cli) -> Result<bool, Box<dyn std::error::Error>> {
             samples
                 .entry((scenario, engine, mode))
                 .or_default()
-                .push((throughput, p99_ns));
+                .push((run_idx, throughput, p99_ns));
         }
     }
 
@@ -168,8 +181,8 @@ fn run(cli: &Cli) -> Result<bool, Box<dyn std::error::Error>> {
     let cells: Vec<CellResult> = samples
         .into_iter()
         .map(|((scenario, engine, mode), pairs)| {
-            let throughput_samples: Vec<f64> = pairs.iter().map(|(t, _)| *t).collect();
-            let p99_samples: Vec<f64> = pairs.iter().map(|(_, p)| *p).collect();
+            let throughput_samples: Vec<f64> = pairs.iter().map(|(_, t, _)| *t).collect();
+            let p99_samples: Vec<f64> = pairs.iter().map(|(_, _, p)| *p).collect();
             let throughput = compute_cov(&throughput_samples);
             let p99_latency_ns = compute_cov(&p99_samples);
             // `--runs >= 2` is enforced at parse time, but a cell can still
@@ -177,7 +190,13 @@ fn run(cli: &Cli) -> Result<bool, Box<dyn std::error::Error>> {
             // metrics (a partially-written JSONL, a scenario list that
             // changed mid-sweep) yields fewer samples than `cli.runs`. Such a
             // cell must not pass on `compute_cov`'s N=1 placeholder 0.0.
-            let samples = pairs.len();
+            //
+            // DISTINCT runs, not row count — see the `samples` map above.
+            let samples = pairs
+                .iter()
+                .map(|(run_idx, _, _)| *run_idx)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
             let passes = samples >= MIN_SAMPLES_PER_CELL
                 && throughput.cov <= cli.throughput_threshold
                 && p99_latency_ns.cov <= cli.p99_threshold;

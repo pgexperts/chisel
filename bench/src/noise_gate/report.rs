@@ -24,7 +24,7 @@ pub struct CellResult {
     /// which is indistinguishable in the COV columns from a genuinely
     /// stable cell. Below 2 this cell has no variance data at all.
     pub samples: usize,
-    /// True if the cell has at least 2 samples AND both
+    /// True if the cell has at least `MIN_SAMPLES_PER_CELL` samples AND both
     /// throughput.cov ≤ throughput_threshold AND
     /// p99_latency_ns.cov ≤ p99_threshold.
     pub passes: bool,
