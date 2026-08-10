@@ -4,11 +4,18 @@
 //! it via the ordinary A/B superblock slot rotation — no data pages are touched
 //! and the per-DB DEK never changes, so there is no re-encryption.
 //!
-//! Durability is identical to a data commit: bump txn_counter, write the inactive
-//! slot, fsync (the linearization point), then promote the in-memory header.
-//! A crash before the fsync returns leaves the OLD superblock in its slot; recovery
-//! always picks the highest-txn_counter slot with a valid checksum, so the old
-//! key-slot table is intact.
+//! Durability: bump txn_counter, write the inactive slot, FSYNC (the
+//! linearization point), scrub the stale key-slot table out of the other N-1
+//! slots, fsync again, then promote the in-memory header. A crash before the
+//! FIRST fsync returns leaves the OLD superblock in its slot; recovery always
+//! picks the highest-txn_counter slot with a valid checksum, so the old
+//! key-slot table is intact and the operation is simply lost. A crash between
+//! the two fsyncs leaves the revocation durable but a sibling still carrying
+//! the revoked credential's wrapped DEK — cleared by the next key operation.
+//!
+//! That first fsync is a BARRIER and is load-bearing, not decorative: without
+//! it all N slot writes are in flight at once and a crash can tear every one of
+//! them, leaving no slot that validates and a database unopenable by any key.
 //!
 //! Guards:
 //! - Refuses if the manager is poisoned (I1 model).
@@ -113,6 +120,23 @@ impl TransactionManager {
             cache.io_mut().write_page_unit(inactive, &unit)?;
         }
 
+        // BARRIER — the revocation's linearization point.
+        //
+        // This must land BEFORE the sibling scrub below, and it is the whole
+        // reason the scrub is safe. Until it returns, the target slot is the
+        // only thing in flight and every sibling is still durable and valid at
+        // its own counter, so the worst a crash can do is lose the revocation
+        // (recoverable: retry). After it returns, the target slot is durable,
+        // passes `validate`, and holds the strict maximum `txn_counter`, so
+        // `Superblock::select` will pick it no matter what happens to the
+        // siblings — which is what lets all N-1 scrub writes share the single
+        // trailing fsync rather than needing one barrier each.
+        //
+        // Two fsyncs total regardless of N. Cost is irrelevant here: add_key /
+        // rotate_key / remove_key are rare administrative operations, and this
+        // function already issues a third fsync via `cache.flush()` at entry.
+        cache.io_mut().fsync()?;
+
         // CRYPTO-1: scrub the key-slot table out of every OTHER slot too.
         //
         // Writing only the target slot left the PRE-revocation table intact in
@@ -127,11 +151,25 @@ impl TransactionManager {
         // sibling keeps its own counter, roots and sealed body and remains a
         // valid shadow-paging fallback.
         //
-        // Crash window: these writes share the target slot's fsync below, so a
-        // crash mid-way can leave a sibling un-scrubbed. That is no worse than
-        // the steady state this replaces, and the next key operation clears it.
-        // Ordering the scrubs after the target write means the revocation itself
-        // is never the thing lost to a partial write.
+        // Crash window: bounded by the barrier fsync ABOVE, not by program
+        // order. The previous version of this comment claimed the scrubs
+        // "share the target slot's fsync below" and that "ordering the scrubs
+        // after the target write means the revocation itself is never the thing
+        // lost to a partial write". Both were wrong, and together they
+        // introduced a worse failure than the one the scrub fixed: program
+        // order is not device order, so with a single trailing fsync all N
+        // slots were in flight at once. A crash could tear EVERY slot, leaving
+        // `Superblock::select` with nothing that validates — `CorruptSuperblock`,
+        // i.e. a database unopenable by ANY key. Before the scrub existed that
+        // window did not exist either, because this function never wrote more
+        // than one slot.
+        //
+        // With the barrier, the target slot is durable, valid, and holds the
+        // strict maximum counter before any sibling is touched — so every
+        // sibling is expendable from here on and all N-1 may share the single
+        // trailing fsync. A crash mid-scrub leaves an un-scrubbed sibling
+        // (recoverable: the next key operation clears it, and the revocation
+        // itself is already durable), never an unopenable file.
         {
             use crate::crypto::ENC_PAGE_SIZE;
             let mut unit = [0u8; ENC_PAGE_SIZE];
@@ -149,9 +187,12 @@ impl TransactionManager {
             }
         }
 
-        // Durability linearization point: the rewrite is crash-safe only after
-        // this fsync returns. A crash before this leaves the old superblock
-        // intact in the other slot; recovery picks it by highest txn_counter.
+        // Second fsync: makes the SCRUB durable. The revocation itself was
+        // linearized by the barrier above; this one only guarantees that the
+        // stale key-slot tables are gone from the siblings. A crash between the
+        // two leaves the revocation in force but a sibling still carrying the
+        // revoked credential's wrapped DEK — recoverable, and cleared by the
+        // next key operation.
         cache.io_mut().fsync()?;
 
         // In-memory promotion: the new slot table becomes the authoritative
@@ -506,11 +547,26 @@ mod tests {
     /// must poison the manager — the I1 poison-on-fatal invariant covers the key-
     /// rotation path, not just data commits.
     ///
-    /// rewrite_crypto_header_inner writes one superblock and then fsyncs; that fsync
-    /// is the only fsync in the call (no data pages are touched). Arming
-    /// `Fault::FailFsync(0)` catches it on the first call.
+    /// FSYNC INDICES IN THIS FUNCTION — this comment used to say
+    /// "rewrite_crypto_header_inner writes one superblock and then fsyncs; that
+    /// fsync is the only fsync in the call (no data pages are touched). Arming
+    /// `Fault::FailFsync(0)` catches it on the first call." That was false even
+    /// before the barrier was added: `PageCache::flush` has no early return and
+    /// fsyncs unconditionally, and `_inner` calls it at entry. So `FailFsync(0)`
+    /// fires on the FLUSH, before a single superblock byte is written — the test
+    /// still passed (an IoError still poisons) but it was asserting a different
+    /// thing than it claimed, and the superblock fsyncs had no coverage at all.
+    ///
+    /// The three fsyncs, in order:
+    ///   0 — `cache.flush()` at entry (spillway/dirty pages)
+    ///   1 — the BARRIER, after the target slot write: the revocation's
+    ///       linearization point
+    ///   2 — after the sibling scrub
+    ///
+    /// This test keeps index 0 (poison-on-any-fsync-failure); the two below
+    /// cover 1 and 2, which is where the durability argument actually lives.
     #[test]
-    fn rewrite_crypto_header_fsync_failure_poisons() {
+    fn rewrite_crypto_header_flush_fsync_failure_poisons() {
         let file = NamedTempFile::new().unwrap();
         let io = PageIo::open(file.path(), false).unwrap();
         let cache = PageCache::new(
@@ -524,8 +580,8 @@ mod tests {
         db.begin().unwrap();
         db.commit().unwrap();
 
-        // Arm a fault on the first fsync so rewrite_crypto_header's superblock
-        // write succeeds but its fsync fails — this is the I1 trigger point.
+        // Index 0 = the entry flush's fsync. Fires before any superblock byte
+        // is written; still an IoError, so it must still poison (I1).
         db.cache.borrow().io().arm_fault(Fault::FailFsync(0));
 
         // add_key calls rewrite_crypto_header; the fsync fault must surface as
@@ -543,6 +599,72 @@ mod tests {
         assert!(
             matches!(db.begin(), Err(ChiselError::Poisoned)),
             "poisoned manager must reject further ops"
+        );
+    }
+
+    /// Index 1 — the BARRIER fsync, the revocation's linearization point.
+    /// A failure here means the target slot may not be durable, so the whole
+    /// operation must poison rather than proceed to scrub siblings on the
+    /// strength of a write that might not have landed.
+    #[test]
+    fn rewrite_crypto_header_barrier_fsync_failure_poisons() {
+        let mut db = fresh_encrypted();
+        db.cache.borrow().io().arm_fault(Fault::FailFsync(1));
+        let result = db.add_key(&raw(0x11), &raw(0x22));
+        assert!(
+            matches!(result, Err(ChiselError::IoError(_))),
+            "barrier fsync failure must surface IoError, got {result:?}"
+        );
+        assert!(
+            db.is_poisoned(),
+            "barrier fsync failure must poison the manager"
+        );
+    }
+
+    /// Index 2 — the fsync after the sibling scrub. Also fatal: the scrub
+    /// writes are already in flight, so a failed fsync leaves their durability
+    /// unknown, which is exactly the fsyncgate case the poison model exists for.
+    ///
+    /// This is the fsync that had NO coverage at all before: the pre-existing
+    /// test documented itself as targeting "the only fsync in the call" while
+    /// actually firing on the entry flush.
+    #[test]
+    fn rewrite_crypto_header_scrub_fsync_failure_poisons() {
+        let mut db = fresh_encrypted();
+        db.cache.borrow().io().arm_fault(Fault::FailFsync(2));
+        let result = db.add_key(&raw(0x11), &raw(0x22));
+        assert!(
+            matches!(result, Err(ChiselError::IoError(_))),
+            "scrub fsync failure must surface IoError, got {result:?}"
+        );
+        assert!(
+            db.is_poisoned(),
+            "scrub fsync failure must poison the manager"
+        );
+    }
+
+    /// Pin the fsync COUNT, so the barrier cannot be deleted silently.
+    ///
+    /// The two index-targeted tests above do not uniquely pin it: with the
+    /// barrier removed, `FailFsync(1)` simply lands on the scrub fsync instead
+    /// and still poisons. Only the count says "there are exactly three, and the
+    /// middle one is the barrier that makes writing N slots safe".
+    ///
+    /// If this fails because you added an fsync, that is fine — update the
+    /// number and the list. If it fails because you REMOVED the barrier, read
+    /// the comment at the barrier first: without it, all N slot writes are in
+    /// flight at once and a crash can leave no slot that validates, which is a
+    /// database unopenable by any key.
+    #[test]
+    fn rewrite_crypto_header_issues_exactly_three_fsyncs() {
+        let mut db = fresh_encrypted();
+        let before = db.cache.borrow().io().fsync_count();
+        db.add_key(&raw(0x11), &raw(0x22)).unwrap();
+        let after = db.cache.borrow().io().fsync_count();
+        assert_eq!(
+            after - before,
+            3,
+            "expected entry flush + barrier + post-scrub fsync"
         );
     }
 
