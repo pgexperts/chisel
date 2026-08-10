@@ -72,9 +72,15 @@ impl TransactionManager {
     /// WITHOUT installing it into `current_roots`; superseded spine pages are
     /// appended to `freed`. The forward-map counterpart to
     /// `membership_insert_candidate` for `allocate_inner`'s atomic staging
-    /// (BUG#2). NOTE: `HandleTable::insert` may `grow`, which bumps the
-    /// in-memory descent depth eagerly — the caller captures and restores that
-    /// depth on the prepare-abort path.
+    /// (BUG#2).
+    ///
+    /// NOTE on depth: `HandleTable::insert` restores its own descent depth on
+    /// its error path (HANDLES-INDEX-3, issue #107), so a FAILED candidate
+    /// needs no unwind here. The caller's `saved_ht_depth` covers the different
+    /// case: `insert` returned Ok — a grow really happened — and a LATER
+    /// prepare step (the membership insert) then fails, so the candidate root
+    /// is discarded without ever being installed. `insert` cannot know about
+    /// that, which is why `abort_allocate_prepare` still restores depth.
     pub(super) fn handle_table_insert_candidate(
         &mut self,
         handle: u64,
@@ -120,8 +126,11 @@ impl TransactionManager {
     /// - `current_roots.handle_table_page` — reverts to the pre-allocate value,
     ///   undoing any lazy `ensure_handle_table` materialization (empty DB goes
     ///   back to `PAGE_ID_NONE`).
-    /// - `handle_table` descent depth — restored from the saved value, undoing
-    ///   the eager bump that `HandleTable::grow` applies before its fallible COW.
+    /// - `handle_table` descent depth — restored from the saved value. This
+    ///   covers the case `HandleTable::insert` cannot: a grow that SUCCEEDED,
+    ///   whose candidate root is being thrown away because a later prepare step
+    ///   failed. (`insert` unwinds its own depth when it is the thing that
+    ///   fails — HANDLES-INDEX-3, issue #107.)
     /// - Inline value's data slot — released via `release_data_slot` so
     ///   `current_live_slots` and the insert cursor stay consistent with the
     ///   un-installed root. A page allocated solely for this value goes to zero

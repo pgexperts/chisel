@@ -123,12 +123,23 @@ struct Roots {
 /// if a savepoint is rolled back to. It is a distinct concern from the
 /// cache-level rollback that the watermark handles.
 ///
-/// `live_slots` and `insert_cursor` snapshot the R1 packing state
-/// (live slot counts per data page + the current in-progress insert
-/// cursor). `rollback_to` restores these so a savepoint rewind leaves
-/// the packer in a consistent state. Cloning the HashMap is O(map
-/// size) per savepoint but savepoints are rare in the target workloads
-/// (drop_table / delete_many don't use them).
+/// `live_slots` snapshots the R1 packing state (live slot counts per data
+/// page). `rollback_to` restores it so a savepoint rewind leaves the packer
+/// consistent. Cloning the HashMap is O(map size) per savepoint but savepoints
+/// are rare in the target workloads (drop_table / delete_many don't use them).
+///
+/// There is deliberately NO `insert_cursor` here. TXN-COMMIT-1 (issue #107):
+/// the cursor used to be snapshotted and restored, which meant `rollback_to`
+/// reinstated a cursor while a savepoint was still on the stack — a state the
+/// design forbids, since `truncate(idx + 1)` guarantees the savepoint survives
+/// the rewind. Slot packing then resumed into a page BELOW the savepoint
+/// watermark, which a second `rollback_to` can neither truncate nor discard.
+/// `SlotPacker::restore` now always clears the cursor, so the invariant lives
+/// in the packer rather than in whoever edits this struct.
+///
+/// `freemap` is the savepoint-scoped slice of `FreemapRecycle` (GAP-1): the
+/// `structural_superseded` length and the `session_owned` set. `rollback_to`
+/// was the only rewind path that never rewound the recycle at all.
 #[derive(Debug)]
 struct Savepoint {
     name: String,
@@ -136,7 +147,7 @@ struct Savepoint {
     watermark: u64,
     freed_pages: Vec<u64>,
     live_slots: FxHashMap<u64, u32>,
-    insert_cursor: Option<u64>,
+    freemap: freemap::FreemapMark,
 }
 
 /// The single writer for a Chisel database. Not thread-safe; file-level mutual

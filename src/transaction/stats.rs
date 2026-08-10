@@ -214,4 +214,16 @@ impl TransactionManager {
     pub(crate) fn current_handle_table_root_page(&self) -> u64 {
         self.current_roots.handle_table_page
     }
+
+    /// The freemap root page id of the active transaction's in-progress roots.
+    ///
+    /// The sibling accessor the I39 note above anticipated. FREEMAP-9
+    /// (issue #107) is the caller: `defrag`'s empty-database fast path must
+    /// consult BOTH roots, because they have independent lifetimes — the
+    /// handle-table root can revert to `PAGE_ID_NONE` on an allocate
+    /// prepare-abort while a freemap tree, lazily created by a later commit,
+    /// persists.
+    pub(crate) fn current_freemap_root_page(&self) -> u64 {
+        self.current_roots.freemap_page
+    }
 }

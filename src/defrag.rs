@@ -133,7 +133,10 @@ pub struct DefragStats {
 ///   `&mut TransactionManager` enforces that at the type level.
 ///
 /// Algorithm (R3 selective):
-///   1. Short-circuit if the handle-table root is empty — nothing to do.
+///   1. Short-circuit if BOTH the handle-table root and the freemap root are
+///      empty — nothing to compact and no orphans possible. The handle-table
+///      root alone is not sufficient: it can revert to PAGE_ID_NONE on an
+///      allocate prepare-abort while a freemap tree persists (FREEMAP-9).
 ///   2. Compute the set of SPARSE data pages up front via
 ///      `txm.sparse_data_pages(sparse_threshold)`. A page is sparse if
 ///      `live_slots / stored_slots < sparse_threshold` — a per-page density
@@ -164,10 +167,12 @@ pub struct DefragStats {
 ///      `freemap_orphans_reclaimed`). Runs unconditionally — even when
 ///      steps 2-6 found no sparse data pages — since freemap orphans are
 ///      an independent reclamation channel. EXCEPTION: the orphan sweep is
-///      skipped while a savepoint is active (it returns 0), because the sweep
-///      COWs the freemap and `rollback_to` does not rewind the structural
-///      recycle streams; see `reclaim_freemap_orphans`. Run defrag outside a
-///      savepoint scope to reclaim crash orphans.
+///      skipped while a savepoint is active (it returns 0). Since GAP-1
+///      (issue #107) `rollback_to` DOES rewind the structural recycle streams,
+///      so this is now defence in depth rather than the sole guarantee; the
+///      residual it covers is `structural_reuse` consumption. See
+///      `reclaim_freemap_orphans`. Run defrag outside a savepoint scope to
+///      reclaim crash orphans.
 ///
 /// What this does NOT do (v1):
 /// - No fancy ordering of handle visits (e.g., group by page). A
@@ -197,16 +202,34 @@ pub fn defrag(txm: &mut TransactionManager, options: &DefragOptions) -> Result<D
     };
 
     // Step 1: empty-database fast path.
-    // I39: single-field accessor replaces the pre-I39 positional
-    // `(u64, u64, u64)` tuple return; only the handle-table root is
-    // consulted here.
-    // Skipping the freemap orphan-sweep (step 7) here is safe: the
-    // handle-table root materialises permanently on the first `allocate`
-    // and never reverts to PAGE_ID_NONE, so an empty handle table implies
-    // no allocation has ever succeeded — therefore no freemap tree exists
-    // (the tree is seeded only when a freed page needs a bitmap bit) and
-    // no orphans are possible.
-    if txm.current_handle_table_root_page() == PAGE_ID_NONE {
+    //
+    // FREEMAP-9 (issue #107): this requires BOTH roots to be unset. It used to
+    // test only the handle-table root, justified by the claim that that root
+    // "materialises permanently on the first `allocate` and never reverts to
+    // PAGE_ID_NONE, so an empty handle table implies no allocation has ever
+    // succeeded — therefore no freemap tree exists".
+    //
+    // That claim is false, and `abort_allocate_prepare` is what falsifies it:
+    // on a non-fatal failure mid-allocate (the CacheFull the fault injector
+    // models) it restores `current_roots.handle_table_page` to its pre-allocate
+    // value — PAGE_ID_NONE on a fresh database — and on the same path releases
+    // the inline value's data slot onto `txn_freed_pages`. If the caller then
+    // COMMITS rather than rolling back (which the public contract explicitly
+    // permits), `persist` lazily CREATES the freemap tree to record that freed
+    // page. The database now has `root_handle_table_page == PAGE_ID_NONE` and a
+    // real `root_freemap_page`, permanently: nothing ever clears a freemap root.
+    //
+    // Under the old single-root test, every future `defrag()` on that database
+    // returned here and never ran `reclaim_freemap_orphans` (step 7) — so any
+    // freemap page a later crash stranded was unreclaimable by the only
+    // mechanism that reclaims them.
+    //
+    // Steps 2-6 (data-page compaction) are genuine no-ops when the handle-table
+    // root is unset, since `current_live_slots` is necessarily empty; the only
+    // thing the early return was ever really skipping is step 7.
+    if txm.current_handle_table_root_page() == PAGE_ID_NONE
+        && txm.current_freemap_root_page() == PAGE_ID_NONE
+    {
         return Ok(stats);
     }
 

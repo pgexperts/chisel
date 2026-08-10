@@ -2519,3 +2519,229 @@ fn plaintext_manager_has_no_cipher() {
         "plaintext create must have no session cipher"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Issue #107 — rewind paths must restore all the state they claim to
+// ─────────────────────────────────────────────────────────────────────────
+
+/// TXN-COMMIT-1: `rollback_to` must leave the insert cursor CLEARED.
+///
+/// The savepoint below survives the rewind (`savepoints.truncate(idx + 1)`),
+/// and `SlotPacker::insert` uses a live cursor unconditionally — so restoring
+/// the pre-savepoint cursor resumes slot packing into a page BELOW the
+/// savepoint watermark, which a second `rollback_to` can neither truncate nor
+/// discard. Every allocation after the rewind then leaks slots into it.
+#[test]
+fn rollback_to_leaves_the_insert_cursor_cleared() {
+    let mut tm = fresh_manager();
+    tm.begin().unwrap();
+
+    // A small (inline) value installs the packing cursor: savepoints is empty
+    // here, so packing_enabled is true.
+    tm.allocate(b"small").unwrap();
+    let cursor_before = tm.packer.insert_cursor();
+    assert!(
+        cursor_before.is_some(),
+        "precondition: an inline allocate with no savepoint must install a cursor"
+    );
+
+    tm.savepoint("sp").unwrap();
+    assert_eq!(
+        tm.packer.insert_cursor(),
+        None,
+        "savepoint creation force-clears the cursor"
+    );
+
+    tm.rollback_to("sp").unwrap();
+    assert!(
+        !tm.savepoints.is_empty(),
+        "precondition: rollback_to keeps the savepoint on the stack, which is \
+         what makes a restored cursor illegal"
+    );
+    assert_eq!(
+        tm.packer.insert_cursor(),
+        None,
+        "rollback_to must not reinstate the pre-savepoint cursor; packing into \
+         a below-watermark page while a savepoint is live is unrewindable"
+    );
+}
+
+/// TXN-COMMIT-1, behavioural half: an allocate AFTER a rollback_to must not
+/// land in the pre-savepoint cursor page. No existing test allocated after a
+/// rollback_to, which is why this went unnoticed.
+#[test]
+fn allocate_after_rollback_to_does_not_reuse_the_pre_savepoint_page() {
+    let mut tm = fresh_manager();
+    tm.begin().unwrap();
+    let h1 = tm.allocate(b"first").unwrap();
+    let page_before = tm.handle_live_page_id(h1).unwrap().expect("h1 is live");
+
+    tm.savepoint("sp").unwrap();
+    tm.rollback_to("sp").unwrap();
+
+    let h2 = tm.allocate(b"second").unwrap();
+    let page_after = tm.handle_live_page_id(h2).unwrap().expect("h2 is live");
+    assert_ne!(
+        page_after, page_before,
+        "the post-rewind allocate packed into the pre-savepoint cursor page; \
+         those slots sit below the savepoint watermark and survive a second \
+         rollback_to as permanent dead weight"
+    );
+}
+
+/// FREEMAP-1: `rollback` must rewind the freemap allocation hint.
+///
+/// `allocate_first` advances the hint on every claim. Rollback restores the
+/// committed roots — so the claimed ids are free again — but the hint used to
+/// stay advanced, and a too-high hint starts every later scan above those ids
+/// and never hands them out. The allocator extends the file instead.
+#[test]
+fn rollback_rewinds_the_freemap_allocation_hint() {
+    let mut tm = fresh_manager();
+
+    // Commit some frees so the committed bitmap has reusable ids for
+    // `allocate_first` to claim (and so the hint has somewhere to advance to).
+    let big: Vec<u8> = vec![0xAB; MAX_INLINE_VALUE + 32];
+    tm.begin().unwrap();
+    let handles: Vec<_> = (0..8).map(|_| tm.allocate(&big).unwrap()).collect();
+    tm.commit().unwrap();
+    tm.begin().unwrap();
+    for h in &handles {
+        tm.delete(*h).unwrap();
+    }
+    tm.commit().unwrap();
+
+    tm.begin().unwrap();
+    let hint_at_begin = tm.freemap.hint();
+    // Draw from the freemap: these allocations claim the freed ids and advance
+    // the hint past them.
+    for _ in 0..4 {
+        tm.allocate(&big).unwrap();
+    }
+    assert!(
+        tm.freemap.hint() > hint_at_begin,
+        "precondition: allocating from the freemap must advance the hint \
+         (begin={hint_at_begin}, now={})",
+        tm.freemap.hint()
+    );
+
+    tm.rollback().unwrap();
+    assert_eq!(
+        tm.freemap.hint(),
+        hint_at_begin,
+        "rollback restored the roots that made those ids free again, so the \
+         hint must come back too — otherwise every id below it is stranded"
+    );
+}
+
+/// GAP-1: `rollback_to` must rewind the freemap recycle's savepoint-scoped
+/// streams, the way full `rollback` does.
+///
+/// Not reachable through the public API today — every freemap-tree mutation
+/// site is gated on `savepoints.is_empty()` for an unrelated reason — so the
+/// post-savepoint entries are forged. That gating is precisely what made this
+/// latent, and nothing recorded that it was load-bearing for savepoint
+/// correctness.
+#[test]
+fn rollback_to_truncates_post_savepoint_structural_superseded() {
+    let mut tm = fresh_manager();
+    tm.begin().unwrap();
+
+    // Pre-savepoint entries: these name pages superseded BEFORE the savepoint,
+    // which the rewind does not undo. They must survive.
+    tm.freemap.push_structural_superseded_for_test(4001);
+    tm.freemap.insert_session_owned_for_test(4001);
+
+    tm.savepoint("sp").unwrap();
+
+    // Post-savepoint entries: the restored roots re-reference 4002, and the
+    // cache truncate destroys 4002 as a COW target. Both must go.
+    tm.freemap.push_structural_superseded_for_test(4002);
+    tm.freemap.insert_session_owned_for_test(4002);
+
+    tm.rollback_to("sp").unwrap();
+
+    assert_eq!(
+        tm.freemap.structural_superseded(),
+        &[4001],
+        "post-savepoint supersedes must be dropped and pre-savepoint ones kept; \
+         a surviving 4002 is promoted at commit and handed out as a COW target, \
+         overwriting a page the committed tree still references"
+    );
+    assert!(
+        tm.freemap.session_owned().contains(&4001),
+        "pre-savepoint session_owned entries are below the watermark and survive"
+    );
+    assert!(
+        !tm.freemap.session_owned().contains(&4002),
+        "post-savepoint session_owned entries name truncated pages and must go; \
+         a stale one suppresses a needed COW and mutates a live committed page"
+    );
+}
+
+/// GAP-1, the other direction: a savepoint that is rolled back to TWICE must
+/// restore the same state both times. `rollback_to` keeps the mark on the
+/// stack, so the mark's own copy has to survive each restore.
+#[test]
+fn rollback_to_is_repeatable_against_the_freemap_mark() {
+    let mut tm = fresh_manager();
+    tm.begin().unwrap();
+    tm.freemap.push_structural_superseded_for_test(5001);
+    tm.savepoint("sp").unwrap();
+
+    for round in 0..2 {
+        tm.freemap.push_structural_superseded_for_test(5002);
+        tm.rollback_to("sp").unwrap();
+        assert_eq!(
+            tm.freemap.structural_superseded(),
+            &[5001],
+            "round {round}: the mark must restore identically every time"
+        );
+    }
+}
+
+/// FREEMAP-9: defrag's empty-database fast path must not skip the freemap
+/// orphan sweep on a database that has no handle table but DOES have a
+/// freemap tree.
+///
+/// That state is reachable and permanent: a non-fatal failure mid-allocate
+/// reverts the handle-table root to PAGE_ID_NONE and frees the inline value's
+/// data page; committing then lazily creates the freemap tree to record the
+/// free. The old fast path returned before step 7 forever after, so orphans
+/// were unreclaimable by the only mechanism that reclaims them.
+#[test]
+fn defrag_sweeps_orphans_when_handle_table_root_is_none() {
+    let mut tm = fresh_manager();
+
+    tm.begin().unwrap();
+    tm.fault.fail_next_handle_table_op.set(true);
+    let failed = tm.allocate(b"small");
+    assert!(
+        failed.is_err(),
+        "precondition: the injected handle-table failure must abort the allocate"
+    );
+    tm.commit().unwrap();
+
+    assert_eq!(
+        tm.current_handle_table_root_page(),
+        crate::page::PAGE_ID_NONE,
+        "precondition: abort_allocate_prepare reverted the handle-table root — \
+         this is the state defrag's old comment claimed could not exist"
+    );
+    assert_ne!(
+        tm.current_freemap_root_page(),
+        crate::page::PAGE_ID_NONE,
+        "precondition: committing after the abort lazily created the freemap tree"
+    );
+
+    // With a real orphan present, the sweep must run and reclaim it.
+    tm.begin().unwrap();
+    let _orphan = tm.test_forge_freemap_orphan().unwrap();
+    let stats = crate::defrag::defrag(&mut tm, &crate::DefragOptions::default()).unwrap();
+    assert!(
+        stats.freemap_orphans_reclaimed >= 1,
+        "defrag returned before the orphan sweep on a database with a real \
+         freemap tree; reclaimed={}",
+        stats.freemap_orphans_reclaimed
+    );
+}

@@ -91,8 +91,11 @@ impl TransactionManager {
         // there is no separate freemap working copy to reset here. Reset the
         // recycle's per-transaction state: clear the session set and reseed the
         // structural reuse pool from the prior commit's deferred dead freemap
-        // pages (the hint persists across transactions — a stale hint only costs a
-        // scan). See `FreemapRecycle::begin`.
+        // pages. The hint persists across transactions but is SNAPSHOTTED here
+        // so rollback can rewind it — a hint left too high after a rollback
+        // strands every free id below it (FREEMAP-1, issue #107); only the
+        // too-low direction is the harmless "costs a scan" case.
+        // See `FreemapRecycle::begin`.
         self.freemap.begin();
         // R1: clone the live-slot counts and reset the insert cursor.
         // The cursor is always None at begin — it only tracks pages

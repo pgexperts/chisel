@@ -261,15 +261,57 @@ impl HandleTable {
         alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
         freed: &mut Vec<u64>,
     ) -> Result<u64> {
+        // HANDLES-INDEX-3 (issue #107): `insert` restores its own `depth` on
+        // every error path.
+        //
+        // `grow` bumps `self.depth` EAGERLY — after its own alloc succeeds but
+        // before `insert_recursive`'s fallible COW runs — so a failure anywhere
+        // below leaves the in-memory descent depth one level deeper than the
+        // root the caller will actually install. Every subsequent `lookup` then
+        // mis-descends and returns `InvalidHandle` for committed handles: the
+        // documented I99 failure mode, reached without any rollback.
+        //
+        // The bump cannot simply be deferred until after `insert_recursive`.
+        // The loop's own termination test is `handle >= self.capacity()` and
+        // `capacity()` reads `self.depth`, so an un-bumped depth makes the loop
+        // non-terminating; and `insert_recursive` is handed `self.depth` as its
+        // starting level, so the descent needs the post-grow value too.
+        // Snapshot-and-restore is therefore the shape, not deferral.
+        //
+        // This used to be the caller's job, and only ONE of the three mutation
+        // paths did it (`allocate_inner`, via `abort_allocate_prepare`). The
+        // other two — `ht_insert` in freemap.rs and `update_inner` in mutate.rs
+        // — relied on a prose argument that their handle was already resolved
+        // by `lookup_live`, so `handle < capacity()` and the loop never runs.
+        // That argument is sound today but it is an inter-module invariant held
+        // together by a comment: the first caller to pass a not-yet-resolved
+        // handle reintroduces the bug silently. Restoring here makes it
+        // structural.
+        let saved_depth = self.depth;
         let mut current_root = root;
         // Grow the tree upward until the handle fits. `grow` stacks a new
         // interior above the old root each time; the old root becomes child 0
         // of the new interior, which preserves addressability of all existing
         // handles (their addresses all fall within the first child's span).
         while handle >= self.capacity() {
-            current_root = self.grow(cache, current_root, alloc)?;
+            match self.grow(cache, current_root, alloc) {
+                Ok(new_root) => current_root = new_root,
+                // Restores across MULTIPLE grows too: `saved_depth` is the
+                // pre-loop value, so a failure on grow #2 unwinds grow #1 as
+                // well.
+                Err(e) => {
+                    self.depth = saved_depth;
+                    return Err(e);
+                }
+            }
         }
-        self.insert_recursive(cache, current_root, handle, entry, self.depth, alloc, freed)
+        match self.insert_recursive(cache, current_root, handle, entry, self.depth, alloc, freed) {
+            Ok(new_root) => Ok(new_root),
+            Err(e) => {
+                self.depth = saved_depth;
+                Err(e)
+            }
+        }
     }
 
     /// Delete a handle: write a tombstone for it and return the previous
@@ -515,6 +557,13 @@ impl HandleTable {
     /// reparented as child 0 of the new tree — so it is NOT superseded and
     /// must NOT be added to the freed list. `grow` therefore allocates (via
     /// the freemap-aware `alloc`) but frees nothing.
+    ///
+    /// Depth note: the `self.depth += 1` below is EAGER — it lands before the
+    /// caller has installed the new root, and before `insert_recursive` has
+    /// had its chance to fail. That is deliberate (`capacity()` and the
+    /// descent both need the post-grow value), and it is `insert` that unwinds
+    /// it on the error path. Do not call `grow` from anywhere that does not
+    /// restore depth on failure.
     fn grow(
         &mut self,
         cache: &mut PageCache,
@@ -960,6 +1009,111 @@ mod tests {
     // load; its page-type / child-pointer bytes are NOT validated. These tests
     // pin that such input yields a typed CorruptPage rather than a panic (OOB
     // slice) or a hang (cyclic recover_depth spine).
+
+    // --- HANDLES-INDEX-3 (issue #107): insert unwinds its own eager depth ---
+
+    /// `grow` bumps `self.depth` before `insert_recursive`'s fallible COW runs.
+    /// If that COW fails, the in-memory depth must not be left one level deeper
+    /// than the root the caller installs — every later `lookup` would
+    /// mis-descend and report `InvalidHandle` for committed handles.
+    ///
+    /// The allocator here succeeds once (the grow's new interior page) and then
+    /// fails, which lands the error precisely in the window between the eager
+    /// bump and a successfully installed root.
+    #[test]
+    fn insert_restores_depth_when_cow_fails_after_grow() {
+        let mut cache = make_cache();
+        let mut ht = HandleTable::new();
+        let root = ht.create_root(&mut cache).unwrap();
+        assert_eq!(ht.depth(), 0, "fresh table starts at depth 0");
+
+        let entry = HandleEntry {
+            page_id: 42,
+            slot_index: 0,
+            flags: HandleFlags::Live,
+            tag: 0,
+            client_byte: 0,
+        };
+
+        // ENTRIES_PER_LEAF (510) is the depth-0 capacity, so this handle forces
+        // exactly one grow.
+        let mut calls = 0;
+        let result = ht.insert(
+            &mut cache,
+            root,
+            ENTRIES_PER_LEAF as u64,
+            &entry,
+            &mut |c| {
+                calls += 1;
+                if calls == 1 {
+                    c.new_page()
+                } else {
+                    Err(ChiselError::CacheFull { limit: 0 })
+                }
+            },
+            &mut Vec::new(),
+        );
+
+        assert!(
+            matches!(result, Err(ChiselError::CacheFull { .. })),
+            "expected the second allocation to fail, got {result:?}"
+        );
+        assert!(
+            calls >= 2,
+            "the grow must have succeeded first; calls={calls}"
+        );
+        assert_eq!(
+            ht.depth(),
+            0,
+            "a failed insert must leave depth where it found it; \
+             a leaked bump makes every later lookup mis-descend"
+        );
+    }
+
+    /// The same unwind must hold across MULTIPLE grows: a handle far enough out
+    /// of range needs two levels, and a failure on the second must undo the
+    /// first as well. `saved_depth` is captured before the loop, not per
+    /// iteration, which is what makes this work.
+    #[test]
+    fn insert_restores_depth_when_a_later_grow_fails() {
+        let mut cache = make_cache();
+        let mut ht = HandleTable::new();
+        let root = ht.create_root(&mut cache).unwrap();
+
+        let entry = HandleEntry {
+            page_id: 7,
+            slot_index: 0,
+            flags: HandleFlags::Live,
+            tag: 0,
+            client_byte: 0,
+        };
+
+        // Beyond depth-1 capacity (510 * 1021), so at least two grows are needed.
+        let far_handle = ENTRIES_PER_LEAF as u64 * 1021 * 2;
+        let mut calls = 0;
+        let result = ht.insert(
+            &mut cache,
+            root,
+            far_handle,
+            &entry,
+            &mut |c| {
+                calls += 1;
+                if calls == 1 {
+                    c.new_page()
+                } else {
+                    Err(ChiselError::CacheFull { limit: 0 })
+                }
+            },
+            &mut Vec::new(),
+        );
+
+        assert!(result.is_err(), "expected failure, got {result:?}");
+        assert_eq!(
+            ht.depth(),
+            0,
+            "depth must unwind all the way to the pre-insert value, not just one level"
+        );
+    }
 
     // capacity()/span_at_level() must SATURATE on an out-of-range depth instead
     // of overflowing — a debug-build multiply panic, or a release wrap to a

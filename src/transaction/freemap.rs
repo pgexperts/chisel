@@ -130,16 +130,60 @@ fn structural_extend(cache: &mut PageCache, structural_reuse: &mut Vec<u64>) -> 
 /// enter `txn_freed_pages`): a freed freemap page sits at a high id where the
 /// lowest-first data allocator would starve it, so routing it back as structural
 /// reuse — where demand matches supply at steady state — is what reclaims it.
+/// The savepoint-scoped slice of `FreemapRecycle` state, captured by
+/// `savepoint_mark` and put back by `rollback_to_mark`. Stored in `Savepoint`
+/// alongside the cache watermark and the roots snapshot.
+///
+/// Two fields, for two different reasons — see `savepoint_mark` for why
+/// `structural_reuse` is not among them.
+///
+/// `Clone` because `rollback_to` may be called repeatedly against the same
+/// savepoint (the engine keeps the mark on the stack), so the record's copy
+/// must outlive each restore.
+#[derive(Debug, Clone)]
+pub(super) struct FreemapMark {
+    /// Length of `structural_superseded` at savepoint time. Truncating back to
+    /// it drops exactly the entries accumulated since, because the vector is
+    /// append-only within a transaction.
+    superseded_len: usize,
+    /// Full copy of `session_owned` at savepoint time. An `FxHashSet<u64>`
+    /// clone per savepoint — smaller than the `live_slots` `FxHashMap` clone
+    /// the same code path already takes.
+    session_owned: FxHashSet<u64>,
+}
+
 pub(super) struct FreemapRecycle {
     // Best-effort lower bound on the lowest free page id in the committed freemap
     // tree, threaded into `FreeMapTree::allocate_first` so a scan starts near the
-    // answer instead of at id 0. Deliberately NOT transactionally tracked: a
-    // too-low hint only costs a wasted left-to-right scan, never correctness (the
-    // scan still returns the true lowest free id), so it needs no begin/rollback
-    // snapshotting — it PERSISTS across transactions. `allocate_first` advances
-    // it; a free at a lower id is invisible until the next scan walks back over
-    // it, which is acceptable slack. Init 0.
+    // answer instead of at id 0. `allocate_first` advances it on every claim.
+    //
+    // The two directions are NOT symmetric, and the old doc here claimed they
+    // were ("a too-low hint only costs a wasted left-to-right scan, never
+    // correctness ... so it needs no begin/rollback snapshotting"). Too LOW is
+    // indeed free: the scan still returns the true lowest free id. Too HIGH
+    // strands every free id below it — `mark_free_committed_path` five lines
+    // down says as much ("a too-high hint would start the next scan above `id`
+    // and never reuse it"), and it is the only thing that ever lowers the hint,
+    // reachable solely from commit and the defrag orphan sweep.
+    //
+    // FREEMAP-1 (issue #107): rollback produced exactly the too-high case.
+    // Committed free ids {10, 20, 30}; a transaction claims 10 then 20, leaving
+    // hint = 20; rollback restores `current_roots` so both are free again in
+    // the committed tree — but the hint stayed at 20, so id 10 was never handed
+    // out again and the allocator extended the file instead. Recovery required
+    // a later free at an id <= 10, or a reopen. A long-lived session with
+    // rollbacks and only high-id frees leaked reusable space monotonically.
+    //
+    // Now snapshotted at `begin` and restored at `rollback`. Still not reset
+    // between successful transactions — across a COMMIT the hint remains a
+    // valid lower bound, which is the part of the original argument that held.
     hint: u64,
+    // The `hint` value as of the last `begin`, restored by `rollback`. One u64,
+    // no on-disk change. Preferred over `hint = 0` on rollback because the
+    // begin-value is exactly correct by induction (rollback restores the very
+    // committed tree that value was a valid bound for), and it avoids a full
+    // left-to-right rescan after every aborted transaction.
+    hint_at_begin: u64,
     // The dead-freemap-page pool available to reuse as structural COW targets in
     // the CURRENT transaction. Seeded from `pending_structural_frees` at `begin`;
     // drained by every structural `extend`; the unconsumed remainder is carried
@@ -175,6 +219,7 @@ impl FreemapRecycle {
     pub(super) fn new() -> Self {
         FreemapRecycle {
             hint: 0,
+            hint_at_begin: 0,
             structural_reuse: Vec::new(),
             structural_superseded: Vec::new(),
             pending_structural_frees: Vec::new(),
@@ -367,14 +412,20 @@ impl FreemapRecycle {
     /// the sweep is a no-op (returns 0). The sweep is the ONLY path that COWs the
     /// freemap (draining committed-LIVE pages into the structural streams) while a
     /// savepoint is open; ordinary allocation already disables structural reuse
-    /// under a savepoint. But `rollback_to` rewinds only the roots + cache
-    /// watermark, NOT the structural streams: a page the sweep drained into
-    /// `structural_superseded` would survive the rollback, get promoted at commit,
-    /// and be reused as a COW target in the next transaction while the last-durable
-    /// superblock still references it — silent durable freemap corruption.
-    /// Deferring orphan reclamation to a defrag run with no active savepoint avoids
-    /// the whole interaction, so `rollback_to_inner` correctly needs no
-    /// structural-stream reset.
+    /// under a savepoint. Historically this bail was the ONLY thing standing
+    /// between that and silent durable freemap corruption, because
+    /// `rollback_to` rewound the roots and the cache watermark but not the
+    /// structural streams — a page the sweep drained into
+    /// `structural_superseded` survived the rollback, got promoted at commit,
+    /// and was reused as a COW target while the last-durable superblock still
+    /// referenced it.
+    ///
+    /// GAP-1 (issue #107) closed that: `rollback_to_inner` now rewinds
+    /// `structural_superseded` and `session_owned` via the savepoint's
+    /// `FreemapMark`. This bail is therefore defence in depth rather than the
+    /// sole guarantee. The residual it still covers is `structural_reuse`,
+    /// which the mark deliberately does not capture — costing a bounded,
+    /// self-healing leak rather than corruption (see `savepoint_mark`).
     ///
     /// THE EXCLUSION SET (get this exactly right): a page in the CURRENT in-memory
     /// recycle pool (`structural_reuse` ∪ `structural_superseded` ∪
@@ -484,12 +535,14 @@ impl FreemapRecycle {
     /// stays intact as the rollback fallback — a rolled-back transaction never
     /// reached commit, so its structural recycle is exactly the pre-transaction
     /// one; `commit` overwrites it on the success path. `structural_superseded` is
-    /// empty here (only `persist` fills it); clear defensively. `hint` is NOT
-    /// reset — it persists across transactions (a stale hint only costs a scan).
+    /// empty here (only `persist` fills it); clear defensively. `hint` is not
+    /// RESET (across a commit it stays a valid lower bound) but it IS
+    /// snapshotted, so `rollback` can put it back — see FREEMAP-1 on the field.
     pub(super) fn begin(&mut self) {
         self.session_owned.clear();
         self.structural_reuse = self.pending_structural_frees.clone();
         self.structural_superseded.clear();
+        self.hint_at_begin = self.hint;
     }
 
     /// At commit: every freemap page COW'd this transaction is now committed
@@ -519,10 +572,80 @@ impl FreemapRecycle {
     /// `structural_reuse` rather than moving it, so it still holds the
     /// pre-transaction dead-freemap-page set (correct: a rolled-back transaction's
     /// structural recycle is exactly the pre-transaction one).
+    /// `hint` is rewound to its begin value: this transaction's `allocate_first`
+    /// calls advanced it past ids that the roots-restore just made free again,
+    /// and a too-high hint strands every free id below it (FREEMAP-1).
     pub(super) fn rollback(&mut self) {
         self.structural_superseded.clear();
         self.structural_reuse.clear();
         self.session_owned.clear();
+        self.hint = self.hint_at_begin;
+    }
+
+    /// Capture the savepoint-scoped part of the recycle state, for
+    /// `rollback_to` to restore. Paired with `rollback_to_mark`.
+    ///
+    /// GAP-1 (issue #107): `rollback_to` was the only rewind path that never
+    /// touched `FreemapRecycle`, while the full-rollback sibling calls
+    /// `rollback()`. What that leaves behind is the residue those two streams
+    /// exist to prevent — a `structural_superseded` entry naming a page the
+    /// restored roots still reference (promoted at the next commit and then
+    /// handed out as a COW target, overwriting a live committed page), and a
+    /// `session_owned` entry naming a COW target the cache truncate destroyed
+    /// (suppressing a needed COW).
+    ///
+    /// Unreachable today only by coincidence: every freemap-tree mutation site
+    /// passes `reuse = savepoints.is_empty()` for the unrelated reason of
+    /// allocation-reuse simplicity, and `reclaim_orphans` bails on
+    /// `savepoint_active` — so nothing mutates the tree inside a savepoint
+    /// scope. Nothing recorded that those gates were load-bearing for savepoint
+    /// correctness. This makes the rewind real instead of incidental.
+    ///
+    /// `structural_reuse` is deliberately NOT captured — because capturing it
+    /// would buy nothing, NOT because restoring it would be dangerous. (An
+    /// earlier version of this comment claimed the latter, arguing that a
+    /// target consumed BEFORE the savepoint could be re-offered and hand out a
+    /// live page twice. That is wrong, and wrong in a load-bearing direction,
+    /// so it is worth stating why: a mark-time snapshot pairs atomically with
+    /// the mark-time roots, so an entry consumed before the savepoint was
+    /// already popped and cannot be IN the snapshot. The only entries a restore
+    /// could re-offer are ones consumed AFTER the savepoint, and those live in
+    /// tree nodes the rewind discards.)
+    ///
+    /// The real reason is that nothing consumes `structural_reuse` inside a
+    /// savepoint scope at all: `structural_extend` is reached only via
+    /// `cow_alloc` under `reuse_enabled`, which is `savepoints.is_empty()` at
+    /// every call site. Should that ever change, the cost of not capturing is a
+    /// bounded leak, not corruption — the consumed id is still in
+    /// `pending_structural_frees` (untouched mid-transaction), so the next
+    /// `begin` re-offers it, and the defrag orphan sweep is the backstop.
+    pub(super) fn savepoint_mark(&self) -> FreemapMark {
+        FreemapMark {
+            superseded_len: self.structural_superseded.len(),
+            session_owned: self.session_owned.clone(),
+        }
+    }
+
+    /// Restore the state captured by `savepoint_mark`.
+    ///
+    /// `structural_superseded` is truncated rather than cleared: it is
+    /// append-only within a transaction (`put_tree` is the only writer; only
+    /// commit/rollback drain it), so the prefix below `superseded_len` is
+    /// exactly the pre-savepoint content and must survive — those entries name
+    /// pages superseded before the savepoint, which the rewind does not undo.
+    ///
+    /// `session_owned` is restored from a snapshot rather than cleared
+    /// wholesale. Clearing would be SAFE (it can only cause an extra COW, never
+    /// suppress a needed one) but lossy in a way that weakens an invariant: a
+    /// re-COW of a page this same transaction already COW'd pushes an
+    /// UNCOMMITTED id onto `structural_superseded`, contradicting that field's
+    /// documented meaning of "committed-tree freemap pages this txn COW'd
+    /// over". Every pre-savepoint entry is below the savepoint watermark (ids
+    /// come from monotonic `new_page` or from prior-commit `structural_reuse`),
+    /// so all of them survive the truncate and the snapshot is exactly right.
+    pub(super) fn rollback_to_mark(&mut self, mark: FreemapMark) {
+        self.structural_superseded.truncate(mark.superseded_len);
+        self.session_owned = mark.session_owned;
     }
 
     // --- Test-only accessors (the recycle pin-tests read/forge these) ---
@@ -552,6 +675,28 @@ impl FreemapRecycle {
     #[cfg(test)]
     pub(super) fn push_structural_reuse_for_test(&mut self, id: u64) {
         self.structural_reuse.push(id);
+    }
+
+    /// The allocation hint (FREEMAP-1). Read by the rollback-rewind test.
+    #[cfg(test)]
+    pub(super) fn hint(&self) -> u64 {
+        self.hint
+    }
+
+    /// Forge a `structural_superseded` entry (GAP-1). The savepoint-rewind test
+    /// needs an entry that post-dates the savepoint, and no public operation
+    /// produces one — every freemap-tree mutation site is gated on
+    /// `savepoints.is_empty()`, which is exactly why the bug is latent rather
+    /// than reachable. Mirrors `push_structural_reuse_for_test`.
+    #[cfg(test)]
+    pub(super) fn push_structural_superseded_for_test(&mut self, id: u64) {
+        self.structural_superseded.push(id);
+    }
+
+    /// Forge a `session_owned` entry (GAP-1). Same rationale as above.
+    #[cfg(test)]
+    pub(super) fn insert_session_owned_for_test(&mut self, id: u64) {
+        self.session_owned.insert(id);
     }
 }
 

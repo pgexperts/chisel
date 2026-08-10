@@ -113,9 +113,21 @@ impl SlotPacker {
         value: &[u8],
     ) -> Result<(u64, u16)> {
         // Packing path: try to reuse the current cursor page if it has room.
-        // The cursor only exists when packing is enabled (savepoints empty),
-        // so this branch implicitly respects the "no packing under savepoints"
-        // rule.
+        //
+        // This branch is unconditional on `packing_enabled` — which gates only
+        // INSTALLING a cursor, further down, never USING one. What makes that
+        // sound is that the cursor is cleared at BOTH points where a savepoint
+        // could otherwise leave a stale one live: `clear_cursor` on savepoint
+        // creation, and `SlotPacker::restore` on `rollback_to`. So "cursor is
+        // Some" implies "no savepoint was on the stack when it was installed,
+        // and none has been created or rewound since", which is the
+        // "no packing under savepoints" rule.
+        //
+        // That used to be an implicit claim and it was FALSE: `rollback_to`
+        // restored the pre-savepoint cursor while keeping the savepoint on the
+        // stack (TXN-COMMIT-1, issue #107). `restore` clearing the cursor is
+        // what makes the sentence above true; do not reintroduce a cursor
+        // restore there.
         if let Some(cursor_page_id) = self.insert_cursor {
             let slot_option = {
                 let buf = cache.get_mut(cursor_page_id)?;
@@ -216,17 +228,45 @@ impl SlotPacker {
     }
 
     /// Read-only snapshot of the working state for a savepoint: the current
-    /// live-slot map (cloned) and the cursor. The savepoint-CREATE path clears
-    /// the cursor separately via `clear_cursor` after snapshotting — snapshot
-    /// itself does not mutate.
-    pub(super) fn snapshot(&self) -> (FxHashMap<u64, u32>, Option<u64>) {
-        (self.current_live_slots.clone(), self.insert_cursor)
+    /// live-slot map, cloned. The savepoint-CREATE path clears the cursor
+    /// separately via `clear_cursor` after snapshotting — snapshot itself does
+    /// not mutate.
+    ///
+    /// The cursor is NOT part of the snapshot. See `restore`.
+    pub(super) fn snapshot(&self) -> FxHashMap<u64, u32> {
+        self.current_live_slots.clone()
     }
 
-    /// Restore the working state from a savepoint snapshot.
-    pub(super) fn restore(&mut self, snap: (FxHashMap<u64, u32>, Option<u64>)) {
-        self.current_live_slots = snap.0;
-        self.insert_cursor = snap.1;
+    /// Restore the working state from a savepoint snapshot, and clear the
+    /// cursor unconditionally.
+    ///
+    /// TXN-COMMIT-1 (issue #107): the cursor used to be snapshotted alongside
+    /// `live_slots` and put back here. That restored value is never legal.
+    /// `rollback_to_inner` calls this and then does `savepoints.truncate(idx +
+    /// 1)`, so a savepoint is GUARANTEED to still be on the stack afterwards —
+    /// and `SlotPacker::insert` takes its cursor branch unconditionally, on the
+    /// strength of a comment claiming "the cursor only exists when packing is
+    /// enabled (savepoints empty)". `packing_enabled` gates only INSTALLING a
+    /// cursor, never USING one.
+    ///
+    /// The concrete leak: `begin(); allocate(v1)` installs cursor = page P
+    /// (savepoints empty, so packing is on); `savepoint("s")` snapshots
+    /// Some(P) and clears; `rollback_to("s")` puts Some(P) back while "s" is
+    /// still live; the next `allocate` appends a slot to P — whose id is BELOW
+    /// the savepoint watermark, so a second `rollback_to("s")` neither
+    /// truncates it (only `truncate(watermark)` runs) nor discards it (unlike
+    /// full rollback, which calls `discard_all_dirty` first). The slot bytes
+    /// and the advanced free_start/free_end survive the rewind as permanent
+    /// dead weight, and repeated savepoint/rollback_to/insert cycles keep
+    /// consuming P until it fills. Reads stay correct — `DataPage::insert` is
+    /// append-only and `live_slots` is restored — so it is a bounded space
+    /// leak, not corruption.
+    ///
+    /// Clearing here rather than at the call site puts the invariant in the
+    /// packer, where it cannot be undone by an edit to savepoints.rs.
+    pub(super) fn restore(&mut self, live_slots: FxHashMap<u64, u32>) {
+        self.current_live_slots = live_slots;
+        self.insert_cursor = None;
     }
 
     /// Clear the insert cursor. Used by the savepoint-create path: once a
