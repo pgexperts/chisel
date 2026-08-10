@@ -1,15 +1,44 @@
 name: Bench
 
 # Triggers on PRs to main. Posts a regression-report comment on the PR.
-# Never blocks merge — signal, not gate.
+#
+# WHAT CAN TURN THIS JOB RED, precisely — this used to say "Never blocks
+# merge — signal, not gate" while no step carried `continue-on-error`, so
+# every step could and did fail the job. The property is now enforced rather
+# than asserted:
+#
+#   * The two `Build bench` steps GATE. A bench target that no longer compiles
+#     is a real breakage in checked-in code, and the root `cargo build` in
+#     ci.yml does not build bench targets, so this is the only place it
+#     surfaces.
+#   * Every step after them — running the scenarios, summarizing, diffing,
+#     posting the comment, and uploading the artifact — is
+#     `continue-on-error: true`. No measurement result and no comment-post
+#     failure can red the check. That covers harness flakes (see
+#     bench/src/sqlite_engine.rs's note on the ~1-in-5 intermittent) as well
+#     as anything transient on the runner.
+#   * The four setup steps BEFORE the builds — the two checkouts, the
+#     toolchain install, and the cache restore — are also left bare and so
+#     also gate. That is deliberate: a failure there is infrastructure, not a
+#     measurement, and it means the job did not run rather than that it ran
+#     and found something. Making it invisible would turn a green check into
+#     a lie. It is the one way this job can go red without any bench code
+#     being at fault.
+#
+# So: benchmark NUMBERS never block merge; benchmark CODE failing to compile
+# does, as does the runner failing to get as far as compiling it. Correctness
+# gating is ci.yml's job, not this workflow's.
 #
 # NOTE on fork PRs: this workflow uses `pull_request` (not
-# `pull_request_target`), so `${{ secrets.GITHUB_TOKEN }}` is read-only
-# for fork PRs and the comment-post step will fail gracefully. This is
-# intentional: `pull_request_target` would run untrusted PR code with
-# elevated token privileges, a real security risk for a workflow that
-# compiles and runs arbitrary Rust. Fork-PR comment posting is not
-# supported in v1.
+# `pull_request_target`), so `${{ secrets.GITHUB_TOKEN }}` is read-only for
+# fork PRs. `pull_request_target` would run untrusted PR code with elevated
+# token privileges, a real security risk for a workflow that compiles and runs
+# arbitrary Rust. The comment steps are therefore skipped outright on fork PRs
+# via a same-repo `if:` guard rather than being allowed to attempt the write
+# and take a 403 — the `permissions: pull-requests: write` block below cannot
+# grant write to a fork's read-only token, so the attempt is guaranteed to
+# fail. The comparison still runs and the artifact still uploads; only the
+# PR comment is unavailable on forks.
 on:
   pull_request:
     branches: [main]
@@ -57,11 +86,16 @@ jobs:
         working-directory: main-checkout/bench
         run: cargo build --release --bench scenarios --bin summarize
 
+      # Everything from here down is `continue-on-error: true`. These steps
+      # produce a REPORT; none of them is a correctness signal, and a flaky
+      # measurement or an unavailable comment API must not red the check.
       - name: Run scenarios on main
+        continue-on-error: true
         working-directory: main-checkout/bench
         run: cargo bench --bench scenarios
 
       - name: Summarize main results
+        continue-on-error: true
         working-directory: main-checkout/bench
         run: |
           cargo run --release --bin summarize -- \
@@ -69,10 +103,12 @@ jobs:
             --out /tmp/main-out
 
       - name: Run scenarios on PR
+        continue-on-error: true
         working-directory: bench
         run: cargo bench --bench scenarios
 
       - name: Summarize PR results
+        continue-on-error: true
         working-directory: bench
         run: |
           cargo run --release --bin summarize -- \
@@ -80,6 +116,7 @@ jobs:
             --out /tmp/pr-out
 
       - name: Generate diff
+        continue-on-error: true
         working-directory: bench
         run: |
           cargo run --release --bin chisel-bench-diff -- \
@@ -89,7 +126,19 @@ jobs:
           echo "----- Diff comment preview -----"
           cat /tmp/diff-comment.md
 
+      # Both comment steps are skipped on fork PRs. The token is read-only
+      # there regardless of the `permissions:` block above, so attempting the
+      # write is a guaranteed "Resource not accessible by integration". The
+      # `if:` is what makes that a clean skip instead of a failure; the
+      # `continue-on-error` is belt-and-braces for same-repo runs, where the
+      # comment API can still rate-limit or 5xx.
+      #
+      # `head.repo.full_name` is compared inside an `if:` expression evaluated
+      # by the Actions expression engine, never interpolated into a shell
+      # command, so it carries no injection surface.
       - name: Find existing bench comment
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
         uses: peter-evans/find-comment@v4
         id: fc
         with:
@@ -98,6 +147,8 @@ jobs:
           body-includes: '<!-- chisel-bench-diff -->'
 
       - name: Create or update PR comment
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
         uses: peter-evans/create-or-update-comment@v5
         with:
           comment-id: ${{ steps.fc.outputs.comment-id }}
@@ -121,6 +172,7 @@ jobs:
       # create-or-update-comment steps above. No injection surface.
       - name: Upload PR-side bench artifacts
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: bench-results-pr-${{ github.event.pull_request.number }}
