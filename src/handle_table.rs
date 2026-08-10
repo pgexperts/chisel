@@ -83,8 +83,9 @@ const PTRS_PER_INTERIOR: usize = (CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE) / CHI
 // for 510 * 1021^depth, capacity(5) ≈ 5.7e17 < u64::MAX < capacity(6), so a tree
 // keyed by u64 handles is never deeper than 6 (a handle in (capacity(5), u64::MAX]
 // forces one final grow to depth 6, whose capacity saturates to u64::MAX). Any
-// spine claiming a deeper tree is corrupt — used by recover_depth's cap, which
-// also bounds a cyclic spine.
+// spine claiming a deeper tree is corrupt. Enforced on both sides: `insert`'s
+// growth loop stops here (the capacity test alone saturates and never stops for
+// handle u64::MAX), and `recover_depth`'s cap, which also bounds a cyclic spine.
 const MAX_DEPTH: u32 = 6;
 
 // Page flags byte (buf[1]): distinguishes leaf from interior. Stored in the
@@ -293,7 +294,34 @@ impl HandleTable {
         // interior above the old root each time; the old root becomes child 0
         // of the new interior, which preserves addressability of all existing
         // handles (their addresses all fall within the first child's span).
-        while handle >= self.capacity() {
+        //
+        // HANDLES-INDEX-7 (issue #116): `self.depth < MAX_DEPTH` is what
+        // actually terminates this loop, not belt-and-braces. `capacity()`
+        // saturates, so from depth 6 up it reports u64::MAX rather than the
+        // true 510 * 1021^6 — and for the single value `handle == u64::MAX`
+        // the test `handle >= capacity()` therefore stays true after every
+        // grow (u64::MAX - 1 exits normally). Unbounded, that costs one alloc
+        // plus an 8 KiB zero-fill per lap and permanently extends the file
+        // until `alloc` fails. Reachable not from any caller but from a
+        // corrupt-but-checksum-valid superblock: `next_handle` is read
+        // verbatim on open with no range validation. Bounding on depth makes
+        // MAX_DEPTH an invariant the WRITE path enforces, rather than an
+        // arithmetic claim plus a cap on `recover_depth`'s walk.
+        //
+        // No error branch belongs behind this bound. At depth 6 the tree's
+        // true capacity (~5.8e20) exceeds u64::MAX, so every u64 handle is
+        // genuinely addressable — u64::MAX descends with `child_idx < 1021`
+        // at every level, and `find_leaf`'s `cap != u64::MAX` clause exists
+        // precisely so it is not wrongly reported absent. Refusing the insert
+        // would make the engine decline to write a handle its own reader is
+        // built to resolve.
+        //
+        // The symmetry stops at `delete`, whose own `handle >= capacity()`
+        // guard has no such saturation carve-out: u64::MAX would be insertable
+        // and readable but report absent on delete. Left as-is deliberately —
+        // it is only reachable via the same corrupt superblock, and closing it
+        // is a separate change from bounding this loop.
+        while self.depth < MAX_DEPTH && handle >= self.capacity() {
             match self.grow(cache, current_root, alloc) {
                 Ok(new_root) => current_root = new_root,
                 // Restores across MULTIPLE grows too: `saved_depth` is the
@@ -344,7 +372,19 @@ impl HandleTable {
         }
         // I26-style guard: handle outside tree's reach is definitionally
         // absent. No tree growth (insert grows; delete doesn't).
-        if handle >= self.capacity() {
+        //
+        // The `cap != u64::MAX` carve-out mirrors `find_leaf`'s and is
+        // load-bearing, not defensive. `capacity()` saturates at depth 6, so a
+        // bare `handle >= capacity()` swallows exactly one handle — `u64::MAX`,
+        // the same handle the bounded growth loop above now lets `insert` write
+        // and `find_leaf` reads back. Without the carve-out that handle is
+        // insertable and readable but permanently undeletable, with `delete`
+        // answering `Ok(None)` ("already absent") over a live entry that stays
+        // live. Refusing to retire a handle this tree agreed to store is the
+        // same write/read split the growth bound exists to avoid, one method
+        // over; both halves of that fix belong together.
+        let cap = self.capacity();
+        if cap != u64::MAX && handle >= cap {
             return Ok((root, None));
         }
         self.delete_recursive(cache, root, handle, self.depth, alloc, freed)
@@ -655,9 +695,14 @@ impl HandleTable {
 
             // Sparse allocation: interior pages don't pre-populate children.
             // A zero pointer means "no subtree allocated here yet"; we lazily
-            // create one only when an insert touches that range. The newly
-            // allocated child is already a fresh page, so it IS its own COW
-            // clone — no further copy needed.
+            // create one only when an insert touches that range.
+            //
+            // The fresh page is NOT terminal: the recursive call below COWs it
+            // immediately (it becomes that frame's superseded `page` and is
+            // pushed to `freed` there), so a first touch costs two allocations
+            // and one PAGE_SIZE copy. Benign — the page was never committed and
+            // nothing references it — but it is why `freed` is not a list of
+            // previously-committed pages only.
             let actual_child = if child_page == 0 {
                 if level == 1 {
                     let leaf = alloc(cache)?;
@@ -736,9 +781,9 @@ impl HandleTable {
         // `child_idx >= PTRS_PER_INTERIOR` and read `buf[CHECKSUM_OFFSET..]`
         // (treating the page's checksum as a child pointer) or panic on
         // an out-of-bounds slice for very large handles. `insert`
-        // pre-grows via `while handle >= capacity { grow() }` so it
-        // cannot hit this path — only the lookup side (read / update /
-        // delete) needs the guard.
+        // pre-grows via `while depth < MAX_DEPTH && handle >= capacity
+        // { grow() }` so it cannot hit this path — only the lookup side
+        // (read / update / delete) needs the guard.
         //
         // The guard MUST run at depth 0 too: there `capacity() ==
         // ENTRIES_PER_LEAF`, and the depth-0 early return below maps the
@@ -1740,5 +1785,160 @@ mod tests {
         assert_eq!(read.tag, 0xDEADBEEF);
         let zeroed = HandleTable::read_entry(&[0u8; PAGE_SIZE], 0);
         assert_eq!(zeroed.tag, 0);
+    }
+
+    // --- HANDLES-INDEX-7 (issue #116): the growth loop is bounded ------------
+
+    /// `capacity()` saturates, so from depth 6 it reports u64::MAX instead of
+    /// the true 510 * 1021^6. For the single handle u64::MAX that leaves
+    /// `handle >= capacity()` true after every grow, and pre-fix the loop kept
+    /// growing — one page and one 8 KiB zero-fill per lap, permanently
+    /// extending the file — until the allocator failed.
+    ///
+    /// The allocation BUDGET, not the cache size, is what makes this a
+    /// boundedness assertion: the fix must finish inside a fixed number of
+    /// allocations (6 grows plus a 13-page COW spine), so an unbounded loop
+    /// fails here fast and deterministically instead of hanging.
+    ///
+    /// The lookup at the end is the other half of the claim: depth 6 addresses
+    /// u64::MAX for real, so the handle the insert wrote must read back.
+    #[test]
+    fn insert_of_max_handle_stops_at_max_depth() {
+        let mut cache = make_cache();
+        let mut ht = HandleTable::new();
+        let root = ht.create_root(&mut cache).unwrap();
+
+        let entry = HandleEntry {
+            page_id: 42,
+            slot_index: 1,
+            flags: HandleFlags::Live,
+            tag: 0,
+            client_byte: 0,
+        };
+
+        let mut budget = 64u32;
+        let new_root = ht
+            .insert(
+                &mut cache,
+                root,
+                u64::MAX,
+                &entry,
+                &mut |c| {
+                    budget -= 1;
+                    if budget == 0 {
+                        return Err(ChiselError::CacheFull { limit: 0 });
+                    }
+                    c.new_page()
+                },
+                &mut Vec::new(),
+            )
+            .expect("insert(u64::MAX) must finish within a bounded allocation budget");
+
+        assert_eq!(ht.depth(), MAX_DEPTH, "growth must stop at MAX_DEPTH");
+        assert_eq!(
+            ht.lookup(&mut cache, new_root, u64::MAX).unwrap(),
+            Some(entry),
+            "depth 6 addresses u64::MAX, so what insert wrote lookup must find"
+        );
+
+        // The third side of the same invariant. `delete`'s bounds guard shares
+        // `capacity()`'s saturation, so without its own `cap != u64::MAX`
+        // carve-out it reports this live entry absent and never retires it —
+        // insert and lookup would agree the handle exists while delete alone
+        // disagreed, silently.
+        let (after_root, removed) = ht
+            .delete(
+                &mut cache,
+                new_root,
+                u64::MAX,
+                &mut |c| c.new_page(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            removed,
+            Some(entry),
+            "delete must retire the entry insert stored and lookup found"
+        );
+        assert_eq!(
+            ht.lookup(&mut cache, after_root, u64::MAX).unwrap(),
+            None,
+            "the entry must actually be gone after delete reports removing it"
+        );
+    }
+
+    // --- HANDLES-INDEX-4 (issue #116): pin, not a regression test ------------
+
+    /// Pins the behaviour the sparse-child comment now describes: a lazily
+    /// created child is NOT terminal — `insert_recursive` COWs it immediately
+    /// and pushes it onto `freed`, so `freed` holds never-committed pages from
+    /// this transaction, not previously-committed ones only.
+    ///
+    /// Passes before and after the comment fix. Its value is forward-looking:
+    /// it fails if someone implements the `level == 1` short-circuit that would
+    /// skip the redundant COW, which would silently re-falsify the comment.
+    ///
+    /// The assertions name the lazily created leaf by its position in the
+    /// allocation sequence, deliberately. A weaker "some allocated page is also
+    /// in `freed`" test is a tautology here: `grow` allocates the new interior
+    /// root through the same closure and `insert_recursive`'s first frame COWs
+    /// it, so the two sets always intersect on the root whatever the sparse-child
+    /// branch does.
+    #[test]
+    fn sparse_child_is_recowed_and_queued_as_freed() {
+        let mut cache = make_cache();
+        let mut ht = HandleTable::new();
+        let mut root = ht.create_root(&mut cache).unwrap();
+
+        let entry = HandleEntry {
+            page_id: 7,
+            slot_index: 0,
+            flags: HandleFlags::Live,
+            tag: 0,
+            client_byte: 0,
+        };
+
+        // One grow to depth 1, so the insert descends through an interior page
+        // whose child pointer for this range is still zero.
+        let mut allocated = Vec::new();
+        let mut freed = Vec::new();
+        root = ht
+            .insert(
+                &mut cache,
+                root,
+                ENTRIES_PER_LEAF as u64,
+                &entry,
+                &mut |c| {
+                    let id = c.new_page()?;
+                    allocated.push(id);
+                    Ok(id)
+                },
+                &mut freed,
+            )
+            .unwrap();
+        assert_eq!(ht.depth(), 1);
+
+        // Allocation order: [0] grow's new interior root, [1] its COW,
+        // [2] the lazily created leaf, [3] the leaf's COW. The fourth
+        // allocation exists only because the fresh child is re-COWed.
+        assert_eq!(
+            allocated.len(),
+            4,
+            "first touch of a sparse child costs two allocations, not one"
+        );
+        assert!(
+            freed.contains(&allocated[2]),
+            "the lazily created leaf ({}) must be queued as freed — it is \
+             re-COWed by the recursive call, so `freed` carries never-committed \
+             pages from this transaction; freed = {:?}, allocated = {:?}",
+            allocated[2],
+            freed,
+            allocated
+        );
+        assert_eq!(
+            ht.lookup(&mut cache, root, ENTRIES_PER_LEAF as u64)
+                .unwrap(),
+            Some(entry)
+        );
     }
 }

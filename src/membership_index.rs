@@ -23,8 +23,10 @@ const SLOTS_PER_PAGE: usize = (CHECKSUM_OFFSET - DATA_PAGE_HEADER_SIZE) / SLOT_S
 // SLOTS_PER_PAGE = 1021, 1021^6 ≈ 1.1e18 < u64::MAX < 1021^7, so a tree keyed by
 // u64 values is never deeper than 6 (a key in (capacity(5), u64::MAX] forces one
 // final grow to depth 6, whose capacity saturates to u64::MAX). Any spine or
-// packed inner-depth claiming a deeper tree is corrupt — used by recover_depth's
-// cap (which also bounds a cyclic spine) and the unpack_inner range check.
+// packed inner-depth claiming a deeper tree is corrupt — used by
+// `RadixU64::insert`'s growth loop (the capacity test alone saturates and never
+// stops for key u64::MAX), recover_depth's cap (which also bounds a cyclic
+// spine) and the unpack_inner range check.
 const MAX_DEPTH: u32 = 6;
 
 fn read_slot(buf: &[u8; PAGE_SIZE], index: usize) -> u64 {
@@ -292,7 +294,14 @@ impl RadixU64 {
     ) -> Result<u64> {
         debug_assert_ne!(value, 0, "0 is the absent sentinel; cannot be stored");
         let mut current_root = root;
-        while key >= self.capacity() {
+        // `self.depth < MAX_DEPTH` is the real terminator — see the mirror of
+        // this loop in `HandleTable::insert` (HANDLES-INDEX-7, issue #116).
+        // `capacity()` saturates, so from depth 6 up it reports u64::MAX and
+        // the key u64::MAX alone keeps the test true after every grow, growing
+        // the file one page per lap until `alloc` fails. Depth 6's true
+        // capacity (1021^7) exceeds u64::MAX, so every u64 key remains
+        // addressable and no error branch belongs here.
+        while self.depth < MAX_DEPTH && key >= self.capacity() {
             current_root = self.grow(cache, current_root, alloc)?;
         }
         self.insert_recursive(cache, current_root, key, value, self.depth, alloc, freed)
@@ -389,7 +398,15 @@ impl RadixU64 {
         alloc: &mut dyn FnMut(&mut PageCache) -> Result<u64>,
         freed: &mut Vec<u64>,
     ) -> Result<(u64, u64)> {
-        if root == PAGE_ID_NONE || key >= self.capacity() {
+        // The `cap != u64::MAX` carve-out mirrors `find_leaf`'s, for the reason
+        // spelled out on `HandleTable::delete`: `capacity()` saturates at depth
+        // 6, so a bare `key >= capacity()` swallows exactly `u64::MAX` — the key
+        // the bounded growth loop now lets `insert` write and `lookup` reads
+        // back. Here the split is directly observable: without it, `lookup`
+        // returns the key's value while `delete` reports `prev == 0` ("was
+        // already absent") and leaves it in the index forever.
+        let cap = self.capacity();
+        if root == PAGE_ID_NONE || (cap != u64::MAX && key >= cap) {
             return Ok((root, 0));
         }
         self.delete_recursive(cache, root, key, self.depth, alloc, freed)
@@ -1509,5 +1526,58 @@ mod tests {
             assert!(removed);
         }
         assert!(idx.handles_for_tag(&mut c, root, 7).unwrap().is_empty());
+    }
+
+    // --- HANDLES-INDEX-7 (issue #116): the growth loop is bounded ------------
+
+    /// Mirror of `handle_table`'s `insert_of_max_handle_stops_at_max_depth`.
+    /// `capacity()` saturates at depth 6 (1021^7 exceeds u64), so the key
+    /// u64::MAX alone kept `key >= capacity()` true after every grow and the
+    /// loop extended the file one page per lap until the allocator failed.
+    ///
+    /// The shared allocation budget is what keeps the pre-fix failure fast and
+    /// deterministic — the assertion is about boundedness, not cache size.
+    #[test]
+    fn insert_of_max_key_stops_at_max_depth() {
+        let mut c = cache(64);
+        let mut t = RadixU64::new();
+
+        let mut budget = 64u32;
+        let mut alloc = |c: &mut PageCache| {
+            budget -= 1;
+            if budget == 0 {
+                return Err(ChiselError::CacheFull { limit: 0 });
+            }
+            c.new_page()
+        };
+
+        let root = t.create_root(&mut c, &mut alloc).unwrap();
+        let new_root = t
+            .insert(&mut c, root, u64::MAX, 1, &mut alloc, &mut Vec::new())
+            .expect("insert(u64::MAX) must finish within a bounded allocation budget");
+
+        assert_eq!(t.depth, MAX_DEPTH, "growth must stop at MAX_DEPTH");
+        assert_eq!(
+            t.lookup(&mut c, new_root, u64::MAX).unwrap(),
+            1,
+            "depth 6 addresses u64::MAX, so what insert wrote lookup must find"
+        );
+
+        // The third side of the same invariant, and the one directly observable
+        // here: `delete` shares `capacity()`'s saturation, so without its own
+        // `cap != u64::MAX` carve-out it answers `prev == 0` — "was already
+        // absent" — for a key `lookup` is simultaneously returning a value for.
+        let (after_root, prev) = t
+            .delete(&mut c, new_root, u64::MAX, &mut alloc, &mut Vec::new())
+            .unwrap();
+        assert_eq!(
+            prev, 1,
+            "delete must report the value it removed, not 'already absent'"
+        );
+        assert_eq!(
+            t.lookup(&mut c, after_root, u64::MAX).unwrap(),
+            0,
+            "the key must actually be gone after delete reports removing it"
+        );
     }
 }

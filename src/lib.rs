@@ -698,8 +698,10 @@ impl Chisel {
     /// Store `value` tagged with `tag` and return a freshly minted stable handle.
     /// Like `allocate`, but additionally registers the handle in the reverse
     /// membership index (tag→handles) so `handles_with_tag(tag)` can enumerate it.
-    /// Tag 0 is the "untagged" sentinel — prefer plain `allocate` for untagged
-    /// values; the membership index is not updated for tag 0.
+    /// Untagged values go through plain [`allocate`](Self::allocate); a `Tag` is
+    /// non-zero by construction, so this method always updates the index. The
+    /// engine's "untagged" sentinel is still a stored `0` — a value no `Tag` can
+    /// produce.
     ///
     /// # Errors
     /// As [`allocate`](Self::allocate) (`NoActiveTransaction`, `CacheFull`,
@@ -710,7 +712,10 @@ impl Chisel {
     }
 
     /// Return the tag stored in the handle-table entry for `handle`.
-    /// Returns 0 for untagged handles. Takes `&self` (F3).
+    /// Returns `None` for untagged handles: "no tag" is the ABSENCE of a `Tag`,
+    /// not a zero one, because `Tag(0)` is unconstructable. The engine still
+    /// stores untagged as `0`; the `0 -> None` mapping happens here, at the
+    /// public boundary. Takes `&self` (F3).
     ///
     /// # Errors
     /// `InvalidHandle` if `handle` is unknown or deleted.
@@ -740,8 +745,9 @@ impl Chisel {
     }
 
     /// Enumerate all live handles that carry `tag`. Returns an empty Vec if
-    /// no handles with that tag exist. Tag 0 always returns an empty Vec
-    /// (the membership index is not updated for untagged values). Takes `&self` (F3).
+    /// no handles carry it. Untagged values are never entered in the membership
+    /// index, and the `Tag` parameter makes that case unaskable — there is no
+    /// tag 0 to pass. Takes `&self` (F3).
     ///
     /// Stability: the same within-session repeatability contract as `handles` —
     /// repeated calls return an identical `Vec` while the set of live handles
