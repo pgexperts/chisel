@@ -382,5 +382,17 @@ fn removed_key_stays_revoked_after_the_winning_slot_is_torn() {
                  key-slot table survived in a sibling"
             ),
         }
+
+        // The other half, and it is not redundant with the `Err(other)` arm
+        // above: a defect that made EVERY key fail with InvalidEncryptionKey —
+        // a scrub that writes a garbage slot table, say — would satisfy the
+        // match and still have bricked the database. Revocation must not be
+        // achieved by denying everyone.
+        let db =
+            Chisel::open(&path2, Options::default().encryption_key(raw(2))).unwrap_or_else(|e| {
+                panic!("slot {slot} torn: the surviving key must still open: {e:?}")
+            });
+        assert!(!db.is_poisoned());
+        db.close().unwrap();
     }
 }

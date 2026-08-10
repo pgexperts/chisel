@@ -11,7 +11,10 @@
 //! picks the highest-txn_counter slot with a valid checksum, so the old
 //! key-slot table is intact and the operation is simply lost. A crash between
 //! the two fsyncs leaves the revocation durable but a sibling still carrying
-//! the revoked credential's wrapped DEK — cleared by the next key operation.
+//! the revoked credential's wrapped DEK — cleared by the next key operation,
+//! or by the next ordinary data commit that rotates onto that slot (commit
+//! writes the live `crypto_header` into every superblock it publishes, so with
+//! N=2 the un-scrubbed sibling is the very next commit's target).
 //!
 //! That first fsync is a BARRIER and is load-bearing, not decorative: without
 //! it all N slot writes are in flight at once and a crash can tear every one of
@@ -168,8 +171,8 @@ impl TransactionManager {
         // strict maximum counter before any sibling is touched — so every
         // sibling is expendable from here on and all N-1 may share the single
         // trailing fsync. A crash mid-scrub leaves an un-scrubbed sibling
-        // (recoverable: the next key operation clears it, and the revocation
-        // itself is already durable), never an unopenable file.
+        // (recoverable: the next commit or key operation clears it, and the
+        // revocation itself is already durable), never an unopenable file.
         {
             use crate::crypto::ENC_PAGE_SIZE;
             let mut unit = [0u8; ENC_PAGE_SIZE];
@@ -645,10 +648,13 @@ mod tests {
 
     /// Pin the fsync COUNT, so the barrier cannot be deleted silently.
     ///
-    /// The two index-targeted tests above do not uniquely pin it: with the
-    /// barrier removed, `FailFsync(1)` simply lands on the scrub fsync instead
-    /// and still poisons. Only the count says "there are exactly three, and the
-    /// middle one is the barrier that makes writing N slots safe".
+    /// The index-targeted tests above do catch barrier removal, but only
+    /// obliquely and only half of them do: with the barrier gone,
+    /// `FailFsync(1)` lands on the scrub fsync and still poisons (that test
+    /// passes), while `FailFsync(2)` never fires at all and its test fails with
+    /// "got Ok(())" — a message that points nowhere near the real cause. This
+    /// test says the actual thing: there are exactly three fsyncs, and the
+    /// middle one is the barrier that makes writing N slots safe.
     ///
     /// If this fails because you added an fsync, that is fine — update the
     /// number and the list. If it fails because you REMOVED the barrier, read
