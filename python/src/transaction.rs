@@ -56,6 +56,41 @@ pub struct PyTransaction {
 }
 
 impl PyTransaction {
+    /// PYTHON-1 (issue #105): the one-shot liveness guard, checked by every
+    /// data method as well as by commit/rollback.
+    ///
+    /// It used to be checked ONLY by commit() and rollback(). Every one of the
+    /// 20 data methods delegated straight through to `PyChisel`, which has no
+    /// notion of WHICH transaction object is asking — `PyTransaction` is
+    /// deliberately stateless (it carries no transaction identity, only a
+    /// `Py<PyChisel>`), so a finished wrapper is indistinguishable from a live
+    /// one and simply re-binds to whatever transaction the engine has open now.
+    ///
+    /// Reproduced against the installed extension:
+    ///
+    ///     tx1 = db.transaction(); tx1.commit()
+    ///     with db.transaction() as tx2:
+    ///         tx1.allocate(b'leaked-into-tx2')   # succeeded
+    ///
+    /// The write committed with tx2's work. A stale handle held past its block
+    /// silently injected writes into an unrelated unit of work, and the caller
+    /// only learned anything was wrong if they later called tx1.rollback() —
+    /// long after the data had landed in the wrong transaction.
+    ///
+    /// The guard covers the READ methods too, not just the mutators. The read
+    /// direction is the same defect: `tx1.read(h)` after tx1 finished does not
+    /// read tx1's snapshot, it reads whatever the engine currently holds,
+    /// including another transaction's uncommitted writes. A uniform "a
+    /// finished Transaction is dead" rule is also the only one that is easy to
+    /// state and to test; nothing is lost, since every read-only method also
+    /// exists on `Chisel` itself.
+    fn check_live(&self) -> PyResult<()> {
+        if self.finished.load(Ordering::SeqCst) {
+            return Err(already_finished_err());
+        }
+        Ok(())
+    }
+
     pub fn new(db: Py<PyChisel>) -> Self {
         Self {
             db,
@@ -114,9 +149,7 @@ impl PyTransaction {
     // Raises AlreadyFinishedError if called a second time (after
     // another commit, a rollback, or a __exit__ has already run).
     fn commit(&self, py: Python<'_>) -> PyResult<()> {
-        if self.finished.load(Ordering::SeqCst) {
-            return Err(already_finished_err());
-        }
+        self.check_live()?;
         self.finished.store(true, Ordering::SeqCst);
         self.db.bind(py).borrow().commit()
     }
@@ -125,14 +158,13 @@ impl PyTransaction {
     // when a user wants to abort a transaction manually without raising
     // an exception through the enclosing `with` block.
     fn rollback(&self, py: Python<'_>) -> PyResult<()> {
-        if self.finished.load(Ordering::SeqCst) {
-            return Err(already_finished_err());
-        }
+        self.check_live()?;
         self.finished.store(true, Ordering::SeqCst);
         self.db.bind(py).borrow().rollback()
     }
 
     fn allocate(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<u64> {
+        self.check_live()?;
         self.db.bind(py).borrow().allocate(value)
     }
 
@@ -141,75 +173,93 @@ impl PyTransaction {
         py: Python<'py>,
         handle: u64,
     ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        self.check_live()?;
         self.db.bind(py).borrow().read(py, handle)
     }
 
     fn update(&self, py: Python<'_>, handle: u64, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.check_live()?;
         self.db.bind(py).borrow().update(handle, value)
     }
 
     fn delete(&self, py: Python<'_>, handle: u64) -> PyResult<()> {
+        self.check_live()?;
         self.db.bind(py).borrow().delete(handle)
     }
 
     fn delete_many(&self, py: Python<'_>, handles: Vec<u64>) -> PyResult<()> {
+        self.check_live()?;
         self.db.bind(py).borrow().delete_many(handles)
     }
 
     fn allocate_tagged(&self, py: Python<'_>, value: &Bound<'_, PyAny>, tag: u32) -> PyResult<u64> {
+        self.check_live()?;
         self.db.bind(py).borrow().allocate_tagged(value, tag)
     }
 
     fn tag(&self, py: Python<'_>, handle: u64) -> PyResult<Option<u32>> {
+        self.check_live()?;
         self.db.bind(py).borrow().tag(handle)
     }
 
     fn client_byte(&self, py: Python<'_>, handle: u64) -> PyResult<u8> {
+        self.check_live()?;
         self.db.bind(py).borrow().client_byte(handle)
     }
 
     fn set_client_byte(&self, py: Python<'_>, handle: u64, byte: u8) -> PyResult<()> {
+        self.check_live()?;
         self.db.bind(py).borrow().set_client_byte(handle, byte)
     }
 
     fn handles_with_tag(&self, py: Python<'_>, tag: u32) -> PyResult<Vec<u64>> {
+        self.check_live()?;
         self.db.bind(py).borrow().handles_with_tag(tag)
     }
 
     fn delete_tagged(&self, py: Python<'_>, handle: u64, tag: u32) -> PyResult<()> {
+        self.check_live()?;
         self.db.bind(py).borrow().delete_tagged(handle, tag)
     }
 
     fn delete_with_tag(&self, py: Python<'_>, tag: u32, max: usize) -> PyResult<(Vec<u64>, bool)> {
+        self.check_live()?;
         self.db.bind(py).borrow().delete_with_tag(tag, max)
     }
 
     fn set_root_name(&self, py: Python<'_>, name: &str, handle: u64) -> PyResult<()> {
+        self.check_live()?;
         self.db.bind(py).borrow().set_root_name(name, handle)
     }
 
     fn get_root_name(&self, py: Python<'_>, name: &str) -> PyResult<Option<u64>> {
+        self.check_live()?;
         self.db.bind(py).borrow().get_root_name(name)
     }
 
     fn clear_root_name(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        self.check_live()?;
         self.db.bind(py).borrow().clear_root_name(name)
     }
 
     fn handles(&self, py: Python<'_>) -> PyResult<Vec<u64>> {
+        self.check_live()?;
         self.db.bind(py).borrow().handles()
     }
 
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.check_live()?;
         self.db.bind(py).borrow().stats(py)
     }
 
     fn counters(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.check_live()?;
         self.db.bind(py).borrow().counters(py)
     }
 
     #[pyo3(signature = (options=None))]
     fn defrag(&self, py: Python<'_>, options: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
+        self.check_live()?;
         self.db.bind(py).borrow().defrag(py, options)
     }
 
@@ -219,6 +269,7 @@ impl PyTransaction {
     // objects route through PyChisel, and the engine rejects
     // savepoint ops outside an active transaction.
     fn savepoint(&self, py: Python<'_>, name: &str) -> PyResult<Py<crate::savepoint::PySavepoint>> {
+        self.check_live()?;
         self.db.bind(py).borrow().savepoint_internal(name)?;
         Py::new(
             py,

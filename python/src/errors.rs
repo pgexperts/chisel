@@ -78,10 +78,26 @@ static IO_ERROR_CLASS: OnceLock<Py<PyType>> = OnceLock::new();
 /// Build the `IoError` class with bases `(FatalError, OSError)`. The MRO is
 /// consistent (C3 succeeds): FatalError's chain (ChiselError -> Exception) and
 /// OSError's chain (Exception) share only Exception/BaseException as a tail.
+/// PYTHON-7 (issue #105): `__module__` must be the DOTTED path
+/// `chisel._chisel`, not the bare `_chisel`. maturin installs the extension as
+/// a SUBMODULE (`module-name = "chisel._chisel"` in pyproject.toml), so
+/// `_chisel` is not importable on its own — and pickle resolves an exception
+/// class by importing `__module__` and looking up `__name__` there. With the
+/// bare name, `pickle.dumps(chisel.PoisonedError('x'))` raised
+/// `PicklingError: import of module '_chisel' failed`.
+///
+/// That matters beyond cosmetics: an exception raised in a
+/// ProcessPoolExecutor / multiprocessing worker is pickled to be re-raised in
+/// the parent, so the original ChiselError was being replaced by a
+/// PicklingError — destroying the two-tier operational/fatal contract exactly
+/// where it matters most, a background writer reporting a FatalError.
+///
+/// The `#[pyclass]` types (Chisel, PyTransaction, ...) always had this right
+/// via an explicit `module = "chisel._chisel"`; only the exceptions did not.
 fn build_io_error_class<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyType>> {
     let bases = (py.get_type::<FatalError>(), py.get_type::<PyOSError>());
     let namespace = PyDict::new(py);
-    namespace.set_item("__module__", "_chisel")?;
+    namespace.set_item("__module__", "chisel._chisel")?;
     namespace.set_item(
         "__doc__",
         "Fatal I/O error. Subclasses both chisel.FatalError and the builtin \
@@ -95,21 +111,29 @@ fn build_io_error_class<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyType>> {
         .map_err(PyErr::from)
 }
 
-create_exception!(_chisel, ChiselError, PyException);
-create_exception!(_chisel, OperationalError, ChiselError);
-create_exception!(_chisel, FatalError, ChiselError);
+create_exception!(chisel._chisel, ChiselError, PyException);
+create_exception!(chisel._chisel, OperationalError, ChiselError);
+create_exception!(chisel._chisel, FatalError, ChiselError);
 
 // Operational
-create_exception!(_chisel, InvalidHandleError, OperationalError);
-create_exception!(_chisel, NoActiveTransactionError, OperationalError);
-create_exception!(_chisel, TransactionAlreadyActiveError, OperationalError);
-create_exception!(_chisel, SavepointNotFoundError, OperationalError);
-create_exception!(_chisel, DuplicateSavepointError, OperationalError);
-create_exception!(_chisel, ReadOnlyModeError, OperationalError);
-create_exception!(_chisel, DatabaseFileNotFoundError, OperationalError);
-create_exception!(_chisel, InvalidRootNameError, OperationalError);
-create_exception!(_chisel, RootNameTableFullError, OperationalError);
-create_exception!(_chisel, InvalidSuperblockCountError, OperationalError);
+create_exception!(chisel._chisel, InvalidHandleError, OperationalError);
+create_exception!(chisel._chisel, NoActiveTransactionError, OperationalError);
+create_exception!(
+    chisel._chisel,
+    TransactionAlreadyActiveError,
+    OperationalError
+);
+create_exception!(chisel._chisel, SavepointNotFoundError, OperationalError);
+create_exception!(chisel._chisel, DuplicateSavepointError, OperationalError);
+create_exception!(chisel._chisel, ReadOnlyModeError, OperationalError);
+create_exception!(chisel._chisel, DatabaseFileNotFoundError, OperationalError);
+create_exception!(chisel._chisel, InvalidRootNameError, OperationalError);
+create_exception!(chisel._chisel, RootNameTableFullError, OperationalError);
+create_exception!(
+    chisel._chisel,
+    InvalidSuperblockCountError,
+    OperationalError
+);
 // PUBLIC-API-8 (issue #106): Options.argon2_params carries cost values the
 // KDF cannot use. Raised before the file is touched, so it is never a
 // credential failure — the Rust variant it maps to used to surface as
@@ -123,49 +147,63 @@ create_exception!(_chisel, InvalidSuperblockCountError, OperationalError);
 // variants by `is_fatal()` alone, so a missing arm is not a compile error
 // here, just a silent downgrade to the generic OperationalError. Wiring an
 // `argon2_params` kwarg later then needs no error-plumbing work.
-create_exception!(_chisel, InvalidArgon2ParamsError, OperationalError);
-create_exception!(_chisel, CacheFullError, OperationalError);
+create_exception!(chisel._chisel, InvalidArgon2ParamsError, OperationalError);
+create_exception!(chisel._chisel, CacheFullError, OperationalError);
 // Byte-budget analogue of CacheFull: raised when the spillway sidecar's
 // byte limit is reached during a transaction. Database intact; commit or
 // roll back to drain the spillway and resume normal operation.
-create_exception!(_chisel, SpillwayFullError, OperationalError);
+create_exception!(chisel._chisel, SpillwayFullError, OperationalError);
 // Raised when a configuration mutator is called while a transaction is
 // active. Analogous to TransactionAlreadyActiveError — both are
 // operational "wrong state" errors; the database is unharmed.
-create_exception!(_chisel, TransactionInProgressError, OperationalError);
+create_exception!(chisel._chisel, TransactionInProgressError, OperationalError);
 // Raised by delete_tagged when the caller supplies a tag that does not
 // match the handle's stored tag. The chunk and membership index are
 // left unmodified — the mismatch is purely a caller error, not a
 // data-integrity problem.
-create_exception!(_chisel, TagMismatchError, OperationalError);
+create_exception!(chisel._chisel, TagMismatchError, OperationalError);
 // Encryption-related operational errors: the database is intact; the caller
 // supplied wrong or missing key material. All three have is_fatal() = false.
 // NoEncryptionKey: encrypted DB opened without an encryption_key argument.
-create_exception!(_chisel, NoEncryptionKeyError, OperationalError);
+create_exception!(chisel._chisel, NoEncryptionKeyError, OperationalError);
 // InvalidEncryptionKey: encryption_key was supplied but unwraps no key slot
 // (wrong passphrase or wrong raw bytes).
-create_exception!(_chisel, InvalidEncryptionKeyError, OperationalError);
+create_exception!(chisel._chisel, InvalidEncryptionKeyError, OperationalError);
 // EncryptionNotSupported: encryption_key was supplied but the DB is plaintext.
-create_exception!(_chisel, EncryptionNotSupportedError, OperationalError);
+create_exception!(
+    chisel._chisel,
+    EncryptionNotSupportedError,
+    OperationalError
+);
 // NoFreeKeySlot: add_key/rotate_key attempted but the 8-slot key table is full.
-create_exception!(_chisel, NoFreeKeySlotError, OperationalError);
+create_exception!(chisel._chisel, NoFreeKeySlotError, OperationalError);
 // LastKeySlot: remove_key would leave the DB with no active key — rejected.
-create_exception!(_chisel, LastKeySlotError, OperationalError);
+create_exception!(chisel._chisel, LastKeySlotError, OperationalError);
 // ISSUES.md I25: raised by PyChisel's with_inner_io/with_inner_mut_io
 // helpers when `inner` has been cleared by a prior close(). Distinct
 // from PoisonedError because close() is a user action — the DB file
 // is intact, only this handle is done. Typical repro: close() inside
 // an enclosing `with db.transaction()` block — the __exit__ tries to
 // commit and surfaces this instead of PoisonedError.
-create_exception!(_chisel, ClosedError, OperationalError);
-// ISSUES.md I22/I24: raised when an explicit `.commit()` / `.rollback()` /
-// `.release()` / `.rollback_to()` is called a second time on a
-// PyTransaction or PySavepoint whose one-shot `finished` guard is
-// already set. Pre-I22 these calls silently succeeded; returning an
-// explicit error makes "called the wrong object" bugs visible. Note
-// that the __exit__ path is still idempotent (the guard short-
-// circuits without raising) so context-manager usage is unaffected.
-create_exception!(_chisel, AlreadyFinishedError, OperationalError);
+create_exception!(chisel._chisel, ClosedError, OperationalError);
+// ISSUES.md I22/I24: raised when a PyTransaction or PySavepoint whose
+// one-shot `finished` guard is already set is driven again. Pre-I22 these
+// calls silently succeeded; returning an explicit error makes "called the
+// wrong object" bugs visible. The __exit__ path stays idempotent (the guard
+// short-circuits without raising), so context-manager usage is unaffected.
+//
+// What sets the guard: `.commit()` / `.rollback()` on a transaction,
+// `.release()` on a savepoint, and `__exit__` on either. `.rollback_to()`
+// does NOT — it is repeatable (PYTHON-3, issue #105), matching the engine,
+// which deliberately keeps the mark on the stack. It still CHECKS the guard,
+// so a rollback_to after a release raises this rather than reaching the
+// engine and coming back as SavepointNotFound.
+//
+// PYTHON-1 (issue #105): a transaction's ~20 DATA methods now check the guard
+// too, not just commit/rollback. They used to delegate unconditionally, so a
+// finished `tx` object wrote into whatever transaction happened to be open —
+// the guard's stated purpose, defeated on precisely the methods that mutate.
+create_exception!(chisel._chisel, AlreadyFinishedError, OperationalError);
 
 // Fatal — matches ChiselError::is_fatal() in src/error.rs, plus PoisonedError:
 // it is a FatalError subclass (a drop-and-reopen condition for the caller) even
@@ -175,16 +213,16 @@ create_exception!(_chisel, AlreadyFinishedError, OperationalError);
 // built in `register` via `build_io_error_class` / cached in `IO_ERROR_CLASS`.
 // DecryptionFailed: a page-read failed MAC verification after a successful open.
 // is_fatal() = true — data integrity cannot be confirmed; treat as poison.
-create_exception!(_chisel, DecryptionFailedError, FatalError);
-create_exception!(_chisel, ChecksumMismatchError, FatalError);
-create_exception!(_chisel, CorruptSuperblockError, FatalError);
-create_exception!(_chisel, FileSizeMismatchError, FatalError);
-create_exception!(_chisel, LockFailedError, FatalError);
-create_exception!(_chisel, UnsupportedFormatVersionError, FatalError);
-create_exception!(_chisel, UnsupportedPageSizeError, FatalError);
-create_exception!(_chisel, CorruptPageError, FatalError);
-create_exception!(_chisel, InvalidPageIdError, FatalError);
-create_exception!(_chisel, PoisonedError, FatalError);
+create_exception!(chisel._chisel, DecryptionFailedError, FatalError);
+create_exception!(chisel._chisel, ChecksumMismatchError, FatalError);
+create_exception!(chisel._chisel, CorruptSuperblockError, FatalError);
+create_exception!(chisel._chisel, FileSizeMismatchError, FatalError);
+create_exception!(chisel._chisel, LockFailedError, FatalError);
+create_exception!(chisel._chisel, UnsupportedFormatVersionError, FatalError);
+create_exception!(chisel._chisel, UnsupportedPageSizeError, FatalError);
+create_exception!(chisel._chisel, CorruptPageError, FatalError);
+create_exception!(chisel._chisel, InvalidPageIdError, FatalError);
+create_exception!(chisel._chisel, PoisonedError, FatalError);
 
 // Manually register each exception class on the module. `create_exception!`
 // creates the type but does NOT attach it to the module; `m.add` does

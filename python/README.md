@@ -96,8 +96,9 @@ with db.transaction() as tx:
 ```
 
 - `sp.release()` flattens the savepoint into the enclosing scope; any savepoints layered on top are also released.
-- `sp.rollback_to()` undoes changes back to the savepoint and leaves it on the stack so you can try again.
-- A second explicit `.release()` or `.rollback_to()` raises `AlreadyFinishedError`.
+- `sp.rollback_to()` undoes changes back to the savepoint and leaves it on the stack so you can try again. It is **repeatable** — call it as often as you like while the savepoint is open. Only `.release()` finishes the object.
+- A second `.release()`, or a `.rollback_to()` after a `.release()`, raises `AlreadyFinishedError`.
+- While the savepoint is still open, `tx.savepoint()` with the same name raises `DuplicateSavepointError`. The name frees up once the savepoint is released — which `__exit__` does on clean exit, including when the body called `.rollback_to()`.
 - `sp.name` is a read-only attribute returning the savepoint's name — useful for logging or debugging mid-transaction.
 
 ## Values (buffer protocol)

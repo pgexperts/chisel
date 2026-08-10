@@ -171,3 +171,51 @@ def test_non_io_error_does_not_carry_errno(tmp_db):
     # class in future, but today it should be absent from non-IoError.
     assert not hasattr(e, "kind"), \
         f"unexpected .kind attribute on {type(e).__name__}"
+
+
+# --- PYTHON-7 (issue #105): exception classes must be importable ------------
+#
+# Every binding exception was declared with `create_exception!(_chisel, ...)`,
+# which sets __module__ to the bare "_chisel". maturin installs the extension
+# as the SUBMODULE chisel._chisel, so "_chisel" is not importable, and pickle
+# resolves an exception class by importing __module__ and looking up __name__
+# there. An exception raised in a ProcessPoolExecutor / multiprocessing worker
+# is pickled to be re-raised in the parent, so the original ChiselError was
+# being replaced by a PicklingError — destroying the two-tier
+# operational/fatal contract exactly where it matters most.
+
+import importlib
+import pickle
+
+_EXCEPTION_CLASSES = sorted(
+    name
+    for name in chisel.__all__
+    if isinstance(getattr(chisel, name, None), type)
+    and issubclass(getattr(chisel, name), Exception)
+)
+
+
+def test_there_are_exception_classes_to_check():
+    # Guard the guard: if __all__ or the filter above ever stops matching,
+    # the two parametrized tests would silently become no-ops.
+    assert len(_EXCEPTION_CLASSES) > 20, _EXCEPTION_CLASSES
+
+
+@pytest.mark.parametrize("cls_name", _EXCEPTION_CLASSES)
+def test_exception_module_is_importable(cls_name):
+    cls = getattr(chisel, cls_name)
+    assert cls.__module__ == "chisel._chisel", (
+        f"{cls_name}.__module__ is {cls.__module__!r}, which is not importable"
+    )
+    # The assertion that makes this a real test rather than a string compare:
+    # the class must actually be findable at that path, which is precisely
+    # what pickle does.
+    mod = importlib.import_module(cls.__module__)
+    assert getattr(mod, cls.__name__) is cls
+
+
+@pytest.mark.parametrize("cls_name", _EXCEPTION_CLASSES)
+def test_exceptions_pickle_roundtrip(cls_name):
+    cls = getattr(chisel, cls_name)
+    revived = pickle.loads(pickle.dumps(cls("boom")))
+    assert type(revived) is cls

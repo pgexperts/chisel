@@ -83,8 +83,9 @@ impl PySavepoint {
     }
 
     // Explicit release(): raises AlreadyFinishedError on a second
-    // call (including after __exit__ has run, or after an earlier
-    // rollback_to). Pre-I22 this was a silent no-op; that masked
+    // call (including after __exit__ has run). Note an earlier `rollback_to`
+    // does NOT finish the savepoint — see rollback_to below.
+    // Pre-I22 this was a silent no-op; that masked
     // "called release() on the wrong sp object" bugs. The __exit__
     // path itself stays idempotent (guard short-circuits without
     // raising), so normal context-manager usage is unaffected.
@@ -96,33 +97,38 @@ impl PySavepoint {
         self.db.bind(py).borrow().release_internal(&self.name)
     }
 
-    // Explicit rollback_to(): same idempotency-as-error policy as
-    // release(). Note that the engine does NOT remove this savepoint —
-    // `rollback_to_inner` ends with `savepoints.truncate(idx + 1)`, which
-    // pops only the savepoints layered ON TOP and deliberately retains
-    // this one so it can be rolled back to again or released
-    // (src/transaction/savepoints.rs:47-49). So a second engine-level
-    // rollback_to would SUCCEED, not fail with SavepointNotFound.
+    // Explicit rollback_to(): REPEATABLE. It CHECKS `finished` but does not
+    // SET it, and that asymmetry is the whole point (PYTHON-3, issue #105).
     //
-    // The guard is therefore load-bearing, not a re-labelling of an error
-    // the engine would raise anyway: it is the only thing enforcing the
-    // Python contract that a Savepoint object is single-use, which is what
-    // makes `with`-block exit and an explicit call unambiguous. Removing it
-    // would silently turn repeated rollback_to into a working operation.
+    // The engine deliberately keeps the mark: `rollback_to_inner` ends with
+    // `savepoints.truncate(idx + 1)`, popping only the savepoints layered on
+    // top, and its doc says so outright — "The named savepoint itself remains
+    // on the stack and can be rolled back to again or released." Setting
+    // `finished` here made the binding strictly MORE restrictive than the
+    // engine, and, because `__exit__` short-circuits on the same flag, it also
+    // leaked the mark: a savepoint whose body called rollback_to was never
+    // released, so its name stayed taken for the rest of the transaction and
+    // `tx.savepoint(same_name)` raised DuplicateSavepointError. An engine
+    // capability the engine documents was unreachable from Python, and the
+    // name was burned with no operation able to free it — release() was
+    // blocked by this guard and re-creation by the engine.
+    //
+    // The retained `load` check is NOT vestigial: it is what makes
+    // `sp.release(); sp.rollback_to()` raise AlreadyFinishedError instead of
+    // reaching the engine and getting SavepointNotFound, which would report a
+    // wrong-object bug as a missing-savepoint bug.
     fn rollback_to(&self, py: Python<'_>) -> PyResult<()> {
         if self.finished.load(Ordering::SeqCst) {
             return Err(already_finished_err());
         }
-        self.finished.store(true, Ordering::SeqCst);
         self.db.bind(py).borrow().rollback_to_internal(&self.name)
     }
 }
 
-// Used by both explicit release() and explicit rollback_to(). Phrased
-// generically ("savepoint already finished") so the same message works
-// whether the prior finish was a release, a rollback_to, or a __exit__.
+// Raised when a Savepoint object is driven after it has been RELEASED —
+// explicitly, or by `__exit__`. `rollback_to` no longer finishes a savepoint
+// (PYTHON-3), so "released" is now the accurate word: a rolled-back-to
+// savepoint is still live and can be rolled back to again.
 fn already_finished_err() -> PyErr {
-    crate::errors::AlreadyFinishedError::new_err(
-        "savepoint already finished (released or rolled back)",
-    )
+    crate::errors::AlreadyFinishedError::new_err("savepoint already released")
 }

@@ -41,7 +41,7 @@ def test_explicit_savepoint_methods(mem_db):
         sp = tx.savepoint("manual")
         tx.allocate(b"b")
         sp.rollback_to()
-        # After rollback_to, the savepoint is consumed
+        # After rollback_to the savepoint is still OPEN; __exit__ releases it.
     assert mem_db.handles() == [h1]
 
 
@@ -63,15 +63,55 @@ def test_savepoint_second_release_raises(mem_db):
             sp.release()
 
 
-def test_savepoint_second_rollback_to_raises(mem_db):
-    # I22: same idempotency-as-error rule as release().
+def test_rollback_to_is_repeatable(mem_db):
+    """PYTHON-3 (issue #105): rollback_to does NOT consume the savepoint.
+
+    This test replaces test_savepoint_second_rollback_to_raises, which asserted
+    the opposite. The engine deliberately keeps the mark on the stack
+    (`savepoints.truncate(idx + 1)`) so it "can be rolled back to again or
+    released"; the binding's guard made that engine capability unreachable from
+    Python and contradicted the README in the same bullet list.
+    """
     with mem_db.transaction() as tx:
-        tx.allocate(b"before")
-        sp = tx.savepoint("once")
-        tx.allocate(b"after")
+        keep = tx.allocate(b"before")
+        sp = tx.savepoint("retry")
+
+        tx.allocate(b"attempt 1")
         sp.rollback_to()
+        tx.allocate(b"attempt 2")
+        sp.rollback_to()  # must not raise
+
+        sp.release()
+    assert mem_db.handles() == [keep]
+
+
+def test_rollback_to_after_release_raises(mem_db):
+    """The guard is still CHECKED by rollback_to, just no longer SET by it.
+
+    Without the retained check, this call would reach the engine and come back
+    as SavepointNotFound — reporting a wrong-object bug as a missing-savepoint
+    bug.
+    """
+    with mem_db.transaction() as tx:
+        sp = tx.savepoint("once")
+        sp.release()
         with pytest.raises(chisel.AlreadyFinishedError):
             sp.rollback_to()
+
+
+def test_scope_exit_releases_after_explicit_rollback_to(mem_db):
+    """The half that leaked: __exit__ short-circuited on the same flag.
+
+    A savepoint whose body called rollback_to was never released, so its name
+    stayed taken for the rest of the transaction with no operation able to free
+    it — release() was blocked by the Python guard and re-creation by the
+    engine's duplicate check.
+    """
+    with mem_db.transaction() as tx:
+        with tx.savepoint("s") as sp:
+            sp.rollback_to()
+        # Name must be free again now that __exit__ released it.
+        tx.savepoint("s")
 
 
 def test_savepoint_explicit_then_with_exit_is_silent(mem_db):
