@@ -11,7 +11,16 @@
 //
 //   2. Reclamation throughput. Pages freed in one commit are reusable in the
 //      next. This bench measures the page count before and after a churn
-//      cycle, reported via Criterion throughput annotations and the aux file.
+//      cycle, reported via Criterion throughput annotations.
+//
+// NOTE ON WHAT IS ACTUALLY REPORTED: only Criterion's wall-clock timings and
+// throughput annotations. This file writes NO aux metrics — it constructs no
+// `AuxMetricsWriter` (only micro_grid.rs does), and the `file_size_bytes` /
+// `pages_allocated` values it reads are `black_box`'d and discarded. Three
+// comments here used to claim otherwise; they are corrected in place below.
+// Wiring up an aux writer so the flat-high-water and reclamation numbers are
+// genuinely trend-tracked is real work, and worth doing — but until it is
+// done, this file must not say it has been.
 //
 // Why public-API rather than freemap_tree internals:
 //   `FreeMapTree`, `PageCache`, and the structural allocator are all
@@ -78,9 +87,15 @@ fn populate(db: &mut Chisel, count: usize, size: usize) -> Vec<chisel::Handle> {
 
 /// One churn cycle: delete all `handles`, commit, reallocate the same count at
 /// `size` bytes each, commit. Returns the new handle list.
-/// Each cycle is ONE delete-commit + ONE allocate-commit = 2 commits = 6 fsyncs
-/// (in-memory: 6 no-op fsyncs). The freemap tree sees `count` frees in the
-/// first commit and `count` reuses in the second.
+/// Each cycle is ONE delete-commit + ONE allocate-commit = 2 commits = 6 fsyncs.
+/// Whether those fsyncs cost anything depends on the CALLER's engine, not on
+/// this function: group 1 runs against `open_in_memory_with_options`, whose
+/// backing `Vec<u8>` makes each fsync a counted no-op (see
+/// `page_io::tests::fsync_count_in_memory_backing_also_increments`); groups 2
+/// and 3 run against a real file and pay a real fsync (`F_FULLFSYNC` on macOS,
+/// plain `fsync` on Linux — see `PageIo::fsync`; the dedicated bench machine
+/// and CI both run Linux). The freemap tree
+/// sees `count` frees in the first commit and `count` reuses in the second.
 fn churn_cycle(db: &mut Chisel, handles: Vec<chisel::Handle>, size: usize) -> Vec<chisel::Handle> {
     let count = handles.len();
     let payload = vec![0u8; size];
@@ -115,15 +130,17 @@ fn churn_cycle(db: &mut Chisel, handles: Vec<chisel::Handle>, size: usize) -> Ve
 ///
 /// Measures the cost of `cycles` delete/realloc commit pairs at a fixed live
 /// size. The throughput unit is "delete+realloc round-trips per second"
-/// (one round-trip = 2 commits). The bench body is inside `iter_custom` so
-/// we can record file-size measurements around the measured segment and
-/// report them separately (see the comment in aux_bench below).
+/// (one round-trip = 2 commits). The bench body is inside `iter_batched` so
+/// each Criterion sample gets a freshly populated, warmed engine and the
+/// setup cost stays outside the measured segment.
 ///
 /// The flat-high-water property: `file_size_bytes` at the end of the last
 /// cycle should be <= `file_size_bytes` at the end of the warm-up cycle.
 /// This bench does NOT assert that numerically — assertions on raw bench
-/// numbers are explicitly forbidden by project conventions. It is captured
-/// in the aux file for trend-tracking.
+/// numbers are explicitly forbidden by project conventions. It does not
+/// record it either: the value is `black_box`'d to keep the optimizer honest
+/// and then dropped. Observing the property today means reading the timings
+/// and running the engine by hand; see the module note above.
 fn bench_delete_churn_flat(c: &mut Criterion) {
     // (live_count, size_bytes, label)
     let cases: &[(usize, usize, &str)] = &[
@@ -144,12 +161,20 @@ fn bench_delete_churn_flat(c: &mut Criterion) {
             // starts from a clean warm state.
             b.iter_batched(
                 || {
-                    // Use a tempfile-backed engine since in-memory
-                    // Vec<u8> opens need special handling in Chisel.
-                    let tf = NamedTempFile::new().expect("tempfile");
+                    // Genuinely in-memory, matching the `in-memory` benchmark
+                    // id above. This used to open a NamedTempFile on the stated
+                    // grounds that "in-memory / Vec<u8> opens need special
+                    // handling in Chisel" — which was never true;
+                    // `open_in_memory_with_options` is public and is what
+                    // bench/src/chisel_engine.rs's own in-memory constructor
+                    // calls. The consequence was that the Criterion row named
+                    // `freemap-churn-flat/in-memory/...` carried real page
+                    // writes and real fsync cost, i.e. exactly the fsync tax
+                    // the in-memory mode exists to exclude, while group 2
+                    // below (which IS file-backed) looked like the only
+                    // file-touching group.
                     let cache_bytes = CACHE_PAGES as u64 * PAGE_SIZE as u64;
-                    let mut db = Chisel::open(
-                        tf.path(),
+                    let mut db = Chisel::open_in_memory_with_options(
                         Options::default()
                             .cache_max_bytes(cache_bytes)
                             .spillway_max_bytes(cache_bytes * 1024),
@@ -159,9 +184,9 @@ fn bench_delete_churn_flat(c: &mut Criterion) {
                     // Warm-up: one churn cycle BEFORE the timed segment so the
                     // freemap structural recycle pool is primed (steady state).
                     let handles = churn_cycle(&mut db, handles, size_bytes);
-                    (db, handles, tf)
+                    (db, handles)
                 },
-                |(mut db, handles, _tf)| {
+                |(mut db, handles)| {
                     // Timed: one delete+realloc round-trip.
                     let new_handles = churn_cycle(&mut db, handles, size_bytes);
                     // black_box both engine and handles to prevent the
@@ -190,8 +215,11 @@ fn bench_delete_churn_flat(c: &mut Criterion) {
 /// `live_count` (extending for every new record). This is observable through
 /// the Chisel public counters API.
 ///
-/// Results go to bench/results/aux_metrics.jsonl via the AuxMetricsWriter
-/// pattern (report-only; trend-tracked, not gated).
+/// Report-only, and — like group 1 — NOT currently trend-tracked: the
+/// `pages_allocated` delta is `black_box`'d, not written anywhere. This used
+/// to claim results go to bench/results/aux_metrics.jsonl "via the
+/// AuxMetricsWriter pattern"; no `AuxMetricsWriter` is constructed in this
+/// file at all. See the module note at the top.
 fn bench_reclamation_pages_allocated(c: &mut Criterion) {
     let cases: &[(usize, usize, &str)] = &[(200, 256, "200x256B"), (100, 4096, "100x4KB")];
 

@@ -9,7 +9,7 @@
 // here; the COV computation and report rendering are in the
 // chisel_bench::noise_gate library module.
 
-use chisel_bench::noise_gate::report::{CellResult, GateResult};
+use chisel_bench::noise_gate::report::{CellResult, GateResult, MIN_SAMPLES_PER_CELL};
 use chisel_bench::noise_gate::{compute_cov, render_report};
 use clap::Parser;
 use std::collections::BTreeMap;
@@ -17,7 +17,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(name = "chisel-bench-noise-gate", version)]
 #[command(about = "Runs the scenario tier N times and reports per-cell COV")]
 struct Cli {
@@ -29,8 +29,8 @@ struct Cli {
     #[arg(long)]
     instance_type: String,
 
-    /// Number of back-to-back runs.
-    #[arg(long, default_value = "5")]
+    /// Number of back-to-back runs (minimum 2 — a COV needs two samples).
+    #[arg(long, default_value = "5", value_parser = parse_runs)]
     runs: usize,
 
     /// Throughput COV threshold (fraction; 0.02 = 2%).
@@ -45,6 +45,35 @@ struct Cli {
     #[arg(long, default_value = "noise-gate-report.md")]
     out: PathBuf,
 }
+
+/// clap value parser for `--runs`. Refuses anything below
+/// `MIN_SAMPLES_PER_CELL` at argv-parse time rather than letting the run
+/// proceed to a vacuous verdict: `--runs 0` executes no benchmark and yields
+/// an empty cell set, and `--runs 1` yields cells whose COV is `compute_cov`'s
+/// N=1 placeholder 0.0, so every cell clears every threshold by construction.
+/// Both used to print "Noise gate PASSED" and exit 0 — on the one tool whose
+/// entire purpose is to refuse hardware that cannot hold a stable number.
+fn parse_runs(s: &str) -> Result<usize, String> {
+    let n: usize = s.parse().map_err(|_| {
+        format!("`{s}` is not a run count (expected a whole number that fits in a usize)")
+    })?;
+    if n < MIN_SAMPLES_PER_CELL {
+        return Err(format!(
+            "must be at least {MIN_SAMPLES_PER_CELL}; a coefficient of variation \
+             is undefined below {MIN_SAMPLES_PER_CELL} samples, so --runs {n} \
+             would qualify a machine on evidence that cannot detect noise"
+        ));
+    }
+    Ok(n)
+}
+
+/// One cell's identity: (scenario, engine, durability mode).
+type CellKey = (String, String, String);
+/// One observation of a cell: which run produced it, its throughput, its p99.
+/// The run index is carried so a cell's sample count can be the number of
+/// distinct RUNS that contributed, not the number of JSONL rows that mentioned
+/// it — see the collection site in `run`.
+type CellSample = (usize, f64, f64);
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -67,7 +96,12 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> Result<bool, Box<dyn std::error::Error>> {
     // Collect per-run cell metrics: keyed by (scenario, engine, mode).
-    let mut samples: BTreeMap<(String, String, String), Vec<(f64, f64)>> = BTreeMap::new();
+    // Tagged with the run index, not just appended: a cell's sample count must
+    // be how many RUNS contributed to it, not how many JSONL rows mentioned it.
+    // Counting rows would let a single run that emitted a cell twice look like
+    // two independent observations, which is exactly the "COV computed from no
+    // run-to-run variance" failure this gate exists to refuse.
+    let mut samples: BTreeMap<CellKey, Vec<CellSample>> = BTreeMap::new();
 
     for run_idx in 0..cli.runs {
         eprintln!("Run {} of {} ...", run_idx + 1, cli.runs);
@@ -139,7 +173,7 @@ fn run(cli: &Cli) -> Result<bool, Box<dyn std::error::Error>> {
             samples
                 .entry((scenario, engine, mode))
                 .or_default()
-                .push((throughput, p99_ns));
+                .push((run_idx, throughput, p99_ns));
         }
     }
 
@@ -147,16 +181,30 @@ fn run(cli: &Cli) -> Result<bool, Box<dyn std::error::Error>> {
     let cells: Vec<CellResult> = samples
         .into_iter()
         .map(|((scenario, engine, mode), pairs)| {
-            let throughput_samples: Vec<f64> = pairs.iter().map(|(t, _)| *t).collect();
-            let p99_samples: Vec<f64> = pairs.iter().map(|(_, p)| *p).collect();
+            let throughput_samples: Vec<f64> = pairs.iter().map(|(_, t, _)| *t).collect();
+            let p99_samples: Vec<f64> = pairs.iter().map(|(_, _, p)| *p).collect();
             let throughput = compute_cov(&throughput_samples);
             let p99_latency_ns = compute_cov(&p99_samples);
-            let passes = throughput.cov <= cli.throughput_threshold
+            // `--runs >= 2` is enforced at parse time, but a cell can still
+            // fall short of that: a scenario present in only some runs'
+            // metrics (a partially-written JSONL, a scenario list that
+            // changed mid-sweep) yields fewer samples than `cli.runs`. Such a
+            // cell must not pass on `compute_cov`'s N=1 placeholder 0.0.
+            //
+            // DISTINCT runs, not row count — see the `samples` map above.
+            let samples = pairs
+                .iter()
+                .map(|(run_idx, _, _)| *run_idx)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            let passes = samples >= MIN_SAMPLES_PER_CELL
+                && throughput.cov <= cli.throughput_threshold
                 && p99_latency_ns.cov <= cli.p99_threshold;
             CellResult {
                 scenario,
                 engine,
                 mode,
+                samples,
                 throughput,
                 p99_latency_ns,
                 passes,
@@ -177,4 +225,57 @@ fn run(cli: &Cli) -> Result<bool, Box<dyn std::error::Error>> {
     fs::write(&cli.out, report)?;
 
     Ok(result.all_pass())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── BENCH-10 (issue #109) ──
+    // `--runs 0` measured nothing and `--runs 1` measured no variance, and
+    // both exited 0 printing "Noise gate PASSED". Refusing at parse time is
+    // what keeps a machine from being qualified on non-evidence.
+
+    #[test]
+    fn parse_runs_rejects_zero_and_one() {
+        for bad in ["0", "1"] {
+            let err = parse_runs(bad).expect_err("--runs {bad} must be rejected");
+            assert!(
+                err.contains("at least 2"),
+                "error should name the floor, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_runs_accepts_two_and_above() {
+        assert_eq!(parse_runs("2").unwrap(), 2);
+        assert_eq!(parse_runs("5").unwrap(), 5);
+    }
+
+    #[test]
+    fn parse_runs_rejects_non_numeric() {
+        assert!(parse_runs("many").is_err());
+        assert!(parse_runs("-1").is_err());
+    }
+
+    #[test]
+    fn cli_rejects_runs_below_the_floor() {
+        // End-to-end through clap, so the wiring of `value_parser` is
+        // covered too — not just the bare function.
+        let err = Cli::try_parse_from([
+            "chisel-bench-noise-gate",
+            "--provider",
+            "hetzner",
+            "--instance-type",
+            "ccx23",
+            "--runs",
+            "1",
+        ])
+        .expect_err("clap must reject --runs 1");
+        assert!(
+            err.to_string().contains("at least 2"),
+            "clap error should carry the reason, got: {err}"
+        );
+    }
 }
