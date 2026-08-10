@@ -307,7 +307,7 @@ fn fatal_error_outside_commit_also_poisons() {
 fn rollback_truncates_cache_and_file_to_pre_txn_watermark() {
     let mut tm = fresh_manager();
     let pre_watermark = tm.cache.borrow().next_page_id();
-    let pre_file_pages = tm.cache.borrow_mut().file_page_count().unwrap();
+    let pre_file_pages = tm.cache.borrow_mut().file_page_count();
 
     tm.begin().unwrap();
     tm.allocate(b"seed").unwrap();
@@ -326,7 +326,7 @@ fn rollback_truncates_cache_and_file_to_pre_txn_watermark() {
     tm.rollback().unwrap();
 
     let post_watermark = tm.cache.borrow().next_page_id();
-    let post_file_pages = tm.cache.borrow_mut().file_page_count().unwrap();
+    let post_file_pages = tm.cache.borrow_mut().file_page_count();
     assert_eq!(
         post_watermark, pre_watermark,
         "rollback must rewind next_page_id to the pre-transaction watermark"

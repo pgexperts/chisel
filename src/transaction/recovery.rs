@@ -93,7 +93,9 @@ impl TransactionManager {
                 Some(cc) => {
                     // Encrypted: zero-pad the 8192-byte image into an 8232-byte
                     // unit (trailing 40 bytes stay zero) and write at the now-set
-                    // ENC_PAGE_SIZE stride. write_page would panic (stride assert).
+                    // ENC_PAGE_SIZE stride. write_page would reject this stride —
+                    // trips its debug_assert, and returns IoError from
+                    // write_page_unit in release.
                     let buf = sb.serialize_encrypted(&cc.page_cipher);
                     let mut unit = [0u8; crate::crypto::ENC_PAGE_SIZE];
                     unit[..buf.len()].copy_from_slice(&buf);
@@ -514,7 +516,7 @@ impl TransactionManager {
             cache.io_mut().force_read_only();
         }
 
-        let page_count = cache.io_mut().page_count()?;
+        let page_count = cache.io_mut().page_count();
         if page_count < sb.total_pages {
             // Stride-correct byte counts: encrypted DBs use ENC_PAGE_SIZE
             // (8232) for every page including superblock slots, so multiply by

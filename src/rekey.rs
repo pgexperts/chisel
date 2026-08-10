@@ -73,7 +73,7 @@ pub(crate) fn rekey(
     let (page_count, superblock_count, stride) = {
         let mut cache = db.txm.cache.borrow_mut();
         let io = cache.io_mut();
-        (io.page_count()?, db.txm.superblock_count, io.stride())
+        (io.page_count(), db.txm.superblock_count, io.stride())
     };
     debug_assert_eq!(stride, crate::crypto::ENC_PAGE_SIZE);
 

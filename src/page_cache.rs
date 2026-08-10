@@ -38,8 +38,20 @@
 //   before insertion; `new_page` evicts after insertion. When every page
 //   in the cache is dirty, `maybe_evict` spills the LRU-tail dirty page
 //   to the `Spillway` sidecar file rather than growing the cache.
-//   `spillway_max_bytes` caps the spillway file; `SpillwayFull` is the
-//   operational error if both cache and spillway are exhausted. With
+//   `spillway_max_bytes` caps the spillway's LIVE RESIDENT SET, not the
+//   sidecar file's length: `Spillway::spill` charges `slots.len() *
+//   payload_size`, while slot addressing runs off the monotonic
+//   `next_slot_index` write cursor that `forget` never decrements. File
+//   length is `next_slot_index * slot_size`, and the cursor advances once
+//   per spill of a page that is not CURRENTLY resident — so a spill →
+//   rehydrate (which calls `forget`, see load_page) → re-spill cycle burns
+//   a fresh slot every lap. Nothing bounds that but `truncate` at
+//   commit/rollback: a transaction whose working set exceeds `max_pages`
+//   can grow `<db>.spillway` arbitrarily without ever raising
+//   `SpillwayFull`. Size the volume from the expected spill CHURN of the
+//   longest transaction, not from `spillway_max_bytes` and not from the
+//   distinct-page count. `SpillwayFull` is the operational error if both
+//   cache and the live spillway set are exhausted. With
 //   `spillway_max_bytes = 0`, the spillway is disabled and `CacheFull`
 //   fires at the strict cache cap (no elasticity, no spilling). The
 //   pre-spillway 8× HARD_CEILING_MULTIPLIER design is gone — see spec
@@ -119,10 +131,15 @@ pub struct PageCache {
     /// the next commit is cheap.
     dirty_scratch: Vec<u64>,
     max_pages: usize,
-    /// Strict upper bound on the spillway sidecar file in bytes
-    /// (excluding per-slot headers). 0 means spillway disabled —
-    /// overflow trips CacheFull at the cache cap. Set via Options;
-    /// runtime-mutable between transactions via set_spillway_max_bytes.
+    /// Strict upper bound on the spillway's LIVE RESIDENT SET in bytes
+    /// (`slots.len() * payload_size`, per-slot headers excluded) — NOT on
+    /// the sidecar file's length. The file is addressed by the monotonic
+    /// `Spillway::next_slot_index` cursor, which `forget` never rewinds,
+    /// so forget/respill churn grows the file beyond this number with no
+    /// `SpillwayFull`. Only `truncate` (commit/rollback) reclaims that
+    /// tail. 0 means spillway disabled — overflow trips CacheFull at the
+    /// cache cap. Set via Options; runtime-mutable between transactions
+    /// via set_spillway_max_bytes.
     spillway_max_bytes: u64,
     /// LRU position policy for commit-drain rehydrated pages. Captured
     /// from Options at construction; runtime-mutable between
@@ -165,11 +182,12 @@ impl PageCache {
     /// in bytes. Converted internally to a page count via
     /// `bytes / PAGE_SIZE as u64`, clamped to at least one page.
     ///
-    /// `spillway_max_bytes` is the strict upper bound on the spillway
-    /// sidecar file (in bytes, header overhead excluded). Spillway open is
-    /// deferred to the first spill; we just record the cap here. Setting
-    /// to 0 means "no spillway"; overflow trips `CacheFull` at the
-    /// `cache_max_bytes` cap.
+    /// `spillway_max_bytes` is the strict upper bound on the spillway's LIVE
+    /// RESIDENT SET (in bytes, header overhead excluded) — see the field doc
+    /// for why that is not the same as a bound on the sidecar file's length.
+    /// Spillway open is deferred to the first spill; we just record the cap
+    /// here. Setting to 0 means "no spillway"; overflow trips `CacheFull` at
+    /// the `cache_max_bytes` cap.
     ///
     /// `drain_insertion` is captured for use during commit drain (see
     /// `flush`).
@@ -177,10 +195,6 @@ impl PageCache {
     /// `next_page_id` is seeded from the file's current length. The
     /// transaction manager calls `set_next_page_id` later to install the
     /// authoritative high-water mark from the chosen superblock.
-    ///
-    /// `unwrap_or(0)` on page_count failure is a tradeoff: we'd rather
-    /// construct a usable cache and surface the underlying I/O error on
-    /// the next real operation than fail the constructor.
     ///
     /// `max_pages` is clamped to at least 1. A value of 0 would trip
     /// `CacheFull` on the first allocation regardless of workload.
@@ -192,7 +206,7 @@ impl PageCache {
         spillway_location: crate::SpillwayLocation,
     ) -> PageCache {
         let max_pages = (cache_max_bytes / PAGE_SIZE as u64).max(1) as usize;
-        let next_page_id = io.page_count().unwrap_or(0);
+        let next_page_id = io.page_count();
         PageCache {
             io,
             entries: FxHashMap::default(),
@@ -420,10 +434,7 @@ impl PageCache {
     /// the pages it already "flushed".
     pub fn flush(&mut self) -> Result<()> {
         // Phase 1a: write every dirty in-cache page to the main file and
-        // clear its dirty flag. The early-return path in transaction.rs
-        // relies on flush() being idempotent between commits — dirty_count
-        // is reset to zero here, not decremented per page, to survive any
-        // future reordering of the loop body.
+        // clear its dirty flag.
         //
         // I52: reuse self.dirty_scratch across calls. We take it out
         // (now self.dirty_scratch is empty but PageCache still owns it
@@ -438,6 +449,17 @@ impl PageCache {
                 .filter(|(_, e)| e.dirty)
                 .map(|(&id, _)| id),
         );
+        // Check the counter against the flags HERE, before the loop touches
+        // either. `dirty_scratch` was just filtered out of `entries` on
+        // `dirty`, so its length IS the number of dirty entries — and this is
+        // the only point where a desync is visible in both directions. After
+        // the loop, `saturating_sub` has already floored an under-count to the
+        // same zero a post-loop assert would accept.
+        debug_assert_eq!(
+            self.dirty_count,
+            dirty_scratch.len(),
+            "flush: dirty_count disagrees with the entries actually flagged dirty"
+        );
         for &page_id in &dirty_scratch {
             // I48 INVARIANT: dirty_scratch was just populated from
             // self.entries (filtered by dirty=true). Nothing between
@@ -449,13 +471,51 @@ impl PageCache {
             // self.entries. The 8 KB stack copy is the same cost as the COW
             // paths elsewhere in the cache that already pay it.
             let plaintext: [u8; PAGE_SIZE] = *self.entries.get(&page_id).unwrap().buf;
+            // Deliberately NOT guarded by `debug_assert!(verify_checksum(..))`.
+            // `stamp_checksum`'s "call before the page is handed to page_io"
+            // rule binds pages that will be READ back; it is not an invariant
+            // over everything flush writes, and asserting it here fails on live
+            // engine paths. The counterexample: `allocate` calls `new_page`,
+            // which inserts a zeroed dirty entry and only then runs
+            // `maybe_evict` — an operational `CacheFull` there returns before
+            // the caller ever initializes or stamps the page, and the entry
+            // stays dirty. The next commit flushes those zeroed bytes. That is
+            // harmless precisely because nothing references them: no root
+            // points at the page, so no read path can reach it, and the one
+            // sweep that scans dead pages (`reclaim_orphans`) already skips
+            // `ChecksumMismatch` on unreachable pages by design.
+            //
+            // So the honest invariant is "every page REACHABLE from a committed
+            // superblock carries a stamped checksum", which this layer cannot
+            // evaluate — the cache does not know what is reachable. A module
+            // that mutates a LIVE page and forgets to restamp still surfaces
+            // only as a `ChecksumMismatch` at the next cold read; catching that
+            // at the write would take a reachability oracle, not an assert.
             self.write_sealed(page_id, &plaintext)?;
             // Mark clean only AFTER the write succeeds. On error the page
             // stays dirty and the I1 poison model discards it.
+            //
+            // Clear the flag and the counter in ONE step. The `?` on the line
+            // above is a mid-loop exit, so a bulk `dirty_count = 0` after the
+            // loop would leave the counter over-counting the entries this loop
+            // already flagged clean. An over-count makes
+            // `evict_clean_to_cap`'s `dirty_count == entries.len()` early-out
+            // fire while clean, evictable entries remain — the cache silently
+            // stops enforcing `max_pages` and `maybe_evict` Phase B spills (or
+            // raises `CacheFull`) on a cache that had room. Only the I1 poison
+            // model keeps that unreachable today; the counter should not need
+            // the poison model to stay honest.
             self.entries.get_mut(&page_id).unwrap().dirty = false;
+            self.dirty_count = self.dirty_count.saturating_sub(1);
         }
         dirty_scratch.clear();
         self.dirty_scratch = dirty_scratch;
+        // The loop decremented exactly once per element, so a cache that passed
+        // the pre-loop assert is already at zero. The assignment is the
+        // release-build self-heal for a desync the assert could not report
+        // there — same posture as `untrack_dirty`'s saturating I116 subtract:
+        // degrade to "cap not strictly enforced until the next flush" rather
+        // than carry a bogus count forward.
         self.dirty_count = 0;
 
         // Phase 1b: drain the spillway in batches. For each batch:
@@ -549,6 +609,9 @@ impl PageCache {
                         }
                     }
                 };
+                // No checksum assertion here either, for the same reason as
+                // Phase 1a: an abandoned allocation can be spilled and drained
+                // without ever having been stamped, and that is legal.
                 // Re-insert as clean: the bytes are now on the main file,
                 // so the cache entry is a valid read-through cache.
                 let entry = CacheEntry {
@@ -676,7 +739,12 @@ impl PageCache {
     /// This is the PHYSICAL file size in pages, which may exceed the
     /// logical committed `total_pages` if a transaction is in-flight or a
     /// prior crash left tail garbage.
-    pub fn file_page_count(&self) -> Result<u64> {
+    ///
+    /// Infallible, mirroring `PageIo::page_count` (a cached `Cell` read since
+    /// I51). The poison check that callers used to get from this method's `?`
+    /// lives on `TransactionManager::file_page_count`, which is where the
+    /// manager state it consults actually is.
+    pub fn file_page_count(&self) -> u64 {
         self.io.page_count()
     }
 
@@ -816,6 +884,25 @@ impl PageCache {
         // would silently drop the caller's pending writes on `page_id`; an
         // assertion surfaces the bug at its source rather than hours later
         // as mysterious data loss.
+        //
+        // What keeps it from firing today, spelled out because the assert is
+        // the only thing standing between a future allocator change and silent
+        // data loss:
+        //   - `cow_alloc`'s ids come from `FreeMapTree::allocate_first`, which
+        //     CLEARS the bit as it hands the id out, so one transaction cannot
+        //     be handed the same id twice. Two paths set bits back, and neither
+        //     can name a page this transaction is writing: the defrag orphan
+        //     sweep marks only pages that are unreachable from the live roots,
+        //     carry a FreeMap/FreeMapInterior type tag, and sit outside the live
+        //     recycle pool; and `FreemapRecycle::persist` runs inside commit,
+        //     after the I28 pre-drain has already flushed the cache and
+        //     truncated the spillway, and allocates only via
+        //     `structural_extend` — never via `allocate_first`.
+        //   - `structural_extend`'s ids come from `structural_reuse`, which is
+        //     drained by `pop` (each id offered once) and seeded at `begin`
+        //     from the PRIOR commit's `pending_structural_frees`.
+        //   - Neither source can name a spillway-resident id at transaction
+        //     start, because commit and rollback both `truncate` the spillway.
         debug_assert!(
             !self.is_dirty(page_id),
             "claim_page called on a dirty page (page_id={page_id}); freemap returned an id with pending writes from the current transaction"
@@ -829,6 +916,29 @@ impl PageCache {
         // id before inserting at MRU, so an explicit LRU remove isn't
         // needed.
         self.entries.remove(&page_id);
+        // A reissued id has a SECOND stale home: the spillway. This is the
+        // module header's "invalidate cache / spillway / freemap state for the
+        // reissued range" rule, which `truncate` already honours via
+        // `forget_above`; `claim_page` is the other reissue path and must
+        // honour it too. Without the forget, flush() writes the freshly claimed
+        // content in Phase 1a and then copies the stale spilled blob over it in
+        // Phase 1b, while the Vacant-only re-insert leaves the cache holding the
+        // NEW bytes marked clean — a cache/disk divergence that stays invisible
+        // until the page is evicted and cold-read.
+        //
+        // Belt and braces, deliberately: the debug_assert above is the primary
+        // guard and (now that `is_dirty` sees spillway residency) does cover
+        // this case, but it compiles out in release. This line is the release
+        // degradation — same data loss the in-cache dirty case already has,
+        // rather than a divergence between what the cache believes and what is
+        // on disk. It is therefore unobservable in a debug test, which panics
+        // at the assert before reaching it; `claim_page_asserts_on_a_spilled_page`
+        // covers the assert, and no test can cover this line without a release
+        // build. On a page that is not spilled — every call today — it is a
+        // single failed HashMap lookup.
+        if let Some(spw) = self.spillway.as_mut() {
+            spw.forget(page_id);
+        }
         let entry = CacheEntry {
             buf: Box::new([0u8; PAGE_SIZE]),
             dirty: true,
@@ -934,12 +1044,27 @@ impl PageCache {
         }
     }
 
-    /// Check if a page is dirty in the cache.
+    /// Does `page_id` hold unflushed writes belonging to the current
+    /// transaction?
     ///
-    /// Used by the transaction layer to reason about whether a page is
-    /// safe to drop at savepoint/rollback boundaries.
+    /// "Dirty" spans BOTH homes an unflushed page can have: a `dirty` entry in
+    /// `entries`, or a spillway slot. The spillway arm is not a convenience —
+    /// it is what makes the predicate honest. A spilled page is dirty by
+    /// construction (`maybe_evict` Phase B only ever spills dirty victims, and
+    /// `load_page`'s rehydrate branch re-inserts it with `dirty: true`), so a
+    /// residency-blind version reports `false` for pages that carry pending
+    /// writes — the exact case `claim_page`'s I20 assert exists to catch.
+    ///
+    /// Sole caller is that assert (plus this module's tests). An earlier doc
+    /// claimed the transaction layer used this "to reason about whether a page
+    /// is safe to drop at savepoint/rollback boundaries"; no such caller has
+    /// ever existed. Rollback decides by watermark (I3), not by asking.
     pub fn is_dirty(&self, page_id: u64) -> bool {
         self.entries.get(&page_id).is_some_and(|e| e.dirty)
+            || self
+                .spillway
+                .as_ref()
+                .is_some_and(|spw| spw.is_resident(page_id))
     }
 
     /// Copy `src`'s page bytes into `dst`, replacing dst's contents.
@@ -1541,6 +1666,56 @@ mod tests {
         let _ = cache.claim_page(id);
     }
 
+    // Spill a dirty page, then ask whether it is dirty. It is — a page only
+    // ever reaches the spillway via maybe_evict Phase B, which spills dirty
+    // victims exclusively, and load_page rehydrates it with `dirty: true`.
+    // `is_dirty` used to consult `entries` alone and answer `false` here, which
+    // meant claim_page's I20 assert — its only caller — was blind to exactly
+    // the case that costs most: a claim over a spilled page discards writes the
+    // cache can no longer see.
+    #[test]
+    fn is_dirty_sees_a_page_that_was_evicted_to_the_spillway() {
+        let (_dir, mut cache) = fresh_cache_with_spillway(2, 8 * PAGE_SIZE as u64);
+        let first = cache.new_page().unwrap();
+        // Two more allocations push the cache past max_pages=2; every entry is
+        // dirty, so Phase B spills the LRU tail — `first`.
+        cache.new_page().unwrap();
+        cache.new_page().unwrap();
+        assert!(
+            !cache.entries.contains_key(&first),
+            "precondition: the LRU-tail page must have left `entries`"
+        );
+        assert!(
+            cache
+                .spillway
+                .as_ref()
+                .expect("spillway opened on first spill")
+                .is_resident(first),
+            "precondition: the evicted page must be spillway-resident"
+        );
+        assert!(
+            cache.is_dirty(first),
+            "a spilled page still holds unflushed writes and must report dirty"
+        );
+    }
+
+    // The I20 assert must cover the spilled case too, not just the resident
+    // one. Claiming a spilled id is the more dangerous of the two: without the
+    // `spw.forget` that claim_page now performs, flush writes the freshly
+    // claimed bytes in Phase 1a and then copies the stale spilled blob over
+    // them in Phase 1b, leaving the cache and the file disagreeing.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "claim_page called on a dirty page")]
+    fn claim_page_asserts_on_a_spilled_page() {
+        let (_dir, mut cache) = fresh_cache_with_spillway(2, 8 * PAGE_SIZE as u64);
+        let first = cache.new_page().unwrap();
+        cache.new_page().unwrap();
+        cache.new_page().unwrap();
+        assert!(!cache.entries.contains_key(&first));
+        let _ = cache.claim_page(first);
+    }
+
     #[test]
     fn claim_page_keeps_dirty_count_consistent() {
         // I114: the I20 debug_assert! in claim_page is a no-op under
@@ -1958,6 +2133,45 @@ mod tests {
             0,
             "phase-1a cleared the real dirty flags, not just the counter"
         );
+    }
+
+    #[test]
+    fn failed_write_mid_flush_leaves_dirty_count_matching_the_flags() {
+        // Phase 1a clears each entry's `dirty` flag as its write succeeds, so a
+        // write error partway through returns with some flags already cleared.
+        // The counter has to come down with them: when it was instead zeroed in
+        // bulk after the loop, the `?` skipped the reset entirely and left
+        // `dirty_count` counting entries that are flagged clean. An over-count
+        // makes `evict_clean_to_cap`'s `dirty_count == entries.len()` early-out
+        // fire while clean, evictable entries remain — the strict `max_pages`
+        // cap silently stops being enforced and `maybe_evict` Phase B spills (or
+        // raises CacheFull) on a cache that had room. The I1 poison model is the
+        // only thing that hides this today.
+        //
+        // `entries` iteration order is unspecified, so we cannot know which
+        // page Phase 1a writes first — and if the faulted page happens to BE
+        // the first, nothing was cleared and even the buggy version stays
+        // consistent. Arming the fault on each page in turn removes the
+        // dependence on that order: at least one round has the fault land after
+        // a successful write, and the invariant is asserted in every round.
+        for victim in 0..4usize {
+            let (_dir, mut cache) = fresh_cache(16);
+            let ids: Vec<u64> = (0..4).map(|_| cache.new_page().unwrap()).collect();
+            assert_eq!(cache.dirty_count, 4);
+            cache.io().arm_fault(Fault::FailWritePage(ids[victim]));
+            let result = cache.flush();
+            assert!(
+                matches!(result, Err(ChiselError::IoError(_))),
+                "flush must surface the injected write failure, got {result:?}"
+            );
+            let flagged_dirty = cache.entries.values().filter(|e| e.dirty).count();
+            assert_eq!(
+                cache.dirty_count, flagged_dirty,
+                "after a write failure on page {} (round {victim}), dirty_count must \
+                 equal the number of entries still flagged dirty",
+                ids[victim]
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

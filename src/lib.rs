@@ -427,7 +427,7 @@ impl Chisel {
         // would then run create_new over its just-committed data. `file_exists`
         // stays above only for the create_if_missing gate, which must remain
         // pre-lock so a refused open never materializes an empty file.
-        let existed = io.page_count()? > 0;
+        let existed = io.page_count() > 0;
         if !existed {
             // `existed` is `len / stride > 0`, so it is false for BOTH an empty
             // file and a file that has content but is shorter than one page.

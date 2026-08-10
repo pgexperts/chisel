@@ -69,15 +69,18 @@ impl TransactionManager {
         Ok(self.cache.borrow().spillway_capacity())
     }
 
-    /// Poisoning-aware wrapper around `PageCache::file_page_count`. Called
-    /// by `Chisel::stats()` so that a fatal I/O error while measuring the
-    /// file size also poisons the manager.
+    /// Poison-checked wrapper around `PageCache::file_page_count`. Called by
+    /// `Chisel::stats()`.
+    ///
+    /// The `Result` is the `check_alive` gate, not the measurement: the count
+    /// itself is a cached `Cell` read and cannot fail, so there is no
+    /// `poison_on_fatal` here — an already-poisoned manager must still refuse
+    /// to report a file size, but reporting one can never poison.
     ///
     /// F3: takes `&self`.
     pub fn file_page_count(&self) -> Result<u64> {
         self.check_alive()?;
-        let result = self.cache.borrow_mut().file_page_count();
-        self.poison_on_fatal(result)
+        Ok(self.cache.borrow().file_page_count())
     }
 
     /// On-disk bytes per page-unit: `PAGE_SIZE` (8192) for a plaintext

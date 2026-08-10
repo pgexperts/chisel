@@ -84,7 +84,7 @@ impl TransactionManager {
         let next_counter = crate::superblock::next_txn_counter(self.txn_counter)?;
         self.txn_counter = next_counter;
 
-        let total_pages = cache.file_page_count()?;
+        let total_pages = cache.file_page_count();
         let r = &self.committed_roots;
         let sb = Superblock {
             magic: page::MAGIC,
