@@ -16,8 +16,31 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # TESTS-CI-6 (issue #110): matrixed over macOS as well as Linux. It was
+  # ubuntu-only, and the engine's platform-sensitive surface is precisely the
+  # part that left uncovered: `libc::flock` (src/page_io.rs), `File::sync_all`
+  # fsync semantics, and the open/create ordering that
+  # tests/options_validation.rs already documents as differing — "macOS ...
+  # sometimes reports ENOENT before the lock is attempted on a missing path",
+  # a divergence the suite works around but never exercised in CI. The only
+  # multi-OS job was `python`, which builds the wheel and runs pytest and
+  # never runs `cargo test`, so it asserts nothing about LockFailed,
+  # FileNotFound, or the zero-length-file path. The project ships macOS wheels
+  # (wheels.yml) and a macOS/iOS Swift binding, so macOS is a first-class
+  # target and a macOS-only regression in PageIo::open must not ship green.
+  #
+  # clippy and fmt stay single-platform below: both are host-independent, so a
+  # second runner would only duplicate their output.
+  #
+  # fail-fast is off so a failure on one OS still reports the other's result —
+  # "does this reproduce on Linux too?" is the first question asked about any
+  # macOS-only failure.
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
 
