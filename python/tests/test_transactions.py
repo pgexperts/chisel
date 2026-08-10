@@ -139,10 +139,15 @@ _GUARDED_TX_METHODS = [
 def test_finished_tx_methods_all_raise(mem_db, name, args):
     """Coverage sweep. This is the test that catches a method being missed.
 
-    AlreadyFinishedError must be raised BEFORE any argument validation, so the
-    deliberately bogus handles/names below never reach the engine — if a guard
+    AlreadyFinishedError must be raised before the call reaches the ENGINE, so
+    the deliberately bogus handles/names below are never validated — if a guard
     is missing, the call fails with some other error (or succeeds) and this
     fails loudly rather than passing by accident.
+
+    Not "before any validation": PyO3 extracts arguments before the method body
+    runs, so a wrong-TYPE argument would still raise TypeError first. Every
+    argument here is type-extractable precisely so that the guard, and not
+    argument extraction, is what each case exercises.
     """
     tx = mem_db.transaction()
     tx.commit()

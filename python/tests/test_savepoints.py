@@ -85,6 +85,35 @@ def test_rollback_to_is_repeatable(mem_db):
     assert mem_db.handles() == [keep]
 
 
+def test_scope_exit_releases_after_an_exception_too(mem_db):
+    """PYTHON-3, the arm a retry loop actually takes.
+
+    __exit__'s exception path rolled back but did NOT release, leaving the mark
+    on the engine stack while `finished` blocked the release() that could clear
+    it. The name stayed taken for the rest of the transaction — the identical
+    "no operation able to free it" trap the clean path had. Retrying the same
+    savepoint name after a failed attempt is the whole point of the closure
+    form, and it failed on the second attempt.
+    """
+
+    class Boom(Exception):
+        pass
+
+    with mem_db.transaction() as tx:
+        keep = tx.allocate(b"keep")
+
+        for _ in range(2):
+            try:
+                with tx.savepoint("attempt") as sp:
+                    tx.allocate(b"discard")
+                    raise Boom
+            except Boom:
+                pass
+
+    # Both attempts rolled back; only the pre-savepoint value survives.
+    assert mem_db.handles() == [keep]
+
+
 def test_rollback_to_after_release_raises(mem_db):
     """The guard is still CHECKED by rollback_to, just no longer SET by it.
 

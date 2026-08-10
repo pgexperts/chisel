@@ -195,10 +195,22 @@ _EXCEPTION_CLASSES = sorted(
 )
 
 
-def test_there_are_exception_classes_to_check():
-    # Guard the guard: if __all__ or the filter above ever stops matching,
-    # the two parametrized tests would silently become no-ops.
-    assert len(_EXCEPTION_CLASSES) > 20, _EXCEPTION_CLASSES
+def test_exception_sweep_covers_every_class_the_module_defines():
+    """Guard the guard, by equality rather than by a loose floor.
+
+    If `__all__` or the filter above stops matching, the two parametrized tests
+    silently become no-ops — a `> 20` threshold would tolerate fifteen classes
+    vanishing. Comparing against module introspection instead means a class
+    added to the extension but forgotten in `__all__` fails HERE, which is also
+    the bug that would keep it unpicklable.
+    """
+    from_module = sorted(
+        name
+        for name in dir(chisel._chisel)
+        if isinstance(getattr(chisel._chisel, name), type)
+        and issubclass(getattr(chisel._chisel, name), Exception)
+    )
+    assert _EXCEPTION_CLASSES == from_module
 
 
 @pytest.mark.parametrize("cls_name", _EXCEPTION_CLASSES)

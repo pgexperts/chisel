@@ -59,9 +59,23 @@ impl PySavepoint {
         slf
     }
 
-    // Exception → rollback_to; clean exit → release. Returns Ok(false)
-    // to avoid suppressing any in-flight exception, matching the
-    // PyTransaction __exit__ policy.
+    // Clean exit → release. Exception → rollback_to, THEN release. Returns
+    // Ok(false) either way so an in-flight exception is never suppressed,
+    // matching the PyTransaction __exit__ policy.
+    //
+    // The release on the exception path is the second half of PYTHON-3
+    // (issue #105). Rolling back without releasing left the mark on the engine
+    // stack while `finished` blocked the Python `release()` that could clear
+    // it — so the name stayed taken for the rest of the transaction and a
+    // later `tx.savepoint(same_name)` raised DuplicateSavepointError. That is
+    // the identical "no operation able to free it" trap the clean path had,
+    // and fixing only the clean path would have left it alive on the arm that
+    // a retry loop actually takes.
+    //
+    // A `with` block is the savepoint's SCOPE; when it ends, by either route,
+    // the name belongs to the enclosing scope again. Releasing after a
+    // rollback_to is exactly what the engine documents as supported — the mark
+    // "can be rolled back to again or released".
     fn __exit__(
         &self,
         py: Python<'_>,
@@ -76,9 +90,8 @@ impl PySavepoint {
         let db = self.db.bind(py).borrow();
         if !exc_type.is_none(py) {
             db.rollback_to_internal(&self.name)?;
-        } else {
-            db.release_internal(&self.name)?;
         }
+        db.release_internal(&self.name)?;
         Ok(false)
     }
 
@@ -126,9 +139,10 @@ impl PySavepoint {
 }
 
 // Raised when a Savepoint object is driven after it has been RELEASED —
-// explicitly, or by `__exit__`. `rollback_to` no longer finishes a savepoint
-// (PYTHON-3), so "released" is now the accurate word: a rolled-back-to
-// savepoint is still live and can be rolled back to again.
+// explicitly, or by `__exit__`, which now releases on BOTH the clean and the
+// exception path. `rollback_to` no longer finishes a savepoint (PYTHON-3), so
+// "released" is the accurate word for every way the guard can be set: a
+// rolled-back-to savepoint is still live and can be rolled back to again.
 fn already_finished_err() -> PyErr {
     crate::errors::AlreadyFinishedError::new_err("savepoint already released")
 }
