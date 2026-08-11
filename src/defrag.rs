@@ -190,6 +190,11 @@ pub fn defrag(txm: &mut TransactionManager, options: &DefragOptions) -> Result<D
     // relocating values, and then hit `NoActiveTransaction` on the
     // first `update` — leaving the sweep in a half-done state with
     // confusing stats. Fail fast instead.
+    //
+    // Not redundant with the identical check inside
+    // `reclaim_freemap_orphans` (TXN-COMMIT-8): that one guards step 7,
+    // which runs only AFTER steps 2-6 have already relocated values. This
+    // one fires before anything moves.
     if !txm.is_active() {
         return Err(crate::error::ChiselError::NoActiveTransaction);
     }

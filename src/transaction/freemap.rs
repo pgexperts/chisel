@@ -405,8 +405,14 @@ impl FreemapRecycle {
     /// already free, and marks each free — routing the mark through the SAME
     /// `mark_free_committed_path` the commit uses (COW + recycle), so a reclaimed
     /// orphan lands in the BITMAP (data-reusable), disjoint from the in-memory
-    /// recycle pool. Requires an active transaction (called by defrag).
-    /// Returns the count reclaimed.
+    /// recycle pool. Returns the count reclaimed.
+    ///
+    /// MUST run inside an active transaction: it advances `roots.freemap_page`
+    /// and pushes committed-LIVE ids into `structural_superseded`, neither of
+    /// which has a meaning — or a promotion path — outside one. This function
+    /// cannot see `active_txn`; the `TransactionManager::reclaim_freemap_orphans`
+    /// wrapper enforces it and is the only sanctioned caller. Do not add a second
+    /// entry point that skips the wrapper.
     ///
     /// `savepoint_active` is `!savepoints.is_empty()` from the caller — when true
     /// the sweep is a no-op (returns 0). The sweep is the ONLY path that COWs the
@@ -802,10 +808,36 @@ impl TransactionManager {
         Ok(())
     }
 
-    /// Commit-path wrapper: reclaim crash-orphaned freemap pages. Read the
+    /// Reclaim crash-orphaned freemap pages. Not on the commit path despite the
+    /// name this docblock used to carry: `defrag` is the only caller, and it runs
+    /// inside a caller-opened transaction, not from `run_commit`. Read the
     /// savepoint-active flag and superblock count into locals BEFORE borrowing the
     /// cache to keep the borrows clean. `pub(crate)` — defrag calls it.
+    ///
+    /// Enforces `reclaim_orphans`' active-transaction requirement here, at the
+    /// only door into it (TXN-COMMIT-8, issue #114).
     pub(crate) fn reclaim_freemap_orphans(&mut self) -> Result<u64> {
+        // The sweep advances `current_roots.freemap_page` and drains
+        // committed-LIVE ids into `structural_superseded`. With no transaction
+        // open there is no commit that can promote either, so both are silently
+        // discarded — the advanced root and the free bits are lost and the COW'd
+        // freemap pages stay dirty at ids nothing references.
+        //
+        // Today that is only a bounded, self-healing leak: `begin()` reseeds
+        // `current_roots` from `committed_roots` and `FreemapRecycle::begin`
+        // clears `structural_superseded`, so no residue survives into a commit,
+        // and the sole public door (`Chisel::defrag`) already returns
+        // NoActiveTransaction first. But that safety is a prose argument spanning
+        // three modules and two lines of `begin()` — exactly the shape of
+        // reasoning that `update_inner` (mutate.rs) names as how a bug got in.
+        // The requirement is documented on `reclaim_orphans`; enforce it where it
+        // is checkable instead of relying on every future caller reading that doc.
+        //
+        // NoActiveTransaction is operational, not fatal (see error.rs), so the
+        // `poison_on_fatal` below correctly leaves the manager usable.
+        if !self.active_txn {
+            return Err(ChiselError::NoActiveTransaction);
+        }
         let savepoint_active = !self.savepoints.is_empty();
         let superblock_count = self.superblock_count;
         // I145: wrap the sweep in poison_on_fatal like every other TM entry point.

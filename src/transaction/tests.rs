@@ -412,7 +412,7 @@ fn operational_error_does_not_poison() {
 // fsync would then leave the last-durable superblock pointing at
 // a page whose bytes no longer match what it committed to —
 // breaking the core shadow-paging invariant. The fix defers the
-// merge of both at-risk sets into `current_freemap` until AFTER
+// merge of both at-risk sets into the committed freemap tree until AFTER
 // the new-freemap-page allocate has run, so `FreeMap::allocate_first`
 // cannot return any of them during the vulnerable window.
 #[test]
@@ -1232,6 +1232,73 @@ fn reclaim_freemap_orphans_excludes_live_recycle_pool() {
     tm.rollback().unwrap();
 }
 
+// TXN-COMMIT-8 (issue #114): `reclaim_orphans` documents an active-transaction
+// requirement that the `reclaim_freemap_orphans` wrapper never checked — only
+// `savepoints.is_empty()`. With no transaction open the sweep still advanced
+// `current_roots.freemap_page` and drained committed-LIVE ids into
+// `structural_superseded`, with no commit path able to promote either.
+//
+// This is NOT a live-corruption regression test: `begin()` reseeds
+// `current_roots` and `FreemapRecycle::begin` clears `structural_superseded`, so
+// the residue never reached a commit, and the only public door (`Chisel::defrag`)
+// rejects the no-transaction case first. It pins the requirement at the door that
+// can actually check it, so a second caller — or a reordering of those two lines
+// in `begin` — cannot quietly re-open the hole.
+#[test]
+fn reclaim_freemap_orphans_requires_an_active_transaction() {
+    let mut tm = fresh_manager();
+    // A real committed freemap tree, so the sweep would have actual work to do
+    // and cannot trivially early-exit on a PAGE_ID_NONE root.
+    let big: Vec<u8> = vec![0xCD; MAX_INLINE_VALUE + 32];
+    tm.begin().unwrap();
+    let mut hs = Vec::new();
+    for _ in 0..8 {
+        hs.push(tm.allocate(&big).unwrap());
+    }
+    tm.commit().unwrap();
+    tm.begin().unwrap();
+    for h in hs.iter().step_by(2) {
+        tm.delete(*h).unwrap();
+    }
+    tm.commit().unwrap();
+    assert_ne!(
+        tm.committed_roots.freemap_page, PAGE_ID_NONE,
+        "precondition: a committed freemap tree must exist"
+    );
+
+    // A genuine orphan the sweep WOULD reclaim, so a pass returning 0 cannot be
+    // mistaken for the guard firing.
+    let _orphan = tm.test_forge_freemap_orphan().unwrap();
+    let root_before = tm.current_roots.freemap_page;
+
+    // No `begin()`. Pre-fix this returned Ok(1).
+    let err = tm.reclaim_freemap_orphans().unwrap_err();
+    assert!(
+        matches!(err, ChiselError::NoActiveTransaction),
+        "expected NoActiveTransaction, got {err:?}"
+    );
+    // NoActiveTransaction is operational (I1): the manager stays usable.
+    assert!(
+        !tm.is_poisoned(),
+        "an operational NoActiveTransaction must not poison"
+    );
+    // Nothing was COW'd: the in-progress root neither advanced nor diverged
+    // from the durable one.
+    assert_eq!(
+        tm.current_roots.freemap_page, root_before,
+        "the rejected sweep advanced current_roots.freemap_page"
+    );
+    assert_eq!(
+        tm.current_roots.freemap_page, tm.committed_roots.freemap_page,
+        "the rejected sweep diverged current_roots from committed_roots"
+    );
+    assert!(
+        tm.freemap.structural_superseded().is_empty(),
+        "the rejected sweep drained committed-live pages into structural_superseded: {:?}",
+        tm.freemap.structural_superseded()
+    );
+}
+
 // Regression test for ISSUES.md I28. I19 introduced `CacheFull` as
 // an **operational** error (documented as "commit or rollback to
 // recover"), but `commit_inner` runs `persist_freemap` BEFORE
@@ -1276,7 +1343,8 @@ fn commit_does_not_poison_when_cache_is_at_strict_cap() {
 
     // Seed one handle so the victim transaction can produce a
     // non-empty `txn_freed_pages` via delete. Without any frees AND
-    // with `current_freemap == committed_freemap`, `persist_freemap`
+    // with `current_roots.freemap_page == committed_roots.freemap_page`,
+    // `persist_freemap`
     // takes its early-exit path and never allocates — which would
     // mean it also cannot trip CacheFull, and the test would fail
     // to reproduce the bug.
@@ -1695,6 +1763,62 @@ fn update_value_write_failure_does_not_free_old_value_pages() {
         big,
         "old value corrupted after its prematurely-freed pages were reused"
     );
+}
+
+// TXN-COMMIT-7 (issue #114): `update_inner`'s Deleted old-entry arm used to be a
+// silent no-op that retired nothing and let the install write a fresh HandleEntry
+// over the tombstone — a resurrected handle whose membership-index entry was never
+// re-added. `delete_inner` funnels the identical impossible state to a fatal
+// CorruptPage (I45). Two opposite answers to one invariant violation; the loud one
+// wins.
+//
+// The arm is unreachable by construction (`lookup_live` maps tombstones to
+// InvalidHandle), so the state is forged with `force_deleted_old_entry` — the only
+// way to cover the escalation at all. Pre-fix `update` returned Ok(()).
+#[test]
+fn update_on_a_tombstoned_old_entry_is_fatal_like_delete() {
+    let mut tm = fresh_manager();
+    tm.begin().unwrap();
+    let h = tm.allocate(b"first").unwrap();
+    tm.commit().unwrap();
+
+    tm.begin().unwrap();
+    tm.fault.force_deleted_old_entry.set(true);
+    let err = tm.update(h, b"second").unwrap_err();
+    assert!(
+        matches!(err, ChiselError::CorruptPage { .. }),
+        "a Deleted old entry must escalate like delete_inner's I45 arm, got {err:?}"
+    );
+    assert!(
+        tm.is_poisoned(),
+        "CorruptPage is fatal — the manager must be poisoned"
+    );
+}
+
+// Behaviour PIN, not a regression test (passes before and after the fix): the
+// liveness funnel `update_inner` depends on. Updating a genuinely deleted handle
+// must stay OPERATIONAL InvalidHandle and must not poison — the fatal arm above
+// applies only to the forged in-memory contradiction, never to an ordinary caller
+// mistake. Existing coverage only pinned `read` after delete.
+#[test]
+fn update_on_a_deleted_handle_is_operational_invalid_handle() {
+    let mut tm = fresh_manager();
+    tm.begin().unwrap();
+    let h = tm.allocate(b"first").unwrap();
+    tm.commit().unwrap();
+
+    tm.begin().unwrap();
+    tm.delete(h).unwrap();
+    let err = tm.update(h, b"second").unwrap_err();
+    assert!(
+        matches!(err, ChiselError::InvalidHandle(_)),
+        "update on a tombstoned handle must be InvalidHandle, got {err:?}"
+    );
+    assert!(
+        !tm.is_poisoned(),
+        "InvalidHandle is operational (I1) — it must not poison"
+    );
+    tm.rollback().unwrap();
 }
 
 // Same guarantee for an INLINE old value (the Live old-release path). When
@@ -2632,6 +2756,56 @@ fn rollback_rewinds_the_freemap_allocation_hint() {
         "rollback restored the roots that made those ids free again, so the \
          hint must come back too — otherwise every id below it is stranded"
     );
+}
+
+// Behaviour PIN, not a regression test (passes before and after): documents the
+// corollary of TXN-COMMIT-5 (issue #114). `new_page()` does no I/O, so
+// `next_page_id` runs ahead of the physical file for the whole transaction; and
+// `PageCache::truncate` is `set_len`, which EXTENDS as readily as it shrinks. A
+// `rollback_to` therefore GROWS the file to the savepoint watermark, with a zero
+// tail — the opposite of what the module header used to imply. Harmless: the ids
+// below the watermark are still dirty in cache and overwrite that tail at the
+// commit flush, and `open_existing` rejects only a file SHORTER than the
+// superblock's total_pages.
+#[test]
+fn rollback_to_may_extend_the_unflushed_file() {
+    let mut tm = fresh_manager();
+    tm.begin().unwrap();
+    // Overflow-sized values so each allocation reserves several page ids without
+    // any of them reaching the file.
+    let big: Vec<u8> = vec![0x5A; MAX_INLINE_VALUE * 3];
+    let mut hs = Vec::new();
+    for _ in 0..6 {
+        hs.push(tm.allocate(&big).unwrap());
+    }
+
+    let file_before = tm.cache.borrow().file_page_count();
+    let watermark = tm.cache.borrow().next_page_id();
+    assert!(
+        watermark > file_before,
+        "precondition: unflushed allocations must run next_page_id ({watermark}) \
+         past the physical length ({file_before})"
+    );
+
+    tm.savepoint("sp").unwrap();
+    for _ in 0..3 {
+        tm.allocate(&big).unwrap();
+    }
+    tm.rollback_to("sp").unwrap();
+
+    assert_eq!(
+        tm.cache.borrow().file_page_count(),
+        watermark,
+        "rollback_to set_len()s to the watermark, which was above the old \
+         physical length — so the rewind GREW the file"
+    );
+
+    // And the extension is benign: the dirty pages below the watermark overwrite
+    // the zero tail at flush, so the commit is readable.
+    tm.commit().unwrap();
+    for h in hs {
+        assert_eq!(tm.read(h).unwrap(), big);
+    }
 }
 
 /// GAP-1: `rollback_to` must rewind the freemap recycle's savepoint-scoped

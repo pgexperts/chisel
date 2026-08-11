@@ -17,6 +17,13 @@
 //!   non-fatal `CacheFull` at the NEW-value-write step (the first fallible step with
 //!   the fix; pre-fix it landed AFTER the old location was freed), proving the old
 //!   value is not prematurely freed before the new entry installs.
+//! - `force_deleted_old_entry`: not a failure injector — a state forger. Rewrites
+//!   the NEXT `update_inner`'s old entry to `HandleFlags::Deleted` right after
+//!   `lookup_live` returns it, forging the in-memory contradiction that arm treats
+//!   as a broken liveness funnel (TXN-COMMIT-7, issue #114). No public call can
+//!   reach that arm — `lookup_live` maps tombstones to `InvalidHandle` — so
+//!   without this seam the I45 escalation would ship untested, which is how the
+//!   arm sat as a silent no-op for as long as it did.
 //! - `fail_membership_op_after`: countdown variant of `fail_next_membership_op` for
 //!   multi-delete passes (e.g. delete_with_tag) — when set to K, the Kth subsequent
 //!   membership-index op fails (the first K-1 succeed), so a test can fail a LATER
@@ -28,5 +35,6 @@ pub(super) struct FaultInjector {
     pub fail_next_membership_op: Cell<bool>,
     pub fail_next_handle_table_op: Cell<bool>,
     pub fail_next_update_value_write: Cell<bool>,
+    pub force_deleted_old_entry: Cell<bool>,
     pub fail_membership_op_after: Cell<u32>,
 }
