@@ -14,9 +14,39 @@
 // tier base — OperationalError or FatalError — never the abstract ChiselError
 // base (I138). So a new variant always lands under the right poison-contract
 // parent even before it gets its own concrete class; adding the concrete arm
-// is still preferred. No test enumerates the Python classes (ISSUES.md I139);
-// the engine-side is_fatal() exhaustiveness test (I104) guards the
-// classification this fallback depends on.
+// is still preferred. The engine-side is_fatal() exhaustiveness test (I104)
+// guards the classification this fallback depends on.
+//
+// TEST COVERAGE OF THIS MAPPING IS ASYMMETRIC. Read the split below before
+// assuming a rearrangement of `to_py_err`'s arms would be caught:
+//   - TIER — complete. All 33 concrete classes have an assertion placing them
+//     under OperationalError or FatalError: test_errors.py's
+//     test_operational_hierarchy (14 names) and test_fatal_hierarchy (10),
+//     test_exception_contract.py's test_operational_hierarchy_missing_classes
+//     (SpillwayFull / TransactionInProgress / TagMismatch) and
+//     test_decryption_failed_is_fatal_hierarchy, and the trailing
+//     `isinstance(..., OperationalError)` of the five encryption and
+//     key-rotation contract tests. test_errors.py's
+//     test_exception_sweep_covers_every_class_the_module_defines compares
+//     chisel.__all__ against dir(chisel._chisel) BY EQUALITY, so a class added
+//     here but not re-exported fails there rather than quietly dropping out of
+//     the parametrized __module__/pickle sweeps.
+//   - ARM — partial. Of the 31 concrete arms in `to_py_err`, 20 are raised
+//     end-to-end from Python AND pinned to the exact class, so swapping one of
+//     those fails loudly. TransactionAlreadyActive is raised but caught only at
+//     the ChiselError base (test_transactions.py::test_nested_transactions_raise).
+//     The remaining ten are never raised from Python at all — they are held
+//     only by the tier assertions above, so a swap among them passes the whole
+//     suite: InvalidHandleError, InvalidArgon2ParamsError, DecryptionFailedError,
+//     ChecksumMismatchError, FileSizeMismatchError, UnsupportedFormatVersionError,
+//     UnsupportedPageSizeError, CorruptPageError, InvalidPageIdError,
+//     PoisonedError. (InvalidArgon2ParamsError is not merely untested but
+//     unreachable from Python by construction — see its registration below.)
+//   - The fatal half is the thin one: only 3 of the 11 fatal arms (IoError,
+//     LockFailed, CorruptSuperblock) are driven end-to-end.
+//     test_exception_contract.py section 11 flags that itself and names the fix
+//     — a Rust-side unit test of `to_py_err`, which needs binding-crate test
+//     infrastructure.
 //
 // Class hierarchy (matches both the .pyi stubs and __init__.py re-exports):
 //
