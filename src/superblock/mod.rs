@@ -389,9 +389,33 @@ impl Superblock {
     }
 
     /// Build the AAD that binds THE SEALED BODY to this superblock's plaintext
-    /// identity. The four bootstrap fields that stay cleartext in both
-    /// encrypted and plaintext DBs are included; this prevents transplanting a
-    /// sealed body from a different DB or a different txn_counter.
+    /// identity — `magic`, `format_version`, `txn_counter`, `superblock_count`.
+    /// Binding those prevents transplanting a sealed body from a different DB or
+    /// a different generation of this one.
+    ///
+    /// Those are the four AAD fields, NOT the whole cleartext set: an encrypted
+    /// DB leaves FIVE of the superblock's SCALAR fields in the clear — and,
+    /// besides those, the entire crypto header (bytes 324..1356: algorithm,
+    /// stride, salt, key-slot table) and the trailing XXH3 page checksum, both
+    /// cleartext by necessity, since they are what the open path needs before
+    /// it can decrypt anything. `page_size` (bytes 48..52, written by
+    /// `serialize_encrypted`) is the fifth scalar and is deliberately outside
+    /// the AAD.
+    /// Do not "fix" that. These 24 bytes are frozen for MAJOR 2 (see below), so
+    /// adding a field here breaks every encrypted database already written — and
+    /// it would buy nothing, because `page_size` is COMPARED against the
+    /// compile-time `PAGE_SIZE` on the open path and never used as a geometry
+    /// input. A forged value can only produce a refusal to open, never wrong page
+    /// arithmetic; authenticating it would change WHICH error a tampered file
+    /// reports, not WHETHER the tampering is caught.
+    ///
+    /// The cost that IS real is availability, not confidentiality: that
+    /// comparison runs on the WINNING slot only, after selection, with no
+    /// fallback to a sibling. One forged u32 plus a recomputed XXH3 — which needs
+    /// write access to the file, not the key — therefore turns an otherwise
+    /// healthy encrypted DB into a permanent `UnsupportedPageSize`. Anyone able
+    /// to do that could truncate the file more easily, which is why this is
+    /// documented rather than defended against.
     ///
     /// Scope note: this covers the body and nothing else. The key-slot DEK
     /// wraps do NOT use it — `wrap_dek`/`unwrap_dek` authenticate against
@@ -402,11 +426,12 @@ impl Superblock {
     /// evidence that it is; binding wraps to the superblock generation would
     /// mean extending the wrap AAD, not reusing this one.
     ///
-    /// These four MUST stay cleartext even in an encrypted DB precisely because
-    /// they are the AAD: slot selection (`max_by_key` on `txn_counter`) and this
-    /// AAD derivation both run BEFORE any DEK is available, so the fields cannot
-    /// live in the DEK-sealed body — the engine must read them to pick the live
-    /// slot and rebuild the AAD before it can open that body.
+    /// These four AAD fields MUST stay cleartext even in an encrypted DB
+    /// precisely because they are the AAD: slot selection (`max_by_key` on
+    /// `txn_counter`) and this AAD derivation both run BEFORE any DEK is
+    /// available, so the fields cannot live in the DEK-sealed body — the engine
+    /// must read them to pick the live slot and rebuild the AAD before it can
+    /// open that body.
     ///
     /// **The 24-byte layout is FROZEN for format MAJOR 2.** GAP-4 (issue #106):
     /// bytes 20..24 used to be labelled "reserved for future AAD fields", which
@@ -674,23 +699,34 @@ impl Superblock {
     }
 
     /// Explain why every candidate slot failed. Called only on the cold path,
-    /// when `select` returned `None` — which means EVERY candidate failed
-    /// `validate` (none deserialized), so this returns one `SlotDefect` per
-    /// genuine superblock slot.
+    /// when `select` returned `None` — so every buffer reported here genuinely
+    /// failed `validate` and genuinely has the defect named.
     ///
-    /// The `buffers` slice may contain up to `MAX_SUPERBLOCKS` pages because
-    /// the open path reads blindly up to that limit without first knowing N.
-    /// Pages at indices >= the actual superblock_count are ordinary data
-    /// pages, not superblock slots — including them in the defect list would
-    /// falsely label intact data pages as corrupt superblocks.
+    /// What this CANNOT promise is that each buffer it reports on is a superblock
+    /// slot, or that it reports on all of them. The `buffers` slice may contain
+    /// up to `MAX_SUPERBLOCKS` pages because the open path reads blindly up to
+    /// that limit without first knowing N, and N itself lives in the superblocks
+    /// that just failed to parse. To bound the report we scan each buffer's raw
+    /// superblock_count field (byte offset 308) and take the first value landing
+    /// in `MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS`; with no plausible value anywhere we
+    /// fall back to `MIN_SUPERBLOCKS`. That heuristic is wrong in both directions:
     ///
-    /// To recover the true count without a valid superblock, we scan each
-    /// buffer's raw superblock_count field (byte offset 308). The first value
-    /// in `MIN_SUPERBLOCKS..=MAX_SUPERBLOCKS` is used as the upper bound.
-    /// If no buffer yields a plausible count (every slot is so badly mangled
-    /// that even the count field is garbage), we fall back to `MIN_SUPERBLOCKS`:
-    /// any real database has at least that many slots, so slots 0..MIN are
-    /// always legitimate candidates to report and we never under-report.
+    ///   - Over-report: the scan covers ALL buffers, data pages included. If every
+    ///     real slot's count field is also mangled out of range, the first
+    ///     plausible value can come from a data page, and ordinary intact data
+    ///     pages below it are then emitted as `BadMagic` superblock defects.
+    ///   - Under-report: with no plausible value at all, `bound` is 2, so a 4-slot
+    ///     database reports two slots and silently omits the other two.
+    ///
+    /// Both are accepted rather than fixed. N is genuinely unrecoverable once
+    /// every count field is destroyed, and nothing branches on this value —
+    /// `diagnose` has exactly one production caller (`open_existing`, filling the
+    /// `CorruptSuperblock { defects }` payload) and it runs only when the file is
+    /// already unopenable. The vector is operator triage material, not a recovery
+    /// input: a false positive inflates apparent damage, a false negative hides
+    /// some, and neither can steer the engine. Read the result as "here is what
+    /// the first few pages of this file look like", and confirm the real slot
+    /// count from provenance rather than from this list's length.
     pub(crate) fn diagnose(buffers: &[[u8; PAGE_SIZE]]) -> Vec<SlotDefect> {
         let bound = buffers
             .iter()
@@ -986,6 +1022,80 @@ mod tests {
                     defect: SuperblockDefect::BadMagic
                 },
             ]
+        );
+    }
+
+    // PIN (issue #118, SUPERBLOCK-RECOVERY-6): `diagnose` can report on pages
+    // that are not superblock slots. Behaviour is unchanged and deliberately so
+    // — this exists to keep the doc honest, and to fail loudly if someone
+    // tightens the bound without updating it.
+    //
+    // Two mangled slots (count field out of range, checksum re-stamped so the
+    // defect is BadCount rather than BadChecksum) and one checksum-valid data
+    // page that happens to carry 4u32 at byte 308. The bound scan looks at ALL
+    // buffers in order, so the data page supplies bound = 4, and the data page
+    // itself is then reported as a corrupt superblock slot.
+    #[test]
+    fn diagnose_can_over_report_past_the_real_slot_count() {
+        const BOGUS_COUNT: u32 = 99;
+        let mangled = || {
+            let mut b = Superblock::new_empty(2).serialize();
+            b[SUPERBLOCK_COUNT_OFFSET..SUPERBLOCK_COUNT_OFFSET + 4]
+                .copy_from_slice(&BOGUS_COUNT.to_le_bytes());
+            page::stamp_checksum(&mut b);
+            b
+        };
+        let mut data_page = [0u8; PAGE_SIZE];
+        data_page[SUPERBLOCK_COUNT_OFFSET..SUPERBLOCK_COUNT_OFFSET + 4]
+            .copy_from_slice(&4u32.to_le_bytes());
+        page::stamp_checksum(&mut data_page);
+
+        assert_eq!(
+            Superblock::diagnose(&[mangled(), mangled(), data_page]),
+            vec![
+                SlotDefect {
+                    slot: 0,
+                    defect: SuperblockDefect::BadCount(BOGUS_COUNT)
+                },
+                SlotDefect {
+                    slot: 1,
+                    defect: SuperblockDefect::BadCount(BOGUS_COUNT)
+                },
+                // Not a superblock slot at all — an intact data page labelled a
+                // corrupt one, because its bytes 308..312 set the bound.
+                SlotDefect {
+                    slot: 2,
+                    defect: SuperblockDefect::BadMagic
+                },
+            ]
+        );
+    }
+
+    // PIN (issue #118, SUPERBLOCK-RECOVERY-6): the other direction. Four real
+    // slots, every count field destroyed, so no buffer yields a plausible N and
+    // the bound falls back to MIN_SUPERBLOCKS — the report covers half the
+    // database and says nothing about the omission.
+    #[test]
+    fn diagnose_under_reports_when_every_count_field_is_garbage() {
+        const BOGUS_COUNT: u32 = 99;
+        let mangled = || {
+            let mut b = Superblock::new_empty(4).serialize();
+            b[SUPERBLOCK_COUNT_OFFSET..SUPERBLOCK_COUNT_OFFSET + 4]
+                .copy_from_slice(&BOGUS_COUNT.to_le_bytes());
+            page::stamp_checksum(&mut b);
+            b
+        };
+        let defects = Superblock::diagnose(&[mangled(), mangled(), mangled(), mangled()]);
+        assert_eq!(
+            defects.len(),
+            MIN_SUPERBLOCKS as usize,
+            "expected the MIN_SUPERBLOCKS fallback to cap the report at 2, got {defects:?}"
+        );
+        assert!(
+            defects
+                .iter()
+                .all(|d| d.defect == SuperblockDefect::BadCount(BOGUS_COUNT)),
+            "every reported slot should carry the mangled count, got {defects:?}"
         );
     }
 
@@ -1411,9 +1521,12 @@ mod tests {
             let buf = sb.serialize();
             let parsed = Superblock::deserialize(&buf)
                 .expect("a freshly-serialized superblock must deserialize");
-            // Field-by-field equality. PartialEq isn't derived on
-            // Superblock, so compare structurally — easier to diagnose
-            // if a single field round-trips wrong.
+            // Field-by-field equality first. `Superblock` DOES derive
+            // PartialEq (test_superblock_roundtrip relies on it), so this
+            // list is a diagnostics choice, not a necessity: a failure
+            // names the field that round-tripped wrong instead of dumping
+            // two 8 KiB structs. The whole-struct assert at the end is what
+            // makes it safe to leave the list hand-written.
             prop_assert_eq!(parsed.magic, sb.magic);
             prop_assert_eq!(parsed.format_version, sb.format_version);
             prop_assert_eq!(parsed.txn_counter, sb.txn_counter);
@@ -1430,6 +1543,11 @@ mod tests {
                 prop_assert_eq!(parsed.named_roots[i].name, sb.named_roots[i].name);
                 prop_assert_eq!(parsed.named_roots[i].handle, sb.named_roots[i].handle);
             }
+            // Backstop for fields nobody remembered to enumerate above: the
+            // list is hand-written, so a newly added `Superblock` field would
+            // otherwise drop out of this property silently. Last statement, so
+            // moving both values is harmless.
+            prop_assert_eq!(parsed, sb);
         }
     }
 }

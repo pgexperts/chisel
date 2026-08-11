@@ -1690,6 +1690,99 @@ fn corrupt_crypto_header_stride_errors_not_panic() {
     }
 }
 
+// SUPERBLOCK-RECOVERY-7 regression (issue #118): the forged-stride guard must
+// hold on the TORN-page-0 path too, not only on the anchor path pinned by
+// `corrupt_crypto_header_stride_errors_not_panic` above.
+//
+// Entry condition for the fallback: page 0 must fail to DESERIALIZE, so the
+// anchor read cannot learn the stride and the default-stride candidate scan
+// finds nothing (siblings sit at 8232-byte boundaries and read as garbage at
+// 8192). `PageIo::read_page` returns raw bytes and verifies no checksum, so a
+// tear is visible only to `Superblock::deserialize` — which is exactly the
+// discriminator the fallback branches on. Hence: forge the stride in EVERY slot
+// WITH a re-stamped checksum, then tear slot 0 WITHOUT re-stamping.
+//
+// Pre-fix this open returned Ok. The fallback hardcodes ENC_PAGE_SIZE, calls
+// `encrypted_stride` only as an is-this-file-encrypted probe, and discards the
+// value, so the surviving sibling's advertised stride was never compared. The
+// forged header was then captured into `crypto_header` and republished by every
+// commit until all N slots carried it — at which point the anchor path rejects
+// the file with no clean sibling left.
+#[test]
+fn torn_page_zero_rejects_a_forged_crypto_header_stride() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("enc.db");
+    let opts = || Options::default().encryption_key(Key::Raw(Zeroizing::new(vec![0x22u8; 32])));
+    {
+        let mut db = Chisel::open(&path, opts()).unwrap();
+        db.begin().unwrap();
+        db.allocate(b"payload").unwrap();
+        db.commit().unwrap();
+    }
+
+    // Stride is the u32 at CRYPTO_HEADER_OFFSET + 1 (bytes 325..329). Forge it
+    // in every slot; the helper is stride-aware and re-stamps each slot's
+    // checksum so `deserialize` still accepts the tampered image.
+    const FORGED_STRIDE: u32 = 12345;
+    for slot in 0..crate::superblock::DEFAULT_SUPERBLOCK_COUNT as u64 {
+        rewrite_encrypted_superblock_slot(&path, slot, |buf| {
+            buf[325..329].copy_from_slice(&FORGED_STRIDE.to_le_bytes());
+        });
+    }
+
+    let read_slot = |slot: u64| -> [u8; PAGE_SIZE] {
+        let mut f = fs::File::open(&path).unwrap();
+        let mut buf = [0u8; PAGE_SIZE];
+        f.seek(SeekFrom::Start(slot * crate::crypto::ENC_PAGE_SIZE as u64))
+            .unwrap();
+        f.read_exact(&mut buf).unwrap();
+        buf
+    };
+
+    // Assert the fixture before tearing anything. N is 2, so tearing slot 0
+    // leaves exactly ONE survivor and zero margin: had the re-stamp above
+    // missed, the open would fail for an unrelated reason and this test would
+    // still pass, pinning nothing.
+    assert_eq!(
+        crate::superblock::DEFAULT_SUPERBLOCK_COUNT,
+        2,
+        "fixture tears slot 0 and relies on slot 1 being the sole survivor"
+    );
+    for slot in 0..2 {
+        let sb = Superblock::deserialize(&read_slot(slot))
+            .unwrap_or_else(|| panic!("slot {slot} must still deserialize after the re-stamp"));
+        assert_eq!(
+            sb.encryption
+                .expect("every slot of an encrypted DB carries a crypto header")
+                .stride,
+            FORGED_STRIDE,
+            "slot {slot} must advertise the forged stride"
+        );
+    }
+
+    // Tear slot 0 in place WITHOUT re-stamping: overwriting the txn_counter
+    // bytes leaves the checksum stale, so `deserialize` rejects page 0 while
+    // `read_page` still hands the raw bytes back.
+    {
+        let mut f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(8)).unwrap();
+        f.write_all(&[0xA5u8; 8]).unwrap();
+        f.sync_all().unwrap();
+    }
+    assert!(
+        Superblock::deserialize(&read_slot(0)).is_none(),
+        "slot 0 must be torn so the open takes the torn-page-0 fallback"
+    );
+
+    match Chisel::open(&path, opts()) {
+        Err(ChiselError::CorruptSuperblock { .. }) => {}
+        Err(other) => panic!(
+            "expected CorruptSuperblock for a forged stride on the torn-page-0 path, got {other:?}"
+        ),
+        Ok(_) => panic!("torn page 0 let a forged crypto-header stride through"),
+    }
+}
+
 /// A hostile key slot must not be able to drive the Argon2 allocator.
 ///
 /// The key-slot cost parameters (`m_cost`/`t_cost`/`p_cost`) are read verbatim

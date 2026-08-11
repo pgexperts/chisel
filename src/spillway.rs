@@ -53,14 +53,19 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::error::{ChiselError, Result};
+#[cfg(test)]
 use crate::page::PAGE_SIZE;
 
 /// Per-slot header: u64 page_id + u64 XXH3 checksum.
 pub const SLOT_HEADER_SIZE: usize = 16;
-/// Default slot size for a plaintext DB (header + PAGE_SIZE). Used by the
-/// test suite and by callers that pass PAGE_SIZE as payload_size. Task 3.3/3.4
-/// uses Spillway::slot_size() instead once the payload_size varies at runtime.
-#[allow(dead_code)]
+/// Slot size for a plaintext DB, so tests can size a spillway cap in whole
+/// slots. TEST-ONLY, and gated as such: there is no production caller and there
+/// should not be one. `payload_size` is a runtime value (`PAGE_SIZE` plaintext,
+/// `ENC_PAGE_SIZE` encrypted), and both sizing sites — the free `write_slot` and
+/// `read_slot` fns — derive the slot width from their `payload_size` argument
+/// rather than from a constant, precisely so a constant cannot go stale against
+/// an encrypted database.
+#[cfg(test)]
 pub const SLOT_SIZE: usize = SLOT_HEADER_SIZE + PAGE_SIZE;
 
 /// Spillway backing storage: real file on disk, or in-memory bytes for
@@ -313,13 +318,6 @@ impl Spillway {
     /// already have ensured no transaction is in flight.
     pub fn set_max_bytes(&mut self, bytes: u64) {
         self.max_bytes = bytes;
-    }
-
-    /// On-disk slot size in bytes: `SLOT_HEADER_SIZE + payload_size`.
-    /// Used by Task 3.3/3.4 to size drain buffers for encrypted DBs.
-    #[allow(dead_code)]
-    pub fn slot_size(&self) -> usize {
-        SLOT_HEADER_SIZE + self.payload_size
     }
 
     /// Write `blob` to this spillway, keyed by `page_id`. `blob` must be
