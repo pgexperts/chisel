@@ -148,16 +148,26 @@ def test_setter_on_closed_db_raises_closed_error(tmp_db):
 # this test would pass today and fail on someone else's machine later.
 #
 # CALIBRATION. Constants below were measured, not guessed: at
-# _CACHE_PAGES = 96 / _N_VALUES = 88 the transaction spills 81 pages (one
-# batch, 84% of the cap) and the read-back yields 96 hits / 80 misses
-# under LruTail against 128 / 48 under Mru — a delta of 32 in each
-# direction, four times _MARGIN. The delta shrinks towards zero as the
-# spill approaches _CACHE_PAGES // 2, which is what the second precondition
-# guards. If a precondition fires, its message names the knob to turn.
+# _CACHE_PAGES = 96 / _N_VALUES = 170 the transaction spills 77 pages (one
+# batch, 80% of the cap) and the read-back yields 170 hits / 170 misses
+# under LruTail against 246 / 94 under Mru — a delta of 76 in each
+# direction, nine times _MARGIN.
+#
+# These numbers moved once already, and the reason is worth knowing before
+# you touch them. The #112 recycle pool cut per-operation page allocation
+# by two orders of magnitude, so the original 88-value workload stopped
+# spilling ENTIRELY and both probes failed their first precondition — which
+# is exactly what that precondition is for. The measured relationship moved
+# with it: the separation now tracks the spill size directly (delta 76 at
+# 77 spilled), where it previously tracked `spilled - _CACHE_PAGES // 2`.
+# So the floor below is far more conservative than the margin now requires;
+# it is kept because a floor well above the noise is cheap, and because the
+# relationship is empirical either way. If a precondition fires, its message
+# names the knob to turn.
 
 _PAGE_SIZE = 8192                    # engine PAGE_SIZE
 _CACHE_PAGES = 96                    # cache cap in pages == drain batch size
-_N_VALUES = 88                       # allocations per probe
+_N_VALUES = 170                      # allocations per probe
 _VALUE = b"d" * 4096
 # Pure safety factor, NOT noise slack: the counts are exactly reproducible
 # (measured identical across 30 fresh processes). It exists so a future page-
@@ -216,17 +226,18 @@ def _drain_probe(*, policy_at_open=None, policy_via_setter=None, path=None):
             f"Two or more batches make the surviving set nondeterministic. "
             f"Adjust _N_VALUES or _CACHE_PAGES."
         )
-        # The separation grows as `spilled - _CACHE_PAGES // 2` (measured), so
-        # the floor must clear _MARGIN, not merely the zero-crossing. Guarding
-        # only at _CACHE_PAGES // 2 would admit a band that passes every
-        # precondition and then fails the direction assertion below with a
-        # message about Mru, sending the reader hunting in the wrong place.
+        # The separation tracks the spill size (measured: 76 at 77 spilled),
+        # so a floor comfortably above _MARGIN keeps the direction assertions
+        # below from ever being the thing that reports a mis-sized workload.
+        # Without it, a too-small spill passes every precondition and then
+        # fails with a message about Mru, sending the reader hunting in the
+        # wrong place. The floor is deliberately far above what the margin
+        # strictly needs — the relationship is empirical, and headroom is free.
         _signal_floor = _CACHE_PAGES // 2 + _MARGIN + 1
         assert spilled > _signal_floor, (
-            f"only {spilled} pages spilled; the two policies separate by "
-            f"about {spilled - _CACHE_PAGES // 2}, which does not clear "
-            f"_MARGIN = {_MARGIN}. Need more than {_signal_floor}. "
-            f"Raise _N_VALUES."
+            f"only {spilled} pages spilled, which is too small a signal to "
+            f"separate the two policies against _MARGIN = {_MARGIN}. Need more "
+            f"than {_signal_floor}. Raise _N_VALUES."
         )
 
         before = db.counters()
