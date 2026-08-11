@@ -1629,6 +1629,74 @@ fn allocate_membership_failure_leaves_maps_consistent() {
     assert_no_reachable_page_is_free(&tm);
 }
 
+// TRIPWIRE — not a regression test. This passes on main today and must keep
+// passing; it exists to FAIL if anyone gives the handle table a
+// `session_owned`-style COW dedup (HANDLES-INDEX-2, issue #112).
+//
+// The hazard it pins: the candidate/prepare-install discard. `allocate_inner`
+// computes a CANDIDATE handle-table root, then runs the fallible membership
+// insert, and on failure `abort_allocate_prepare` discards the candidate by
+// restoring `current_roots.handle_table_page = saved_ht_root`. That restore
+// only works because the candidate is a DIFFERENT page id. If the insert had
+// mutated the already-session-owned root in place, the saved id and the
+// candidate id would be the same page, the restore would restore nothing, and
+// the entry would already be written — a `Live` handle-table entry pointing at
+// the inline slot the abort just released, with no reverse-index entry: the
+// exact cross-map divergence the atomic-staging work exists to prevent.
+//
+// The FIRST allocate is load-bearing. It is what makes the handle-table root
+// session-owned, so the failing allocate is one that dedup WOULD have taken in
+// place. Without it the root is still `PAGE_ID_NONE` and dedup never engages —
+// which is why `allocate_membership_failure_leaves_maps_consistent` just above,
+// which arms the injector against an empty table, does not cover this shape.
+#[test]
+fn a_failed_tagged_allocate_leaves_the_handle_table_untouched() {
+    let mut tm = fresh_manager();
+    tm.begin().unwrap();
+
+    // Establish a session-owned handle-table root inside THIS transaction.
+    let first = tm.allocate_tagged(b"first", 7).unwrap();
+    let root_after_first = tm.current_roots.handle_table_page;
+    assert_ne!(
+        root_after_first, PAGE_ID_NONE,
+        "precondition: the first allocate must materialize the handle-table root"
+    );
+
+    let ghost = tm.current_roots.next_handle;
+    tm.fault.fail_next_membership_op.set(true);
+    let err = tm.allocate_tagged(b"second", 7).unwrap_err();
+    assert!(
+        matches!(err, ChiselError::CacheFull { .. }),
+        "expected the injected CacheFull, got {err:?}"
+    );
+    assert!(!tm.is_poisoned(), "a non-fatal CacheFull must not poison");
+
+    let live = tm.handles().unwrap();
+    assert_eq!(
+        live,
+        vec![first],
+        "the failed allocate must leave no entry behind; a second entry here is a \
+         Live handle pointing at a released slot with no reverse-index entry"
+    );
+    assert_eq!(
+        tm.current_roots.next_handle, ghost,
+        "failed allocate must not burn the handle id"
+    );
+    assert!(
+        matches!(tm.tag(ghost), Err(ChiselError::InvalidHandle(_))),
+        "ghost handle after a failed allocate_tagged must be InvalidHandle"
+    );
+    assert_eq!(
+        tm.handles_with_tag(7).unwrap(),
+        vec![first],
+        "forward and reverse maps must still agree"
+    );
+
+    tm.commit().unwrap();
+    assert_eq!(tm.handles().unwrap(), vec![first]);
+    assert_no_reachable_page_is_free(&tm);
+}
+
 // The FORWARD-step counterpart: a non-fatal CacheFull during the
 // handle-table insert (the step that eagerly bumps the descent depth via
 // HandleTable::grow, and on a fresh DB lazily materializes the root). The

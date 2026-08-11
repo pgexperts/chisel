@@ -282,7 +282,11 @@ impl RadixU64 {
     /// prior-transaction freed pages before extending); `freed` collects the
     /// page ids this call supersedes so the caller can return them to the
     /// freemap on commit. Threading both is what keeps the membership index at
-    /// a bounded steady-state page count under churn.
+    /// a bounded steady-state page count under churn ACROSS COMMITS — not
+    /// within one. `alloc` reuses only pages the COMMITTED freemap marks free,
+    /// and this radix has no `session_owned` in-place dedup, so every mutation
+    /// re-COWs its whole root-to-leaf path and nothing it frees is reusable
+    /// until commit (HANDLES-INDEX-2, issue #112).
     pub fn insert(
         &mut self,
         cache: &mut PageCache,

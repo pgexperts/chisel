@@ -194,3 +194,55 @@ dual_backing_test!(
     test_uncommitted_handle_is_reminted,
     test_uncommitted_handle_is_reminted_body
 );
+
+// TRIPWIRE — not a regression test. This passes on main today and must keep
+// passing; it exists to FAIL if anyone gives the handle table a
+// `session_owned`-style COW dedup (HANDLES-INDEX-2, issue #112) without
+// handling savepoints.
+//
+// The hazard it pins: `rollback_to` cannot undo an IN-PLACE write.
+// `savepoint` captures `watermark = cache.next_page_id()` plus a clone of the
+// current roots; `rollback_to` does `cache.truncate(watermark)` and restores
+// those roots. Truncate drops only entries with `id >= watermark`, so a page
+// allocated BEFORE the savepoint keeps whatever was written into it AFTER.
+//
+// With a naive dedup, the second allocate below would recognise the
+// handle-table root as one this transaction already COW'd (page id below the
+// watermark) and write the new entry straight into it. Restoring the roots
+// then restores the same page id, so the entry survives: `handles()` reports
+// two, and a `commit()` here would make the phantom durable, pointing at a
+// data slot whose live-slot count `packer.restore` just rewound.
+//
+// `next_handle` also rewinds, so the NEXT allocate would overwrite the
+// phantom slot and mask the bug — which is why this asserts on `handles()`
+// immediately after `rollback_to` and allocates nothing further.
+fn rollback_to_savepoint_undoes_a_later_allocate_in_the_same_transaction_body(b: &Backing) {
+    let mut db = open_chisel(b);
+    db.begin().unwrap();
+    let kept = db.allocate(b"before savepoint").unwrap();
+    db.savepoint("sp").unwrap();
+    let discarded = db.allocate(b"after savepoint").unwrap();
+    db.rollback_to("sp").unwrap();
+
+    let live = db.handles().unwrap();
+    assert_eq!(
+        live.len(),
+        1,
+        "rollback_to must leave exactly the pre-savepoint handle in the table; got {live:?}"
+    );
+    assert_eq!(live[0], kept, "the surviving handle must be the kept one");
+    assert!(
+        matches!(db.read(discarded), Err(ChiselError::InvalidHandle(_))),
+        "the post-savepoint handle must not resolve"
+    );
+
+    // ...and the phantom must not be reachable through a commit either.
+    db.commit().unwrap();
+    assert_eq!(db.handles().unwrap().len(), 1);
+    assert_eq!(db.read(kept).unwrap(), b"before savepoint");
+}
+
+dual_backing_test!(
+    rollback_to_savepoint_undoes_a_later_allocate_in_the_same_transaction,
+    rollback_to_savepoint_undoes_a_later_allocate_in_the_same_transaction_body
+);
