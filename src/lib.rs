@@ -589,7 +589,11 @@ impl Chisel {
     /// time — there is no nesting beyond savepoints.
     ///
     /// # Errors
-    /// `TransactionAlreadyActive` if a transaction is already open.
+    /// `ReadOnlyMode` if the handle cannot write — either
+    /// [`Options::read_only`] was set, or the file's format minor version is
+    /// newer than this build's and `open` forced the handle read-only on an
+    /// otherwise-successful open; `TransactionAlreadyActive` if a transaction
+    /// is already open.
     pub fn begin(&mut self) -> Result<()> {
         self.txm.begin()
     }
@@ -1091,8 +1095,10 @@ impl Chisel {
     /// # Errors
     /// `EncryptionNotSupported` if the database has no encryption;
     /// `InvalidEncryptionKey` if `existing` unlocks no slot; `NoFreeKeySlot` if
-    /// all 8 key slots are full. An fsync/superblock failure is fatal and poisons
-    /// the handle.
+    /// all 8 key slots are full; `TransactionInProgress` if a transaction is
+    /// active — the key slots are rewritten through their own superblock
+    /// commit, which cannot interleave with one. An fsync/superblock failure is
+    /// fatal and poisons the handle.
     pub fn add_key(&mut self, existing: &crypto::Key, new: &crypto::Key) -> Result<()> {
         self.txm.add_key(existing, new)
     }
@@ -1126,8 +1132,10 @@ impl Chisel {
     /// # Errors
     /// `EncryptionNotSupported` if the database has no encryption;
     /// `InvalidEncryptionKey` if `old` unlocks no slot; `NoFreeKeySlot` if all 8
-    /// key slots are full (no room to stage `new` before revoking `old`). An
-    /// fsync/superblock failure is fatal and poisons the handle.
+    /// key slots are full (no room to stage `new` before revoking `old`);
+    /// `TransactionInProgress` if a transaction is active — the key slots are
+    /// rewritten through their own superblock commit, which cannot interleave
+    /// with one. An fsync/superblock failure is fatal and poisons the handle.
     pub fn rotate_key(&mut self, old: &crypto::Key, new: &crypto::Key) -> Result<()> {
         self.txm.rotate_key(old, new)
     }
@@ -1145,7 +1153,9 @@ impl Chisel {
     /// `EncryptionNotSupported` if the database has no encryption;
     /// `InvalidEncryptionKey` if `key` unlocks no slot; `LastKeySlot` if
     /// `key` is the only active credential (removing it would make the database
-    /// permanently unopenable — nothing is changed). An fsync/superblock
+    /// permanently unopenable — nothing is changed); `TransactionInProgress` if
+    /// a transaction is active — the key slots are rewritten through their own
+    /// superblock commit, which cannot interleave with one. An fsync/superblock
     /// failure is fatal and poisons the handle.
     pub fn remove_key(&mut self, key: &crypto::Key) -> Result<()> {
         self.txm.remove_key(key)

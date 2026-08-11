@@ -44,7 +44,15 @@ use super::*;
 /// back a page still referenced by the live tree (the I18 invariant). Routing
 /// handle-table and membership COW allocation through here — rather than the
 /// monotonic `new_page` — is what lets those structures reach a bounded
-/// steady-state page count instead of leaking one page per mutation.
+/// steady-state page count ACROSS COMMITS instead of leaking one page per
+/// mutation forever.
+///
+/// HANDLES-INDEX-2 (issue #112): that bound does NOT extend within a single
+/// transaction, and this comment used to read as if it did. The deferral in the
+/// paragraph above is exactly why — nothing this transaction frees is reusable
+/// by this transaction. Neither radix has the freemap tree's `session_owned`
+/// in-place dedup, so a long transaction's handle-table and membership churn
+/// still marches the file high-water up monotonically until it commits.
 pub(super) fn cow_alloc(
     cache: &mut PageCache,
     tree: &mut FreeMapTree,

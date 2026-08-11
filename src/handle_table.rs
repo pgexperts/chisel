@@ -250,9 +250,21 @@ impl HandleTable {
     /// layer: it reuses a page freed by a *prior* committed transaction when
     /// one is available, falling back to extending the file. Routing COW
     /// allocation through it (instead of `cache.new_page()` directly) is what
-    /// lets the handle table reach a bounded steady-state page count rather
-    /// than growing one page per mutation. `freed` collects the page ids this
-    /// call supersedes so the caller can return them to the freemap on commit.
+    /// lets the handle table reach a bounded steady-state page count ACROSS
+    /// COMMITS rather than growing one page per mutation forever. `freed`
+    /// collects the page ids this call supersedes so the caller can return them
+    /// to the freemap on commit.
+    ///
+    /// HANDLES-INDEX-2 (issue #112): that bound is across commits ONLY. It says
+    /// nothing about churn WITHIN one transaction, and this comment used to read
+    /// as if it did. `alloc` can only reuse pages the *committed* freemap bitmap
+    /// marks free; the ids in `freed` sit in `txn_freed_pages` and do not reach
+    /// that bitmap until commit. There is also no "already COW'd this
+    /// transaction" check below — `FreeMapTree.session_owned` gives the freemap
+    /// tree exactly that, and neither this radix nor `membership_index` has an
+    /// equivalent — so every mutation re-COWs the whole root-to-leaf path. N
+    /// mutations on a depth-d table therefore allocate up to N*(d+1) pages
+    /// inside one transaction, none of them reclaimable before it commits.
     pub fn insert(
         &mut self,
         cache: &mut PageCache,

@@ -192,7 +192,13 @@ fn bench_delete_churn_flat(c: &mut Criterion) {
                     // black_box both engine and handles to prevent the
                     // optimizer from eliding the work.
                     black_box(db.file_size_bytes().expect("file_size_bytes"));
-                    black_box(new_handles.len())
+                    black_box(new_handles.len());
+                    // Return the engine rather than dropping it here.
+                    // `iter_batched` drops the routine's output AFTER
+                    // `measurement.end`, so this moves engine teardown (and
+                    // freeing the in-memory backing store) out of the timed
+                    // span; it is not the round-trip this row measures.
+                    (db, new_handles)
                 },
                 criterion::BatchSize::PerIteration,
             );
@@ -246,7 +252,7 @@ fn bench_reclamation_pages_allocated(c: &mut Criterion) {
                     let handles = churn_cycle(&mut db, handles, size_bytes);
                     (db, handles, tf)
                 },
-                |(mut db, handles, _tf)| {
+                |(mut db, handles, tf)| {
                     let counters_before = db.counters().expect("counters before");
                     let size_before = db.file_size_bytes().expect("size before");
 
@@ -263,7 +269,13 @@ fn bench_reclamation_pages_allocated(c: &mut Criterion) {
                             .saturating_sub(counters_before.pages_allocated),
                     );
                     black_box(size_after as i64 - size_before as i64);
-                    black_box(new_handles.len())
+                    black_box(new_handles.len());
+                    // Return engine + tempfile so Criterion drops them after
+                    // `measurement.end`. Dropping the NamedTempFile here
+                    // charged this row for unlinking a multi-megabyte file,
+                    // whose cost varies by filesystem and has nothing to do
+                    // with reclamation throughput.
+                    (db, new_handles, tf)
                 },
                 criterion::BatchSize::PerIteration,
             );
@@ -339,8 +351,12 @@ fn bench_defrag_orphan_sweep(c: &mut Criterion) {
                     // optimizer cannot elide the defrag work.
                     black_box(stats.freemap_orphans_reclaimed);
                     black_box(db.file_size_bytes().expect("file_size after defrag"));
-                    drop(db);
-                    drop(tf);
+                    // These used to be `drop(db); drop(tf);` right here, which
+                    // put the engine close and the tempfile unlink INSIDE the
+                    // measured span. The timed segment is reopen + defrag, not
+                    // teardown; returning the pair lets `iter_batched` drop it
+                    // after `measurement.end`.
+                    (db, tf)
                 },
                 criterion::BatchSize::PerIteration,
             );

@@ -40,7 +40,7 @@ fn render_status_line(report: &DiffReport) -> String {
     if report.scenarios.is_empty() {
         return "❗ No scenarios to compare — both inputs have empty scenario data".to_string();
     }
-    if has_missing_cell(report) {
+    if has_unusable_cell(report) {
         return "❗ Diff incomplete — see details below".to_string();
     }
     if report.regression_count > 0 {
@@ -57,12 +57,18 @@ fn render_status_line(report: &DiffReport) -> String {
     "✅ No regressions detected".to_string()
 }
 
-fn has_missing_cell(report: &DiffReport) -> bool {
+// True when any cell cannot be compared: absent on one side, or present on
+// both but uncomputable (`ZeroBaseline`). Named for the property rather than
+// for "missing" because a zero-baseline cell is present and still unusable —
+// and it MUST be included here. Without it the status line reads
+// "✅ No regressions detected" over a table containing a degenerate cell,
+// which is the failure the zero guard exists to prevent.
+fn has_unusable_cell(report: &DiffReport) -> bool {
     report.scenarios.iter().any(|s| {
         s.metrics.iter().any(|m| {
             matches!(
                 m.status,
-                DeltaStatus::BaselineMissing | DeltaStatus::PrMissing
+                DeltaStatus::BaselineMissing | DeltaStatus::PrMissing | DeltaStatus::ZeroBaseline
             )
         })
     })
@@ -82,7 +88,7 @@ fn render_summary_table(report: &DiffReport) -> String {
 
 fn sort_summary_rows(report: &DiffReport) -> Vec<&ScenarioDiff> {
     let mut rows: Vec<&ScenarioDiff> = report.scenarios.iter().collect();
-    let any_attention = report.regression_count > 0 || has_missing_cell(report);
+    let any_attention = report.regression_count > 0 || has_unusable_cell(report);
     if any_attention {
         // Worst-regression first; missing-cell rows sort to the top.
         rows.sort_by(|a, b| {
@@ -96,13 +102,16 @@ fn sort_summary_rows(report: &DiffReport) -> Vec<&ScenarioDiff> {
     rows
 }
 
-// Higher = sorts earlier. Missing-cell rows get +infinity; regressed
-// rows get their delta_pct; everything else gets f64::NEG_INFINITY.
+// Higher = sorts earlier. Unusable-cell rows (missing on either side, or
+// zero-baseline) get +infinity; regressed rows get their delta_pct;
+// everything else gets f64::NEG_INFINITY. Zero-baseline rows belong in the
+// +infinity group: they have no delta_pct, so leaving them out would sort
+// them to the BOTTOM with the clean rows.
 fn sort_key_attention(s: &ScenarioDiff) -> f64 {
     if s.metrics.iter().any(|m| {
         matches!(
             m.status,
-            DeltaStatus::BaselineMissing | DeltaStatus::PrMissing
+            DeltaStatus::BaselineMissing | DeltaStatus::PrMissing | DeltaStatus::ZeroBaseline
         )
     }) {
         return f64::INFINITY;
@@ -120,6 +129,10 @@ fn render_summary_row(s: &ScenarioDiff) -> String {
     let throughput_str = match (&throughput.status, throughput.delta_pct) {
         (DeltaStatus::PrMissing, _) => "—".to_string(),
         (DeltaStatus::BaselineMissing, _) => "—".to_string(),
+        // Spelled out rather than left to the `(_, None)` fallthrough: a
+        // zero-baseline cell has no percentage, and the reason it has none is
+        // worth naming next to the other two uncomparable statuses.
+        (DeltaStatus::ZeroBaseline, _) => "—".to_string(),
         (_, Some(bad_pct)) => {
             // Throughput display sign is opposite of bad-direction-positive,
             // but guard exact zero to avoid rendering "-0.0%".
@@ -129,7 +142,7 @@ fn render_summary_row(s: &ScenarioDiff) -> String {
         (_, None) => "—".to_string(),
     };
 
-    let worst_str = match (&s.worst_regression, missing_marker(s)) {
+    let worst_str = match (&s.worst_regression, attention_marker(s)) {
         (_, Some(marker)) => marker,
         (Some(md), None) => format!("{} {} ⚠️", md.metric.label(), format_delta_display(md),),
         (None, None) => "—".to_string(),
@@ -141,7 +154,11 @@ fn render_summary_row(s: &ScenarioDiff) -> String {
     )
 }
 
-fn missing_marker(s: &ScenarioDiff) -> Option<String> {
+// Marker for the "Worst Δ" column when a row has something more important to
+// say than its worst regression. Checked BEFORE `worst_regression` in
+// `render_summary_row`, so the ordering here is a priority ordering: a wholly
+// absent cell outranks a new scenario, which outranks a degenerate one.
+fn attention_marker(s: &ScenarioDiff) -> Option<String> {
     let pr_missing = s
         .metrics
         .iter()
@@ -150,6 +167,10 @@ fn missing_marker(s: &ScenarioDiff) -> Option<String> {
         .metrics
         .iter()
         .any(|m| matches!(m.status, DeltaStatus::BaselineMissing));
+    let zero_baseline = s
+        .metrics
+        .iter()
+        .any(|m| matches!(m.status, DeltaStatus::ZeroBaseline));
     if pr_missing {
         Some(format!(
             "❌ {} / {} — missing on PR side",
@@ -158,6 +179,14 @@ fn missing_marker(s: &ScenarioDiff) -> Option<String> {
     } else if baseline_missing {
         Some(format!(
             "❓ {} / {} — new scenario, no baseline",
+            s.scenario, s.mode
+        ))
+    } else if zero_baseline {
+        Some(format!(
+            // Deliberately not "zero baseline": the status also covers a
+            // non-finite or negative value on EITHER side, so naming the
+            // baseline would point a reader at the wrong column.
+            "❗ {} / {} — degenerate value, no % comparison",
             s.scenario, s.mode
         ))
     } else {
@@ -170,6 +199,12 @@ fn missing_marker(s: &ScenarioDiff) -> Option<String> {
 // so display_pct == delta_pct. For throughput, flip the sign — but
 // avoid producing -0.0 when the raw delta is exactly zero (would
 // render as "-0.0%" and look like a tiny regression).
+//
+// The `unwrap_or(0.0)` below is why every caller must screen out statuses
+// that carry no percentage: a `None` delta silently prints as "+0.0%".
+// Both callers do — `render_summary_row` only reaches here for a
+// `Regressed` worst-Δ, and `render_detail_cell` handles `ZeroBaseline` and
+// the missing statuses in earlier arms.
 fn format_delta_display(md: &MetricDelta) -> String {
     let raw = md.delta_pct.unwrap_or(0.0);
     let display_pct = match md.metric {
@@ -215,31 +250,39 @@ fn render_detail_row(s: &ScenarioDiff) -> String {
 fn render_detail_cell(md: &MetricDelta) -> String {
     match (&md.status, md.baseline, md.pr) {
         (DeltaStatus::PrMissing, _, _) | (DeltaStatus::BaselineMissing, _, _) => "—".to_string(),
+        // Both values exist; the percentage does not. Show the raw pair — the
+        // reader needs to see WHICH side was degenerate — and print "n/a"
+        // where the percentage would go. Letting this fall through to the arm
+        // below would render `0 ops/s → 900 ops/s (+0.0%)`, because
+        // `format_delta_display` turns a `None` delta into 0.0: a degenerate
+        // cell dressed up as an unchanged one.
+        (DeltaStatus::ZeroBaseline, Some(b), Some(p)) => format!(
+            "{} → {} (n/a) ❗",
+            format_value(md.metric, b),
+            format_value(md.metric, p)
+        ),
         (_, Some(b), Some(p)) => {
             let flag = if matches!(md.status, DeltaStatus::Regressed { .. }) {
                 " ⚠️"
             } else {
                 ""
             };
-            let delta = format_delta_display(md);
-            match md.metric {
-                Metric::Throughput => format!(
-                    "{} → {} ({}){}",
-                    format_throughput(b),
-                    format_throughput(p),
-                    delta,
-                    flag
-                ),
-                _ => format!(
-                    "{} → {} ({}){}",
-                    format_duration_ns(b),
-                    format_duration_ns(p),
-                    delta,
-                    flag
-                ),
-            }
+            format!(
+                "{} → {} ({}){}",
+                format_value(md.metric, b),
+                format_value(md.metric, p),
+                format_delta_display(md),
+                flag
+            )
         }
         _ => "—".to_string(),
+    }
+}
+
+fn format_value(metric: Metric, v: f64) -> String {
+    match metric {
+        Metric::Throughput => format_throughput(v),
+        _ => format_duration_ns(v),
     }
 }
 
@@ -420,6 +463,53 @@ mod tests {
         assert!(
             out.contains("❓ ycsb-c / chisel-strict — new scenario, no baseline"),
             "new-scenario marker missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn zero_baseline_does_not_render_as_no_regressions() {
+        // `DeltaStatus::ZeroBaseline` has no exhaustive match anywhere, so the
+        // variant could be added and every render site would still compile
+        // while quietly treating it as an ordinary comparison. This pins the
+        // two places that would be silently wrong: the status line (which
+        // would read "✅ No regressions detected" over a degenerate table) and
+        // the detail cell (which would print "0 ops/s → 1000 ops/s (+0.0%)").
+        let baseline = one_scenario(
+            "ycsb-a/chisel-strict",
+            ScenarioMetrics {
+                throughput_ops_per_sec: 0.0,
+                ..fixed_metrics()
+            },
+        );
+        let pr = one_scenario("ycsb-a/chisel-strict", fixed_metrics());
+        let report = compare(
+            &baseline,
+            &pr,
+            PathBuf::from("b"),
+            PathBuf::from("p"),
+            now(),
+        );
+        let out = render_markdown(&report);
+
+        assert!(
+            !out.contains("✅ No regressions detected"),
+            "degenerate cell reported as clean:\n{out}"
+        );
+        assert!(
+            out.contains("❗ Diff incomplete — see details below"),
+            "diff-incomplete header missing:\n{out}"
+        );
+        assert!(
+            out.contains("❗ ycsb-a / chisel-strict — degenerate value, no % comparison"),
+            "degenerate-value marker missing:\n{out}"
+        );
+        assert!(
+            out.contains("0 ops/s → 1000 ops/s (n/a)"),
+            "detail cell should show both raw values and no percentage:\n{out}"
+        );
+        assert!(
+            !out.contains("inf"),
+            "no infinity should reach the rendered output:\n{out}"
         );
     }
 

@@ -103,8 +103,10 @@ fn seed_for(row_name: &str) -> u64 {
 
 /// Snapshot-restore cell-runner — used by every row except warm-read
 /// (allocate, cold-read, update, delete). Each iteration copies the pre-built
-/// snapshot, opens a fresh engine, runs the workload's ops grouped into
-/// transactions of `ops_per_tx`, then drops engine + tempfile.
+/// snapshot, opens a fresh engine, and runs the workload's ops grouped into
+/// transactions of `ops_per_tx`. Engine + tempfile are RETURNED from the timed
+/// routine, not dropped inside it, so their teardown lands outside the
+/// measured span.
 fn run_snapshot_restore_cell(
     group: &mut BenchmarkGroup<'_, WallTime>,
     mode: EngineMode,
@@ -122,13 +124,22 @@ fn run_snapshot_restore_cell(
                 let engine = mode.open(working.path(), CACHE_SIZE_PAGES).unwrap();
                 (engine, working)
             },
-            |(mut engine, _working)| {
+            |(mut engine, working)| {
                 drive_workload_with_tx_granularity(
                     &mut *engine,
                     workload,
                     ops_per_tx,
                     snapshot_ids,
                 );
+                // Hand engine + tempfile back to Criterion instead of dropping
+                // them here. `iter_batched` does `drop(black_box(output))`
+                // AFTER `measurement.end`, so returning the tuple moves engine
+                // teardown out of the timed span. Dropping it inside charged
+                // this row for SQLite's close-time WAL checkpoint (up to ~8 MB
+                // of frames) and a NamedTempFile unlink of a file up to ~25 MB
+                // — neither of which is the operation the row is named after,
+                // and both of which cost differently per engine.
+                (engine, working)
             },
             BatchSize::PerIteration,
         );
@@ -182,6 +193,11 @@ fn run_cold_read_cell(
                     snapshot_ids,
                     &mut Vec::new(),
                 );
+                // Open stays inside the span deliberately (that IS cold read);
+                // CLOSE does not. Returning the pair defers both the engine
+                // teardown and the tempfile unlink until after
+                // `measurement.end` — see `run_snapshot_restore_cell`.
+                (engine, working)
             },
             BatchSize::PerIteration,
         );

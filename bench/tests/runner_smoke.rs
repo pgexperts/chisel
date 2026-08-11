@@ -44,13 +44,19 @@ fn smoke_run_one_snapshot_restore_cell() {
                         .unwrap();
                     (engine, working)
                 },
-                |(mut engine, _working)| {
+                |(mut engine, working)| {
                     drive_workload_with_tx_granularity(
                         &mut *engine,
                         workload_ref,
                         /*ops_per_tx*/ 1,
                         &snapshot_ids,
                     );
+                    // Mirrors micro_grid.rs: return engine + tempfile so their
+                    // teardown happens after `measurement.end` rather than
+                    // inside the timed span. This smoke test asserts nothing
+                    // about timing, but it is the shape the real cell-runners
+                    // use and should not drift from them.
+                    (engine, working)
                 },
                 BatchSize::PerIteration,
             );

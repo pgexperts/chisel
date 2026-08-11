@@ -43,6 +43,17 @@ impl Metric {
     }
 }
 
+/// Outcome of comparing one metric on one scenario/mode cell.
+///
+/// NOTHING MATCHES THIS EXHAUSTIVELY. Every consumer in `render.rs` and in
+/// this module is a `matches!` or has a `_` arm, so adding a variant compiles
+/// clean and then degrades silently — a new status quietly takes on whatever
+/// the fallthrough arm does. Adding a variant therefore means walking every
+/// `DeltaStatus` occurrence by hand (`grep DeltaStatus bench/src/diff/`) and
+/// deciding for each: does it count toward `regression_count`, does it force
+/// the "Diff incomplete" status line, does it sort to the top, and how does
+/// the detail cell render? `ZeroBaseline` was added that way; the next one
+/// must be too.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeltaStatus {
     /// Metric improved (PR is faster / higher throughput). Not flagged.
@@ -55,6 +66,19 @@ pub enum DeltaStatus {
     BaselineMissing,
     /// Cell present on baseline but absent on PR side.
     PrMissing,
+    /// Both sides present, but no percentage is computable: the baseline is
+    /// zero, or either side is non-finite. Dividing here yields `inf` (which
+    /// passes the regression threshold and renders as "inf%") or `NaN` (which
+    /// fails BOTH comparisons and would land in the `Unchanged` arm, reporting
+    /// a degenerate cell as healthy). Both are producible upstream —
+    /// `runner.rs` emits `throughput = 0.0` when `total_ns == 0` and defaults
+    /// every percentile to `0.0` for an empty op list, and `diff/parse.rs`
+    /// range-validates nothing it reads out of `results.json`.
+    ///
+    /// Treated like the missing-cell statuses: not a regression, but it does
+    /// force the "Diff incomplete" status line so a degenerate run cannot be
+    /// mistaken for a clean one.
+    ZeroBaseline,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +133,11 @@ pub fn compare(
         let baseline_m = baseline.scenarios.get(&key);
         let pr_m = pr.scenarios.get(&key);
         let diff = compare_scenario(&key, baseline_m, pr_m);
+        // Only `Regressed` counts. `ZeroBaseline` deliberately does NOT: it is
+        // an uncomputable cell, not a slower one, and inflating this number
+        // with it would report a phantom regression. It still reaches the
+        // reader — `render::has_unusable_cell` forces the "Diff incomplete"
+        // status line, which outranks the regression line.
         regression_count += diff
             .metrics
             .iter()
@@ -146,6 +175,10 @@ fn compare_scenario(
         compare_metric(Metric::P99, baseline, pr),
     ];
 
+    // `Regressed` only, for the same reason as `regression_count` above: a
+    // `ZeroBaseline` cell has `delta_pct: None` and would compare as 0.0 here,
+    // so admitting it would let an uncomputable cell win the "Worst Δ" column
+    // with a meaningless number.
     let worst_regression = metrics
         .iter()
         .filter(|m| matches!(m.status, DeltaStatus::Regressed { .. }))
@@ -199,6 +232,26 @@ fn compare_metric(
         (Some(b), Some(p)) => {
             let bv = extract(b);
             let pv = extract(p);
+            // Guard the division BEFORE performing it. `bv == 0.0` covers both
+            // signed zeros; `!is_finite()` covers inf and NaN arriving from
+            // `results.json`, which `parse.rs` does not range-check. Every
+            // percentage below this point is finite by construction.
+            // `bv <= 0.0`, not `== 0.0`: every metric here is non-negative by
+            // construction, so a negative baseline is as degenerate as a zero
+            // one — and worse to divide by. `bv = -5, pv = 100` on a latency
+            // metric yields -2100%, classified Improved: a blow-up reported as
+            // a win. That is the silent-wrong-direction half of this bug, and
+            // it admits the same corrupt-`results.json` threat model the
+            // `!is_finite()` term already defends against.
+            if bv <= 0.0 || !bv.is_finite() || pv < 0.0 || !pv.is_finite() {
+                return MetricDelta {
+                    metric,
+                    baseline: Some(bv),
+                    pr: Some(pv),
+                    delta_pct: None,
+                    status: DeltaStatus::ZeroBaseline,
+                };
+            }
             // Bad-direction-positive sign convention. For throughput,
             // bad = lower, so delta_pct = (baseline - pr) / baseline * 100.
             // For latency, bad = higher, so delta_pct = (pr - baseline) / baseline * 100.
@@ -206,6 +259,25 @@ fn compare_metric(
                 Metric::Throughput => (bv - pv) / bv * 100.0,
                 Metric::P50 | Metric::P95 | Metric::P99 => (pv - bv) / bv * 100.0,
             };
+            // The guard above makes this unreachable for any real metric, but
+            // a subnormal baseline (bv = 5e-324) with a large pv is finite on
+            // both inputs and still overflows the ratio to inf. Fall back to
+            // ZeroBaseline rather than only asserting: the assert is
+            // debug-only, so release would otherwise render the very "inf%"
+            // this guard exists to eliminate.
+            if !delta_pct.is_finite() {
+                debug_assert!(
+                    delta_pct.is_finite(),
+                    "delta_pct must be finite past the zero/non-finite guard: bv={bv} pv={pv}"
+                );
+                return MetricDelta {
+                    metric,
+                    baseline: Some(bv),
+                    pr: Some(pv),
+                    delta_pct: None,
+                    status: DeltaStatus::ZeroBaseline,
+                };
+            }
             let status = if delta_pct > metric.threshold_pct() {
                 DeltaStatus::Regressed {
                     pct: delta_pct,
@@ -369,6 +441,85 @@ mod tests {
                 assert_eq!(*threshold_pct, 10.0);
             }
             other => panic!("expected Regressed, got {other:?}"),
+        }
+    }
+
+    fn zero_metrics() -> ScenarioMetrics {
+        ScenarioMetrics {
+            throughput_ops_per_sec: 0.0,
+            p50_ns: 0.0,
+            p95_ns: 0.0,
+            p99_ns: 0.0,
+        }
+    }
+
+    #[test]
+    fn zero_baseline_is_not_a_regression() {
+        // A baseline cell of all zeros — producible upstream when a scenario
+        // records no ops. Before the guard, each latency metric divided by
+        // zero to +inf, sailed past its threshold, and was reported as
+        // `Regressed { pct: inf }`, rendering "inf%" in the PR comment;
+        // throughput divided to -inf and was reported as `Improved`.
+        let baseline = one_scenario("ycsb-a/chisel-strict", zero_metrics());
+        let pr = one_scenario("ycsb-a/chisel-strict", fixed_metrics());
+        let report = compare(
+            &baseline,
+            &pr,
+            PathBuf::from("b"),
+            PathBuf::from("p"),
+            now(),
+        );
+
+        assert_eq!(
+            report.regression_count, 0,
+            "a zero baseline is uncomputable, not a regression"
+        );
+        let s = &report.scenarios[0];
+        assert!(s.worst_regression.is_none());
+        for md in &s.metrics {
+            assert!(
+                matches!(md.status, DeltaStatus::ZeroBaseline),
+                "{:?} should be ZeroBaseline, got {:?}",
+                md.metric,
+                md.status
+            );
+            assert_eq!(
+                md.delta_pct, None,
+                "{:?} must carry no percentage",
+                md.metric
+            );
+            // Both raw values survive so the detail table can show them.
+            assert_eq!(md.baseline, Some(0.0));
+            assert!(md.pr.is_some());
+        }
+    }
+
+    #[test]
+    fn zero_baseline_and_zero_pr_is_not_silently_unchanged() {
+        // 0.0 / 0.0 is NaN, which fails BOTH `> threshold` and `< 0.0` and so
+        // fell into the `else` arm: a degenerate cell classified `Unchanged`
+        // and reported as healthy. This is the quieter half of the defect and
+        // the reason a plain `bv != 0.0` early-out is not enough on its own —
+        // the status has to be distinguishable from a genuine no-change.
+        let baseline = one_scenario("ycsb-a/chisel-strict", zero_metrics());
+        let pr = one_scenario("ycsb-a/chisel-strict", zero_metrics());
+        let report = compare(
+            &baseline,
+            &pr,
+            PathBuf::from("b"),
+            PathBuf::from("p"),
+            now(),
+        );
+
+        assert_eq!(report.regression_count, 0);
+        for md in &report.scenarios[0].metrics {
+            assert!(
+                !matches!(md.status, DeltaStatus::Unchanged),
+                "{:?} was classified Unchanged — a NaN delta reported as healthy",
+                md.metric
+            );
+            assert!(matches!(md.status, DeltaStatus::ZeroBaseline));
+            assert_eq!(md.delta_pct, None);
         }
     }
 
