@@ -294,9 +294,13 @@ impl TransactionManager {
             self.handle_table.set_depth(depth);
         }
         // The freemap root+depth were restored by `current_roots =
-        // committed_roots.clone()` above; any dirty freemap pages this
-        // transaction COW'd sit above the watermark and were dropped by the
-        // truncate. Discard the in-transaction structural working state
+        // committed_roots.clone()` above. The dirty freemap pages this
+        // transaction COW'd were dropped by (a) and (b) TOGETHER, not by the
+        // truncate alone: pages this transaction EXTENDED sit at/above the
+        // watermark and died in (b), while pages drawn from `structural_reuse`
+        // are prior-commit ids BELOW the watermark, which only (a)'s
+        // `discard_all_dirty` reaches. Discard the in-transaction structural
+        // working state
         // (`structural_superseded` + `structural_reuse` + the session set) while
         // leaving `pending_structural_frees` intact as the pre-transaction
         // baseline. See `FreemapRecycle::rollback` for the per-stream reasoning.

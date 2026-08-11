@@ -413,8 +413,10 @@ fn operational_error_does_not_poison() {
 // a page whose bytes no longer match what it committed to —
 // breaking the core shadow-paging invariant. The fix defers the
 // merge of both at-risk sets into the committed freemap tree until AFTER
-// the new-freemap-page allocate has run, so `FreeMap::allocate_first`
-// cannot return any of them during the vulnerable window.
+// the new-freemap-page allocate has run, so `FreeMapTree::allocate_first`
+// cannot return any of them during the vulnerable window. (The tree's, not
+// the leaf's: `FreeMap` only flips the bit it is handed — choosing which id
+// to hand out is the tree's job.)
 #[test]
 fn persist_freemap_does_not_reuse_committed_live_pages() {
     let mut tm = fresh_manager();
@@ -823,6 +825,89 @@ fn structural_recycle_rollback_resets_pools() {
     }
 }
 
+// PIN (FREEMAP-7, issue #115) — a pin, NOT a bug report; it passes both before
+// and after that finding's comment fix.
+//
+// `FreemapRecycle::rollback` used to justify clearing the session set with "any
+// freemap pages this aborted transaction COW'd sit above the watermark and were
+// just truncated". Pages popped from `structural_reuse` are prior-commit ids
+// that sit BELOW the watermark, so `cache.truncate` (filter: `id >= n`) cannot
+// touch them — `discard_all_dirty` is what drops their contents. This pins the
+// division of labour so the corrected reasoning cannot quietly become false: a
+// maintainer who "optimizes" rollback by dropping or reordering
+// `discard_all_dirty` would leave this aborted transaction's freemap-leaf bytes
+// dirty at a pooled id for a later commit to flush.
+//
+// Counterfactual (verified): deleting `cache.discard_all_dirty();` from
+// `rollback_inner` (lifecycle.rs) makes the final `is_dirty` loop fail, naming
+// the leaked page. `structural_recycle_rollback_resets_pools` also goes red on
+// that deletion, but only as a downstream symptom a whole transaction later —
+// `claim_page`'s I20 `debug_assert!` fires when the next transaction is handed
+// the still-dirty pooled id. That assert is compiled out of release builds,
+// where this test's `assert!` still holds; and its message blames the
+// allocator, not the rollback that left the page dirty.
+#[test]
+fn rollback_drops_pool_reused_freemap_cows_that_sit_below_the_watermark() {
+    let mut tm = fresh_manager();
+    let big: Vec<u8> = vec![0xAB; MAX_INLINE_VALUE + 32];
+
+    // A non-empty deferred recycle, so `begin` seeds `structural_reuse` with
+    // real prior-commit ids for this transaction to pop.
+    let survivors = structural_churn(&mut tm, &big, 8, 4);
+    assert!(
+        !tm.freemap.pending_structural_frees().is_empty(),
+        "precondition: a prior commit must leave a non-empty deferred recycle"
+    );
+
+    let watermark = tm.committed_roots.total_pages;
+    let _ = take_structural_reuse_log();
+
+    // Allocations claim bitmap-free data pages, which COW the freemap leaf
+    // through `structural_extend` — the pop this test is about. Do NOT commit.
+    tm.begin().unwrap();
+    let _fresh: Vec<u64> = (0..6).map(|_| tm.allocate(&big).unwrap()).collect();
+    for h in &survivors {
+        tm.delete(*h).unwrap();
+    }
+    let pooled = take_structural_reuse_log();
+    assert!(
+        !pooled.is_empty(),
+        "precondition: the transaction must actually reuse a pooled freemap page, \
+             else the below-watermark case is untested"
+    );
+
+    // The claim the old comment had backwards: these ids are BELOW the
+    // watermark, which is exactly what puts them out of `truncate`'s reach.
+    for id in &pooled {
+        assert!(
+            *id < watermark,
+            "pooled freemap COW target {id} must sit BELOW the rollback watermark \
+                 {watermark} — a truncate whose filter is `id >= n` cannot drop it"
+        );
+    }
+    // And they hold this transaction's writes right now, so dropping them is
+    // real work rather than a vacuous assertion.
+    {
+        let cache = tm.cache.borrow();
+        assert!(
+            pooled.iter().any(|id| cache.is_dirty(*id)),
+            "precondition: a pooled COW target must be dirty before the rollback"
+        );
+    }
+
+    tm.rollback().unwrap();
+
+    // `discard_all_dirty` is what got them; the truncate never could have.
+    let cache = tm.cache.borrow();
+    for id in &pooled {
+        assert!(
+            !cache.is_dirty(*id),
+            "rollback left pooled freemap COW target {id} dirty below the watermark \
+                 — a later commit would flush this aborted transaction's bytes"
+        );
+    }
+}
+
 // PROPERTY 2b — the orphan sweep must NOT run under a savepoint.
 //
 // `rollback_to(savepoint)` rewinds the roots + cache watermark but does NOT
@@ -1193,6 +1278,63 @@ fn reclaim_freemap_orphans_marks_lost_freemap_pages_free() {
         tree.is_free(&mut cache, orphan).unwrap(),
         "reclaimed orphan {orphan} must read free in the committed freemap"
     );
+}
+
+// PIN (FREEMAP-8, issue #115) — a pin, NOT a bug report; it passes both before
+// and after that finding's comment fix.
+//
+// `persist`'s early return used to be justified by "the recycle/supersede
+// streams are only ever non-empty when there were frees". That premise is
+// false, and this pins the counterexample so it cannot be reasserted: the
+// defrag orphan sweep fills `structural_superseded` with `txn_freed_pages`
+// still empty. A future change leaning on the false premise — folding stream
+// promotion into `persist`, or asserting `structural_superseded.is_empty()`
+// when there were no data frees — would drop a commit's dead freemap pages out
+// of the recycle and turn bounded churn back into unbounded file growth.
+#[test]
+fn a_transaction_with_no_data_frees_still_fills_the_structural_stream() {
+    let mut tm = fresh_manager();
+    // Churn first so a real freemap tree exists for the sweep to walk and COW.
+    let big: Vec<u8> = vec![0xCD; MAX_INLINE_VALUE + 32];
+    tm.begin().unwrap();
+    let mut hs = Vec::new();
+    for _ in 0..40 {
+        hs.push(tm.allocate(&big).unwrap());
+    }
+    tm.commit().unwrap();
+    tm.begin().unwrap();
+    for h in hs.iter().step_by(2) {
+        tm.delete(*h).unwrap();
+    }
+    tm.commit().unwrap();
+
+    // The orphan gives the sweep something to mark, which is what makes it COW
+    // the freemap with no data free anywhere in the transaction.
+    let orphan = tm.test_forge_freemap_orphan().unwrap();
+
+    tm.begin().unwrap();
+    assert!(
+        tm.txn_freed_pages.is_empty(),
+        "precondition: this transaction frees no data pages"
+    );
+    let reclaimed = tm.reclaim_freemap_orphans().unwrap();
+    assert!(
+        reclaimed >= 1,
+        "the forged orphan {orphan} must be reclaimed"
+    );
+
+    // The counterexample itself: zero data frees, yet the structural stream is
+    // non-empty.
+    assert!(
+        tm.txn_freed_pages.is_empty(),
+        "the sweep must not route freemap pages through the DATA free stream"
+    );
+    assert!(
+        !tm.freemap.structural_superseded().is_empty(),
+        "marking alone fills structural_superseded — `persist`'s emptiness check \
+             says nothing whatever about the structural streams"
+    );
+    tm.commit().unwrap();
 }
 
 // The sweep's exclusion set is load-bearing: a page CURRENTLY in the live

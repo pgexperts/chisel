@@ -4,21 +4,29 @@
 // FreeMap page. Each bit represents one page in the database file.
 //   1 = free (available for reuse), 0 = in use.
 //
-// The freemap is wired into page allocation (ISSUES.md R2) via the shared
-// `cow_alloc` helper in transaction.rs: data-page allocation AND the
-// handle-table / membership-index COW paths prefer `FreeMap::allocate_first`
-// (reusing a page freed by a prior committed transaction) and fall back to
-// extending the file only when the freemap has no free id to hand out.
-// Reclamation happens during commit via `persist_freemap` (now
-// `FreemapRecycle::persist`), which marks `txn_freed_pages` free in a COW of
-// the committed freemap tree BEFORE the new snapshot is durable
-// (I18 ordering) so allocation cannot reuse a page the last-durable
-// superblock still references. The handle table and membership index both feed
-// their COW-superseded pages into `txn_freed_pages` and allocate through
-// `cow_alloc`, so they reach a bounded steady-state page count rather than
-// growing one page per mutation. Overflow pages still extend directly (call
-// `PageCache::new_page`), but their frees do feed the freemap on commit, so a
-// later data/handle-table allocation can reclaim them.
+// Nothing in this module decides WHICH page id is handed out. That decision
+// belongs to the freemap tree (freemap_tree.rs), which descends its radix spine
+// to a leaf and then calls in here only to inspect or flip one already-named
+// bit. The production allocation path (ISSUES.md R2) runs:
+//
+//   `cow_alloc` (transaction/freemap.rs)
+//     -> `FreeMapTree::allocate_first`
+//        -> `scan_from` / `scan_node` -> `FreeMap::first_free_bit_from`  (FIND)
+//        -> `FreeMapTree::clear_bit` -> `cow_descend` -> `FreeMap::clear_bit`
+//                                                                       (CLAIM)
+//
+// Data-page allocation AND the handle-table / membership-index COW paths all
+// enter through `cow_alloc`, so they prefer a page freed by a prior committed
+// transaction and extend the file only when the tree has no free id to hand
+// out. Reclamation happens during commit via `FreemapRecycle::persist`, which
+// marks `txn_freed_pages` free in a COW of the committed freemap tree BEFORE
+// the new snapshot is durable (I18 ordering) so allocation cannot reuse a page
+// the last-durable superblock still references. The handle table and membership
+// index both feed their COW-superseded pages into `txn_freed_pages` and
+// allocate through `cow_alloc`, so they reach a bounded steady-state page count
+// rather than growing one page per mutation. Overflow pages still extend
+// directly (call `PageCache::new_page`), but their frees do feed the freemap on
+// commit, so a later data/handle-table allocation can reclaim them.
 //
 // On-disk layout of a freemap page:
 //   byte 0        : PageType tag (0x04 = FreeMap)
@@ -41,7 +49,8 @@
 //
 // Endianness: the bitmap is a flat byte array; bit_position() uses the
 // convention (byte_idx = page_id / 8, bit_idx = page_id % 8) with LSB = lowest
-// page_id within a byte. `allocate_first` relies on this via `trailing_zeros`.
+// page_id within a byte. `first_free_bit_from` relies on this via
+// `trailing_zeros`.
 
 use crate::page::{PageType, DATA_PAGE_HEADER_SIZE, PAGE_BODY_SIZE, PAGE_SIZE};
 
@@ -56,25 +65,36 @@ const BITMAP_OFFSET: usize = DATA_PAGE_HEADER_SIZE;
 
 pub struct FreeMap;
 
-// I35 reshape note: capacity and is_free are reached only from src-tests
-// today (capacity from src/freemap.rs's own tests; is_free from
-// src/transaction.rs's I27/I28 regression tests). The production allocator
-// path uses `allocate_first` + `mark_free`. They stay behind
-// `#[allow(dead_code)]` rather than being deleted: is_free is the natural
-// predicate any future health-check tool would call, and capacity is its
-// companion bound.
-#[allow(dead_code)]
+// Every item below has a live PRODUCTION caller, which is why no blanket
+// `#[allow(dead_code)]` sits on this impl any more. The allow used to cover the
+// whole block, and what it hid was two genuinely dead functions —
+// `allocate_first` and `capacity`, deleted for issue #115 — sitting under a
+// note that named them as the production allocator path. Without the allow, the
+// compiler flags the next item that loses its last caller instead.
+//
+//   * `first_free_bit_from` + `clear_bit` <- `FreeMapTree::allocate_first`
+//     (find the lowest free id in a leaf, then claim exactly that bit).
+//   * `mark_free` <- `FreeMapTree::mark_free`, reached from commit's
+//     `FreemapRecycle::persist` and from the defrag orphan sweep.
+//   * `is_free` <- `FreeMapTree::is_free` <- `FreemapRecycle::reclaim_orphans`.
+//     PRODUCTION, not test-only: the orphan sweep calls it to confirm a dead
+//     freemap-typed page is genuinely free before reclaiming it, so weakening
+//     the predicate would let the sweep double-reclaim a live page. (The note
+//     that stood here had this backwards, and cited `src/transaction.rs` — a
+//     file that no longer exists.)
+//   * `init_page` <- `FreeMapTree::create`, `cow_descend`'s absent-leaf
+//     materialization, and `page`'s page-type construction.
+//
+// Bounds: every accessor here is TOTAL. `bit_position` maps any u64 to a
+// (byte, bit) pair and each accessor range-checks `byte_idx < PAGE_BODY_SIZE`,
+// so an id past this leaf's `PAGE_BODY_SIZE * 8` reach is ignored by the
+// mutators and reads as "not free". Treat that as a crash guard, NOT a contract
+// to lean on: silently dropping a write is tolerable only because such an id
+// never belonged to this leaf in the first place. Choosing the leaf is
+// `freemap_tree.rs`'s job, and its `cow_descend` rejects an out-of-reach id
+// outright (FREEMAP-6, issue #115) rather than letting it through to a leaf
+// where `id % LEAF_CAPACITY` would alias onto some other page's bit.
 impl FreeMap {
-    /// Maximum number of pages one freemap page can track.
-    //
-    // Invariant: any page_id passed to is_free/mark_free/allocate_first
-    // must be < capacity(). Out-of-range IDs are silently ignored by the
-    // mutators and treated as "not free" by is_free — this is defensive, not
-    // a contract to rely on.
-    pub fn capacity() -> usize {
-        PAGE_BODY_SIZE * 8
-    }
-
     /// Initialize a page buffer as an empty freemap (all bits 0 = all in use).
     //
     // Starting state is "nothing is free". Callers must explicitly `mark_free`
@@ -116,27 +136,6 @@ impl FreeMap {
         }
     }
 
-    /// Allocate the first free page. Clears its bit and returns the page ID.
-    //
-    // Linear scan; returns the lowest free page_id. `trailing_zeros` finds the
-    // lowest-set bit within the first non-zero byte, which matches the
-    // bit_position() convention (LSB = lowest page_id within a byte).
-    //
-    // Allocation combines two effects: (1) locate a free page, (2) flip its
-    // bit to "in use" in the same pass — callers get an already-claimed id.
-    pub fn allocate_first(buf: &mut [u8; PAGE_SIZE]) -> Option<u64> {
-        for byte_idx in 0..PAGE_BODY_SIZE {
-            let byte = buf[BITMAP_OFFSET + byte_idx];
-            if byte != 0 {
-                let bit_idx = byte.trailing_zeros() as usize;
-                let page_id = (byte_idx * 8 + bit_idx) as u64;
-                buf[BITMAP_OFFSET + byte_idx] &= !(1 << bit_idx);
-                return Some(page_id);
-            }
-        }
-        None
-    }
-
     /// Return the lowest free page id that is `>= lo`, or `None` if every free
     /// bit in this leaf is below `lo`.
     ///
@@ -146,11 +145,9 @@ impl FreeMap {
     /// exhausted prefix. Pass `lo = 0` to find the absolute lowest free bit.
     ///
     /// The starting byte is masked so that bits below `lo` within that byte are
-    /// ignored; subsequent bytes scan whole. Uses the same `trailing_zeros`
-    /// LSB-first convention as `allocate_first`.
-    // `#[allow(dead_code)]`: the freemap tree is the production caller; no
-    // non-test caller exists yet in this unit.
-    #[allow(dead_code)]
+    /// ignored; subsequent bytes scan whole. `trailing_zeros` finds the
+    /// lowest-set bit within the first non-zero byte, which is exactly
+    /// `bit_position`'s LSB-first convention.
     pub fn first_free_bit_from(buf: &[u8; PAGE_SIZE], lo: u64) -> Option<u64> {
         let start_byte = (lo / 8) as usize;
         if start_byte >= PAGE_BODY_SIZE {
@@ -173,14 +170,12 @@ impl FreeMap {
 
     /// Clear one specific bit (mark the page as in-use).
     ///
-    /// The inverse of `mark_free` for a single id: `allocate_first` on the tree
-    /// uses this to claim a found id by clearing exactly its bit (rather than
-    /// the leaf-local `FreeMap::allocate_first`, which clears the *lowest* bit —
-    /// the tree has already decided *which* id to hand out by descending the
-    /// spine). Silently ignores out-of-range ids and does not re-stamp the
-    /// checksum, matching `mark_free`'s contract.
-    // `#[allow(dead_code)]`: the freemap tree is the production caller.
-    #[allow(dead_code)]
+    /// The inverse of `mark_free` for a single id. `FreeMapTree::allocate_first`
+    /// uses this to CLAIM the id it found: by that point the tree has already
+    /// decided *which* id to hand out (it descended the spine, then
+    /// `first_free_bit_from` picked the bit), so the leaf only needs its one
+    /// named bit cleared. Silently ignores out-of-range ids and does not
+    /// re-stamp the checksum, matching `mark_free`'s contract.
     pub fn clear_bit(buf: &mut [u8; PAGE_SIZE], page_id: u64) {
         let (byte_idx, bit_idx) = Self::bit_position(page_id);
         if byte_idx < PAGE_BODY_SIZE {
@@ -190,7 +185,7 @@ impl FreeMap {
 
     // Maps a page_id to (byte_index_within_bitmap, bit_index_within_byte).
     // LSB-first within a byte: page_id 0 = bit 0 of byte 0, page_id 7 = bit 7
-    // of byte 0, page_id 8 = bit 0 of byte 1. `allocate_first` depends on
+    // of byte 0, page_id 8 = bit 0 of byte 1. `first_free_bit_from` depends on
     // this ordering via `trailing_zeros`.
     //
     // The returned byte index is relative to the bitmap body; every accessor
@@ -210,25 +205,6 @@ mod tests {
     // Freemap had no prior in-module test mod; this is a fresh one. All
     // tests are pure bitmap manipulation — no PageCache, no I/O.
     use super::*;
-
-    #[test]
-    fn test_freemap_allocate_first_free() {
-        let mut buf = [0u8; PAGE_SIZE];
-        FreeMap::init_page(&mut buf);
-        FreeMap::mark_free(&mut buf, 50);
-        FreeMap::mark_free(&mut buf, 200);
-        let alloc = FreeMap::allocate_first(&mut buf);
-        assert_eq!(alloc, Some(50));
-        let alloc2 = FreeMap::allocate_first(&mut buf);
-        assert_eq!(alloc2, Some(200));
-        let alloc3 = FreeMap::allocate_first(&mut buf);
-        assert_eq!(alloc3, None);
-    }
-
-    #[test]
-    fn test_freemap_capacity() {
-        assert_eq!(FreeMap::capacity(), PAGE_BODY_SIZE * 8);
-    }
 
     #[test]
     fn first_free_bit_from_returns_lowest_at_or_above_lo() {

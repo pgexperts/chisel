@@ -86,12 +86,20 @@ pub(super) fn run_commit(ctx: &mut CommitCtx<'_>) -> Result<()> {
     // persist_freemap adds.
     ctx.cache.borrow_mut().flush()?;
 
-    // Step 0 (ISSUES.md R2 / I11): persist the freemap tree. This marks
-    // `txn_freed_pages` (plus the prior commit's deferred structural frees)
-    // free in a COW of the committed tree and updates
+    // Step 0 (ISSUES.md R2 / I11): persist the freemap tree. This marks THIS
+    // commit's DATA frees — `txn_freed_pages`, and ONLY those — free in a COW
+    // of the committed tree, and updates
     // `current_roots.{freemap_page, freemap_depth}`. Runs BEFORE the main
     // flush so the new freemap pages join the same durable write set as all
     // other dirty data pages.
+    //
+    // The prior commit's deferred structural frees are NOT marked free here.
+    // They are CONSUMED as COW targets by `structural_extend`, which pops them
+    // off `structural_reuse`. Recording them in the bitmap as well would hand
+    // the same page out twice — once by `cow_alloc` as a data page, once as a
+    // freemap COW target — and re-open the self-reference recursion the
+    // extend-only rule exists to prevent. See the TWO FREE-STREAMS block above
+    // `FreemapRecycle::persist` (transaction/freemap.rs) for the full split.
     //
     // Persist's own borrow lives in this scope so it drops before the held
     // step-1-through-4 borrow acquired below: a second `borrow_mut` on the
