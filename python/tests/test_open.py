@@ -108,6 +108,14 @@ def test_open_with_custom_spillway_size(tmp_db):
         assert db is not None
 
 
+# The three drain_insertion tests below are acceptance-only: they pin the
+# kwarg's shape, not its effect. The behavioural pin — that the policy
+# actually reaches the page cache and changes which pages survive a
+# spilling commit — lives in
+# test_runtime_config.py::test_drain_insertion_open_kwarg_changes_cache_residency,
+# where the single-drain-batch precondition it needs can be kept in one place.
+
+
 def test_open_with_drain_insertion_lru_tail(tmp_db):
     # Default value explicit-passed. Mainly verifies that a
     # DrainInsertion variant survives the round-trip through pyo3 into
