@@ -377,9 +377,23 @@ impl FreemapRecycle {
     /// Mark this commit's DATA frees (`txn_freed_pages`) free in a COW of the
     /// committed tree, via the shared marking path. Each call take/puts the tree,
     /// but the session-owned set persists on the recycle, so a leaf hit by several
-    /// frees is COW'd once. A no-op when nothing was freed (the recycle/supersede
-    /// streams are only ever non-empty when there were frees, so the single
-    /// emptiness check suffices).
+    /// frees is COW'd once.
+    ///
+    /// The `is_empty` early return is a FAST PATH, not a gate. This method marks
+    /// DATA frees and does nothing else, so an empty `txn_freed_pages` leaves the
+    /// loop below a no-op anyway — returning early is behaviourally identical to
+    /// falling through. In particular it says NOTHING about the structural
+    /// streams, which are routinely non-empty with zero data frees: `begin` seeds
+    /// `structural_reuse` from the prior commit's deferred frees, and ANY freemap
+    /// COW fills `structural_superseded` — the defrag orphan sweep does exactly
+    /// that (`reclaim_orphans` -> `mark_free_committed_path` -> `cow_descend` ->
+    /// `put_tree`) without ever touching `txn_freed_pages`.
+    ///
+    /// So do NOT fold the stream promotion into this method, and do not condition
+    /// it on this check. `FreemapRecycle::commit` promotes both streams
+    /// unconditionally; gating that on data frees would drop a commit's dead
+    /// freemap pages out of the recycle, turning bounded steady-state freemap
+    /// churn back into unbounded file growth.
     pub(super) fn persist(
         &mut self,
         cache: &mut PageCache,
@@ -571,9 +585,35 @@ impl FreemapRecycle {
     /// `structural_superseded` holds committed-tree freemap pages this aborted
     /// transaction COW'd-over; the abort means the committed tree still references
     /// them, so they are NOT dead and must never be recycled. `structural_reuse`
-    /// was the working copy; drop it. The session set: any freemap pages this
-    /// aborted transaction COW'd sit above the watermark and were just truncated,
-    /// so their ids must not be treated as in-place-mutable next transaction.
+    /// was the working copy; drop it.
+    ///
+    /// The session set is cleared because both kinds of COW target this
+    /// transaction produced are gone — but by two DIFFERENT mechanisms, and the
+    /// truncate alone does NOT suffice:
+    ///
+    ///   * pages this transaction EXTENDED sit at/above the rollback watermark
+    ///     and die with `cache.truncate(committed_roots.total_pages)`;
+    ///   * pages popped from `structural_reuse` are prior-commit ids that lie
+    ///     BELOW that watermark by construction (each was allocated before the
+    ///     commit that superseded it), so the truncate — whose filter is
+    ///     `id >= n` — cannot reach them. `cache.discard_all_dirty()`, which
+    ///     `rollback_inner` runs FIRST, is what drops their contents.
+    ///
+    /// Either kind left in the set would suppress a needed COW next transaction,
+    /// over a page whose in-transaction contents no longer exist. Re-offering a
+    /// pooled id next transaction is nonetheless correct: `pending_structural_
+    /// frees` is untouched here, the page is still dead, and `begin` re-clones
+    /// it into the pool.
+    ///
+    /// The savepoint sibling is safe only by coincidence. `savepoint_mark`'s
+    /// GAP-1 note below already records WHICH gates supply that coincidence
+    /// (`cow_alloc`'s `reuse_enabled = savepoints.is_empty()`, `reclaim_orphans`
+    /// bailing on `savepoint_active`, `persist` being commit-only); what is not
+    /// recorded there is the CONSEQUENCE of moving one, which is specific to
+    /// this path: `rollback_to_inner` (savepoints.rs) calls `truncate` alone,
+    /// with no `discard_all_dirty`, so it would leave post-savepoint bytes dirty
+    /// at a below-watermark pooled id — the one case the truncate cannot reach.
+    ///
     /// `pending_structural_frees` is NOT touched — `begin` CLONED it into
     /// `structural_reuse` rather than moving it, so it still holds the
     /// pre-transaction dead-freemap-page set (correct: a rolled-back transaction's

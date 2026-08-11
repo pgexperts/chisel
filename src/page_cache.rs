@@ -1055,10 +1055,13 @@ impl PageCache {
     /// residency-blind version reports `false` for pages that carry pending
     /// writes — the exact case `claim_page`'s I20 assert exists to catch.
     ///
-    /// Sole caller is that assert (plus this module's tests). An earlier doc
-    /// claimed the transaction layer used this "to reason about whether a page
-    /// is safe to drop at savepoint/rollback boundaries"; no such caller has
-    /// ever existed. Rollback decides by watermark (I3), not by asking.
+    /// Callers are that assert, this module's tests, and the FREEMAP-7 pin
+    /// (`rollback_drops_pool_reused_freemap_cows_that_sit_below_the_watermark`),
+    /// which OBSERVES the post-rollback state rather than deciding anything with
+    /// it. An earlier doc claimed the transaction layer used this "to reason
+    /// about whether a page is safe to drop at savepoint/rollback boundaries";
+    /// no such caller has ever existed. Rollback still decides by watermark plus
+    /// `discard_all_dirty` (I3), not by asking.
     pub fn is_dirty(&self, page_id: u64) -> bool {
         self.entries.get(&page_id).is_some_and(|e| e.dirty)
             || self

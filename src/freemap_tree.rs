@@ -307,8 +307,12 @@ impl FreeMapTree {
     /// written — then apply `leaf_op(leaf_buf, id % LEAF_CAPACITY)` to the COW'd
     /// leaf and stamp it. The single tested spine implementation shared by both
     /// `mark_free` (leaf_op = set bit) and `clear_bit` (leaf_op = clear bit), so
-    /// set and clear can never diverge. Assumes `id` is in range (callers grow
-    /// first if needed).
+    /// set and clear can never diverge.
+    ///
+    /// An `id` past the tree's reach is REJECTED as `CorruptPage`, never
+    /// silently aliased. Callers still grow first when they may exceed capacity
+    /// (`mark_free_growing`); the guard is what turns forgetting to into a loud
+    /// failure rather than a write to the wrong page.
     fn cow_descend(
         &mut self,
         cache: &mut PageCache,
@@ -317,6 +321,25 @@ impl FreeMapTree {
         leaf_op: &mut dyn FnMut(&mut [u8; PAGE_SIZE], u64),
     ) -> Result<()> {
         self.check_depth()?;
+        // FREEMAP-6 (issue #115): bound the WRITE path exactly as `find_leaf`
+        // bounds the read path. Never write a bit this tree would refuse to
+        // read — an unbounded id here is not a no-op, it is a write at the
+        // WRONG id. At depth 0 the descent loop below never runs and the leaf op
+        // lands on `id % LEAF_CAPACITY`, so `mark_free(LEAF_CAPACITY + 7)` would
+        // free LIVE page 7 and the next `allocate_first` would hand it out —
+        // while `is_free(LEAF_CAPACITY + 7)` still answers "in use", hiding the
+        // damage at the id that was written and inflicting it on the id that was
+        // not. `CorruptPage` (fatal) matches `check_depth` above: this cannot be
+        // reached by correct code, so an occurrence means either the caller or
+        // the stored depth is untrustworthy and no further writing is safe.
+        //
+        // Same saturation caveat as `find_leaf`: at a depth whose true capacity
+        // exceeds u64 every id is in reach, so skip the guard rather than
+        // rejecting id == u64::MAX.
+        let cap = self.capacity();
+        if cap != u64::MAX && id >= cap {
+            return Err(ChiselError::CorruptPage { page_id: self.root });
+        }
         // COW the root first; the new root replaces self.root and the old one is
         // superseded. (grow has already ensured depth covers id, if needed.)
         // The root's position type follows depth exactly as the read paths see it:
@@ -338,6 +361,25 @@ impl FreeMapTree {
         for level in (1..=self.depth).rev() {
             let span = self.child_span(level);
             let child_idx = (remaining / span) as usize;
+            // Defense in depth, the write-path counterpart to `find_leaf`'s
+            // slot guard — and, like that one, not reachable by arithmetic: a
+            // `check_depth`-validated depth plus the range guard above already
+            // bound `child_idx` below PTRS_PER_INTERIOR at every level, and the
+            // one depth where `capacity()` saturates (5) still divides by a
+            // span just under 2^56, so the quotient tops out at 259 —
+            // `mark_free_growing(u64::MAX)` reaches exactly that, legally, and
+            // 259 is far below PTRS_PER_INTERIOR. It is here
+            // because the write path has strictly more to lose than the read
+            // path: `find_leaf` can answer "absent", whereas
+            // `read_child`/`write_child` index `DATA_PAGE_HEADER_SIZE + index *
+            // PTR_SIZE` with no bound of their own — slot 1021 would silently
+            // overwrite the checksum field and 1022+ would panic on the slice.
+            // Fatal rather than operational is doubly right here: by this point
+            // the root has already been COW'd and `self.root` reassigned, so
+            // there is no clean state left to hand back to a caller.
+            if child_idx >= PTRS_PER_INTERIOR {
+                return Err(ChiselError::CorruptPage { page_id: current });
+            }
             let child = read_child(cache.get(current)?, child_idx);
             // A child below interior `level` is a leaf at level 1 and an interior
             // at deeper levels — the same position type the read paths validate.
@@ -436,9 +478,18 @@ impl FreeMapTree {
     }
 
     /// Mark `id` free (set its bit), COWing the spine and materializing any
-    /// absent nodes. Assumes `id` is in range; use `mark_free_growing` when it
-    /// may exceed capacity.
-    pub fn mark_free(
+    /// absent nodes. `id` must already be in range; `mark_free_growing` is the
+    /// entry point that guarantees that, and it is the only one the manager
+    /// uses.
+    ///
+    /// Module-private ON PURPOSE (FREEMAP-6, issue #115). This was `pub` on a
+    /// `pub(crate)` type, so a new caller could reach it having forgotten to
+    /// grow, and `cow_descend` now rejects that as `CorruptPage` — a loud
+    /// failure, but still a failure a caller had to hit at runtime. Privacy is
+    /// what keeps the mistake from compiling in the first place; the guard is
+    /// the backstop for the paths privacy cannot cover (a corrupt stored
+    /// depth).
+    fn mark_free(
         &mut self,
         cache: &mut PageCache,
         id: u64,
@@ -922,6 +973,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    // FREEMAP-6 (issue #115). The WRITE path must refuse an id it cannot reach,
+    // because the alternative is not "no effect" — it is an effect at the WRONG
+    // id. At depth 0 `cow_descend`'s descent loop never runs, so the leaf op
+    // lands on `id % LEAF_CAPACITY`: marking `LEAF_CAPACITY + 7` free used to
+    // set the free bit for page 7 — a LIVE page the next `allocate_first` hands
+    // straight out, i.e. a double allocation. The read path already refuses the
+    // id (`find_leaf`'s `id >= capacity()` guard), so the damage was invisible
+    // at the id you wrote and lethal at the id you did not.
+    #[test]
+    fn an_out_of_reach_id_is_rejected_by_the_write_path_not_aliased() {
+        let mut c = make_cache(256);
+        let mut t = FreeMapTree::create(&mut c, &mut extend).unwrap();
+        assert_eq!(t.depth, 0, "the aliasing case is the depth-0 tree");
+        let out_of_reach = LEAF_CAPACITY + 7;
+
+        // The read path already refuses the id.
+        assert!(
+            !t.is_free(&mut c, out_of_reach).unwrap(),
+            "precondition: the read path reports an out-of-reach id as in-use"
+        );
+
+        // So the write path must refuse it too — never write a bit this tree
+        // would refuse to read.
+        let err = match t.mark_free(&mut c, out_of_reach, &mut extend) {
+            Ok(()) => panic!("the write path accepted an out-of-reach id"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ChiselError::CorruptPage { .. }),
+            "expected CorruptPage, got {err:?}"
+        );
+
+        // The corruption itself: page 7 is live and must not have been freed by
+        // a write aimed at LEAF_CAPACITY + 7.
+        assert!(
+            !t.is_free(&mut c, 7).unwrap(),
+            "aliased write: freeing LEAF_CAPACITY + 7 set the free bit for LIVE \
+             page 7, which the next allocate_first would hand out"
+        );
     }
 
     // Defense in depth for the SECURITY-SWEEP-3 hazard. `open_existing` rejects
