@@ -154,7 +154,9 @@ fn passphrase_key_round_trip() {
 /// Regression: open an encrypted DB immediately after creation, WITHOUT any
 /// user commit. Before the fix, `slot_idx = txn_counter % N = (N-1) % N = N-1`
 /// pointed at the loser slot (counter 0) while the winner (counter N-1) is at
-/// slot 0, causing an AAD mismatch and a spurious InvalidEncryptionKey.
+/// slot 0, causing an AAD mismatch — reported as a spurious `DecryptionFailed`
+/// today, and as an even more misleading `InvalidEncryptionKey` before issue
+/// #119. Either way the correct key wrongly fails to open the database.
 #[test]
 fn open_encrypted_db_with_no_commits_uses_correct_key() {
     let dir = tempfile::tempdir().unwrap();
@@ -167,7 +169,7 @@ fn open_encrypted_db_with_no_commits_uses_correct_key() {
         // create-seed inversion bug breaks: the winner slot is at page 0
         // (counter N-1) but txn_counter % N = N-1 != 0 for N=2.
     }
-    // Reopen with the correct key: must not return InvalidEncryptionKey.
+    // Reopen with the correct key: must open, not fail the body decrypt.
     let result = Chisel::open(
         &path,
         Options::default()

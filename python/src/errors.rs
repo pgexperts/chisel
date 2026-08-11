@@ -211,8 +211,13 @@ create_exception!(chisel._chisel, AlreadyFinishedError, OperationalError);
 // just means the manager is already dead, not a fresh fatal.
 // IoError is NOT declared here: it needs two bases (FatalError + OSError) and is
 // built in `register` via `build_io_error_class` / cached in `IO_ERROR_CLASS`.
-// DecryptionFailed: a page-read failed MAC verification after a successful open.
-// is_fatal() = true — data integrity cannot be confirmed; treat as poison.
+// DecryptionFailed: a page-read failed MAC verification after a successful open,
+// or (issue #119) the sealed superblock body failed it during open itself, on a
+// file whose key slot the supplied credential had already unwrapped — proving
+// the credential correct and the file damaged. is_fatal() = true in both cases —
+// data integrity cannot be confirmed; treat as poison. Note the open-time case
+// is a behaviour change: such a file used to raise the OPERATIONAL
+// InvalidEncryptionKeyError, inviting a caller to retry credentials forever.
 create_exception!(chisel._chisel, DecryptionFailedError, FatalError);
 create_exception!(chisel._chisel, ChecksumMismatchError, FatalError);
 create_exception!(chisel._chisel, CorruptSuperblockError, FatalError);

@@ -13,10 +13,15 @@
 // (chisel::{Chisel, ChiselError, Key, Options}); no crate-internal paths.
 
 use chisel::{Chisel, ChiselError, Key, Options};
-use zeroize::Zeroizing;
 
+// PUBLIC-API-9 (issue #119): built via `Key::raw`, the constructor a downstream
+// crate can call without adding `zeroize` to its own manifest. This file cannot
+// PROVE that property — Cargo hands integration tests the crate's own
+// dependencies, so `zeroize::Zeroizing` would resolve here either way — but the
+// public-API contract test is the right place to exercise the path we tell
+// downstream users to take.
 fn raw_key(b: u8) -> Key {
-    Key::Raw(Zeroizing::new(vec![b; 32]))
+    Key::raw(vec![b; 32])
 }
 
 #[test]
