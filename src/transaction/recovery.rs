@@ -343,6 +343,45 @@ impl TransactionManager {
             if header.algorithm != crate::superblock::ALGO_XCHACHA20POLY1305 {
                 return Err(ChiselError::EncryptionNotSupported);
             }
+            // SUPERBLOCK-RECOVERY-7 (issue #118): validate the WINNER's stride,
+            // whichever path found it. The anchor check above only ever inspects
+            // page 0; when page 0 is torn the fallback hardcodes ENC_PAGE_SIZE and
+            // calls `encrypted_stride` purely as an is-this-file-encrypted probe,
+            // discarding the value. The same forged field therefore got two
+            // different verdicts, decided by nothing but whether slot 0 happened
+            // to be torn: rejected when it was intact, opened when it was not.
+            //
+            // Tolerating it is not harmless, because the forged value does not stay
+            // in the slot we read it from: the TransactionManager below captures
+            // this header verbatim into `crypto_header`, and every commit
+            // republishes it into the slot it writes. Commit round-robins
+            // (`txn_counter % N`), so after N commits every slot carries the forged
+            // stride under a freshly stamped, valid checksum — and the NEXT open
+            // takes the anchor path, rejects it, and has no clean sibling left to
+            // fall back to. The engine would have bricked the file itself.
+            //
+            // Accepted narrowing: this also fires in a case the anchor never
+            // covered — page 0 intact and clean, but a sibling with a higher
+            // txn_counter carrying a forged stride wins selection. Such a file
+            // opens today and will not after this check. It is tampered by
+            // construction (XXH3 is non-cryptographic and publicly computable, so
+            // producing this state needs write access to the file, not the key),
+            // and the winning slot is the one whose sealed body we are about to
+            // trust, so refusing is the honest answer rather than a regression.
+            //
+            // Keep the anchor check as well: it is the fast pre-check that keeps a
+            // forged 0 or a huge value out of `set_stride`'s division (I144). This
+            // one runs after the stride has already been applied, so it cannot
+            // replace it.
+            //
+            // `defects: Vec::new()` mirrors the anchor path. The winner passed
+            // checksum and magic by construction, so there is no slot defect that
+            // explains this refusal — `validate` does not cover the crypto header.
+            if header.stride as usize != crate::crypto::ENC_PAGE_SIZE {
+                return Err(ChiselError::CorruptSuperblock {
+                    defects: Vec::new(),
+                });
+            }
         }
         let cipher = match (&sb.encryption, &key) {
             (None, None) => None,
@@ -384,11 +423,25 @@ impl TransactionManager {
                 // InvalidEncryptionKey rather than poisoning.
                 sb.decrypt_body(&cipher, raw)
                     .map_err(|_| ChiselError::InvalidEncryptionKey)?;
-                // The IO stride was already switched to header.stride during the
-                // bootstrap read above (so slots 1..N and the file-size checks
-                // use the 8232-byte unit). Here we only install the cipher on
-                // the cache so subsequent data-page reads go through
-                // PageCipher::open.
+                // Whenever page 0 and the winning slot agree the DB is encrypted,
+                // the IO stride is already the constant ENC_PAGE_SIZE (so slots
+                // 1..N and the file-size checks used the 8232-byte unit): either
+                // set from page 0's crypto-header on the anchor path, which only
+                // proceeds once that header's stride equals the constant, or
+                // hardcoded by the torn-slot-0 fallback, which never consults the
+                // header at all. Deliberately NOT "whatever header.stride said" —
+                // the SUPERBLOCK-RECOVERY-7 check above proves the two are equal,
+                // but the constant is what was actually applied to the IO layer.
+                //
+                // They can disagree only under a whole-slot transplant: page 0
+                // deserializes as a valid PLAINTEXT superblock (so the anchor
+                // never calls set_stride and the fallback never fires) while a
+                // planted encrypted slot outranks it on txn_counter. The stride
+                // is then still 8192 here and the reads below misalign into
+                // DecryptionFailed. That needs file write access, costs
+                // availability only, and predates this check.
+                // Here we only install the cipher on the cache so subsequent
+                // data-page reads go through PageCipher::open.
                 cache.set_cipher(cipher.clone());
                 Some(cipher)
             }
