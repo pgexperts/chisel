@@ -54,9 +54,10 @@ const SLOT_FLAG_LIVE: u16 = 0x0001;
 
 pub struct DataPage;
 
-// `free_space`, `used_space`, and `iter_live` are called only from
-// cfg(test) today; `#[allow(dead_code)]` suppresses the lib-build warning.
-#[allow(dead_code)]
+// The allow-attributes below sit on the three individually test-only items, NOT
+// on this impl block. A block-level allow also disarms dead-code detection for
+// `init_page`, `insert`, `read`, and `slot_count` — the live API — so a future
+// refactor that orphaned one of those would produce no warning.
 impl DataPage {
     /// Initialize a page buffer as an empty data page.
     //
@@ -98,10 +99,16 @@ impl DataPage {
     // NOT account for holes left by dead slots (the transaction layer frees
     // whole pages rather than compacting individual pages). Returns 0 if the
     // header is structurally invalid (a corrupt page with free_start > free_end,
-    // or free_end past the checksum region, etc.) so downstream mutators refuse
-    // to operate on it. The more precise validity check is `validate_header` —
-    // callers that care about the distinction between "full" and "corrupt"
-    // should use that.
+    // or free_end past the checksum region, etc.) — a conservative answer, but
+    // it is NOT what stops a mutator: `insert` gates on `validate_header`
+    // itself and never consults this. Callers that need to tell "full" from
+    // "corrupt" must likewise use `validate_header`, since this collapses both
+    // to 0.
+    //
+    // Test-only today: no production caller reads occupancy. Kept because a
+    // slotted-page layout without a free-space query is awkward to reason
+    // about, and the tests do use it.
+    #[allow(dead_code)]
     pub fn free_space(buf: &[u8; PAGE_SIZE]) -> usize {
         match Self::validate_header(buf) {
             Some((free_start, free_end, _)) => free_end - free_start,
@@ -227,14 +234,24 @@ impl DataPage {
 
     /// Total occupied bytes (live data + slot directory), for computing occupancy.
     //
-    // Used by defrag/stats to decide whether a page is sparse enough to merit
-    // consolidation. Counts only live entries' payload plus the full slot
-    // directory overhead for those live slots — dead slots' directory bytes
-    // and orphaned data bytes are not included.
+    // Counts only live entries' payload plus the slot-directory overhead for
+    // those live slots — dead slots' directory bytes and orphaned data bytes
+    // are not included.
+    //
+    // Test-only today. This used to claim "used by defrag/stats to decide
+    // whether a page is sparse enough to merit consolidation"; it is not.
+    // Defrag's density heuristic lives in
+    // `TransactionManager::sparse_data_pages_inner`, which divides the
+    // packer's live-slot COUNT by `DataPage::slot_count` — slot ratios, not
+    // bytes. Nothing downstream depends on this function's byte semantics, so
+    // "fixing" them to match some consumer's expectation would be fixing them
+    // for nobody.
+    #[allow(dead_code)]
     pub fn used_space(buf: &[u8; PAGE_SIZE]) -> usize {
-        // Corrupt header ⇒ occupancy is meaningless; returning 0 keeps
-        // defrag's density math defined without pretending the page has
-        // usable free space.
+        // Corrupt header ⇒ occupancy is meaningless, and 0 is the answer that
+        // cannot be mistaken for "this page has room". (No consumer depends on
+        // that choice — see the note above; defrag's density math reads
+        // slot_count, not this.)
         let Some((_, _, count)) = Self::validate_header(buf) else {
             return 0;
         };
@@ -255,12 +272,19 @@ impl DataPage {
     /// Iterate over all live slots, yielding (slot_index, data_slice).
     //
     // Slot indices in the result are the CURRENT indices (matching what read()
-    // would accept), not dense 0..N. This lets callers preserve identity
-    // across the iteration — important for defrag, which rewrites handle
-    // table entries.
+    // would accept), not dense 0..N, so a caller can preserve slot identity
+    // across the iteration.
+    //
+    // Test-only today. The identity property used to be justified as "important
+    // for defrag, which rewrites handle table entries" — defrag does rewrite
+    // handle-table entries, but it enumerates them through
+    // `HandleTable::iter_live` (handle_table.rs), a different function over a
+    // different structure. It has never called this one.
+    #[allow(dead_code)]
     pub fn iter_live(buf: &[u8; PAGE_SIZE]) -> Vec<(u16, &[u8])> {
-        // Corrupt header ⇒ no slots are reported; see used_space for the
-        // same reasoning.
+        // Corrupt header ⇒ report no slots, the same fail-empty choice
+        // `used_space` makes: a page whose directory bounds cannot be trusted
+        // has no slot the caller may safely index.
         let Some((_, _, count)) = Self::validate_header(buf) else {
             return Vec::new();
         };

@@ -239,9 +239,18 @@ pub fn compute_checksum(buf: &[u8; PAGE_SIZE]) -> u64 {
 }
 
 /// Write the checksum into the last 8 bytes of the page buffer.
-/// Must be called after every mutation and before the page is handed to
-/// page_io for writing — otherwise the next read will see a stale checksum
-/// and treat the page as corrupt.
+///
+/// Must be called after every mutation of a page that will be READ back —
+/// i.e. any page a committed superblock can reach. Skip it and the next cold
+/// read raises `ChecksumMismatch`, which is fatal and poisons the manager.
+///
+/// The rule is scoped to reachable pages on purpose, because `PageCache::flush`
+/// does write unstamped pages in one legitimate case: an allocation abandoned
+/// part-way (e.g. `new_page` succeeded but `maybe_evict` then returned
+/// `CacheFull`) leaves a zeroed dirty entry that no root will ever reference.
+/// Those bytes reach disk unstamped and stay unread; `reclaim_orphans` is
+/// explicitly built to skip unreachable pages it cannot checksum. So flush
+/// cannot assert this contract — only the mutating module can honour it.
 pub fn stamp_checksum(buf: &mut [u8; PAGE_SIZE]) {
     let cksum = compute_checksum(buf);
     buf[CHECKSUM_OFFSET..].copy_from_slice(&cksum.to_le_bytes());

@@ -83,15 +83,24 @@ pub struct Spillway {
     /// `slots.len()` instead; the cursor's tail garbage is reclaimed by
     /// `truncate`.
     ///
-    /// For the FILE backing, the cursor directly maps to the on-disk write
-    /// position. For the MEMORY backing, the `Vec<u8>` in `Backing::Memory`
-    /// grows by slot_size for every distinct page spilled within a transaction
-    /// (forget/respill of the same page reuses an existing slot and does NOT
-    /// shrink the vec). A long transaction that forget/respills many distinct
-    /// pages therefore grows the in-memory vec cumulatively — bounded by the
-    /// number of distinct page ids ever spilled in that transaction, not by
-    /// the live set (`slots.len()`). `truncate` at commit/rollback reclaims
-    /// all of it; the risk is peak memory during a single large transaction.
+    /// The cursor advances once per spill of a page that is not CURRENTLY
+    /// resident. Re-spilling a page that is still in `slots` reuses its slot
+    /// (the `if let Some(&existing)` arm of `spill`), but `forget` removes the
+    /// key, so a rehydrate-then-respill of the SAME page id takes the `else`
+    /// arm and burns a fresh slot. Backing size is therefore
+    /// `next_slot_index * slot_size` and is bounded by the number of SPILL
+    /// EVENTS in the transaction — not by `max_bytes`, and not by the number
+    /// of distinct page ids either. A transaction whose working set exceeds
+    /// the cache's `max_pages` churns the same ids through spill/rehydrate and
+    /// grows this without limit. (An earlier version of this doc claimed
+    /// forget/respill "reuses an existing slot"; it does not, and the
+    /// distinct-page bound it derived from that was wrong in the unsafe
+    /// direction — it under-predicts the peak.)
+    ///
+    /// For the FILE backing the cursor is the on-disk write position; for the
+    /// MEMORY backing it drives `Vec<u8>` growth. `truncate` at
+    /// commit/rollback reclaims all of it, so the exposure is peak file size
+    /// (or peak memory) within a single large transaction.
     next_slot_index: u64,
     /// Strict upper bound on the LIVE resident set's logical size in bytes,
     /// excluding per-slot headers (`slots.len() * payload_size`). Captured at

@@ -322,7 +322,7 @@ impl PageIo {
     /// `read_exact` — side-effectful operations on the File handle. The
     /// bounds check is effectively free post-I51 (cached page count).
     pub fn read_page_unit(&mut self, page_id: u64) -> Result<Vec<u8>> {
-        let page_count = self.page_count()?;
+        let page_count = self.page_count();
         if page_id >= page_count {
             return Err(ChiselError::InvalidPageId { page_id });
         }
@@ -361,7 +361,7 @@ impl PageIo {
     ///
     /// Shares all validation (bounds check, fault injection) with `read_page_unit`.
     pub fn read_page_unit_into(&mut self, page_id: u64, buf: &mut [u8]) -> Result<()> {
-        let page_count = self.page_count()?;
+        let page_count = self.page_count();
         if page_id >= page_count {
             return Err(ChiselError::InvalidPageId { page_id });
         }
@@ -457,11 +457,24 @@ impl PageIo {
     /// DBs go through `read_page_unit` directly from PageCache. Returning
     /// `[u8; PAGE_SIZE]` by value keeps the layer buffer-free so callers
     /// never accidentally alias the underlying File.
+    ///
+    /// The stride guard is a real check, not a `debug_assert`, mirroring
+    /// `write_page_unit`'s length check. It used to be debug-only, which meant
+    /// that in a release build the `copy_from_slice` below took an 8232-byte
+    /// blob into an 8192-byte array and aborted the process — turning a caller
+    /// bug on an encrypted database into a crash on the one path the poison
+    /// model cannot mediate, while the sibling `write_page` returned a typed
+    /// error for the identical mistake. (`write_page` keeps its `debug_assert`
+    /// because the `write_page_unit` behind it already rejects a wrong-width
+    /// blob with an `IoError` in release — a different message, same variant.
+    /// Nothing behind `read_page_unit` checks the destination width.)
     pub fn read_page(&mut self, page_id: u64) -> Result<[u8; PAGE_SIZE]> {
-        debug_assert_eq!(
-            self.stride, PAGE_SIZE,
-            "read_page called on an encrypted stride; use read_page_unit"
-        );
+        if self.stride != PAGE_SIZE {
+            return Err(ChiselError::IoError(std::io::Error::other(format!(
+                "read_page called at stride {} != PAGE_SIZE {}; use read_page_unit",
+                self.stride, PAGE_SIZE
+            ))));
+        }
         let blob = self.read_page_unit(page_id)?;
         let mut buf = [0u8; PAGE_SIZE];
         buf.copy_from_slice(&blob);
@@ -558,8 +571,18 @@ impl PageIo {
     ///
     /// I123 (ISSUES.md, 2026-06-21): takes `&self` — pure Cell read, no
     /// syscall. Dropping `&mut` removes the latent double-borrow risk.
-    pub fn page_count(&self) -> Result<u64> {
-        Ok(self.cached_page_count.get())
+    ///
+    /// Returns `u64`, not `Result<u64>`. The pre-I51 implementation seeked to
+    /// EOF on every call and could genuinely fail; the `Result` outlived that
+    /// by a year and had every caller paying a `?` for a branch the body could
+    /// not take. Worse, the impossible-Err branch was load-bearing in
+    /// `PageCache::new`, whose doc explained an `unwrap_or(0)` fallback to a
+    /// zero page count that no execution could reach. If this ever needs to
+    /// consult the filesystem again, reintroduce the `Result` then — the
+    /// compiler will point at every caller that has to decide what a failure
+    /// means, which is exactly the review the silent `unwrap_or(0)` skipped.
+    pub fn page_count(&self) -> u64 {
+        self.cached_page_count.get()
     }
 
     /// Byte length of the backing store, measured now.
@@ -751,12 +774,12 @@ mod read_only_tests {
     fn test_page_io_file_len() {
         let file = NamedTempFile::new().unwrap();
         let mut io = PageIo::open(file.path(), false).unwrap();
-        assert_eq!(io.page_count().unwrap(), 0);
+        assert_eq!(io.page_count(), 0);
         let buf = [0u8; PAGE_SIZE];
         io.write_page(0, &buf).unwrap();
-        assert_eq!(io.page_count().unwrap(), 1);
+        assert_eq!(io.page_count(), 1);
         io.write_page(2, &buf).unwrap();
-        assert_eq!(io.page_count().unwrap(), 3);
+        assert_eq!(io.page_count(), 3);
     }
 
     // ── I51 page-count cache regressions (file-backed half) ───────
@@ -776,7 +799,7 @@ mod read_only_tests {
         let f = seeded_file();
         let mut io = PageIo::open(f.path(), false).unwrap();
         // seeded_file wrote one page; cache should be 1 immediately.
-        assert_eq!(io.page_count().unwrap(), 1);
+        assert_eq!(io.page_count(), 1);
         // And read_page(0) — which uses the cached page_count for its
         // bounds check — must succeed without tripping InvalidPageId.
         assert_eq!(io.read_page(0).unwrap(), [0u8; PAGE_SIZE]);
@@ -793,11 +816,11 @@ mod read_only_tests {
             io.write_page(0, &[0u8; PAGE_SIZE]).unwrap();
             io.write_page(1, &[0u8; PAGE_SIZE]).unwrap();
             io.write_page(2, &[0u8; PAGE_SIZE]).unwrap();
-            assert_eq!(io.page_count().unwrap(), 3);
+            assert_eq!(io.page_count(), 3);
             // io drops here, releasing the flock.
         }
         let io = PageIo::open(f.path(), false).unwrap();
-        assert_eq!(io.page_count().unwrap(), 3);
+        assert_eq!(io.page_count(), 3);
     }
 }
 
@@ -814,7 +837,7 @@ mod memory_backing_tests {
     #[test]
     fn memory_starts_with_zero_pages() {
         let io = PageIo::open_in_memory().unwrap();
-        assert_eq!(io.page_count().unwrap(), 0);
+        assert_eq!(io.page_count(), 0);
     }
 
     #[test]
@@ -834,7 +857,7 @@ mod memory_backing_tests {
         io.write_page(0, &[0u8; PAGE_SIZE]).unwrap();
         io.write_page(1, &[0u8; PAGE_SIZE]).unwrap();
         io.write_page(2, &[0u8; PAGE_SIZE]).unwrap();
-        assert_eq!(io.page_count().unwrap(), 3);
+        assert_eq!(io.page_count(), 3);
     }
 
     #[test]
@@ -845,7 +868,7 @@ mod memory_backing_tests {
         let mut buf = [0u8; PAGE_SIZE];
         buf[42] = 0xAB;
         io.write_page(5, &buf).unwrap();
-        assert_eq!(io.page_count().unwrap(), 6);
+        assert_eq!(io.page_count(), 6);
         for p in 0..5 {
             assert_eq!(io.read_page(p).unwrap(), [0u8; PAGE_SIZE]);
         }
@@ -876,9 +899,9 @@ mod memory_backing_tests {
         io.write_page(0, &marker).unwrap();
         io.write_page(1, &[0u8; PAGE_SIZE]).unwrap();
 
-        let before_count = io.page_count().unwrap();
+        let before_count = io.page_count();
         io.fsync().unwrap();
-        let after_count = io.page_count().unwrap();
+        let after_count = io.page_count();
 
         assert_eq!(before_count, after_count);
         assert_eq!(io.read_page(0).unwrap(), marker);
@@ -892,10 +915,10 @@ mod memory_backing_tests {
         io.write_page(1, &[2u8; PAGE_SIZE]).unwrap();
         io.write_page(2, &[3u8; PAGE_SIZE]).unwrap();
         io.set_page_count(1).unwrap();
-        assert_eq!(io.page_count().unwrap(), 1);
+        assert_eq!(io.page_count(), 1);
         assert_eq!(io.read_page(0).unwrap(), [1u8; PAGE_SIZE]);
         io.set_page_count(4).unwrap();
-        assert_eq!(io.page_count().unwrap(), 4);
+        assert_eq!(io.page_count(), 4);
         // Pages 1..=3 are freshly zero-filled after re-growth.
         for p in 1..4 {
             assert_eq!(io.read_page(p).unwrap(), [0u8; PAGE_SIZE]);
@@ -927,9 +950,9 @@ mod memory_backing_tests {
     fn page_count_cache_extends_on_write_past_eof() {
         // Fresh memory PageIo starts at 0; writing page 4 extends to 5.
         let mut io = PageIo::open_in_memory().unwrap();
-        assert_eq!(io.page_count().unwrap(), 0);
+        assert_eq!(io.page_count(), 0);
         io.write_page(4, &[0u8; PAGE_SIZE]).unwrap();
-        assert_eq!(io.page_count().unwrap(), 5);
+        assert_eq!(io.page_count(), 5);
     }
 
     #[test]
@@ -941,9 +964,9 @@ mod memory_backing_tests {
         // that the new write_page logic gets the same answer.
         let mut io = PageIo::open_in_memory().unwrap();
         io.write_page(5, &[0u8; PAGE_SIZE]).unwrap();
-        assert_eq!(io.page_count().unwrap(), 6);
+        assert_eq!(io.page_count(), 6);
         io.write_page(2, &[0u8; PAGE_SIZE]).unwrap();
-        assert_eq!(io.page_count().unwrap(), 6);
+        assert_eq!(io.page_count(), 6);
     }
 
     #[test]
@@ -953,11 +976,11 @@ mod memory_backing_tests {
         // to verify both directions.
         let mut io = PageIo::open_in_memory().unwrap();
         io.set_page_count(10).unwrap();
-        assert_eq!(io.page_count().unwrap(), 10);
+        assert_eq!(io.page_count(), 10);
         io.set_page_count(3).unwrap();
-        assert_eq!(io.page_count().unwrap(), 3);
+        assert_eq!(io.page_count(), 3);
         io.set_page_count(7).unwrap();
-        assert_eq!(io.page_count().unwrap(), 7);
+        assert_eq!(io.page_count(), 7);
     }
 
     // The remaining two I51 tests are file-backed and live in
@@ -1040,12 +1063,40 @@ mod stride_tests {
         io.write_page_unit(2, &blob2).unwrap(); // page 1 zero-filled by growth
 
         // page_count is in stride-units: writing page 2 extends to 3.
-        assert_eq!(io.page_count().unwrap(), 3);
+        assert_eq!(io.page_count(), 3);
 
         assert_eq!(io.read_page_unit(0).unwrap(), blob0);
         assert_eq!(io.read_page_unit(2).unwrap(), blob2);
         // The zero-filled gap page reads back as all zeros.
         assert_eq!(io.read_page_unit(1).unwrap(), vec![0u8; ENC_PAGE_SIZE]);
+    }
+
+    // read_page on an encrypted stride must return a typed error the poison
+    // model can classify, not abort the process. The guard used to be a
+    // `debug_assert_eq!`, which compiles out in release and left the following
+    // `copy_from_slice` to take an 8232-byte blob into an 8192-byte array —
+    // a panic, on the one class of failure the engine cannot mediate. Its
+    // sibling `write_page` has always returned an error for the same mistake
+    // (via write_page_unit's length check).
+    #[test]
+    fn read_page_rejects_an_encrypted_stride_instead_of_panicking() {
+        let mut io = PageIo::open_in_memory().unwrap();
+        io.set_stride(ENC_PAGE_SIZE);
+        io.write_page_unit(0, &vec![0u8; ENC_PAGE_SIZE]).unwrap();
+
+        let err = io
+            .read_page(0)
+            .expect_err("read_page must refuse a non-PAGE_SIZE stride");
+        match err {
+            ChiselError::IoError(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("read_page") && msg.contains("read_page_unit"),
+                    "error should name the misuse and the right alternative, got {msg:?}"
+                );
+            }
+            other => panic!("expected IoError, got {other:?}"),
+        }
     }
 
     // The plaintext stride (default) keeps PAGE_SIZE offset math intact.
@@ -1071,13 +1122,13 @@ mod stride_tests {
         // Write 2 plaintext pages (stride == PAGE_SIZE by default).
         io.write_page(0, &[0u8; PAGE_SIZE]).unwrap();
         io.write_page(1, &[0u8; PAGE_SIZE]).unwrap();
-        assert_eq!(io.page_count().unwrap(), 2);
+        assert_eq!(io.page_count(), 2);
 
         // After switching to ENC_PAGE_SIZE stride: 2 * 8192 = 16384 bytes.
         // 16384 / 8232 = 1 full unit (remainder discarded by integer div).
         io.set_stride(ENC_PAGE_SIZE);
         assert_eq!(io.stride(), ENC_PAGE_SIZE);
-        assert_eq!(io.page_count().unwrap(), 1);
+        assert_eq!(io.page_count(), 1);
     }
 
     // set_page_count uses stride so the file length is n * stride bytes.
@@ -1086,7 +1137,7 @@ mod stride_tests {
         let mut io = PageIo::open_in_memory().unwrap();
         io.set_stride(ENC_PAGE_SIZE);
         io.set_page_count(3).unwrap();
-        assert_eq!(io.page_count().unwrap(), 3);
+        assert_eq!(io.page_count(), 3);
         // The flat byte vec must be exactly 3 * 8232 bytes.
         // Verify indirectly: reading page 2 (zero-filled) must succeed.
         assert_eq!(io.read_page_unit(2).unwrap(), vec![0u8; ENC_PAGE_SIZE]);
@@ -1111,7 +1162,7 @@ mod stride_tests {
         io.write_page(0, &buf).unwrap();
         io.write_page(1, &[0xAB; PAGE_SIZE]).unwrap();
 
-        assert_eq!(io.page_count().unwrap(), 2);
+        assert_eq!(io.page_count(), 2);
         assert_eq!(io.read_page(0).unwrap(), buf);
         assert_eq!(io.read_page(1).unwrap(), [0xAB; PAGE_SIZE]);
     }

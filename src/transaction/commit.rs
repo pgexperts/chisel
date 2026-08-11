@@ -141,7 +141,7 @@ pub(super) fn run_commit(ctx: &mut CommitCtx<'_>) -> Result<()> {
     // cleanly) take acknowledged, fsynced commits at MAX+1, MAX+2 — superblocks
     // this same binary then refuses to read. There is no panic left here at all.
     *ctx.txn_counter = next_counter;
-    let total_pages = cache.file_page_count()?;
+    let total_pages = cache.file_page_count();
     let sb = Superblock {
         magic: page::MAGIC,
         // Encrypted DBs use MAJOR=2 so an old binary rejects them.

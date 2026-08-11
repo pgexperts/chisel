@@ -47,8 +47,12 @@
 //! the prev=None and next=None nodes respectively. They're cached so
 //! `iter_lru_to_mru` and `push_front` don't have to scan to find them.
 //!
-//! No `unsafe`. Fits in cache-line-sized state per node (16 bytes for
-//! the `Node` plus map overhead).
+//! No `unsafe`. Per-node state is 32 bytes for the `Node` (plus map
+//! overhead): `Option<u64>` has no niche to pack the discriminant into, so
+//! each link costs 16 bytes, not 8. If that footprint ever matters, encoding
+//! the links as sentinel `u64`s would halve it. The
+//! `node_is_two_niche_free_options_wide` test below pins the figure so this
+//! paragraph cannot drift again.
 
 use rustc_hash::FxHashMap;
 
@@ -233,6 +237,19 @@ mod tests {
 
     fn collect_lru_to_mru(idx: &LruIndex) -> Vec<u64> {
         idx.iter_lru_to_mru().collect()
+    }
+
+    #[test]
+    fn node_is_two_niche_free_options_wide() {
+        // The module doc used to justify map-stored neighbour pointers with
+        // "16 bytes for the `Node`", which is half the real figure: `u64` has
+        // no invalid bit pattern for `Option` to reuse as its discriminant, so
+        // `Option<u64>` is a padded 16 bytes and two of them are 32. Anyone
+        // re-deriving the memory trade-off (sizing an LRU against a cache
+        // budget, or costing a switch to packed u32/sentinel links) starts
+        // from this number, so pin it rather than trusting prose.
+        assert_eq!(std::mem::size_of::<Option<u64>>(), 16);
+        assert_eq!(std::mem::size_of::<Node>(), 32);
     }
 
     #[test]
