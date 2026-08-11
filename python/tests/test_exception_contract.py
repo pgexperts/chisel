@@ -366,10 +366,14 @@ def test_corrupt_superblock_routes_to_fatal_class(tmp_db):
 #   DecryptionFailed       -> DecryptionFailedError       (FatalError)
 #
 # The three operational variants are reachable end-to-end from Python at
-# open() time and are TRIGGERED below. DecryptionFailed fires only on a
-# per-PAGE MAC verification failure during a read AFTER a successful open —
-# it requires tampering with an encrypted data page's ciphertext/tag at a
-# precise on-disk offset (the 8232-byte encrypted stride), which is the same
+# open() time and are TRIGGERED below. DecryptionFailed fires on a per-PAGE MAC
+# verification failure during a read after a successful open, and (issue #119)
+# on the sealed superblock body during open itself once a key slot has already
+# unwrapped. Either way it requires tampering with ciphertext/tag bytes at a
+# precise on-disk offset (the 8232-byte encrypted stride) AND restamping the
+# XXH3 page checksum, which covers the sealed body -- tampering the ciphertext
+# alone fails `deserialize`, so the slot is filtered out before selection and
+# the open reports sibling fallback or CorruptSuperblock instead. That is the same
 # "hard-to-trigger fatal, needs binding-crate test infra" class as the
 # per-variant fatal coverage noted in test 11. It is therefore pinned by the
 # issubclass(FatalError) hierarchy check only, not triggered here.

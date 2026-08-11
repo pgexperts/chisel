@@ -305,10 +305,13 @@ impl TransactionManager {
         }
 
         // Step 2 + 3: pick the winner. We need BOTH the deserialized superblock
-        // AND the raw buffer it came from (for decrypt_body's AAD reconstruction).
-        // select() discards the buffer index, so we re-select here as a
-        // (superblock, &buf) pair. Tie-break is identical to select(): max_by_key
-        // returns the last maximum, matching the plaintext path's behavior.
+        // AND the raw buffer it came from (for decrypt_body's AAD reconstruction),
+        // plus the buffer's own position, which is the slot's page id
+        // (read_candidates pushes units 0..N in order) and lets a body-decrypt
+        // failure name the damaged slot. select() discards all of that, so we
+        // re-select here as a (slot index, superblock, &buf) triple. Tie-break is
+        // identical to select(): max_by_key returns the last maximum, matching the
+        // plaintext path's behavior.
         //
         // IMPORTANT: do NOT reconstruct the buffer index from
         // `txn_counter % superblock_count`. That formula matches the commit
@@ -318,10 +321,11 @@ impl TransactionManager {
         // decrypt_body builds its AAD from the winner's txn_counter but reads
         // the sealed body from the wrong buffer, causing an AAD mismatch →
         // CryptoError::Auth → the correct key wrongly fails to open.
-        let (mut sb, raw) = candidates
+        let (winner_slot, mut sb, raw) = candidates
             .iter()
-            .filter_map(|b| Superblock::deserialize(b).map(|sb| (sb, b)))
-            .max_by_key(|(sb, _)| sb.txn_counter)
+            .enumerate()
+            .filter_map(|(i, b)| Superblock::deserialize(b).map(|sb| (i as u64, sb, b)))
+            .max_by_key(|(_, sb, _)| sb.txn_counter)
             .ok_or_else(|| ChiselError::CorruptSuperblock {
                 defects: Superblock::diagnose(&candidates),
             })?;
@@ -418,11 +422,44 @@ impl TransactionManager {
                 let (_slot, dek) = header.unlock(k)?;
                 let cipher = crate::crypto::PageCipher::new(dek);
                 // decrypt_body fills total_pages, named_roots, etc.
-                // A tag failure here means corruption, not a wrong key
-                // (the slot already authenticated the DEK), so map to
-                // InvalidEncryptionKey rather than poisoning.
+                //
+                // PUBLIC-API-7 (issue #119): a tag failure HERE is corruption,
+                // not a wrong key, and the error must say so. An AEAD failure is
+                // uniform in isolation — a wrong key and a tampered ciphertext
+                // both just fail the tag check — so the discriminator is not the
+                // failure but the SEQUENCING. `unlock` above is itself an AEAD
+                // open, and its success is cryptographic proof that the supplied
+                // credential derived the KEK that wrapped this DEK. Every
+                // wrong-credential open dies there and never reaches this line.
+                // What is left is a damaged or forged body, a body sealed under a
+                // different DEK, or an AAD that no longer matches the cleartext
+                // bootstrap fields — none of which another passphrase fixes.
+                //
+                // The honest limit, which this does NOT address: if the KEY SLOT
+                // itself is damaged, `unlock` skips it as non-matching and a
+                // CORRECT credential still surfaces as `InvalidEncryptionKey`.
+                // That case genuinely is indistinguishable from a wrong key
+                // (see `tampered_key_slot_cost_params_do_not_reach_the_allocator`).
+                //
+                // `DecryptionFailed`, not `CorruptSuperblock`: the latter means
+                // "no readable superblock at all" and is documented as
+                // recoverable by reopening, because slot selection may pick a
+                // different slot next time. That is false here — `max_by_key` is
+                // deterministic, so a reopen fails identically forever. Same call
+                // the repo already made for `InvalidFreemapDepth`.
+                //
+                // The fatal classification poisons nothing on this path: no
+                // TransactionManager exists yet, and the only POISON-relevant
+                // `is_fatal()` consultation is `poison_on_fatal`, a method on a
+                // live manager (transaction/lifecycle.rs). The Python binding
+                // also reads `is_fatal()`, but only to pick an exception tier,
+                // and `DecryptionFailed` has an explicit arm there. The previous
+                // comment's "rather than poisoning" justified the mapping with a
+                // mechanism that does not run here.
                 sb.decrypt_body(&cipher, raw)
-                    .map_err(|_| ChiselError::InvalidEncryptionKey)?;
+                    .map_err(|_| ChiselError::DecryptionFailed {
+                        page_id: winner_slot,
+                    })?;
                 // Whenever page 0 and the winning slot agree the DB is encrypted,
                 // the IO stride is already the constant ENC_PAGE_SIZE (so slots
                 // 1..N and the file-size checks used the 8232-byte unit): either
@@ -824,7 +861,7 @@ mod tests {
     /// byte-patching `format_version` the way the plaintext sibling test does
     /// would not work here, because those bytes are part of `sb_identity_aad`.
     /// Patching them invalidates the sealed body, so `decrypt_body` fails with
-    /// `CryptoError::Auth` and the open dies as `InvalidEncryptionKey` long
+    /// `CryptoError::Auth` and the open dies as `DecryptionFailed` long
     /// before reaching the gate.
     #[test]
     fn encrypted_file_with_newer_encrypted_minor_is_forced_read_only() {

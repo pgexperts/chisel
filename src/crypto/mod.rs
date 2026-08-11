@@ -48,6 +48,52 @@ impl std::fmt::Debug for Key {
     }
 }
 
+// PUBLIC-API-9 (issue #119): constructors that keep `Zeroizing` off the caller's
+// construction path.
+//
+// The variants' fields are a third-party type, so `Key::Raw(..)` is only
+// writable by a downstream crate that adds its own `zeroize` dependency, at a
+// version that unifies with this crate's `~1.8` pin. That made an undeclared,
+// separately-versioned dependency the gate on the ENTIRE encryption surface —
+// `Options::encryption_key`, `add_key`, `rotate_key`, `remove_key`, `rekey` —
+// and a future major bump of `zeroize` here would break every caller's
+// construction site without changing a single chisel signature.
+//
+// `Zeroizing` remains re-exported from the crate root (see lib.rs) for callers
+// who already hold one, e.g. from a keyring crate. The variants stay open
+// because sealing them would remove `Key::Raw(..)` matching from every existing
+// consumer, including the Python binding.
+impl Key {
+    /// High-entropy key material — 32 bytes recommended, though any NON-EMPTY
+    /// length is accepted and stretched to a key-encryption key via
+    /// HKDF-SHA256. Empty material is rejected: `derive_kek` returns
+    /// `BadKeyLength`, which surfaces as `InvalidEncryptionKey` (pinned by
+    /// `add_key_with_invalid_raw_key_returns_error_not_panic`).
+    /// Equivalent to `Key::Raw(Zeroizing::new(bytes.into()))`, but does not
+    /// require the caller to depend on `zeroize`.
+    ///
+    /// Drop semantics: the returned `Key` wipes ITS OWN copy of the material. It
+    /// cannot wipe the caller's original. Passing a `Vec<u8>` moves that buffer
+    /// in, so the buffer that gets wiped is the caller's; passing a `&[u8]`
+    /// copies, leaving the source the caller's to zeroize.
+    pub fn raw(bytes: impl Into<Vec<u8>>) -> Self {
+        Key::Raw(Zeroizing::new(bytes.into()))
+    }
+
+    /// A human secret, stretched to a key-encryption key via Argon2id (cost from
+    /// `Options::argon2_params` on create, or the stored slot's params on
+    /// reopen). Equivalent to `Key::Passphrase(Zeroizing::new(s.into()))`, but
+    /// does not require the caller to depend on `zeroize`.
+    ///
+    /// Same drop semantics as [`Key::raw`]: a `String` is moved in and wiped, a
+    /// `&str` is copied and the source stays the caller's problem. A `&str`
+    /// literal in particular lives in the binary's read-only data and is never
+    /// wiped by anything.
+    pub fn passphrase(s: impl Into<String>) -> Self {
+        Key::Passphrase(Zeroizing::new(s.into()))
+    }
+}
+
 /// The Data Encryption Key: seals every page and the superblock body. Generated
 /// once at create time, held for the open session only, wiped on drop. Never
 /// written to disk except KEK-wrapped in a key-slot.
@@ -802,6 +848,41 @@ mod tests {
         // Clone works (needed by Options/rotation).
         let _r2 = raw.clone();
         let _p2 = pass.clone();
+    }
+
+    /// PUBLIC-API-9 (issue #119): `Key::raw` / `Key::passphrase` must produce
+    /// exactly what the variant constructors produce, so the ergonomic path and
+    /// the `Zeroizing` path are interchangeable rather than subtly different.
+    ///
+    /// This is a PIN, not a regression test. The bug it documents — a downstream
+    /// crate hitting E0433 on an unlinked `zeroize` — cannot be reproduced from
+    /// inside this workspace, because Cargo hands unit tests, integration tests,
+    /// and doctests the crate's own dependencies as `--extern`. Only a genuinely
+    /// external crate sees the failure. What DOES fail without the constructors
+    /// is the README doctest, which now calls `Key::passphrase`.
+    #[test]
+    fn key_constructors_produce_the_same_material_as_manual_construction() {
+        // Each argument form the `impl Into` signatures are meant to accept.
+        let from_vec = Key::raw(vec![1u8, 2, 3]);
+        let from_slice = Key::raw(&[1u8, 2, 3][..]);
+        let from_array = Key::raw([1u8, 2, 3]);
+        let manual_raw = Key::Raw(Zeroizing::new(vec![1u8, 2, 3]));
+        for k in [&from_vec, &from_slice, &from_array] {
+            match (k, &manual_raw) {
+                (Key::Raw(a), Key::Raw(b)) => assert_eq!(a.as_slice(), b.as_slice()),
+                _ => panic!("Key::raw must build the Raw variant"),
+            }
+        }
+
+        let from_str = Key::passphrase("pw");
+        let from_string = Key::passphrase(String::from("pw"));
+        let manual_pass = Key::Passphrase(Zeroizing::new("pw".to_string()));
+        for k in [&from_str, &from_string] {
+            match (k, &manual_pass) {
+                (Key::Passphrase(a), Key::Passphrase(b)) => assert_eq!(a.as_str(), b.as_str()),
+                _ => panic!("Key::passphrase must build the Passphrase variant"),
+            }
+        }
     }
 
     #[test]

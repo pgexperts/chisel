@@ -102,6 +102,15 @@ pub use crypto::{
     Argon2Params, Key, MAX_ARGON2_M_COST, MAX_ARGON2_P_COST, MAX_ARGON2_T_COST, MIN_ARGON2_M_COST,
     MIN_ARGON2_P_COST, MIN_ARGON2_T_COST,
 };
+// PUBLIC-API-9 (issue #119): `Zeroizing` is ALREADY part of this crate's public
+// surface — the public `Key` variants' fields have type `Zeroizing<..>`, so a
+// `zeroize` major bump is already a chisel major bump whether or not this line
+// exists. Re-exporting therefore adds no new semver exposure; it makes the
+// existing exposure NAMEABLE, so a caller who holds a `Zeroizing` (from a
+// keyring crate, say) or who matches on `Key::Raw(z)` does not need a second,
+// separately-versioned `zeroize` in their own manifest just to spell the type.
+// `Key::raw` / `Key::passphrase` cover the construction case without it.
+pub use zeroize::Zeroizing;
 
 use std::path::Path;
 
@@ -169,7 +178,9 @@ pub struct Options {
     /// must unwrap one of the on-disk key slots or `open` returns
     /// `InvalidEncryptionKey`. Supplying a key to open a plaintext DB returns
     /// `EncryptionNotSupported`; omitting it on an encrypted DB returns
-    /// `NoEncryptionKey`.
+    /// `NoEncryptionKey`. A key that DOES unwrap a slot but then fails to
+    /// authenticate the sealed superblock body returns `DecryptionFailed`,
+    /// which is a corrupt file rather than a credential problem.
     pub encryption_key: Option<Key>,
     /// Argon2id cost parameters used to derive the KEK from a `Key::Passphrase`
     /// on *create*. `None` uses `Argon2Params::default()` (OWASP: 19 MiB / t=2 /
@@ -387,8 +398,11 @@ impl Chisel {
     /// or `LockFailed` (another handle holds the exclusive flock).
     /// For an encrypted database: `NoEncryptionKey` (file is encrypted but
     /// no `encryption_key` given), `InvalidEncryptionKey` (key unwraps no
-    /// key slot), or `EncryptionNotSupported` (key given for a plaintext
-    /// file). When reopening an existing file, parsing the superblock can
+    /// key slot), `EncryptionNotSupported` (key given for a plaintext
+    /// file), or `DecryptionFailed` (the key unwrapped a slot but the sealed
+    /// superblock body then failed authentication — the file is damaged, not
+    /// the credential, so retrying other keys cannot help).
+    /// When reopening an existing file, parsing the superblock can
     /// also yield `UnsupportedFormatVersion`, `CorruptSuperblock`,
     /// `ChecksumMismatch`, `FileSizeMismatch`, or `IoError`.
     pub fn open(path: &Path, options: Options) -> Result<Chisel> {

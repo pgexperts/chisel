@@ -439,9 +439,12 @@ impl Superblock {
     /// superblock ever written sealed its body against this exact byte string,
     /// so populating those bytes changes the AAD for all of them and
     /// `open_body` returns `CryptoError::Auth` on every existing encrypted
-    /// database. That surfaces to the user as `InvalidEncryptionKey` — i.e. an
-    /// upgraded binary reports every CORRECT passphrase as wrong, rather than
-    /// reporting a format break. The encrypted-MINOR write-gate cannot catch it
+    /// database. That surfaces to the user as `DecryptionFailed` — i.e. an
+    /// upgraded binary reports every deployed encrypted database as corrupt,
+    /// rather than reporting a format break. (Before issue #119 it was reported
+    /// as `InvalidEncryptionKey`, accusing the operator's CORRECT passphrase;
+    /// the variant now at least reads as damage, but the database is just as
+    /// bricked either way.) The encrypted-MINOR write-gate cannot catch it
     /// either, since a MINOR bump does not force read-only for a file this
     /// binary believes it understands.
     ///
@@ -825,8 +828,10 @@ mod tests {
     /// written. Changing its layout — including populating the trailing four
     /// zero bytes, which the code used to advertise as "reserved for future
     /// AAD fields" — makes `open_body` fail with `CryptoError::Auth` on every
-    /// existing encrypted database, surfacing as `InvalidEncryptionKey`, i.e.
-    /// indistinguishable from a wrong passphrase. Nothing else in the crate
+    /// existing encrypted database, surfacing as `DecryptionFailed`, i.e. every
+    /// deployed file reported as corrupt. (Pre-#119 it surfaced as
+    /// `InvalidEncryptionKey`, indistinguishable from a wrong passphrase; the
+    /// blast radius is unchanged, only the error's honesty.) Nothing else in the crate
     /// enforces the layout: there is no scheme byte, no branch on
     /// format_version, and the MINOR write-gate does not fire for it. This
     /// fixture is the enforcement, and it fails at test time rather than at a

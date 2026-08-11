@@ -1852,6 +1852,70 @@ fn tampered_key_slot_cost_params_do_not_reach_the_allocator() {
     );
 }
 
+/// PUBLIC-API-7 (issue #119): a damaged sealed superblock body must NOT be
+/// reported as a wrong credential.
+///
+/// The complement of the test above, and the reason the two variants are
+/// distinguishable at all: the discriminator is not the AEAD failure (a wrong
+/// key and a tampered ciphertext both just fail the tag check) but WHERE in the
+/// sequence it fires. Here the key slot is left intact, so `unlock` succeeds —
+/// cryptographic proof that this credential derived the KEK that wrapped this
+/// DEK — and only the body's ciphertext is flipped. Nothing the operator can
+/// type fixes that, so the error must be the fatal `DecryptionFailed` rather
+/// than the operational `InvalidEncryptionKey` that invites a credential retry.
+///
+/// A raw key (HKDF), not a passphrase: this test only needs a slot that
+/// unwraps, and a passphrase would spend a 19 MiB Argon2id derivation per open
+/// in a debug-profile run.
+#[test]
+fn corrupt_sealed_superblock_body_is_not_reported_as_a_wrong_key() {
+    use crate::crypto::{NONCE_LEN, TAG_LEN};
+    use crate::superblock::SEALED_BODY_OFFSET;
+
+    let tmp = NamedTempFile::new().unwrap();
+    let key = || Key::Raw(Zeroizing::new(vec![0xa5u8; 32]));
+
+    let mut db = Chisel::open(tmp.path(), Options::default().encryption_key(key())).unwrap();
+    db.begin().unwrap();
+    db.allocate(b"payload").unwrap();
+    db.commit().unwrap();
+    drop(db);
+
+    // First ciphertext byte of the sealed body: nonce || tag || ct_len(u16 LE)
+    // || ciphertext. Flipping it leaves the cleartext bootstrap fields, the
+    // crypto header, and every key slot untouched, so the slot still unwraps
+    // and only the body's Poly1305 tag disagrees. Patch EVERY slot so the
+    // winner is corrupt whichever one selection lands on.
+    let ct_at = SEALED_BODY_OFFSET + NONCE_LEN + TAG_LEN + 2;
+    for sb_slot in 0..crate::DEFAULT_SUPERBLOCK_COUNT as u64 {
+        rewrite_encrypted_superblock_slot(tmp.path(), sb_slot, |buf| {
+            buf[ct_at] ^= 0xff;
+        });
+    }
+
+    let err = Chisel::open(tmp.path(), Options::default().encryption_key(key()))
+        .err()
+        .expect("a tampered sealed body must not open");
+    assert!(
+        matches!(err, ChiselError::DecryptionFailed { .. }),
+        "the correct key unwrapped a slot, so this is corruption, not a credential \
+         problem; expected DecryptionFailed, got {err:?}"
+    );
+    // Fatal is the point of the change, not an incidental property: an
+    // operational classification tells an automated caller to retry other
+    // credentials forever against a file that needs a restore.
+    assert!(err.is_fatal(), "a damaged superblock body is fatal");
+    // The error names the slot it failed on, which is the slot selection
+    // picked -- necessarily one of the real superblock slots.
+    let ChiselError::DecryptionFailed { page_id } = err else {
+        unreachable!()
+    };
+    assert!(
+        page_id < crate::DEFAULT_SUPERBLOCK_COUNT as u64,
+        "page_id must name the winning superblock slot, got {page_id}"
+    );
+}
+
 // ── SECURITY-SWEEP hardening (2026-07-29 review) ────────────────────────
 //
 // These three model the review's stated threat: the attacker controls the

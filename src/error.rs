@@ -239,9 +239,20 @@ pub enum ChiselError {
     // Fatal — an AEAD authentication failure while decrypting a page that
     // was already located and read off disk. The ciphertext, tag, nonce, or
     // session DEK disagree, so the last-committed snapshot cannot be trusted;
-    // poisons the manager (I1) exactly like ChecksumMismatch. Distinct from
-    // InvalidEncryptionKey (a *key-slot* unwrap failure at open, before any
-    // page is served) — this fires mid-session on a real data/handle page.
+    // poisons the manager (I1) exactly like ChecksumMismatch.
+    //
+    // Two sites raise it. Mid-session, on any encrypted unit the page cache
+    // opens — data, handle-table, freemap or overflow alike — where
+    // `page_id` is that page. And at open (PUBLIC-API-7, issue #119), on the
+    // winning superblock's sealed body, where `page_id` is that slot's page id;
+    // that site is reached only after a key slot has already unwrapped, which
+    // proves the supplied credential is correct and leaves a damaged or forged
+    // body as the only explanation.
+    //
+    // Never ambiguous with InvalidEncryptionKey (a *key-slot* unwrap failure)
+    // despite both being AEAD failures, because they are two separate opens in
+    // sequence: the key-slot open must succeed before either site above can be
+    // reached at all.
     DecryptionFailed {
         page_id: u64,
     },
@@ -467,9 +478,12 @@ impl From<io::Error> for ChiselError {
 impl From<crate::crypto::CryptoError> for ChiselError {
     // A CryptoError reaching the engine through `?` in the create/open/key-management
     // paths is always a key-or-KDF problem on intact on-disk data, so it maps to the
-    // operational InvalidEncryptionKey. The page-read path (Phase 3) does NOT use this
-    // blanket conversion — it maps decrypt failures explicitly to the fatal
-    // ChiselError::DecryptionFailed { page_id } via `.map_err(...)`. The operational
+    // operational InvalidEncryptionKey. Two sites deliberately bypass this blanket
+    // conversion and map explicitly to the fatal ChiselError::DecryptionFailed
+    // { page_id } via `.map_err(...)`, because at both of them the credential has
+    // already been proven and only the data can be at fault: the page-read path
+    // (Phase 3), and the superblock sealed-body decrypt in open_existing, which runs
+    // after a key slot has unwrapped (PUBLIC-API-7, issue #119). The operational
     // cases that are NOT CryptoError-derived (no key supplied for an encrypted DB; a
     // key supplied for a plaintext DB) are returned explicitly as NoEncryptionKey /
     // EncryptionNotSupported at their decision sites.

@@ -268,19 +268,18 @@ For tuned options (cache size, superblock count), use `Chisel::open_in_memory_wi
 
 Encryption is opt-in and driven entirely through `Options::encryption_key`. A key is supplied as a `chisel::Key`:
 
-- `Key::Raw(bytes)` — high-entropy key material (32 bytes), stretched to a key-encryption key via HKDF-SHA256.
-- `Key::Passphrase(string)` — a human secret, stretched via Argon2id (memory-hard). Cost comes from `Options::argon2_params` on create, or the stored slot's params on reopen.
+- `Key::raw(bytes)` — high-entropy key material (32 bytes), stretched to a key-encryption key via HKDF-SHA256.
+- `Key::passphrase(string)` — a human secret, stretched via Argon2id (memory-hard). Cost comes from `Options::argon2_params` on create, or the stored slot's params on reopen.
 
-Both variants zeroize their material on drop.
+Both variants zeroize their material on drop. The constructors wrap the material in `zeroize::Zeroizing` for you, so you do not need a `zeroize` dependency of your own; the enum variants `Key::Raw(..)` / `Key::Passphrase(..)` remain available for callers who already hold a `Zeroizing`, which Chisel re-exports as `chisel::Zeroizing`.
 
 ```rust,no_run
 # fn main() -> chisel::Result<()> {
 use chisel::{Chisel, Key, Options};
 use std::path::Path;
-use zeroize::Zeroizing;
 
 // Create (or reopen) an encrypted database.
-let key = Key::Passphrase(Zeroizing::new("correct horse battery staple".into()));
+let key = Key::passphrase("correct horse battery staple");
 let mut db = Chisel::open(
     Path::new("secret.db"),
     Options::default().encryption_key(key),
