@@ -97,6 +97,13 @@ impl TransactionManager {
         // too-low direction is the harmless "costs a scan" case.
         // See `FreemapRecycle::begin`.
         self.freemap.begin();
+        // Issue #112: start the within-transaction recycle pool empty. Both of
+        // its fields are judged against `committed_roots` and the allocation
+        // watermark AS OF NOW, so an entry surviving from the previous
+        // transaction would name a page the last commit made live — the one
+        // state that would let the pool hand out a page a durable superblock
+        // still references.
+        self.txn_pages.reset();
         // R1: clone the live-slot counts and reset the insert cursor.
         // The cursor is always None at begin — it only tracks pages
         // allocated during the current transaction.
@@ -212,6 +219,7 @@ impl TransactionManager {
             cache: &self.cache,
             savepoints: &mut self.savepoints,
             txn_freed_pages: &mut self.txn_freed_pages,
+            txn_pages: &mut self.txn_pages,
             freemap: &mut self.freemap,
             packer: &mut self.packer,
             committed_roots: &mut self.committed_roots,
@@ -305,6 +313,12 @@ impl TransactionManager {
         // leaving `pending_structural_frees` intact as the pre-transaction
         // baseline. See `FreemapRecycle::rollback` for the per-stream reasoning.
         self.freemap.rollback();
+        // Issue #112: drop the within-transaction recycle pool. Its pages died
+        // with the transaction — the extended ones in (b), the committed-free
+        // reuses in (a) — so nothing here needs queueing anywhere; the point is
+        // that no id survives into the next transaction, where it would name a
+        // page the restored `committed_roots` references.
+        self.txn_pages.reset();
         // R1: revert the live-slot counts and drop the insert cursor.
         self.packer.rollback();
         self.active_txn = false;

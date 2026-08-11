@@ -265,3 +265,70 @@ fn heavy_churn_with_reclamation_survives_reopen_file_backed() {
         assert_eq!(got, handles, "handles_with_tag({tag}) after reopen");
     }
 }
+
+// HANDLES-INDEX-2 (issue #112). A single transaction's page footprint must be
+// bounded by the data it writes, not by how many mutations it makes.
+//
+// Every handle-table mutation COWs the whole root-to-leaf spine. The superseded
+// pages queue in `txn_freed_pages` and do not reach the committed freemap until
+// commit, so before the within-transaction recycle pool NOTHING a transaction
+// freed was reusable by that same transaction: N allocations against a depth-1
+// table extended the file by ~N*2 pages, dirtied all of them, and only marked
+// them free once the commit that made them garbage had already flushed them.
+//
+// METRIC. This asserts on committed `total_pages` — the file high-water mark,
+// which is what the issue's own title names — and NOT on
+// `counters().pages_allocated`. That distinction is worth recording, because
+// the obvious counter is the wrong one HERE: the recycle pool does not remove
+// the per-level allocations, it satisfies them from a bounded pool of pages
+// this transaction already superseded. `pages_allocated` counts a pool draw
+// exactly like a file extension (both go through `PageCache::reissue_page`),
+// so it stays at roughly 2 per op by design and cannot discriminate. What
+// changes, and what this measures, is how many DISTINCT pages the transaction
+// needs.
+#[test]
+fn many_allocates_in_one_transaction_do_not_grow_the_file_per_level() {
+    let mut db = Chisel::open_in_memory_with_options(Options::default()).unwrap();
+
+    // Seed past ENTRIES_PER_LEAF (510) so the handle table sits at depth >= 1
+    // and every further insert has a real spine to COW. At depth 0 a mutation
+    // COWs one page and the defect barely shows.
+    db.begin().unwrap();
+    for _ in 0..600 {
+        db.allocate(b"seed").unwrap();
+    }
+    db.commit().unwrap();
+
+    let pages_before = db.stats().unwrap().total_pages;
+
+    const N: u64 = 2000;
+    db.begin().unwrap();
+    for i in 0..N {
+        db.allocate(&i.to_le_bytes()).unwrap();
+    }
+    db.commit().unwrap();
+
+    let growth = db.stats().unwrap().total_pages - pages_before;
+    let per_op = growth as f64 / N as f64;
+
+    // MEASURED, not reasoned. With the pool: growth = 10 pages, 0.005 per op —
+    // the data pages the 2000 values pack into plus the handle-table leaves
+    // they genuinely need. With the pool's feed disabled (a one-line revert of
+    // `retire_superseded`'s gate): growth = 3318 pages, 1.659 per op. The gap
+    // is 332x; the bound sits 20x above the observed figure and 16x below the
+    // regression, so ordinary drift in value size or leaf fanout cannot reach
+    // it but a return to per-mutation growth cannot miss it.
+    //
+    // 1.659 rather than the ~2.0 a depth-1 spine implies, because the seed
+    // transaction's own supersedes reach the committed freemap at its commit
+    // and absorb part of this transaction's churn. That absorption is exactly
+    // the masking that makes a file-size metric weaker on a long-lived
+    // database — here the seeding is small and fixed, so it costs a constant
+    // factor, not the signal.
+    assert!(
+        per_op < 0.10,
+        "one transaction allocated {per_op} pages per mutation ({growth} pages for {N} \
+         allocates); the handle-table spine is being re-extended per mutation instead of \
+         recycled within the transaction"
+    );
+}

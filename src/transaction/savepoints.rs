@@ -32,6 +32,20 @@ impl TransactionManager {
         // TXN-COMMIT-1 was; see `SlotPacker::restore`.
         let live_slots = self.packer.snapshot();
         self.packer.clear_cursor();
+        // Issue #112: empty the within-transaction recycle pool into the
+        // ordinary free queue BEFORE the `mem::take` below moves that queue into
+        // the savepoint record. Same posture as freemap reuse and slot packing —
+        // a savepoint scope turns the optimization off — but here it is required,
+        // not merely simplifying: the pool must be provably empty for the whole
+        // scope, so that `rollback_to` (which can only rewind the cache above the
+        // watermark) never has to undo a write into a pooled page allocated
+        // below it.
+        //
+        // Queueing rather than discarding is the pre-#112 behaviour restored
+        // exactly: every id in the pool was superseded before the roots snapshot
+        // taken on the next line, so it is dead under this savepoint too, and
+        // `txn_freed_pages` is where such pages went before the pool existed.
+        self.txn_pages.drain_into(&mut self.txn_freed_pages);
         self.savepoints.push(Savepoint {
             name: name.to_string(),
             roots: self.current_roots.clone(),
@@ -110,6 +124,18 @@ impl TransactionManager {
         self.freemap.rollback_to_mark(mark);
         self.savepoints.truncate(idx + 1);
         self.txn_freed_pages.clear();
+        // Issue #112: the recycle pool must be empty here, and this asserts it
+        // rather than assuming it. `savepoint_inner` drained it on the way in
+        // and `retire_superseded` refuses to refill it while any savepoint is
+        // open, so the only way an entry could exist is if one of those two
+        // gates had been moved — and a pooled entry surviving a rewind is
+        // exactly the hazard the drain exists to prevent. `truncate(idx + 1)`
+        // above keeps this savepoint on the stack, so the scope (and the gate)
+        // continues past this call.
+        debug_assert!(
+            self.txn_pages.recyclable().is_empty(),
+            "recycle pool must stay empty inside a savepoint scope"
+        );
 
         Ok(())
     }

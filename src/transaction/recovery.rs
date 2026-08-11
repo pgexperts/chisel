@@ -156,6 +156,7 @@ impl TransactionManager {
             active_txn: false,
             savepoints: Vec::new(),
             txn_freed_pages: Vec::new(),
+            txn_pages: freemap::TxnPageRecycle::new(),
             freemap: freemap::FreemapRecycle::new(),
             // A fresh database has no data pages and no live slots yet.
             packer: packing::SlotPacker::new(),
@@ -722,6 +723,7 @@ impl TransactionManager {
             active_txn: false,
             savepoints: Vec::new(),
             txn_freed_pages: Vec::new(),
+            txn_pages: freemap::TxnPageRecycle::new(),
             freemap: freemap::FreemapRecycle::new(),
             packer: packing::SlotPacker::from_committed(committed_live_slots),
             poisoned: Cell::new(false),
