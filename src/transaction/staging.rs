@@ -47,7 +47,10 @@ impl TransactionManager {
         let mut tree = self.freemap.take_tree(&self.current_roots);
         let result = {
             let mut cache = self.cache.borrow_mut();
-            let mut alloc = |c: &mut PageCache| self.freemap.cow_alloc_into(c, &mut tree, reuse);
+            let mut alloc = |c: &mut PageCache| {
+                self.freemap
+                    .cow_alloc_into(c, &mut tree, &mut self.txn_pages, reuse)
+            };
             self.membership_index.insert(
                 &mut cache,
                 self.current_roots.membership_index_page,
@@ -100,7 +103,10 @@ impl TransactionManager {
         let mut tree = self.freemap.take_tree(&self.current_roots);
         let result = {
             let mut cache = self.cache.borrow_mut();
-            let mut alloc = |c: &mut PageCache| self.freemap.cow_alloc_into(c, &mut tree, reuse);
+            let mut alloc = |c: &mut PageCache| {
+                self.freemap
+                    .cow_alloc_into(c, &mut tree, &mut self.txn_pages, reuse)
+            };
             self.handle_table.insert(
                 &mut cache,
                 self.current_roots.handle_table_page,
@@ -152,6 +158,12 @@ impl TransactionManager {
     ///   committed state). Overflow value pages are in the same residue class.
     ///   The residue leaks only if the caller commits after the operational
     ///   error rather than rolling back — contrary to documented contract.
+    /// - Recycle-pool draws (issue #112). A candidate allocation may have
+    ///   consumed pooled ids that the discarded `freed` list will not put back.
+    ///   Same residue class, same reclamation, and — the part that matters —
+    ///   NOT a correctness question in either direction: a consumed pooled page
+    ///   is dead whether or not the candidate survives, so nothing here can free
+    ///   a live page or hand out a referenced one.
     fn abort_allocate_prepare(
         &mut self,
         saved_root: u64,
@@ -178,7 +190,10 @@ impl TransactionManager {
         let mut tree = self.freemap.take_tree(&self.current_roots);
         let result = {
             let mut cache = self.cache.borrow_mut();
-            let mut alloc = |c: &mut PageCache| self.freemap.cow_alloc_into(c, &mut tree, reuse);
+            let mut alloc = |c: &mut PageCache| {
+                self.freemap
+                    .cow_alloc_into(c, &mut tree, &mut self.txn_pages, reuse)
+            };
             self.membership_index.remove(
                 &mut cache,
                 self.current_roots.membership_index_page,
@@ -329,14 +344,18 @@ impl TransactionManager {
         }
 
         // INSTALL phase (infallible): both maps move together, and only now is
-        // the handle id consumed and the superseded spine pages queued for
-        // reclamation at commit.
+        // the handle id consumed and the superseded spine pages retired — to
+        // the within-transaction recycle pool or to `txn_freed_pages`, per
+        // `retire_superseded`. Retiring ONLY here is what keeps a DISCARDED
+        // candidate's pages out of both streams: the abort path above drops
+        // `ht_freed`/`mi_freed` on the floor, so a candidate that never becomes
+        // the installed root can neither free a live page nor feed the pool.
         self.current_roots.next_handle += 1;
         self.current_roots.handle_table_page = ht_new_root;
-        self.txn_freed_pages.append(&mut ht_freed);
+        self.retire_superseded(&mut ht_freed);
         if let Some(root) = mi_new_root {
             self.current_roots.membership_index_page = root;
-            self.txn_freed_pages.append(&mut mi_freed);
+            self.retire_superseded(&mut mi_freed);
         }
 
         Ok(handle)

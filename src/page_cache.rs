@@ -894,7 +894,9 @@ impl PageCache {
         //     can name a page this transaction is writing: the defrag orphan
         //     sweep marks only pages that are unreachable from the live roots,
         //     carry a FreeMap/FreeMapInterior type tag, and sit outside the live
-        //     recycle pool; and `FreemapRecycle::persist` runs inside commit,
+        //     STRUCTURAL recycle pool (the freemap's three streams — not
+        //     `TxnPageRecycle`, which is a different pool with the same
+        //     nickname); and `FreemapRecycle::persist` runs inside commit,
         //     after the I28 pre-drain has already flushed the cache and
         //     truncated the spillway, and allocates only via
         //     `structural_extend` — never via `allocate_first`.
@@ -907,35 +909,79 @@ impl PageCache {
             !self.is_dirty(page_id),
             "claim_page called on a dirty page (page_id={page_id}); freemap returned an id with pending writes from the current transaction"
         );
+        self.reissue_page(page_id)
+    }
+
+    /// Reissue a page id whose current DIRTY contents this transaction has
+    /// already superseded — the draw side of the within-transaction recycle
+    /// pool (HANDLES-INDEX-2, issue #112). Behaviourally identical to
+    /// `claim_page`; the only difference is the absent I20 assert.
+    ///
+    /// That assert is NOT weakened here, it is TRADED. `claim_page` proves
+    /// safety with "this id has no pending writes at all"; the pool cannot
+    /// offer that (handing back a page this transaction wrote and then
+    /// replaced is the entire point) and must instead prove the strictly
+    /// stronger property that the pending writes are unreachable — from
+    /// `current_roots`, from `committed_roots`, and from every open savepoint's
+    /// roots. Discarding writes no snapshot can observe is not data loss.
+    ///
+    /// `TxnPageRecycle` in `transaction/freemap.rs` carries that proof and is
+    /// the ONLY sanctioned caller. A second caller must reproduce all three
+    /// halves of it, not just the first.
+    pub(crate) fn reclaim_dead_txn_page(&mut self, page_id: u64) -> Result<()> {
+        self.reissue_page(page_id)
+    }
+
+    /// Shared body of `claim_page` and `reclaim_dead_txn_page`: drop whatever
+    /// the cache and the spillway hold for `page_id`, install a fresh zeroed
+    /// DIRTY entry, and count the reissue as an allocation.
+    ///
+    /// Zeroing (rather than handing back the stale bytes) is what lets every
+    /// COW consumer treat a reissued id exactly like a `new_page` id. The
+    /// alternative — trusting each caller to overwrite the whole page — would
+    /// make a stale-but-checksum-valid radix node reachable through a single
+    /// missed write, which is precisely the failure mode the callers cannot
+    /// detect.
+    fn reissue_page(&mut self, page_id: u64) -> Result<()> {
         // Remove any pre-existing entry so a stale cached copy from a
-        // prior reader doesn't leak into the new transaction's view.
-        // The debug_assert above guarantees any prior entry was clean,
-        // so removing it doesn't change `dirty_count`. Then insert a
-        // fresh dirty entry, incrementing the counter.
+        // prior reader doesn't leak into the new transaction's view, then
+        // insert a fresh dirty entry.
         // `LruIndex::push_front` auto-removes any prior entry for this
         // id before inserting at MRU, so an explicit LRU remove isn't
         // needed.
-        self.entries.remove(&page_id);
+        //
+        // The removed entry may be DIRTY on the `reclaim_dead_txn_page` path
+        // (never on the `claim_page` path, whose assert forbids it), so the
+        // decrement is conditional and the net effect there is zero: one dirty
+        // entry replaced by another. A SPILLED page is not in `entries` at all
+        // and was already decremented when it was evicted, so the `forget`
+        // below needs no matching adjustment.
+        let was_dirty = self.entries.remove(&page_id).is_some_and(|e| e.dirty);
+        self.untrack_dirty(was_dirty);
         // A reissued id has a SECOND stale home: the spillway. This is the
         // module header's "invalidate cache / spillway / freemap state for the
         // reissued range" rule, which `truncate` already honours via
-        // `forget_above`; `claim_page` is the other reissue path and must
-        // honour it too. Without the forget, flush() writes the freshly claimed
+        // `forget_above`; this is the other reissue path and must honour it
+        // too. Without the forget, flush() writes the freshly claimed
         // content in Phase 1a and then copies the stale spilled blob over it in
         // Phase 1b, while the Vacant-only re-insert leaves the cache holding the
         // NEW bytes marked clean — a cache/disk divergence that stays invisible
         // until the page is evicted and cold-read.
         //
-        // Belt and braces, deliberately: the debug_assert above is the primary
-        // guard and (now that `is_dirty` sees spillway residency) does cover
-        // this case, but it compiles out in release. This line is the release
-        // degradation — same data loss the in-cache dirty case already has,
-        // rather than a divergence between what the cache believes and what is
-        // on disk. It is therefore unobservable in a debug test, which panics
-        // at the assert before reaching it; `claim_page_asserts_on_a_spilled_page`
-        // covers the assert, and no test can cover this line without a release
-        // build. On a page that is not spilled — every call today — it is a
-        // single failed HashMap lookup.
+        // For the `claim_page` caller this is belt and braces, deliberately:
+        // its debug_assert is the primary guard and (now that `is_dirty` sees
+        // spillway residency) does cover this case, but it compiles out in
+        // release, so this line is the release degradation — same data loss the
+        // in-cache dirty case already has, rather than a divergence between what
+        // the cache believes and what is on disk. It is therefore unobservable
+        // in a debug test on that path, which panics at the assert before
+        // reaching it; `claim_page_asserts_on_a_spilled_page` covers the assert.
+        //
+        // For the `reclaim_dead_txn_page` caller there is no assert and this
+        // line is LOAD-BEARING in every profile: a pooled page is dirty by
+        // construction and may well have been spilled, and the stale blob it
+        // would otherwise leave behind is a superseded radix node with a valid
+        // checksum — the one shape a cold read cannot reject.
         if let Some(spw) = self.spillway.as_mut() {
             spw.forget(page_id);
         }

@@ -237,6 +237,19 @@ pub struct TransactionManager {
     // their old contents must stay readable via `committed_roots` until
     // commit promotes the new roots.
     txn_freed_pages: Vec<u64>,
+    // The WITHIN-transaction recycle pool (HANDLES-INDEX-2, issue #112): pages
+    // this transaction both allocated and superseded, handed back to `cow_alloc`
+    // as COW targets instead of waiting for commit to release them through the
+    // freemap. This is what bounds a single transaction's page churn; without
+    // it, N mutations against a depth-d radix allocate N*(d+1) distinct pages
+    // and reclaim none of them until commit.
+    //
+    // Read `TxnPageRecycle`'s doc (freemap.rs) before touching any of its call
+    // sites: it is safe only because BOTH halves of "this transaction allocated
+    // it" and "this transaction superseded it" are established, and because
+    // feed and draw are both gated on `savepoints.is_empty()`. Distinct from
+    // `freemap.structural_reuse`, which recycles FREEMAP pages across commits.
+    txn_pages: freemap::TxnPageRecycle,
     // The structural-page recycle cluster and freemap commit/alloc/persist
     // machinery — the crash-durability backbone — extracted into its own owned
     // unit. No code outside `freemap.rs` touches the inner fields; the rest of

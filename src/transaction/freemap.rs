@@ -47,19 +47,37 @@ use super::*;
 /// steady-state page count ACROSS COMMITS instead of leaking one page per
 /// mutation forever.
 ///
-/// HANDLES-INDEX-2 (issue #112): that bound does NOT extend within a single
-/// transaction, and this comment used to read as if it did. The deferral in the
-/// paragraph above is exactly why — nothing this transaction frees is reusable
-/// by this transaction. Neither radix has the freemap tree's `session_owned`
-/// in-place dedup, so a long transaction's handle-table and membership churn
-/// still marches the file high-water up monotonically until it commits.
+/// HANDLES-INDEX-2 (issue #112): that bound used not to extend WITHIN a single
+/// transaction, for exactly the reason in the paragraph above — nothing this
+/// transaction frees reaches the committed bitmap before commit, so a long
+/// transaction's handle-table and membership churn marched the file high-water
+/// up monotonically. `pool` closes that: it is a within-transaction supply of
+/// pages this transaction both allocated and superseded, drawn from BEFORE the
+/// committed bitmap. See `TxnPageRecycle` for the invariant that makes handing
+/// one back safe.
 pub(super) fn cow_alloc(
     cache: &mut PageCache,
     tree: &mut FreeMapTree,
     hint: &mut u64,
     structural_reuse: &mut Vec<u64>,
+    pool: &mut TxnPageRecycle,
     reuse_enabled: bool,
 ) -> Result<u64> {
+    // Pool BEFORE bitmap, for three independent reasons: a pooled page needs no
+    // freemap COW to claim (the bitmap path COWs a leaf per claim), it is space
+    // no other transaction could have used anyway, and draining it here is what
+    // keeps the pool bounded instead of letting it accumulate until commit.
+    //
+    // Same `reuse_enabled` gate as the bitmap path, which is
+    // `savepoints.is_empty()` at every call site. That is not incidental
+    // sharing: it is half of the pool's savepoint argument (see
+    // `TxnPageRecycle`).
+    if reuse_enabled {
+        if let Some(id) = pool.draw(cache)? {
+            pool.record(id);
+            return Ok(id);
+        }
+    }
     if reuse_enabled && tree.root != PAGE_ID_NONE {
         // `allocate_first` claims a free DATA page (clearing its bit), which COWs
         // the freemap leaf. That leaf COW's structural `extend` reuses a dead
@@ -68,10 +86,203 @@ pub(super) fn cow_alloc(
         let mut extend = |c: &mut PageCache| structural_extend(c, structural_reuse);
         if let Some(id) = tree.allocate_first(cache, hint, &mut extend)? {
             cache.claim_page(id)?;
+            pool.record(id);
             return Ok(id);
         }
     }
-    cache.new_page()
+    let id = cache.new_page()?;
+    pool.record(id);
+    Ok(id)
+}
+
+/// Within-transaction recycle pool for COW targets (HANDLES-INDEX-2, issue
+/// #112). Owned by `TransactionManager` as the single `txn_pages` field.
+///
+/// THE PROBLEM. `cow_alloc` reuses only pages that are free in the COMMITTED
+/// freemap bitmap. Everything this transaction supersedes queues in
+/// `txn_freed_pages` and does not reach the bitmap until `persist` runs at
+/// commit, so N mutations against a depth-d handle table allocate N*(d+1)
+/// distinct pages, dirty all of them, and reclaim none until the transaction
+/// ends. A bulk load in one transaction grows the file by millions of pages
+/// whose contents nothing will ever read.
+///
+/// WHAT THIS IS NOT. Issue #112 proposed giving both radices the freemap tree's
+/// `session_owned` dedup: re-touch a page this transaction already COW'd IN
+/// PLACE. That corrupts data here, and the two tripwire tests
+/// (`rollback_to_savepoint_undoes_a_later_allocate_in_the_same_transaction`,
+/// `a_failed_tagged_allocate_leaves_the_handle_table_untouched`) exist to fail
+/// if anyone tries it. In-place mutation breaks two things the freemap tree
+/// never has to survive:
+///
+///   * every mutation path computes a CANDIDATE radix root and discards it on a
+///     later fallible step by restoring a saved ROOT ID. Mutated in place the id
+///     is unchanged, so the restore restores nothing and the discarded write
+///     stays.
+///   * `rollback_to` truncates only above the savepoint watermark, so an
+///     in-place write into a page allocated BEFORE the savepoint survives the
+///     rewind as a phantom entry.
+///
+/// The freemap tree escapes both only because nothing mutates it inside a
+/// savepoint scope and its mutations have no candidate/discard step. Neither
+/// escape transfers.
+///
+/// THE INVARIANT. A page may be handed back as a COW target only if NO
+/// RESTORABLE SNAPSHOT references it. There are exactly two kinds: the roots
+/// the last durable superblock names (`committed_roots` — where `rollback` and
+/// crash recovery land), and each open savepoint's `roots` clone (where
+/// `rollback_to` lands). Membership requires BOTH halves, and each half retires
+/// one of them:
+///
+///   * THIS TRANSACTION ALLOCATED IT — recorded by `record`, called on every id
+///     `cow_alloc` returns. The base cases are `FreeMapTree::allocate_first`,
+///     which by the I18 invariant only ever yields an id whose bit is FREE in
+///     the committed bitmap (so no committed structure references it), and
+///     `PageCache::new_page`, which is monotonic above the begin watermark (so
+///     the id did not exist when the last superblock was written). A pooled
+///     draw is the inductive case: it was already recorded. Hence
+///     `committed_roots` cannot reference a pooled page.
+///   * THIS TRANSACTION SUPERSEDED IT — `retire` is fed ONLY from a `freed` vec
+///     at an INSTALL site, i.e. after the replacement root has been written into
+///     `current_roots`. Hence `current_roots` cannot reference it either. This
+///     is also what makes the candidate/discard hazard structurally absent: a
+///     discarded candidate's `freed` vec is dropped, never retired, so it
+///     contributes nothing.
+///
+/// Savepoint roots are retired by gating BOTH the feed (`retire`) and the draw
+/// (`cow_alloc`) on `savepoints.is_empty()`, and by draining the pool into
+/// `txn_freed_pages` when a savepoint is pushed. So while any savepoint is open
+/// the pool is empty and inert, and a page a savepoint's roots reference can
+/// never be in it: it would have to have been superseded while that savepoint
+/// was open (feed disabled) or before it existed (in which case the savepoint's
+/// later roots clone cannot name it, and the drain had already emptied the pool
+/// regardless).
+///
+/// THE STREAM SPLIT, which is the easiest thing to get wrong. A page routed to
+/// `recyclable` must NOT also be queued in `txn_freed_pages`: `persist` would
+/// mark a page free that the pool has since handed out and made live again —
+/// the I18 hazard in new dress. `retire` therefore assigns each freed id to
+/// exactly one stream. Symmetrically, whatever is still in `recyclable` at
+/// commit IS genuinely dead and must be appended to `txn_freed_pages` before
+/// `persist` runs, or the space leaks. Both halves live in `commit.rs`.
+pub(super) struct TxnPageRecycle {
+    /// Every page id `cow_alloc` has returned this transaction. This is the
+    /// "we allocated it" half of the invariant, and it is a SET rather than a
+    /// watermark comparison because `cow_alloc` has two base sources: ids above
+    /// the begin watermark (`new_page`) and ids below it (committed-free bits).
+    /// Both are safe; only an explicit record distinguishes them from a genuine
+    /// committed page.
+    ///
+    /// Cleared at begin/commit/rollback. NOT cleared by `rollback_to`: an entry
+    /// for a page the rewind truncated is stale but harmless, because `retire`
+    /// re-checks the other half (the page was just superseded from the LIVE
+    /// tree) on every use, and "this transaction allocated it" cannot become
+    /// false mid-transaction — `committed_roots` is frozen until commit.
+    allocated: FxHashSet<u64>,
+    /// Dead-this-transaction pages available as COW targets, LIFO. Kept small
+    /// by construction: each mutation supersedes about as many pages as it
+    /// allocates, and the draw happens before the feed, so the pool oscillates
+    /// around one root-to-leaf spine rather than growing with the transaction.
+    recyclable: Vec<u64>,
+}
+
+impl TxnPageRecycle {
+    /// Fresh pool for a newly-opened manager.
+    pub(super) fn new() -> Self {
+        TxnPageRecycle {
+            allocated: FxHashSet::default(),
+            recyclable: Vec::new(),
+        }
+    }
+
+    /// Record an id `cow_alloc` is handing out. Called on ALL THREE of its
+    /// sources (pool draw, committed-bitmap claim, file extension) so the
+    /// "we allocated it" half of the invariant needs no case analysis at the
+    /// `retire` end. Recording a data page costs 8 bytes and buys nothing today
+    /// — data-page frees go straight to `txn_freed_pages` via
+    /// `release_data_slot` — but a conditional here would be one more thing a
+    /// future allocation site could get wrong.
+    fn record(&mut self, id: u64) {
+        self.allocated.insert(id);
+    }
+
+    /// Take the next COW target from the pool, or `None` when it is empty.
+    ///
+    /// The reissue happens BEFORE the pop, deliberately. `reclaim_dead_txn_page`
+    /// is fallible (`maybe_evict` can raise `CacheFull` / `SpillwayFull`), and
+    /// leaving the id in the pool on that path keeps it reachable — by a later
+    /// draw, or by the commit-time drain into `txn_freed_pages`. Popping first
+    /// would strand the page in neither stream, leaking it if the caller
+    /// commits after the operational error. Reclaiming an id whose earlier
+    /// reclaim failed is harmless: the page is still dead and the reissue is
+    /// idempotent.
+    fn draw(&mut self, cache: &mut PageCache) -> Result<Option<u64>> {
+        let Some(&id) = self.recyclable.last() else {
+            return Ok(None);
+        };
+        cache.reclaim_dead_txn_page(id)?;
+        self.recyclable.pop();
+        Ok(Some(id))
+    }
+
+    /// Route one INSTALL site's superseded pages to the correct reclamation
+    /// stream. `pool_enabled` is `savepoints.is_empty()` — see the savepoint
+    /// paragraph on the struct.
+    ///
+    /// Each id lands in EXACTLY ONE stream. That is the whole safety property
+    /// of this function: an id in both would be marked free by `persist` while
+    /// the pool had already handed it out and made it live again.
+    fn retire(&mut self, freed: &mut Vec<u64>, txn_freed_pages: &mut Vec<u64>, pool_enabled: bool) {
+        if !pool_enabled {
+            txn_freed_pages.append(freed);
+            return;
+        }
+        for id in freed.drain(..) {
+            if self.allocated.contains(&id) {
+                // A page cannot be superseded twice without being re-allocated
+                // in between (once superseded, no descent from `current_roots`
+                // can reach it), and re-allocation goes through `draw`, which
+                // pops it. So this cannot fire — but if it ever did, the pool
+                // would hand the same live page out twice. The scan is
+                // debug-only and the pool holds about one root-to-leaf spine.
+                debug_assert!(
+                    !self.recyclable.contains(&id),
+                    "page {id} superseded twice without an intervening allocation; \
+                     the recycle pool would hand it out twice"
+                );
+                self.recyclable.push(id);
+            } else {
+                txn_freed_pages.push(id);
+            }
+        }
+    }
+
+    /// Move the whole pool into `txn_freed_pages`. Used at commit (the
+    /// remainder is genuinely dead and must reach `persist` or it leaks) and
+    /// when a savepoint is pushed (the pool must be inert inside a savepoint
+    /// scope, and its contents were superseded before the savepoint's roots
+    /// snapshot, so queueing them as ordinary frees is exactly the
+    /// pre-#112 behaviour).
+    pub(super) fn drain_into(&mut self, txn_freed_pages: &mut Vec<u64>) {
+        txn_freed_pages.append(&mut self.recyclable);
+    }
+
+    /// Drop all per-transaction state. Called at begin, commit, and rollback —
+    /// every point at which `committed_roots` and the allocation watermark stop
+    /// being the ones the recorded ids were judged against. A surviving entry
+    /// would be an id this transaction did NOT allocate, which is precisely the
+    /// state that lets a pooled page still be referenced by a durable
+    /// superblock.
+    pub(super) fn reset(&mut self) {
+        self.allocated.clear();
+        self.recyclable.clear();
+    }
+
+    /// The pool's current contents. Not test-gated: `rollback_to_inner` asserts
+    /// on it in every debug build, which is where the savepoint half of the
+    /// invariant is actually checked rather than merely argued.
+    pub(super) fn recyclable(&self) -> &[u64] {
+        &self.recyclable
+    }
 }
 
 // Verification hook (tests only): every page id drawn from `structural_reuse`
@@ -273,10 +484,20 @@ impl FreemapRecycle {
     /// may call this several times on the one tree; that shared `session_owned`
     /// accumulation is load-bearing), so this takes `&mut tree` rather than
     /// owning it.
+    ///
+    /// `txn_pages` is the DATA/radix-side recycle (`TxnPageRecycle`), a
+    /// different pool from this type's `structural_reuse` and passed in rather
+    /// than owned: the two must not be confused. `structural_reuse` holds dead
+    /// FREEMAP pages deferred one commit and is drawn from by `structural_extend`
+    /// only; `txn_pages` holds pages this TRANSACTION superseded and is drawn
+    /// from by `cow_alloc` only. Crossing them would let a freemap COW draw
+    /// space from the structure it is recording, which is the recursion the
+    /// extend-only rule exists to prevent.
     pub(super) fn cow_alloc_into(
         &mut self,
         cache: &mut PageCache,
         tree: &mut FreeMapTree,
+        txn_pages: &mut TxnPageRecycle,
         reuse: bool,
     ) -> Result<u64> {
         cow_alloc(
@@ -284,6 +505,7 @@ impl FreemapRecycle {
             tree,
             &mut self.hint,
             &mut self.structural_reuse,
+            txn_pages,
             reuse,
         )
     }
@@ -463,6 +685,21 @@ impl FreemapRecycle {
     /// crash-orphaned pages are correctly flagged; in a normal (no-crash) defrag
     /// the live pool is excluded so the two reclamation channels never overlap.
     ///
+    /// There is a FOURTH stream of unreachable-but-not-free pages since #112 —
+    /// `TxnPageRecycle::recyclable` — and it is deliberately NOT in the set
+    /// below, because it cannot reach this walk in the first place. A pooled
+    /// page is dirty by construction, and the walk reads through `cache.get`
+    /// (cache and spillway before disk), so it always presents this
+    /// transaction's radix-typed or zeroed content, never the stale on-disk
+    /// bytes that would make it look like a freemap page. That is the whole
+    /// argument, and it has a dependency worth stating: if this walk ever
+    /// cold-reads the file, a pooled page whose DISK bytes are a stale
+    /// `FreeMap` (freed in an earlier commit, re-allocated this transaction via
+    /// `allocate_first`, not yet flushed) would be swept, its bit freed
+    /// mid-transaction, and `allocate_first` could then hand out a page the
+    /// pool has already made live. Add it to the exclusion set before making
+    /// this walk bypass the cache.
+    ///
     /// Reading each non-reachable page through the cache checksum-verifies it.
     /// A page that fails because it is GARBAGE/corrupt (`CorruptPage` /
     /// `ChecksumMismatch`) is SKIPPED, not propagated (2026-06-22 review:
@@ -490,8 +727,11 @@ impl FreemapRecycle {
             return Ok(0); // no tree yet => no freemap pages can be orphaned
         }
 
-        // Pages that are NOT orphans even though unreachable + not-free: the live
-        // recycle pool (all three streams). See "THE EXCLUSION SET" above.
+        // Pages that are NOT orphans even though unreachable + not-free: the
+        // STRUCTURAL recycle pool (all three of its streams). The fourth stream,
+        // `TxnPageRecycle::recyclable`, is excluded by construction rather than
+        // by membership here — see "THE EXCLUSION SET" above for why, and for
+        // what would change that.
         let mut excluded: FxHashSet<u64> = FxHashSet::default();
         excluded.extend(self.structural_reuse.iter().copied());
         excluded.extend(self.structural_superseded.iter().copied());
@@ -829,12 +1069,16 @@ impl TransactionManager {
         let mut freed: Vec<u64> = Vec::new();
         let reuse = self.savepoints.is_empty();
         // Build the freemap-tree handle (with the session set moved in). The
-        // alloc closure captures `&mut self.freemap` + the local `tree`, disjoint
-        // from `self.handle_table`, so both can borrow `self` at once.
+        // alloc closure captures `&mut self.freemap` + `&mut self.txn_pages` +
+        // the local `tree`, all disjoint from `self.handle_table`, so both can
+        // borrow `self` at once.
         let mut tree = self.freemap.take_tree(&self.current_roots);
         let result = {
             let mut cache = self.cache.borrow_mut();
-            let mut alloc = |c: &mut PageCache| self.freemap.cow_alloc_into(c, &mut tree, reuse);
+            let mut alloc = |c: &mut PageCache| {
+                self.freemap
+                    .cow_alloc_into(c, &mut tree, &mut self.txn_pages, reuse)
+            };
             self.handle_table.insert(
                 &mut cache,
                 self.current_roots.handle_table_page,
@@ -847,13 +1091,35 @@ impl TransactionManager {
         // Write back freemap growth (its supersedes go to structural_superseded
         // via put_tree). Done before the `?` so a freemap COW that happened before
         // an insert error still returns the session set and records the extended
-        // root. Handle-table supersedes (`freed`) only land in txn_freed_pages
-        // after the new root is installed.
+        // root. Handle-table supersedes (`freed`) are only retired after the new
+        // root is installed.
         self.freemap.put_tree(&mut self.current_roots, tree);
         let new_root = result?;
         self.current_roots.handle_table_page = new_root;
-        self.txn_freed_pages.append(&mut freed);
+        self.retire_superseded(&mut freed);
         Ok(())
+    }
+
+    /// Retire one install site's superseded radix pages: pages this transaction
+    /// itself allocated go to the within-transaction recycle pool, the rest to
+    /// `txn_freed_pages` for `persist` to mark free at commit
+    /// (HANDLES-INDEX-2, issue #112).
+    ///
+    /// CALL THIS ONLY AFTER THE NEW ROOT IS INSTALLED. Every caller replaced a
+    /// bare `self.txn_freed_pages.append(&mut freed)` that sat in the same
+    /// position for the same reason, and the reason is now doing double duty:
+    /// it kept a discarded candidate's pages from being freed while still
+    /// referenced, and it is also what keeps a discarded candidate from feeding
+    /// the pool. Moving a call above its install would reintroduce the
+    /// candidate/discard corruption the pool design exists to avoid.
+    ///
+    /// The `savepoints.is_empty()` gate is read here rather than passed in so
+    /// no caller can supply a different answer than `cow_alloc`'s `reuse` flag;
+    /// the two must agree for the savepoint half of the invariant to hold.
+    pub(super) fn retire_superseded(&mut self, freed: &mut Vec<u64>) {
+        let pool_enabled = self.savepoints.is_empty();
+        self.txn_pages
+            .retire(freed, &mut self.txn_freed_pages, pool_enabled);
     }
 
     /// Reclaim crash-orphaned freemap pages. Not on the commit path despite the

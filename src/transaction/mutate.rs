@@ -207,8 +207,14 @@ impl TransactionManager {
         // (freeing the page only when its last live slot goes); for Overflow, the
         // walked chain pages are queued for reclamation.
         self.current_roots.handle_table_page = ht_new_root;
-        self.txn_freed_pages.append(&mut ht_freed);
+        self.retire_superseded(&mut ht_freed);
         match old_release {
+            // Value storage stays on the plain `txn_freed_pages` path. The
+            // recycle pool takes RADIX supersedes only: an overflow chain page
+            // is allocated by `Overflow::write` via `cache.new_page` directly
+            // (never through `cow_alloc`), and a data page's id arrives here
+            // from `SlotPacker::release`, not from a `freed` list. Feeding
+            // either into the pool would be a second, unaudited route into it.
             OldRelease::Inline(page_id) => self.release_data_slot(page_id),
             OldRelease::Overflow(freed) => self.txn_freed_pages.extend_from_slice(&freed),
         }
@@ -259,7 +265,10 @@ impl TransactionManager {
         let mut tree = self.freemap.take_tree(&self.current_roots);
         let delete_result = {
             let mut cache = self.cache.borrow_mut();
-            let mut alloc = |c: &mut PageCache| self.freemap.cow_alloc_into(c, &mut tree, reuse);
+            let mut alloc = |c: &mut PageCache| {
+                self.freemap
+                    .cow_alloc_into(c, &mut tree, &mut self.txn_pages, reuse)
+            };
             self.handle_table.delete(
                 &mut cache,
                 self.current_roots.handle_table_page,
@@ -359,14 +368,22 @@ impl TransactionManager {
         // spine pages are queued only now, post-install, so an early prepare
         // failure leaves them referenced by the still-current old tree.
         self.current_roots.handle_table_page = ht_new_root;
-        self.txn_freed_pages.append(&mut ht_freed);
+        self.retire_superseded(&mut ht_freed);
         match release {
+            // Value storage keeps the plain `txn_freed_pages` path — see the
+            // matching note in `update_inner`.
             PendingRelease::Inline(page_id) => self.release_data_slot(page_id),
             PendingRelease::Overflow(freed) => self.txn_freed_pages.extend_from_slice(&freed),
         }
         if let Some(root) = mi_new_root {
             self.current_roots.membership_index_page = root;
-            self.txn_freed_pages.append(&mut idx_freed);
+            // `idx_freed` can carry whole orphaned subtrees from
+            // `free_subtree`, not just a root-to-leaf spine. That is fine and
+            // needs no special case: every page in it was unlinked from the
+            // membership tree by the removal that produced the root installed
+            // one line above, so the "this transaction superseded it" half holds
+            // for each, and `free_subtree` pushes each page exactly once.
+            self.retire_superseded(&mut idx_freed);
         }
 
         Ok(())

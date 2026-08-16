@@ -282,11 +282,18 @@ impl RadixU64 {
     /// prior-transaction freed pages before extending); `freed` collects the
     /// page ids this call supersedes so the caller can return them to the
     /// freemap on commit. Threading both is what keeps the membership index at
-    /// a bounded steady-state page count under churn ACROSS COMMITS — not
-    /// within one. `alloc` reuses only pages the COMMITTED freemap marks free,
-    /// and this radix has no `session_owned` in-place dedup, so every mutation
-    /// re-COWs its whole root-to-leaf path and nothing it frees is reusable
-    /// until commit (HANDLES-INDEX-2, issue #112).
+    /// a bounded steady-state page count under churn ACROSS COMMITS.
+    ///
+    /// HANDLES-INDEX-2 (issue #112): the WITHIN-transaction bound comes from a
+    /// different mechanism. This radix still re-COWs its whole root-to-leaf path
+    /// per mutation and deliberately has no `session_owned`-style in-place
+    /// dedup — that would break the caller's candidate/discard protocol and
+    /// `rollback_to`. Instead the transaction layer routes `freed` into a
+    /// within-transaction recycle pool that `alloc` draws from first, so the
+    /// per-mutation allocations rotate through a handful of ids. See
+    /// `TxnPageRecycle` in `transaction/freemap.rs`; note in particular that
+    /// `freed` is now the pool's supply, so the caller's "install the new root
+    /// first" rule guards the pool as well as the freemap.
     pub fn insert(
         &mut self,
         cache: &mut PageCache,

@@ -24,11 +24,12 @@
 // the last-durable superblock still references. The handle table and membership
 // index both feed their COW-superseded pages into `txn_freed_pages` and
 // allocate through `cow_alloc`, so they reach a bounded steady-state page count
-// ACROSS COMMITS rather than growing one page per mutation forever. That bound
-// does not hold WITHIN a transaction: `cow_alloc` reuses only what the
-// COMMITTED bitmap marks free, and neither radix has the freemap tree's
-// `session_owned` in-place dedup, so a long transaction's churn still marches
-// the high-water mark up until it commits (HANDLES-INDEX-2). Overflow pages still extend
+// ACROSS COMMITS rather than growing one page per mutation forever. WITHIN a
+// transaction the committed bitmap is no help — nothing this transaction frees
+// reaches it before commit — so that bound comes from a second, separate pool:
+// `TxnPageRecycle` (transaction/freemap.rs) collects pages this transaction both
+// allocated and superseded and hands them back through `cow_alloc` ahead of the
+// bitmap (HANDLES-INDEX-2, issue #112). Overflow pages still extend
 // directly (call `PageCache::new_page`), but their frees do feed the freemap on
 // commit, so a later data/handle-table allocation can reclaim them.
 //

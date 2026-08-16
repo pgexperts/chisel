@@ -317,11 +317,23 @@ fn rollback_truncates_cache_and_file_to_pre_txn_watermark() {
     }
     // Sanity: the transaction must have extended the cache past the
     // pre-transaction watermark. Otherwise the test below is vacuous.
+    //
+    // The bound used to be `pre_watermark + 510` — one extension per allocate,
+    // which is the defect HANDLES-INDEX-2 (issue #112) describes rather than a
+    // property worth pinning. With the within-transaction recycle pool the same
+    // 511 allocates extend by 7 pages (2 -> 9): two handle-table leaves, the
+    // interior root `grow` adds, and the data pages the values pack into. Every
+    // COW target after the first is drawn from the pool instead of the file.
+    //
+    // What this test actually needs is "several pages above the watermark,
+    // including intermediate COW pages", so the truncate below has the full I7
+    // shape to undo. Four is comfortably under the observed seven and does not
+    // re-encode an allocation-per-mutation assumption.
     let mid_watermark = tm.cache.borrow().next_page_id();
     assert!(
-            mid_watermark > pre_watermark + 510,
-            "expected the transaction to allocate many pages beyond {pre_watermark}, got {mid_watermark}"
-        );
+        mid_watermark >= pre_watermark + 4,
+        "expected the transaction to allocate several pages beyond {pre_watermark}, got {mid_watermark}"
+    );
 
     tm.rollback().unwrap();
 
@@ -3127,5 +3139,233 @@ fn defrag_sweeps_orphans_when_handle_table_root_is_none() {
         "defrag returned before the orphan sweep on a database with a real \
          freemap tree; reclaimed={}",
         stats.freemap_orphans_reclaimed
+    );
+}
+
+// --- Within-transaction recycle pool (HANDLES-INDEX-2, issue #112) ----------
+//
+// Three tests, one per leg of `TxnPageRecycle`'s invariant. Each pins a
+// property the pool's safety argument asserts, so the argument fails loudly
+// rather than silently if a future edit moves one of its gates.
+
+// LEG 1: the stream split. A page routed to the recycle pool must never also
+// sit in `txn_freed_pages` — `persist` would mark free a page the pool has
+// already handed back out and made live again (the I18 hazard in new dress).
+// Also pins the bound the pool exists to deliver: the transaction's file
+// extension must not scale with its mutation count.
+#[test]
+fn a_committed_page_this_transaction_did_not_allocate_never_enters_the_pool() {
+    // The `allocated` half of the recycle pool's membership rule — the half
+    // that makes this shadow paging at all. `retire` pools an id only if THIS
+    // transaction allocated it; a page the durable superblock still names must
+    // go to `txn_freed_pages` instead, where `persist` marks it free at commit
+    // and nothing reissues it mid-transaction.
+    //
+    // Without this pin the check is enforced by reasoning alone: replacing
+    // `self.allocated.contains(&id)` with `true` — pooling every superseded
+    // page, committed ones included — leaves the rest of the suite green. The
+    // corruption it admits is the worst shape this engine has: commit phase 1
+    // flushes the overwritten page to the main file BEFORE the superblock
+    // swap, so a crash in that window recovers onto the still-durable old
+    // superblock, which now points at a page whose bytes are gone.
+    let mut tm = fresh_manager();
+    tm.begin().unwrap();
+    let h = tm.allocate(b"seed").unwrap();
+    tm.commit().unwrap();
+
+    let committed_ht_root = tm.committed_roots.handle_table_page;
+    assert_ne!(
+        committed_ht_root, PAGE_ID_NONE,
+        "precondition: the seed commit must have materialized a handle table"
+    );
+
+    tm.begin().unwrap();
+    // Any mutation COWs the handle-table spine, superseding that committed root.
+    tm.update(h, b"second").unwrap();
+
+    assert!(
+        !tm.txn_pages.recyclable().contains(&committed_ht_root),
+        "page {committed_ht_root} is named by the committed superblock, so \
+         pooling it would let a later COW in this same transaction overwrite \
+         live shadow-paging state"
+    );
+    assert!(
+        tm.txn_freed_pages.contains(&committed_ht_root),
+        "a superseded COMMITTED page must still reach txn_freed_pages, or \
+         persist never marks it free and the space leaks forever"
+    );
+}
+
+#[test]
+fn a_transaction_recycles_its_own_superseded_radix_pages() {
+    let mut tm = fresh_manager();
+
+    // Seed past ENTRIES_PER_LEAF so the handle table is at depth >= 1 and every
+    // later mutation COWs a real root->leaf spine.
+    tm.begin().unwrap();
+    let mut handles = Vec::new();
+    for i in 0..600u64 {
+        handles.push(tm.allocate_tagged(&i.to_le_bytes(), 9).unwrap());
+    }
+    tm.commit().unwrap();
+
+    const N: usize = 400;
+    tm.begin().unwrap();
+    let watermark_before = tm.cache.borrow().next_page_id();
+    for &h in handles.iter().take(N) {
+        tm.allocate(b"fresh").unwrap();
+        tm.update(h, b"rewritten").unwrap();
+    }
+    let extended = tm.cache.borrow().next_page_id() - watermark_before;
+
+    // The two streams must be disjoint. This is the whole safety property of
+    // `TxnPageRecycle::retire`, checked against the real state rather than
+    // argued: an id in both would be marked free by the commit below while the
+    // pool considers it available.
+    for id in tm.txn_pages.recyclable() {
+        assert!(
+            !tm.txn_freed_pages.contains(id),
+            "page {id} is queued as a data free AND held in the recycle pool; \
+             commit would mark a page free that the pool can hand out"
+        );
+    }
+
+    // 800 spine-COWing mutations against a depth-1 table used to extend the
+    // file by well over 800 pages. The bound here is deliberately loose — this
+    // test pins the ORDER, not a page count.
+    //
+    // Note how this test reports a regression: with the pool's feed disabled it
+    // does not reach this assertion at all, it dies at the `update` above with
+    // `CacheFull { limit: 1024 }`. That is the more important half of the
+    // defect — the superseded pages are not merely allocated, they stay DIRTY
+    // and pinned until commit flushes them — and `fresh_manager`'s 1024-page
+    // cache is the same 8 MiB `Options::default()` gives a real caller.
+    assert!(
+        extended < N as u64,
+        "{N} allocate+update pairs extended the file by {extended} pages; the \
+         handle-table spine is not being recycled within the transaction"
+    );
+
+    tm.commit().unwrap();
+    assert_no_reachable_page_is_free(&tm);
+    assert_eq!(tm.read(handles[0]).unwrap(), b"rewritten");
+    assert_eq!(tm.handles().unwrap().len(), 600 + N);
+}
+
+// LEG 2: the commit-time drain. Whatever the pool still holds when the
+// transaction ends is genuinely dead, and `run_commit` must hand it to
+// `persist` before the freemap is written — nothing else ever marks it free,
+// and `begin` starts the next transaction with an empty pool. Without the
+// drain this is a silent, permanent leak of exactly the space the pool was
+// created to save.
+#[test]
+fn the_recycle_pool_remainder_is_freed_by_the_commit_that_ends_the_transaction() {
+    let mut tm = fresh_manager();
+
+    tm.begin().unwrap();
+    let mut handles = Vec::new();
+    for i in 0..600u64 {
+        handles.push(tm.allocate(&i.to_le_bytes()).unwrap());
+    }
+    tm.commit().unwrap();
+
+    // Several deletes in one transaction: the first COWs committed spine pages
+    // (which go to `txn_freed_pages`), and every one after that supersedes the
+    // pages its predecessor allocated — which is what leaves a non-empty pool
+    // when the mutations stop.
+    tm.begin().unwrap();
+    for h in handles.iter().take(8) {
+        tm.delete(*h).unwrap();
+    }
+    let leftover: Vec<u64> = tm.txn_pages.recyclable().to_vec();
+    assert!(
+        !leftover.is_empty(),
+        "test precondition: the workload must leave pages in the recycle pool"
+    );
+    tm.commit().unwrap();
+
+    // Every leftover must now be free in the COMMITTED freemap tree. A missing
+    // one is unreachable, unfreed, and unrecoverable short of a defrag sweep.
+    {
+        let mut cache = tm.cache.borrow_mut();
+        let tree = FreeMapTree::from_roots(
+            tm.committed_roots.freemap_page,
+            tm.committed_roots.freemap_depth,
+        );
+        for id in &leftover {
+            assert!(
+                tree.is_free(&mut cache, *id).unwrap(),
+                "page {id} was left in the recycle pool at commit and never marked \
+                 free — the commit-time drain leaked it"
+            );
+        }
+    }
+    // ...and the drain must not have freed anything still in use.
+    assert_no_reachable_page_is_free(&tm);
+}
+
+// LEG 3: savepoint scopes. `rollback_to` can only rewind the cache ABOVE the
+// savepoint watermark, so it cannot undo a write into a page allocated below
+// it. The pool is therefore drained when a savepoint is pushed and refuses to
+// refill while one is open, which makes "a pooled page is referenced by a
+// savepoint's roots" unrepresentable rather than merely unlikely.
+#[test]
+fn the_recycle_pool_stays_empty_inside_a_savepoint_scope() {
+    let mut tm = fresh_manager();
+
+    tm.begin().unwrap();
+    for i in 0..600u64 {
+        tm.allocate(&i.to_le_bytes()).unwrap();
+    }
+    tm.commit().unwrap();
+
+    tm.begin().unwrap();
+    // Fill the pool outside any savepoint.
+    for _ in 0..8 {
+        tm.allocate(b"outer").unwrap();
+    }
+    assert!(
+        !tm.txn_pages.recyclable().is_empty(),
+        "test precondition: mutations outside a savepoint must fill the pool"
+    );
+    let pooled_before: Vec<u64> = tm.txn_pages.recyclable().to_vec();
+
+    tm.savepoint("sp").unwrap();
+    assert!(
+        tm.txn_pages.recyclable().is_empty(),
+        "pushing a savepoint must drain the pool"
+    );
+    // Drained, not discarded: the pages were superseded before the savepoint's
+    // roots snapshot, so they are dead under it too and must still reach the
+    // freemap. `savepoint_inner` moves `txn_freed_pages` into the record, so
+    // that is where they now live.
+    for id in &pooled_before {
+        assert!(
+            tm.savepoints[0].freed_pages.contains(id),
+            "page {id} vanished when the savepoint drained the pool"
+        );
+    }
+
+    for _ in 0..8 {
+        tm.allocate(b"inner").unwrap();
+    }
+    assert!(
+        tm.txn_pages.recyclable().is_empty(),
+        "mutations inside a savepoint scope must not refill the pool"
+    );
+
+    tm.rollback_to("sp").unwrap();
+    assert!(
+        tm.txn_pages.recyclable().is_empty(),
+        "the pool must still be empty after rollback_to"
+    );
+
+    tm.release("sp").unwrap();
+    tm.commit().unwrap();
+    assert_no_reachable_page_is_free(&tm);
+    assert_eq!(
+        tm.handles().unwrap().len(),
+        608,
+        "the 8 post-savepoint allocates must have been rolled back"
     );
 }

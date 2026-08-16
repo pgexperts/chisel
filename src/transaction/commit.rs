@@ -7,15 +7,20 @@
 
 use super::*;
 
-/// Borrows of the exactly-twelve pieces of `TransactionManager` state the commit
-/// protocol touches, bundled so `commit_inner` can stay a thin caller while the
-/// load-bearing sequence lives here. All fields are distinct manager fields (plus
-/// the shared `&RefCell` for the cache), so the borrow checker accepts the
-/// simultaneous distinct-field borrows the caller constructs.
+/// Borrows of the exactly-thirteen pieces of `TransactionManager` state the
+/// commit protocol touches, bundled so `commit_inner` can stay a thin caller
+/// while the load-bearing sequence lives here. All fields are distinct manager
+/// fields (plus the shared `&RefCell` for the cache), so the borrow checker
+/// accepts the simultaneous distinct-field borrows the caller constructs.
 pub(super) struct CommitCtx<'a> {
     pub cache: &'a std::cell::RefCell<PageCache>,
     pub savepoints: &'a mut Vec<Savepoint>,
     pub txn_freed_pages: &'a mut Vec<u64>,
+    /// The within-transaction recycle pool (issue #112). The commit path is the
+    /// only place its REMAINDER has anywhere to go: those pages are dead, and if
+    /// they do not reach `txn_freed_pages` before `persist` they are lost to
+    /// the freemap for good.
+    pub txn_pages: &'a mut freemap::TxnPageRecycle,
     pub freemap: &'a mut freemap::FreemapRecycle,
     pub packer: &'a mut packing::SlotPacker,
     pub committed_roots: &'a mut Roots,
@@ -57,6 +62,20 @@ pub(super) fn run_commit(ctx: &mut CommitCtx<'_>) -> Result<()> {
     for sp in ctx.savepoints.iter_mut() {
         ctx.txn_freed_pages.append(&mut sp.freed_pages);
     }
+
+    // Issue #112: whatever the within-transaction recycle pool still holds is
+    // genuinely dead — every entry was superseded by a root this transaction
+    // installed, and this commit is about to make those roots durable. It must
+    // reach `txn_freed_pages` BEFORE `persist` below, or the space is lost:
+    // nothing else ever marks it free, and the next transaction starts with an
+    // empty pool.
+    //
+    // The converse is the dangerous direction and is handled at the other end:
+    // `TxnPageRecycle::retire` puts each superseded id in exactly one stream, so
+    // draining here cannot duplicate an id that `persist` is already going to
+    // mark free, and — more to the point — cannot mark free a page the pool has
+    // since handed back out. A page that left the pool was popped by `draw`.
+    ctx.txn_pages.drain_into(ctx.txn_freed_pages);
 
     // I28: drain the page cache BEFORE persist_freemap runs. Without
     // this, `persist_freemap`'s own freemap-page allocation
@@ -224,6 +243,11 @@ pub(super) fn run_commit(ctx: &mut CommitCtx<'_>) -> Result<()> {
     // txn_freed_pages were already marked free in the new committed freemap
     // tree by persist_freemap; clear the vector now that it's done its job.
     ctx.txn_freed_pages.clear();
+    // Issue #112: drop the recycle pool's per-transaction record. `allocated`
+    // was a statement about the roots this commit has just superseded; carried
+    // into the next transaction every id in it would name a page the NEW
+    // committed superblock references.
+    ctx.txn_pages.reset();
     // Clear the freemap session set (every page COW'd this transaction is now
     // committed) and promote the structural recycle for the next transaction:
     // this commit's supersedes + the unconsumed reuse remainder become next

@@ -313,6 +313,13 @@ impl TransactionManager {
     /// non-fatal failure they are harmless above-watermark scratch, and the
     /// session set must still be returned for a retry/commit in the same
     /// transaction to stay consistent.
+    ///
+    /// The closure also threads `txn_pages` (issue #112), so a data page may be
+    /// served from the within-transaction recycle pool. That is deliberate and
+    /// safe — a pooled page is dead to every restorable snapshot regardless of
+    /// what it is reused AS — but note the reverse does not hold: data-page
+    /// frees do NOT feed the pool (`release_data_slot` queues them on
+    /// `txn_freed_pages`), so a page can never sit in both streams.
     pub(super) fn insert_into_data_page(&mut self, value: &[u8]) -> Result<(u64, u16)> {
         // `reuse` gates freemap reuse inside cow_alloc; `packing_enabled` gates
         // installing the freshly-allocated page as the cursor. Both are the
@@ -324,7 +331,10 @@ impl TransactionManager {
         let mut tree = self.freemap.take_tree(&self.current_roots);
         let result = {
             let mut cache = self.cache.borrow_mut();
-            let mut alloc = |c: &mut PageCache| self.freemap.cow_alloc_into(c, &mut tree, reuse);
+            let mut alloc = |c: &mut PageCache| {
+                self.freemap
+                    .cow_alloc_into(c, &mut tree, &mut self.txn_pages, reuse)
+            };
             self.packer
                 .insert(&mut cache, &mut alloc, packing_enabled, value)
         };
