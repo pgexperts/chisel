@@ -968,6 +968,16 @@ mod tests {
             page::FORMAT_MINOR_VERSION_ENCRYPTED + 1,
             page::FORMAT_MINOR_VERSION_ENCRYPTED,
         );
+
+        // Issue #179, on the route that alarms: the caller never asked for
+        // read-only, the write-gate imposed it. Refusing is right; poisoning an
+        // otherwise-healthy handle over an operational error is not.
+        let other = Key::Raw(Zeroizing::new(vec![0xa5u8; 32]));
+        assert!(
+            matches!(db.add_key(&key, &other), Err(ChiselError::ReadOnlyMode)),
+            "a gate-imposed read-only handle must refuse add_key operationally",
+        );
+        assert!(!db.is_poisoned(), "ReadOnlyMode must not poison the handle");
     }
 
     /// The complement of the test above: a file at THIS binary's encrypted

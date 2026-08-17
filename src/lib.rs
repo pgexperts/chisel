@@ -1097,8 +1097,11 @@ impl Chisel {
     /// `InvalidEncryptionKey` if `existing` unlocks no slot; `NoFreeKeySlot` if
     /// all 8 key slots are full; `TransactionInProgress` if a transaction is
     /// active — the key slots are rewritten through their own superblock
-    /// commit, which cannot interleave with one. An fsync/superblock failure is
-    /// fatal and poisons the handle.
+    /// commit, which cannot interleave with one; `ReadOnlyMode` if the handle
+    /// cannot write — either [`Options::read_only`] was set, or the file's
+    /// format minor version is newer than this build's and `open` forced the
+    /// handle read-only on an otherwise-successful open. An fsync/superblock
+    /// failure is fatal and poisons the handle.
     pub fn add_key(&mut self, existing: &crypto::Key, new: &crypto::Key) -> Result<()> {
         self.txm.add_key(existing, new)
     }
@@ -1135,7 +1138,11 @@ impl Chisel {
     /// key slots are full (no room to stage `new` before revoking `old`);
     /// `TransactionInProgress` if a transaction is active — the key slots are
     /// rewritten through their own superblock commit, which cannot interleave
-    /// with one. An fsync/superblock failure is fatal and poisons the handle.
+    /// with one; `ReadOnlyMode` if the handle cannot write — either
+    /// [`Options::read_only`] was set, or the file's format minor version is
+    /// newer than this build's and `open` forced the handle read-only on an
+    /// otherwise-successful open. An fsync/superblock failure is fatal and
+    /// poisons the handle.
     pub fn rotate_key(&mut self, old: &crypto::Key, new: &crypto::Key) -> Result<()> {
         self.txm.rotate_key(old, new)
     }
@@ -1155,7 +1162,10 @@ impl Chisel {
     /// `key` is the only active credential (removing it would make the database
     /// permanently unopenable — nothing is changed); `TransactionInProgress` if
     /// a transaction is active — the key slots are rewritten through their own
-    /// superblock commit, which cannot interleave with one. An fsync/superblock
+    /// superblock commit, which cannot interleave with one; `ReadOnlyMode` if
+    /// the handle cannot write — either [`Options::read_only`] was set, or the
+    /// file's format minor version is newer than this build's and `open` forced
+    /// the handle read-only on an otherwise-successful open. An fsync/superblock
     /// failure is fatal and poisons the handle.
     pub fn remove_key(&mut self, key: &crypto::Key) -> Result<()> {
         self.txm.remove_key(key)
