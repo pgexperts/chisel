@@ -76,6 +76,54 @@ use crate::stats::ChiselCounters;
 // max_pages itself, with no elasticity. See spec
 // 2026-05-03-chisel-spillway-design.md.
 
+/// Where commit-drain rehydrated pages are inserted into the LRU.
+///
+/// `LruTail` makes the just-drained pages the first eviction candidates
+/// after commit; preserves any pre-transaction warm pages. The default,
+/// per spec §"Drain insertion policy".
+///
+/// `Mru` treats drained pages as recently touched. Useful when the
+/// caller expects to read them again next transaction.
+///
+/// I36: `#[non_exhaustive]` so a third drain policy (e.g. a hint-based
+/// split between recently-touched and cold) can land without breaking
+/// callers. External `match` arms need a `_ => …` catchall.
+///
+/// Defined here rather than in `lib.rs` (issue #161): the policy is a leaf
+/// with no dependencies of its own, and the only code that acts on it is
+/// `flush`'s drain phase a few hundred lines below. `lib.rs` re-exports it,
+/// so `chisel::DrainInsertion` is unchanged — it is the same
+/// define-low/re-export-high shape the eight `pub use` statements at the top
+/// of `lib.rs` already establish.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainInsertion {
+    LruTail,
+    Mru,
+}
+
+/// How to open a spillway sidecar. `Path` for file-backed databases
+/// (path is the main db path; spillway will be at `<path>.spillway`),
+/// `InMemory` for memory-backed.
+///
+/// I37 (ISSUES.md, 2026-05-22): pub(crate) because the only legitimate
+/// constructors are inside `Chisel::open` and
+/// `Chisel::open_in_memory_with_options`. External callers route
+/// through those — there's no API path that needs them to construct
+/// a `SpillwayLocation` directly.
+///
+/// Lives here for the same reason as `DrainInsertion` above (LAYER-1, issue
+/// #161): a leaf enum this module matches on belongs at this module's layer,
+/// not above it. Declaring it in `lib.rs` made layer 3 name a layer 8 item —
+/// the one upward edge the amended layer rule would otherwise have had to
+/// carry as a standing exception. `lib.rs` re-exports it `pub(crate)`, so
+/// every existing `crate::SpillwayLocation` spelling still resolves.
+#[derive(Debug, Clone)]
+pub(crate) enum SpillwayLocation {
+    Path(std::path::PathBuf),
+    InMemory,
+}
+
 struct CacheEntry {
     buf: Box<[u8; PAGE_SIZE]>,
     // `dirty` means "modified since last flush, must be written on commit".
@@ -148,7 +196,7 @@ pub struct PageCache {
     /// LruTail = first eviction candidate (good when drained pages are
     /// unlikely to be needed again soon); Mru = recently-touched
     /// semantics (good when the workload revisits recently-committed pages).
-    drain_insertion: crate::DrainInsertion,
+    drain_insertion: DrainInsertion,
     /// How to lazily open the spillway when a first spill happens. Held
     /// here rather than opening eagerly because no-spill workloads
     /// shouldn't pay any filesystem cost for a feature they never use.
@@ -202,7 +250,7 @@ impl PageCache {
         io: PageIo,
         cache_max_bytes: u64,
         spillway_max_bytes: u64,
-        drain_insertion: crate::DrainInsertion,
+        drain_insertion: DrainInsertion,
         spillway_location: crate::SpillwayLocation,
     ) -> PageCache {
         let max_pages = (cache_max_bytes / PAGE_SIZE as u64).max(1) as usize;
@@ -625,8 +673,8 @@ impl PageCache {
                     // Not present: insert and register in the LRU index.
                     e.insert(entry);
                     match drain_policy {
-                        crate::DrainInsertion::LruTail => self.lru.push_back(page_id),
-                        crate::DrainInsertion::Mru => self.lru.push_front(page_id),
+                        DrainInsertion::LruTail => self.lru.push_back(page_id),
+                        DrainInsertion::Mru => self.lru.push_front(page_id),
                     }
                 }
                 // If already present — a same-id spill within a batch — skip:
@@ -1058,7 +1106,7 @@ impl PageCache {
     /// keep `Result<()>` because they perform real fallibility checks
     /// (poison + active-txn). Only the bottom layer can honestly
     /// shed the `Result`.
-    pub fn set_drain_insertion(&mut self, policy: crate::DrainInsertion) {
+    pub fn set_drain_insertion(&mut self, policy: DrainInsertion) {
         self.drain_insertion = policy;
     }
 

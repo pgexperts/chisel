@@ -49,7 +49,17 @@ When a comment and the code disagree, the comment is stale by default. Update or
 
 ## Layer model
 
-Chisel's modules form a strict bottom-up dependency graph: each layer only depends on layers below it, never sideways or upward. Read the codebase in dependency order and you never have to forward-reference.
+**The rule: no module may name an item defined at a higher layer.** Dependencies run strictly downward across layers, so reading the codebase in layer order never requires a forward reference to a layer you have not read yet.
+
+A layer number is a **peer bucket, not a rung**. Modules sharing a number may reference each other, and several do — `superblock` reads `page` and `crypto` and returns `error::ChiselError`, `error` carries a `superblock::SlotDefect` in one variant, `freemap_tree` composes `freemap`. The mermaid graph below, not the layer number, is the authority on order *within* a bucket; the number tells you only that nothing above it may be named. (Layer 1 is the one bucket that is not even internally acyclic: `error` and `superblock` name each other. Read them together.)
+
+That authority only works if the graph is kept complete, so it carries an obligation: **a new intra-bucket edge must be drawn in the graph, and must not create a cycle** beyond the grandfathered `error` ↔ `superblock` pair. Without that clause this paragraph would be the rule's escape hatch — inside a bucket the layer number forbids nothing, and layer 1 alone holds six modules. The graph is currently sparser than the code (several real intra-bucket edges are undrawn), so treat a missing edge as a gap to fill rather than as permission.
+
+A module's layer is set by its **dependency depth, not its conceptual altitude** — a module that names nothing may sit at the bottom no matter how high-level its contents read. `handle.rs` holds the public `Handle`/`Tag` newtypes and `stats.rs` holds the public `Stats`/`ChiselCounters` snapshots, and both sit at layer 1 because neither imports anything. Read that as the tie-breaker it is, not as an algorithm: the buckets are not a strict ranking by import depth, and `lru.rs` is the standing counterexample — it names nothing crate-internal either, yet sits at 2 beside the module that consumes it. The invariant the table actually enforces is the one clause above: never name upward. Filing a dependency-free type at the altitude of the API that returns it is what produced both violations fixed in issue #161 — `DrainInsertion` was declared in `lib.rs` and reached down for by the `page_cache` flush that implements it, and `stats.rs` was filed at layer 7 for being "maintenance", which made the layer-3 `PageCache::counters()` look like an upward reference.
+
+`SpillwayLocation` was the third instance of the same misfiling and moved with them, so no module named below layer 8 now names an item above it. If you find yourself wanting an exception, the type is almost certainly a dependency-free leaf that belongs at the layer that consumes it, re-exported upward — the shape the eight `pub use` statements at the top of `lib.rs` already establish.
+
+Layer 8 is the exception, and it is a mutual one rather than an upward edge: `rekey.rs` names `Chisel` and `Options` from `lib.rs`, while `lib.rs` calls `rekey::rekey`. Promoting `rekey` above `lib` would only invert which half is upward, so both share bucket 8 and the cycle is named here — the same treatment `error` ↔ `superblock` gets in layer 1. It exists because `rekey` rewrites a whole database through the public API rather than through the engine internals; that is what makes it a peer of `lib.rs` and not a layer over it.
 
 ```mermaid
 flowchart BT
@@ -70,7 +80,7 @@ flowchart BT
     membership_index["membership_index.rs<br/>RadixU64 + two-level<br/>MembershipIndex (tag→handles)"]
     transaction["transaction/ (mod.rs + ~15 submodules)<br/>TransactionManager:<br/>orchestrates everything below"]
     defrag["defrag.rs<br/>sparse-page consolidation"]
-    stats["stats.rs<br/>Stats snapshot type"]
+    stats["stats.rs<br/>Stats + ChiselCounters<br/>snapshot types (no imports)"]
     lib["lib.rs<br/>Chisel: thin public API"]
 
     page --> page_io
@@ -81,7 +91,7 @@ flowchart BT
     crypto --> page_cache
     page_io --> page_cache
     lru --> page_cache
-    page_cache --> spillway
+    spillway --> page_cache
     crypto --> superblock
     page --> freemap
     page --> data_page
@@ -103,7 +113,8 @@ flowchart BT
     membership_index --> transaction
     error --> transaction
     transaction --> defrag
-    transaction --> stats
+    stats --> page_cache
+    stats --> transaction
     handle --> lib
     transaction --> lib
 ```
@@ -115,11 +126,12 @@ flowchart BT
 | 1 | `page.rs` | Page size, type tags, header sizes, magic, format-version constants, XXH3 checksum primitives. | `PAGE_SIZE = 8192`; checksum lives in the last 8 bytes; little-endian on disk. |
 | 1 | `error.rs` | `ChiselError` enum, `is_fatal()` classifier (operational vs fatal). | Fatal variants poison the manager (I1). |
 | 1 | `handle.rs` | Public `Handle` (`u64`) and `Tag` (`NonZeroU32`) newtypes for the API surface. | `#[repr(transparent)]` on `Handle` is load-bearing — the bench adapter transmutes `&[u64]` → `&[Handle]` (I120/I126). Lives ABOVE the engine; the engine stays raw-integer. |
+| 1 | `stats.rs` | Two snapshot structs: `Stats` (`handle_count`, `total_pages`, `file_size_bytes`, spillway bytes) and `ChiselCounters` (cache hits/misses, pages allocated, fsync calls — cumulative-from-open engine activity). | Both are point-in-time snapshots, not live views. `ChiselCounters` is `#[non_exhaustive]` so future counters can be added without a breaking change. Layer 1 because the module has zero imports (issue #161) — its consumers, `PageCache` at layer 3 and `TransactionManager` at layer 6, are therefore reading downward, which is what "`PageCache::counters()` aggregates the four counters" below has always described. |
 | 1 | `crypto/mod.rs` | At-rest crypto core: XChaCha20-Poly1305 `PageCipher` (page + body seal/open), envelope KDF (HKDF-SHA256 raw / Argon2id passphrase), DEK wrap/unwrap, zeroizing `Key`/`Argon2Params`. | Standalone — touches no engine layer. Only vetted RustCrypto primitives; all randomness OS-sourced. `ENC_PAGE_SIZE = 8232`, `NONCE_LEN = 24`, `TAG_LEN = 16`, `DEK_LEN = 32`. |
 | 1 | `superblock/` (`mod.rs` + `crypto_header.rs`) | In-memory `Superblock` struct, `serialize`/`deserialize`, `select()` across N candidate slots; `crypto_header.rs` holds the plaintext crypto-header + 8-slot key-slot table and the sealed-body decrypt path. | Magic + checksum + `superblock_count ∈ 2..=16` filter slots before tie-breaking by `txn_counter`. Encrypted DBs seal the sensitive body under the DEK. |
 | 2 | `page_io.rs` | Raw `pread`/`pwrite` of fixed-**stride** pages, exclusive `flock`, `fsync`, in-memory `Vec<u8>` backing. Tracks cumulative successful `fsync_calls` via `Cell<u64>`. Stride = `PAGE_SIZE` (plaintext) or `ENC_PAGE_SIZE` (encrypted), set once via `set_stride`. | The **only** module that touches the filesystem; crypto-agnostic (moves `stride`-byte blobs at `page_id * stride`). |
 | 2 | `lru.rs` | O(1) intrusive doubly-linked LRU index over `u64` page ids (`FxHashMap`-backed, I77). | Replaces the O(n) `VecDeque::retain` LRU; consumed only by `page_cache`. |
-| 3 | `page_cache.rs` | LRU cache over `PageIo`, dirty tracking, checksum validation on load, `PageCipher` seal/open at the I/O boundary, spillway overflow, `CacheFull`/`SpillwayFull` errors. Owns three `Cell<u64>` engine-activity counters (cache hits/misses, pages allocated) and aggregates them with `PageIo::fsync_count` into `counters()`. | Strict cap at `max_pages` — dirty pages are pinned against eviction and spill to the sidecar rather than growing the cache (cap = `spillway_max_bytes`, which bounds the spillway's LIVE resident set, not the sidecar file's length); `CacheFull` at `max_pages` when the spillway is disabled (`spillway_max_bytes=0`); checksums verified on disk LOAD only. |
+| 3 | `page_cache.rs` | LRU cache over `PageIo`, dirty tracking, checksum validation on load, `PageCipher` seal/open at the I/O boundary, spillway overflow, `CacheFull`/`SpillwayFull` errors. Owns three `Cell<u64>` engine-activity counters (cache hits/misses, pages allocated) and aggregates them with `PageIo::fsync_count` into `counters()`. Defines `DrainInsertion` (re-exported by `lib.rs`), the drain-phase LRU placement policy. | Strict cap at `max_pages` — dirty pages are pinned against eviction and spill to the sidecar rather than growing the cache (cap = `spillway_max_bytes`, which bounds the spillway's LIVE resident set, not the sidecar file's length); `CacheFull` at `max_pages` when the spillway is disabled (`spillway_max_bytes=0`); checksums verified on disk LOAD only. |
 | 3 | `spillway.rs` | Sidecar `<db>.spillway` file for dirty pages the LRU is forced to spill. Per-slot XXH3 over `page_id ‖ payload`; crypto-agnostic (plaintext 8192-byte page or sealed 8232-byte blob). | Never `fsync`ed; truncated at commit/rollback and re-created at open — its content is always discardable uncommitted state. Created `O_EXCL | O_NOFOLLOW` mode 0600; a pre-existing entry is unlinked only if it is a plain file this uid owns (see "File permissions" below). |
 | 4 | `freemap.rs` | Single-page bitmap primitive: `allocate_first` / `mark_free` on one `[u8; PAGE_SIZE]` buffer. | Pure buffer manipulation; no cache or I/O. Composed into the multi-page tree by `freemap_tree.rs`. |
 | 4 | `freemap_tree.rs` | COW radix tree of FreeMap leaves; the full multi-page freemap. | All structural COW pages sourced out-of-band (never from the bitmap); session-COW dedup (one COW per node per commit). |
@@ -129,8 +141,8 @@ flowchart BT
 | 5 | `membership_index.rs` | Reverse index `tag → {handles}` for chunk tags. A generic copy-on-write radix `RadixU64` (u64 key → u64 value, 0 = absent) used twice: an outer tree keyed by tag whose value bit-packs `(inner_depth \| inner_root)`, and per-tag inner trees keyed by handle. Returns the new root id after a COW mutation, like `handle_table`. | Fan-out 1021 per level; `0` is the absent sentinel; outer value packs `inner_root` in low 58 bits, `inner_depth` in top 6. |
 | 6 | `transaction/` (`mod.rs` + submodules) | `TransactionManager`: orchestrates begin/commit/rollback, savepoints, `persist_freemap`, the commit protocol, key-slot management, the poison flag. Submodules: `commit`, `lifecycle`, `mutate`, `read`, `savepoints`, `named_roots`, `staging` (I18 atomic allocate), `freemap` (structural-page recycle), `packing` (R1 `SlotPacker`), `keys` (key-slot ops), `recovery` (`create_new`/`open_existing`), `config`, `fault` (test-only injection), `stats`. | Commit protocol step ordering is load-bearing — see next section. |
 | 7 | `defrag.rs` | Sparse-page consolidation; runs inside an active transaction. | `pages_examined`/`pages_freed` are page-granular (I17). |
-| 7 | `stats.rs` | Two snapshot structs: `Stats` (`handle_count`, `total_pages`, `file_size_bytes`) and `ChiselCounters` (cache hits/misses, pages allocated, fsync calls — cumulative-from-open engine activity). | Both are point-in-time snapshots, not live views. `ChiselCounters` is `#[non_exhaustive]` so future counters can be added without a breaking change. |
 | 8 | `lib.rs` | `Chisel` public API; thin wrapper over `TransactionManager`. Public surface includes the encryption additions: `Key`, `Argon2Params`, `Options::encryption_key` / `argon2_params`, and `add_key` / `rotate_key` / `remove_key`. | `&mut self` everywhere except `read`/`get_root_name`/`handles`/`stats`/`counters` (F3). |
+| 8 | `rekey.rs` | Whole-database DEK rotation: copy every page under a fresh key into a sidecar, then atomically rename over the original. | Peer of `lib.rs`, not a layer above it: it drives the rewrite through the public `Chisel`/`Options` surface, and `lib.rs` calls back into `rekey::rekey`. That mutual edge is named above the table, like `error` ↔ `superblock` in layer 1. Opens its own file, so it holds no live handle to poison. |
 
 > `bench/` is a `default-members` workspace member (I58/I61), so a root `cargo test` runs its tests too.
 

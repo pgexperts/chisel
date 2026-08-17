@@ -83,6 +83,8 @@ pub use error::{ChiselError, Result};
 pub use defrag::{DefragOptions, DefragStats};
 pub use handle::{Handle, Tag, TagDropProgress};
 pub use page::PAGE_SIZE;
+pub use page_cache::DrainInsertion;
+pub(crate) use page_cache::SpillwayLocation;
 pub use stats::{ChiselCounters, Stats};
 // SlotDefect and SuperblockDefect were public before this branch (pre-existing API).
 pub use superblock::{
@@ -187,40 +189,6 @@ pub struct Options {
     /// p=1). Ignored for `Key::Raw` (HKDF, no cost params) and on reopen (the
     /// params are read from the key slot the file was written with).
     pub argon2_params: Option<Argon2Params>,
-}
-
-/// Where commit-drain rehydrated pages are inserted into the LRU.
-///
-/// `LruTail` makes the just-drained pages the first eviction candidates
-/// after commit; preserves any pre-transaction warm pages. The default,
-/// per spec §"Drain insertion policy".
-///
-/// `Mru` treats drained pages as recently touched. Useful when the
-/// caller expects to read them again next transaction.
-///
-/// I36: `#[non_exhaustive]` so a third drain policy (e.g. a hint-based
-/// split between recently-touched and cold) can land without breaking
-/// callers. External `match` arms need a `_ => …` catchall.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DrainInsertion {
-    LruTail,
-    Mru,
-}
-
-/// How to open a spillway sidecar. `Path` for file-backed databases
-/// (path is the main db path; spillway will be at `<path>.spillway`),
-/// `InMemory` for memory-backed.
-///
-/// I37 (ISSUES.md, 2026-05-22): pub(crate) because the only legitimate
-/// constructors are inside `Chisel::open` and
-/// `Chisel::open_in_memory_with_options`. External callers route
-/// through those — there's no API path that needs them to construct
-/// a `SpillwayLocation` directly.
-#[derive(Debug, Clone)]
-pub(crate) enum SpillwayLocation {
-    Path(std::path::PathBuf),
-    InMemory,
 }
 
 impl Default for Options {
