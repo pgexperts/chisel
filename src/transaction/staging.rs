@@ -257,6 +257,21 @@ impl TransactionManager {
         // to the documented contract.
         let handle = self.current_roots.next_handle;
 
+        // Decide the successor NOW, before any part of the allocation is staged,
+        // so a refusal costs no work and leaves the transaction byte-identical.
+        // It cannot move down into the INSTALL phase: that phase is infallible by
+        // construction, which is what makes the forward and reverse maps move
+        // together (BUG#2).
+        //
+        // The install used to do `next_handle += 1` unchecked. `next_handle` is
+        // read from the superblock at open, so a forged `u64::MAX` overflowed it
+        // on the very first allocate — a panic in debug, a wrap to handle 0 (the
+        // reserved "no handle" sentinel) in release. `next_handle_after` also
+        // keeps this from writing a `next_handle` that `open_existing`'s own
+        // bound would refuse to read back, which is the half-invariant the
+        // txn_counter fix left open one field over.
+        let next_handle = crate::superblock::next_handle_after(handle)?;
+
         // Value storage (PREPARE). For an inline value this also bumps
         // current_live_slots and may set the insert cursor; capture its page id
         // so a later prepare failure can release it via `abort_allocate_prepare`,
@@ -350,7 +365,7 @@ impl TransactionManager {
         // candidate's pages out of both streams: the abort path above drops
         // `ht_freed`/`mi_freed` on the floor, so a candidate that never becomes
         // the installed root can neither free a live page nor feed the pool.
-        self.current_roots.next_handle += 1;
+        self.current_roots.next_handle = next_handle;
         self.current_roots.handle_table_page = ht_new_root;
         self.retire_superseded(&mut ht_freed);
         if let Some(root) = mi_new_root {

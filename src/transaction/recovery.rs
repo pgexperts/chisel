@@ -590,6 +590,42 @@ impl TransactionManager {
             });
         }
 
+        // Third field on the same trust boundary, and the last superblock scalar
+        // that feeds arithmetic (issue #152). `next_handle` was adopted verbatim
+        // into `Roots` below and the allocator then did `next_handle += 1`
+        // unchecked. Forged to `u64::MAX` in a plaintext superblock — the page
+        // checksum is XXH3, non-cryptographic and publicly recomputable — the
+        // first `allocate` minted `u64::MAX` and the bump overflowed: a panic in
+        // debug, which bypasses the poison model and reaches the PyO3 binding as
+        // a `PanicException`, and in release a wrap to 0, the reserved "no
+        // handle" sentinel, colliding with every handle minted afterwards.
+        //
+        // That was unreachable until the radix growth loops were bounded on
+        // MAX_DEPTH (issue #116): before, `next_handle = u64::MAX` sent the
+        // handle-table insert into an unbounded grow loop that extended the file
+        // until the allocator gave up, so the insert failed and the increment
+        // was never reached. Bounding the loop is what let the insert succeed.
+        //
+        // The bound lives HERE rather than in `Superblock::validate`, where the
+        // per-slot `txn_counter` bound sits, for two reasons. `next_handle` is
+        // not a selection input, so the "let a forged slot lose to a healthy
+        // sibling" argument that put `txn_counter` in `validate` does not apply.
+        // And `validate` reads the RAW page: an encrypted database keeps
+        // `next_handle` in the AEAD-sealed body and leaves bytes 40..48 zero, so
+        // a bound there would silently cover plaintext files only. This runs
+        // after `decrypt_body`, so both kinds are held to the same rule.
+        //
+        // The cost is the one `freemap_depth` already pays: a forged value in the
+        // winning slot fails the open outright instead of rewinding to a sibling.
+        // Anyone able to rewrite superblock bytes can truncate the file instead,
+        // so availability against that attacker was never on offer.
+        if sb.next_handle > crate::superblock::MAX_NEXT_HANDLE {
+            return Err(ChiselError::InvalidNextHandle {
+                stored: sb.next_handle,
+                max: crate::superblock::MAX_NEXT_HANDLE,
+            });
+        }
+
         // I29 write-gate: a file whose MINOR exceeds this binary's may contain
         // version-requiring page layouts we cannot safely write — we would
         // stamp pages at our older minor and drop the newer fields. Reads ARE

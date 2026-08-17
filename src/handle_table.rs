@@ -322,10 +322,17 @@ impl HandleTable {
         // grow (u64::MAX - 1 exits normally). Unbounded, that costs one alloc
         // plus an 8 KiB zero-fill per lap and permanently extends the file
         // until `alloc` fails. Reachable not from any caller but from a
-        // corrupt-but-checksum-valid superblock: `next_handle` is read
-        // verbatim on open with no range validation. Bounding on depth makes
-        // MAX_DEPTH an invariant the WRITE path enforces, rather than an
-        // arithmetic claim plus a cap on `recover_depth`'s walk.
+        // corrupt-but-checksum-valid superblock, whose `next_handle` was at the
+        // time read verbatim on open with no range validation.
+        //
+        // Issue #152 has since bounded `next_handle` at open and at the mint
+        // that consumes it, so `allocate` can no longer deliver `u64::MAX` here.
+        // The bound stays, and not only as belt-and-braces: `update` reaches
+        // this same `insert` with a CALLER-supplied handle that `lookup_live`
+        // resolved out of the on-disk table, which no mint bound covers. And
+        // bounding on depth is what makes MAX_DEPTH an invariant the WRITE path
+        // enforces, rather than an arithmetic claim plus a cap on
+        // `recover_depth`'s walk.
         //
         // No error branch belongs behind this bound. At depth 6 the tree's
         // true capacity (~5.8e20) exceeds u64::MAX, so every u64 handle is
@@ -335,11 +342,13 @@ impl HandleTable {
         // would make the engine decline to write a handle its own reader is
         // built to resolve.
         //
-        // The symmetry stops at `delete`, whose own `handle >= capacity()`
-        // guard has no such saturation carve-out: u64::MAX would be insertable
-        // and readable but report absent on delete. Left as-is deliberately —
-        // it is only reachable via the same corrupt superblock, and closing it
-        // is a separate change from bounding this loop.
+        // `delete` carries the same carve-out (see its guard below), so insert,
+        // lookup and delete all agree on u64::MAX. That was not true when this
+        // loop was first bounded: the delete half landed in the same PR only
+        // after review pointed out that bounding the loop is precisely what
+        // makes u64::MAX insertable, and therefore what makes a delete gap
+        // reachable. Splitting the two would have left a handle that inserts
+        // and reads back but reports absent on delete.
         while self.depth < MAX_DEPTH && handle >= self.capacity() {
             match self.grow(cache, current_root, alloc) {
                 Ok(new_root) => current_root = new_root,

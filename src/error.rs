@@ -195,6 +195,22 @@ pub enum ChiselError {
         stored: u32,
         max: u32,
     },
+    // Raised at open time when the superblock's `next_handle` exceeds
+    // `MAX_NEXT_HANDLE`, the reserve that guarantees the allocator can bump it
+    // without overflowing u64. Handles are minted monotonically from 1 and each
+    // one burns a handle-table leaf slot permanently, so no correct binary can
+    // have written a value that large — it is a corrupt or forged field.
+    //
+    // Same call as `InvalidFreemapDepth`, for the same reason: the superblock
+    // parsed and validated fine apart from this one field, and every sibling
+    // slot is subject to the identical bound, so `CorruptSuperblock`'s
+    // documented "a reopen may select a different slot" recovery would be a lie.
+    // It carries the offending value because a bare "corrupt" tells an operator
+    // nothing about which field to look at.
+    InvalidNextHandle {
+        stored: u64,
+        max: u64,
+    },
     // Raised when a commit (or a crypto-header rewrite) would push
     // `txn_counter` past `MAX_TXN_COUNTER`, the bound `Superblock::validate`
     // enforces on the read side.
@@ -210,6 +226,29 @@ pub enum ChiselError {
     // the first commit after opening a file forged at exactly MAX_TXN_COUNTER,
     // which is precisely the case this exists to make clean.
     TxnCounterExhausted {
+        current: u64,
+    },
+    // Raised when an allocation would push `next_handle` past `MAX_NEXT_HANDLE`,
+    // the bound `open_existing` enforces on the read side.
+    //
+    // Fatal, and refused BEFORE any part of the allocation is staged, for the
+    // reason `TxnCounterExhausted` gives: the alternative is persisting a
+    // superblock this same binary would refuse to open. Unguarded it was worse
+    // still — the bump overflowed u64, panicking in debug and wrapping to handle
+    // 0, the reserved "no handle" sentinel, in release.
+    //
+    // Fatal rather than operational despite leaving the transaction untouched:
+    // reaching it means the superblock carries a `next_handle` no correct binary
+    // could have written, which is an integrity violation and not a caller
+    // mistake. It is the identical situation `TxnCounterExhausted` describes,
+    // one field over.
+    //
+    // Legitimately unreachable — a file that opens has 2^32 handles of headroom,
+    // and climbing to the bound at all would take ~1.8e19 allocations. It IS
+    // reachable adversarially, on the first allocate after opening a plaintext
+    // file forged at exactly MAX_NEXT_HANDLE, which is the case this exists to
+    // make clean.
+    HandleSpaceExhausted {
         current: u64,
     },
 
@@ -288,7 +327,9 @@ impl ChiselError {
                 | ChiselError::InvalidPageId { .. }
                 | ChiselError::UnsupportedPageSize { .. }
                 | ChiselError::InvalidFreemapDepth { .. }
+                | ChiselError::InvalidNextHandle { .. }
                 | ChiselError::TxnCounterExhausted { .. }
+                | ChiselError::HandleSpaceExhausted { .. }
                 | ChiselError::DecryptionFailed { .. }
         )
     }
@@ -399,9 +440,17 @@ impl fmt::Display for ChiselError {
                 f,
                 "txn_counter {current} is at the maximum this format supports; the database can accept no further commits"
             ),
+            ChiselError::HandleSpaceExhausted { current } => write!(
+                f,
+                "next_handle {current} is at the maximum this format supports; the database can accept no further allocations"
+            ),
             ChiselError::InvalidFreemapDepth { stored, max } => write!(
                 f,
                 "superblock declares freemap depth {stored}, which exceeds the maximum {max} (corrupt or forged superblock)"
+            ),
+            ChiselError::InvalidNextHandle { stored, max } => write!(
+                f,
+                "superblock declares next_handle {stored}, which exceeds the maximum {max} (corrupt or forged superblock)"
             ),
             ChiselError::NoEncryptionKey => write!(
                 f,
@@ -666,7 +715,9 @@ mod tests {
                 | ChiselError::InvalidPageId { .. }
                 | ChiselError::UnsupportedPageSize { .. }
                 | ChiselError::InvalidFreemapDepth { .. }
+                | ChiselError::InvalidNextHandle { .. }
                 | ChiselError::TxnCounterExhausted { .. }
+                | ChiselError::HandleSpaceExhausted { .. }
                 | ChiselError::DecryptionFailed { .. } => true,
             }
         }
@@ -718,7 +769,9 @@ mod tests {
                 compiled: 0,
             },
             ChiselError::InvalidFreemapDepth { stored: 0, max: 0 },
+            ChiselError::InvalidNextHandle { stored: 0, max: 0 },
             ChiselError::TxnCounterExhausted { current: 0 },
+            ChiselError::HandleSpaceExhausted { current: 0 },
             ChiselError::NoEncryptionKey,
             ChiselError::InvalidEncryptionKey,
             ChiselError::EncryptionNotSupported,
@@ -733,15 +786,18 @@ mod tests {
                 "is_fatal() disagrees with the documented Fatal/Operational block for {e:?}"
             );
         }
-        // Tripwire: exactly 12 variants are fatal today. If this count moves, the
+        // Tripwire: exactly 14 variants are fatal today. If this count moves, the
         // Fatal/Operational split changed — confirm that was intentional (it is a
         // breaking change for callers doing error-class matching, per the header).
-        // Last moved 11 -> 12 by TxnCounterExhausted (a database that cannot
-        // accept another commit is terminal for the handle); before that,
-        // 10 -> 11 by InvalidFreemapDepth, fatal because a superblock field
+        // Last moved 12 -> 14 by the `next_handle` pair (issue #152), which is the
+        // txn_counter pair one field over: InvalidNextHandle for the same reason
+        // as InvalidFreemapDepth, HandleSpaceExhausted for the same reason as
+        // TxnCounterExhausted. Before that, 11 -> 12 by TxnCounterExhausted (a
+        // database that cannot accept another commit is terminal for the handle),
+        // and 10 -> 11 by InvalidFreemapDepth, fatal because a superblock field
         // outside its representable range cannot be resolved by retrying —
         // every sibling slot carries the same value.
-        assert_eq!(all.iter().filter(|e| e.is_fatal()).count(), 12);
+        assert_eq!(all.iter().filter(|e| e.is_fatal()).count(), 14);
     }
 
     // Phase 4: the three operational encryption errors are recoverable (the
