@@ -184,6 +184,30 @@ pub struct DefragStats {
 ///   pages orphaned by a crash are swept back into the bitmap. Handle-
 ///   table and overflow spine cleanup still requires a separate mechanism.
 pub fn defrag(txm: &mut TransactionManager, options: &DefragOptions) -> Result<DefragStats> {
+    // A poisoned manager is dead, and defrag must refuse like every other entry
+    // point does. It cannot call `check_alive` (private to the transaction
+    // module), so it asks the same question through the public flag.
+    //
+    // Why here and not one of the three other candidate doors. Steps 2-7 were
+    // already covered incidentally, though by one check rather than two:
+    // `sparse_data_pages` at step 2 refused a poisoned manager and every later
+    // step propagates with `?`, so step 7 never ran. (`reclaim_freemap_orphans`
+    // grew its own `check_alive` in this same change; before that it had none.)
+    // The empty-database fast path below returns before step 2, so `defrag` on
+    // a poisoned, empty database returned `Ok(stats)`. Guarding that fast path
+    // would fix the one return and leave the next early return uncovered;
+    // guarding `Chisel::defrag` would fix the public API and leave the next
+    // in-crate caller uncovered. This function is where defrag's preconditions
+    // live (the `is_active` check below is the sibling) and every route into a
+    // pass goes through it, so it is the door that closes the class.
+    //
+    // `Poisoned` is operational by `is_fatal()`'s classification, so returning
+    // it poisons nothing further and reclassifies nothing — it reports a
+    // manager that is already dead.
+    if txm.is_poisoned() {
+        return Err(crate::error::ChiselError::Poisoned);
+    }
+
     // Defrag mutates through `txm.update`, which requires an active
     // transaction. Without this check, a caller who forgot to `begin()`
     // would do some reads (those fall back to committed_roots), start
@@ -325,6 +349,43 @@ mod tests {
         tm.begin().unwrap();
         tm.commit().unwrap();
         tm
+    }
+
+    // A poisoned manager must refuse a defrag pass even when there is provably
+    // nothing to compact. The empty-database fast path returns before
+    // `sparse_data_pages` and `reclaim_freemap_orphans` — the two calls that
+    // check the poison flag for themselves — so pre-fix this returned
+    // `Ok(DefragStats { .. })` from a manager every other entry point had
+    // already declared dead.
+    //
+    // The transaction must be opened BEFORE the poison: `begin()` checks the
+    // flag too, so the reachable shape is a transaction that was healthy when it
+    // started and hit a fatal error part-way through.
+    #[test]
+    fn defrag_on_a_poisoned_empty_database_refuses() {
+        let mut tm = fresh_manager();
+        tm.begin().unwrap();
+
+        // Precondition: both roots unset, so the run under test really does take
+        // the fast path. Without this the test could pass on the strength of
+        // `sparse_data_pages`'s own check and never exercise the gap.
+        assert_eq!(
+            tm.current_handle_table_root_page(),
+            PAGE_ID_NONE,
+            "precondition: the handle-table root must be unset for the fast path"
+        );
+        assert_eq!(
+            tm.current_freemap_root_page(),
+            PAGE_ID_NONE,
+            "precondition: the freemap root must be unset for the fast path"
+        );
+
+        tm.force_poison_for_test();
+        let err = defrag(&mut tm, &DefragOptions::default()).unwrap_err();
+        assert!(
+            matches!(err, crate::error::ChiselError::Poisoned),
+            "expected Poisoned from a defrag pass on a dead manager, got {err:?}"
+        );
     }
 
     // A defrag pass reports any freemap orphan it reclaimed. Forge an orphan (a

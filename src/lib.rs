@@ -1049,8 +1049,10 @@ impl Chisel {
     /// scope to reclaim crash-orphaned freemap pages.
     ///
     /// # Errors
-    /// `NoActiveTransaction` if no transaction is open; `CacheFull` if the
-    /// relocation working set exceeds the cache cap.
+    /// `Poisoned` if a previous fatal error killed the handle — checked before
+    /// the transaction state, and checked even for a database with nothing to
+    /// compact; `NoActiveTransaction` if no transaction is open; `CacheFull` if
+    /// the relocation working set exceeds the cache cap.
     pub fn defrag(&mut self, options: DefragOptions) -> Result<DefragStats> {
         defrag::defrag(&mut self.txm, &options)
     }

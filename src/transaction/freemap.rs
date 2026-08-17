@@ -325,6 +325,28 @@ fn structural_extend(cache: &mut PageCache, structural_reuse: &mut Vec<u64>) -> 
     }
 }
 
+/// The savepoint-scoped slice of `FreemapRecycle` state, captured by
+/// `savepoint_mark` and put back by `rollback_to_mark`. Stored in `Savepoint`
+/// alongside the cache watermark and the roots snapshot.
+///
+/// Two fields, for two different reasons — see `savepoint_mark` for why
+/// `structural_reuse` is not among them.
+///
+/// `Clone` because `rollback_to` may be called repeatedly against the same
+/// savepoint (the engine keeps the mark on the stack), so the record's copy
+/// must outlive each restore.
+#[derive(Debug, Clone)]
+pub(super) struct FreemapMark {
+    /// Length of `structural_superseded` at savepoint time. Truncating back to
+    /// it drops exactly the entries accumulated since, because the vector is
+    /// append-only within a transaction.
+    superseded_len: usize,
+    /// Full copy of `session_owned` at savepoint time. An `FxHashSet<u64>`
+    /// clone per savepoint — smaller than the `live_slots` `FxHashMap` clone
+    /// the same code path already takes.
+    session_owned: FxHashSet<u64>,
+}
+
 /// Owns the structural-page recycle cluster and the freemap commit/alloc/persist
 /// machinery — the crash-durability backbone of the engine. Held by
 /// `TransactionManager` as the single `freemap` field.
@@ -349,28 +371,6 @@ fn structural_extend(cache: &mut PageCache, structural_reuse: &mut Vec<u64>) -> 
 /// enter `txn_freed_pages`): a freed freemap page sits at a high id where the
 /// lowest-first data allocator would starve it, so routing it back as structural
 /// reuse — where demand matches supply at steady state — is what reclaims it.
-/// The savepoint-scoped slice of `FreemapRecycle` state, captured by
-/// `savepoint_mark` and put back by `rollback_to_mark`. Stored in `Savepoint`
-/// alongside the cache watermark and the roots snapshot.
-///
-/// Two fields, for two different reasons — see `savepoint_mark` for why
-/// `structural_reuse` is not among them.
-///
-/// `Clone` because `rollback_to` may be called repeatedly against the same
-/// savepoint (the engine keeps the mark on the stack), so the record's copy
-/// must outlive each restore.
-#[derive(Debug, Clone)]
-pub(super) struct FreemapMark {
-    /// Length of `structural_superseded` at savepoint time. Truncating back to
-    /// it drops exactly the entries accumulated since, because the vector is
-    /// append-only within a transaction.
-    superseded_len: usize,
-    /// Full copy of `session_owned` at savepoint time. An `FxHashSet<u64>`
-    /// clone per savepoint — smaller than the `live_slots` `FxHashMap` clone
-    /// the same code path already takes.
-    session_owned: FxHashSet<u64>,
-}
-
 pub(super) struct FreemapRecycle {
     // Best-effort lower bound on the lowest free page id in the committed freemap
     // tree, threaded into `FreeMapTree::allocate_first` so a scan starts near the
@@ -1131,6 +1131,13 @@ impl TransactionManager {
     /// Enforces `reclaim_orphans`' active-transaction requirement here, at the
     /// only door into it (TXN-COMMIT-8, issue #114).
     pub(crate) fn reclaim_freemap_orphans(&mut self) -> Result<u64> {
+        // The `check_alive` half of the wrapper pattern, which this entry point
+        // was missing while already carrying the `poison_on_fatal` half (I145
+        // below). Same argument as the active-transaction guard beneath it:
+        // enforce the precondition at the door rather than trusting every
+        // caller. `defrag` now refuses on a poisoned manager before it ever
+        // reaches step 7, so this is defence in depth, not the live guard.
+        self.check_alive()?;
         // The sweep advances `current_roots.freemap_page` and drains
         // committed-LIVE ids into `structural_superseded`. With no transaction
         // open there is no commit that can promote either, so both are silently
