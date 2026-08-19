@@ -25,6 +25,11 @@
 //! - Refuses if an active user transaction is in flight — a key-rotation is its
 //!   own atomic superblock write and cannot be interleaved with a data commit.
 //! - Refuses if the database is plaintext (no cipher).
+//! - Refuses if the handle is read-only. All four refusals change nothing on
+//!   disk. Three of them also leave the handle usable; the `Poisoned` refusal
+//!   does not, because it only reports a manager that was already dead. The
+//!   read-only one has to be checked before the header rewrite begins, not
+//!   discovered inside it (issue #179).
 
 use super::*;
 use crate::superblock::CryptoHeader;
@@ -41,10 +46,13 @@ impl TransactionManager {
     /// the fsync returns.
     ///
     /// # Errors
-    /// - `ChiselError::Poisoned` — manager is in the poison state.
-    /// - `ChiselError::TransactionInProgress` — an active user transaction exists.
-    /// - `ChiselError::EncryptionNotSupported` — this is a plaintext database.
-    /// - I/O errors from the cache flush, write, or fsync — all fatal (poison).
+    /// `Poisoned` if the manager is in the poison state; `TransactionInProgress`
+    /// if an active user transaction exists; `EncryptionNotSupported` if this is
+    /// a plaintext database; `ReadOnlyMode` if the handle cannot write. All four
+    /// change nothing on disk, and the last three leave the handle usable —
+    /// `Poisoned` reports a manager that is already dead, so retrying it is
+    /// futile. Errors from the cache flush, the writes, or the fsyncs are fatal
+    /// and poison the manager.
     pub(crate) fn rewrite_crypto_header(&mut self, new_header: CryptoHeader) -> Result<()> {
         self.check_alive()?;
         if self.active_txn {
@@ -53,9 +61,35 @@ impl TransactionManager {
         if self.cipher.is_none() {
             return Err(ChiselError::EncryptionNotSupported);
         }
-        // All errors past this point are fatal: after flush() the cache dirty
-        // flags are cleared; any subsequent failure is indistinguishable from a
-        // mid-commit crash under fsyncgate semantics.
+        // Issue #179. This guard has to be HERE, in the wrapper, ahead of
+        // `_inner` — not inside it. `_inner` opens with `cache.flush()`, whose
+        // trailing fsync is unconditional (no dirty-page early return), so on a
+        // read-only handle `PageIo::fsync` hands back an operational
+        // `ReadOnlyMode` before a single superblock byte is written. The
+        // `is_err()` poison below cannot tell that apart from a torn write, so
+        // without this guard a refusal that changes nothing killed the handle
+        // and every later call returned `Poisoned` — an operational error
+        // escalated to fatal, which is exactly what the I1 model forbids.
+        // Guarding inside `_inner` would not help: the same `is_err()` would
+        // poison on the guard's own error.
+        //
+        // Returning early loses nothing. A read-only handle cannot have dirtied
+        // a page, so the flush this skips had nothing to write; and the header
+        // rewrite it precedes could not have been performed on this handle
+        // anyway.
+        if self.cache.borrow().io().is_read_only() {
+            return Err(ChiselError::ReadOnlyMode);
+        }
+        // All errors past this point are fatal, and the read-only guard above is
+        // what makes that true rather than merely asserted: `read_only` is fixed
+        // at open, so `ReadOnlyMode` — the one operational error reachable in
+        // `_inner` — is now unreachable there, leaving I/O failures, the
+        // integrity errors the flush can surface when it rehydrates or decrypts
+        // a spilled page (`ChecksumMismatch`, `InvalidPageId`,
+        // `DecryptionFailed`), and a counter exhaustion. Every one of those is
+        // fatal. After flush() the cache dirty flags are cleared, so
+        // any of those is indistinguishable from a mid-commit crash under
+        // fsyncgate semantics. Hence poison-on-any-Err, matching commit().
         let result = self.rewrite_crypto_header_inner(new_header);
         if result.is_err() {
             self.poisoned.set(true);

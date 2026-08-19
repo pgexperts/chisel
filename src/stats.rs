@@ -1,7 +1,16 @@
-// stats.rs — Maintenance layer (layer 7). A plain snapshot struct returned
-// by Chisel::stats() for observability: handle count, page count, and raw
-// file size. Defined as its own module so that lib.rs and the public API
-// don't have to pull in transaction.rs just to expose these three numbers.
+// stats.rs — Foundation layer (layer 1). Plain snapshot structs returned by
+// Chisel::stats() and Chisel::counters() for observability: handle count,
+// page count, raw file size, and the cumulative engine-activity counters.
+// Defined as its own module so that lib.rs and the public API don't have to
+// pull in transaction.rs just to expose these numbers.
+//
+// Layer 1 despite reading like a top-of-stack observability concern: this
+// module has no `use` statements at all, and layers are assigned by
+// dependency depth rather than conceptual altitude (ARCHITECTURE.md, "Layer
+// model"). It was filed at layer 7 until issue #161, which made every
+// consumer of `ChiselCounters` — `PageCache` at layer 3 above all — look
+// like an upward reference when the real dependency runs downward. `handle.rs`
+// sits at layer 1 for exactly the same reason.
 //
 // This is a snapshot, not a live view — callers should not cache it across
 // commits. Values reflect the state at the time stats() was called.

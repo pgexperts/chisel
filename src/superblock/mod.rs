@@ -100,6 +100,66 @@ pub fn next_txn_counter(current: u64) -> Result<u64, crate::error::ChiselError> 
     Ok(next)
 }
 
+// Headroom the allocator is guaranteed at open, reserved off the top of
+// `next_handle`'s range — the mirror of TXN_COUNTER_RESERVE above, for the
+// last superblock scalar that feeds arithmetic (issue #152).
+// `TransactionManager::open_existing` refuses any superblock declaring more
+// than MAX_NEXT_HANDLE. Read that as arithmetic headroom, NOT as a mint
+// budget: it guarantees the allocator's `+ 1` stays at least 2^32 away from
+// overflowing u64, not that an opened file has 2^32 mints left. A file forged
+// at exactly MAX_NEXT_HANDLE opens (the gate rejects `>`, not `>=`) and its
+// FIRST allocate refuses — zero mints, which is what
+// `a_database_forged_at_the_handle_boundary_refuses_to_allocate_rather_than_wrapping`
+// pins. Do not build a batch-reservation scheme on a budget this does not give.
+//
+// The reserve is what gives the open-time bound teeth. Without it the only
+// value worth rejecting would be one past u64::MAX, which the field cannot
+// hold — so every forgery, `u64::MAX` included, would pass.
+//
+// Reserving these ids costs nothing real. Handles are minted monotonically
+// from 1 and each one burns a 16-byte handle-table leaf slot permanently
+// (delete writes a tombstone in place), so climbing to MAX_NEXT_HANDLE
+// legitimately means ~1.8e19 allocations and ~295 exabytes of handle table
+// alone. The size matches TXN_COUNTER_RESERVE for symmetry rather than for
+// its reasoning: that reserve sizes a SESSION, because commits bump the
+// counter without re-validating and only a reopen re-checks. `next_handle_after`
+// re-validates on every single mint, so the reserve's only real job here is
+// the one the paragraph above states — making forgeries rejectable at all.
+//
+// This does NOT contradict ADR 0027's finding that `u64::MAX` is addressable.
+// The radix still inserts, looks up and deletes every u64 handle, above this
+// bound included; a handle-table page holding such an id reads back fine. What
+// is bounded is the MINTING policy — which ids this engine will ever hand out
+// — exactly as MAX_TXN_COUNTER bounds which counters it will ever write while
+// leaving the on-disk field u64-wide.
+pub const HANDLE_ID_RESERVE: u64 = 1 << 32;
+pub const MAX_NEXT_HANDLE: u64 = u64::MAX - HANDLE_ID_RESERVE;
+
+/// The value `next_handle` must take after minting `current`, or a typed error
+/// if minting would push it past what the open path accepts.
+///
+/// This closes the same half-invariant `next_txn_counter` does: bounding what
+/// we ACCEPT at open without bounding what we WRITE would let the engine
+/// persist a `next_handle` it then refuses to open, turning a loud refusal into
+/// a database that opens today and not tomorrow.
+///
+/// With NEITHER bound — the state this fixes — a plaintext superblock forged to
+/// `next_handle = u64::MAX` made the allocator's unchecked `+= 1` overflow:
+/// a panic in debug builds, which bypasses the poison model and reaches the
+/// PyO3 binding as a `PanicException` rather than a mapped error class, and in
+/// release a wrap to 0 — the reserved "no handle" sentinel — which then
+/// collides with every handle the store hands out afterwards.
+///
+/// Callers must consult this BEFORE staging any part of the allocation, so a
+/// refusal costs no work and leaves the transaction exactly as it was.
+pub fn next_handle_after(current: u64) -> Result<u64, crate::error::ChiselError> {
+    let next = current.saturating_add(1);
+    if next > MAX_NEXT_HANDLE {
+        return Err(crate::error::ChiselError::HandleSpaceExhausted { current });
+    }
+    Ok(next)
+}
+
 // Byte offset of the superblock_count field within the serialized
 // superblock page. Placed AFTER the named-root table (which ends at
 // NAMED_ROOTS_END = 308). Deserialization rejects any value outside
@@ -1004,6 +1064,40 @@ mod tests {
         assert!(matches!(
             next_txn_counter(u64::MAX),
             Err(crate::error::ChiselError::TxnCounterExhausted { .. })
+        ));
+    }
+
+    // The same two-sided rule for `next_handle` (issue #152). The read side of
+    // this one lives in `open_existing` rather than `validate` — `next_handle`
+    // is not a selection input, and `validate` reads the raw page, where an
+    // encrypted DB's copy is sealed away — so what is pinned here is the write
+    // side and the exact position of the boundary the two halves share.
+    #[test]
+    fn next_handle_after_refuses_to_leave_the_openable_range() {
+        // A fresh store seeds next_handle at 1, so this is the first bump the
+        // allocator ever makes.
+        assert_eq!(next_handle_after(1).unwrap(), 2);
+        // MAX_NEXT_HANDLE - 1 is the last id that can be minted: the successor
+        // it writes is MAX_NEXT_HANDLE itself, which `open_existing` accepts
+        // (its check is `>`, not `>=`). Pinning both sides matters — a database
+        // sitting exactly on the boundary is the one that opens cleanly and then
+        // exercises the refusal below.
+        assert_eq!(
+            next_handle_after(MAX_NEXT_HANDLE - 1).unwrap(),
+            MAX_NEXT_HANDLE
+        );
+        assert!(matches!(
+            next_handle_after(MAX_NEXT_HANDLE),
+            Err(crate::error::ChiselError::HandleSpaceExhausted {
+                current
+            }) if current == MAX_NEXT_HANDLE
+        ));
+        // Saturating, not wrapping: `u64::MAX` is the forged value this whole
+        // bound exists for, and it must refuse rather than roll over to 0 — the
+        // reserved "no handle" sentinel.
+        assert!(matches!(
+            next_handle_after(u64::MAX),
+            Err(crate::error::ChiselError::HandleSpaceExhausted { .. })
         ));
     }
 

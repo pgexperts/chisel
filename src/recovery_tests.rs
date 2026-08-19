@@ -2260,14 +2260,18 @@ fn a_forged_overflow_length_cannot_run_the_delete_path_out_of_memory() {
     }
 }
 
-// Helper for the two txn_counter tests below. Patches bytes 8..16 of one
-// superblock slot and re-stamps the XXH3 checksum, which is exactly what an
-// attacker with byte-level file access does — the checksum is non-cryptographic
-// and publicly recomputable. Going through `Superblock::serialize` would not
-// work here: `deserialize` now rejects the forged value, so the round-trip
-// cannot produce the bytes under test.
+// Shared by the txn_counter and next_handle forgery tests below. Patches one
+// u64 field of one superblock slot in place and re-stamps the XXH3 checksum,
+// which is exactly what an attacker with byte-level file access does — the
+// checksum is non-cryptographic and publicly recomputable. Going through
+// `Superblock::serialize` would not work for either field: both are now bounded
+// on the read side, so the round-trip cannot produce the bytes under test.
+//
+// PLAINTEXT superblocks only. An encrypted database keeps both of these fields
+// where the AEAD covers them, so patching the same offsets there changes bytes
+// nobody reads.
 #[cfg(test)]
-fn forge_txn_counter(path: &std::path::Path, slot: u64, value: u64) {
+fn forge_superblock_u64(path: &std::path::Path, slot: u64, offset: usize, value: u64) {
     let mut f = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -2276,11 +2280,41 @@ fn forge_txn_counter(path: &std::path::Path, slot: u64, value: u64) {
     let mut buf = [0u8; PAGE_SIZE];
     f.seek(SeekFrom::Start(slot * PAGE_SIZE as u64)).unwrap();
     f.read_exact(&mut buf).unwrap();
-    buf[8..16].copy_from_slice(&value.to_le_bytes());
+    buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     page::stamp_checksum(&mut buf);
     f.seek(SeekFrom::Start(slot * PAGE_SIZE as u64)).unwrap();
     f.write_all(&buf).unwrap();
     f.sync_all().unwrap();
+}
+
+// Offsets from `Superblock::serialize`, which is the on-disk format contract.
+#[cfg(test)]
+fn forge_txn_counter(path: &std::path::Path, slot: u64, value: u64) {
+    forge_superblock_u64(path, slot, 8, value);
+}
+
+#[cfg(test)]
+fn forge_next_handle(path: &std::path::Path, slot: u64, value: u64) {
+    forge_superblock_u64(path, slot, 40, value);
+}
+
+// Returns the slot `Superblock::select` would currently pick — the highest
+// txn_counter, which is the only slot whose payload fields the engine adopts.
+// Forging a loser proves nothing.
+#[cfg(test)]
+fn winning_slot(path: &std::path::Path) -> u64 {
+    let mut f = fs::File::open(path).unwrap();
+    let mut best = (0u64, 0u64);
+    for slot in 0..2u64 {
+        let mut buf = [0u8; PAGE_SIZE];
+        f.seek(SeekFrom::Start(slot * PAGE_SIZE as u64)).unwrap();
+        f.read_exact(&mut buf).unwrap();
+        let sb = Superblock::deserialize(&buf).expect("slot must be valid");
+        if sb.txn_counter >= best.1 {
+            best = (slot, sb.txn_counter);
+        }
+    }
+    best.0
 }
 
 #[test]
@@ -2348,21 +2382,7 @@ fn a_forged_txn_counter_in_one_slot_loses_to_its_healthy_sibling() {
     // Forge whichever slot currently wins selection. u64::MAX would outrank
     // every sibling, so without the bound this slot is guaranteed to be chosen
     // and its adopted counter would then panic the next commit.
-    let newest = {
-        let mut f = fs::File::open(&path).unwrap();
-        let mut best = (0u64, 0u64);
-        for slot in 0..2u64 {
-            let mut buf = [0u8; PAGE_SIZE];
-            f.seek(SeekFrom::Start(slot * PAGE_SIZE as u64)).unwrap();
-            f.read_exact(&mut buf).unwrap();
-            let sb = Superblock::deserialize(&buf).expect("slot must be valid");
-            if sb.txn_counter >= best.1 {
-                best = (slot, sb.txn_counter);
-            }
-        }
-        best.0
-    };
-    forge_txn_counter(&path, newest, u64::MAX);
+    forge_txn_counter(&path, winning_slot(&path), u64::MAX);
 
     let mut db = Chisel::open(&path, Default::default())
         .expect("a healthy sibling slot must still open the database");
@@ -2410,21 +2430,11 @@ fn a_database_forged_at_the_boundary_refuses_to_commit_rather_than_writing_past_
     // `max_by_key` returns the last maximum — so selection would pick the
     // create-seed slot and the database would come back empty for reasons that
     // have nothing to do with what this test is about.
-    let newest = {
-        let mut f = fs::File::open(&path).unwrap();
-        let mut best = (0u64, 0u64);
-        for slot in 0..2u64 {
-            let mut buf = [0u8; PAGE_SIZE];
-            f.seek(SeekFrom::Start(slot * PAGE_SIZE as u64)).unwrap();
-            f.read_exact(&mut buf).unwrap();
-            let sb = Superblock::deserialize(&buf).expect("slot must be valid");
-            if sb.txn_counter >= best.1 {
-                best = (slot, sb.txn_counter);
-            }
-        }
-        best.0
-    };
-    forge_txn_counter(&path, newest, crate::superblock::MAX_TXN_COUNTER);
+    forge_txn_counter(
+        &path,
+        winning_slot(&path),
+        crate::superblock::MAX_TXN_COUNTER,
+    );
 
     // Opens: the boundary value is legal.
     let mut db = Chisel::open(&path, Default::default())
@@ -2446,6 +2456,117 @@ fn a_database_forged_at_the_boundary_refuses_to_commit_rather_than_writing_past_
     // "refused" from "wrote a superblock nobody can read".
     let db = Chisel::open(&path, Default::default())
         .expect("a refused commit must leave the file exactly as it was");
+    assert_eq!(db.read(handle).unwrap(), b"still here afterwards");
+}
+
+#[test]
+fn a_forged_next_handle_is_refused_at_open() {
+    // Issue #152, the read half. `next_handle` was the last superblock scalar
+    // feeding arithmetic with no bound anywhere: `open_existing` adopted it
+    // verbatim into `Roots`, `Superblock::validate` never looked at it, and the
+    // allocate install phase then did `next_handle += 1` — not even the
+    // `checked_add` the txn_counter site had.
+    //
+    // Forging bytes 40..48 of a plaintext superblock to u64::MAX and re-stamping
+    // the XXH3 checksum is free for anyone with byte-level file access. The
+    // first `allocate` then minted u64::MAX and overflowed the bump: a panic in
+    // debug — bypassing the poison model and surfacing to Python as a
+    // PanicException rather than a mapped error class — and in release a wrap to
+    // 0, the reserved "no handle" sentinel, colliding with live handles.
+    //
+    // Note what made this reachable: until the radix growth loops were bounded
+    // on MAX_DEPTH (issue #116), inserting handle u64::MAX spun in an unbounded
+    // grow loop and failed with CacheFull after extending the file, so the
+    // increment was never reached. That fix is what let the insert succeed.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        db.allocate(b"payload").unwrap();
+        db.commit().unwrap();
+    }
+
+    // Forge every slot. Unlike txn_counter, `next_handle` is not a selection
+    // input — a forgery in a losing slot is simply never adopted — so forging
+    // all of them is what makes the winner carry the value under test regardless
+    // of which slot selection picks.
+    for slot in 0..2u64 {
+        forge_next_handle(&path, slot, u64::MAX);
+    }
+
+    match Chisel::open(&path, Default::default()) {
+        // Not CorruptSuperblock: that variant means "no readable superblock at
+        // all" and is documented as reopen-recoverable via slot selection. Every
+        // slot here parses fine apart from this one field, and every slot is held
+        // to the same bound, so the error must name the field — exactly the call
+        // `InvalidFreemapDepth` already makes.
+        Err(ChiselError::InvalidNextHandle { stored, max }) => {
+            assert_eq!(stored, u64::MAX);
+            assert_eq!(max, crate::superblock::MAX_NEXT_HANDLE);
+        }
+        Ok(_) => panic!("a next_handle of u64::MAX must not open"),
+        Err(other) => panic!("expected InvalidNextHandle, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_database_forged_at_the_handle_boundary_refuses_to_allocate_rather_than_wrapping() {
+    // Issue #152, the write half — and the lesson #153 paid for on the
+    // txn_counter side: a stricter reader with an unchanged writer turns a loud
+    // panic into silent data loss.
+    //
+    // MAX_NEXT_HANDLE itself is VALID — the open-time check is `>`, not `>=` —
+    // so a file forged at exactly the boundary opens cleanly. Without a matching
+    // write-side check the allocations that follow would be committed and
+    // fsynced with `next_handle` at MAX+1, MAX+2 …, superblocks this same binary
+    // then refuses to open: one commit past the bound silently loses an
+    // acknowledged commit on the next open, and once every slot is past it the
+    // database is permanently unopenable.
+    //
+    // So: refuse the allocate, before anything is staged, and leave the last
+    // durable state exactly as it was.
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    let handle;
+    {
+        let mut db = Chisel::open(&path, Default::default()).unwrap();
+        db.begin().unwrap();
+        handle = db.allocate(b"still here afterwards").unwrap();
+        db.commit().unwrap();
+    }
+
+    // Only the winning slot: `next_handle` is adopted from the selected slot
+    // alone, and forging both would tie nothing — but leaving the loser intact
+    // keeps the forgery to a single variable.
+    forge_next_handle(
+        &path,
+        winning_slot(&path),
+        crate::superblock::MAX_NEXT_HANDLE,
+    );
+
+    let mut db = Chisel::open(&path, Default::default())
+        .expect("MAX_NEXT_HANDLE is inside the accepted range and must open");
+
+    db.begin().unwrap();
+    match db.allocate(b"this handle cannot be represented") {
+        Err(ChiselError::HandleSpaceExhausted { current }) => {
+            assert_eq!(current, crate::superblock::MAX_NEXT_HANDLE);
+        }
+        Ok(_) => panic!("minting past MAX_NEXT_HANDLE must be refused, not persisted"),
+        Err(other) => panic!("expected HandleSpaceExhausted, got {other:?}"),
+    }
+    // The refusal is classified fatal, so it poisons — same contract as
+    // TxnCounterExhausted, and the reason the recovery below goes through a
+    // reopen rather than a rollback.
+    assert!(matches!(db.rollback(), Err(ChiselError::Poisoned)));
+    drop(db);
+
+    // Nothing was written: the database still opens and still holds the last
+    // durable state. This is the assertion that distinguishes "refused" from
+    // "wrote a superblock nobody can read".
+    let db = Chisel::open(&path, Default::default())
+        .expect("a refused allocate must leave the file exactly as it was");
     assert_eq!(db.read(handle).unwrap(), b"still here afterwards");
 }
 

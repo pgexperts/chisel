@@ -254,6 +254,68 @@ fn remove_key_plaintext_db_returns_encryption_not_supported() {
     assert!(!db.is_poisoned());
 }
 
+// ── read-only handles (issue #179) ───────────────────────────────────────────
+
+/// On a read-only handle every key operation must refuse OPERATIONALLY: the
+/// handle stays usable and reads keep working.
+///
+/// This is a regression test for issue #179, and the defect it pins is subtle
+/// enough to be worth stating: the error VARIANT was always correct. What was
+/// wrong was the side effect. `rewrite_crypto_header` poisons on any `Err` from
+/// its inner half, and that inner half opened with a `cache.flush()` whose
+/// trailing fsync is unconditional — so `PageIo::fsync`'s read-only guard
+/// turned an operational `ReadOnlyMode` into a permanently dead manager, and
+/// every later call returned `Poisoned`. The `is_poisoned` and `read`
+/// assertions below are therefore the load-bearing ones; the `matches!` lines
+/// passed even before the fix.
+///
+/// `remove_key` is deliberately absent: this database has a single active slot,
+/// so `remove_key` returns `LastKeySlot` before it ever reaches the choke point
+/// under test, and would prove nothing.
+#[test]
+fn key_ops_on_a_read_only_handle_refuse_without_poisoning() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("db");
+
+    let h = {
+        let mut db = Chisel::open(&path, Options::default().encryption_key(raw(1))).unwrap();
+        db.begin().unwrap();
+        let h = db.allocate(b"secret").unwrap();
+        db.commit().unwrap();
+        db.close().unwrap();
+        h
+    };
+
+    let mut db = Chisel::open(
+        &path,
+        Options::default().encryption_key(raw(1)).read_only(true),
+    )
+    .expect("an encrypted database must open read-only");
+
+    let err = db.add_key(&raw(1), &raw(2)).unwrap_err();
+    assert!(
+        matches!(err, ChiselError::ReadOnlyMode),
+        "expected ReadOnlyMode, got {err:?}"
+    );
+    assert!(
+        !db.is_poisoned(),
+        "ReadOnlyMode is an operational error; add_key must not poison the handle"
+    );
+    // The contract operational errors carry: the handle is still usable.
+    assert_eq!(db.read(h).unwrap(), b"secret");
+
+    let err = db.rotate_key(&raw(1), &raw(2)).unwrap_err();
+    assert!(
+        matches!(err, ChiselError::ReadOnlyMode),
+        "expected ReadOnlyMode, got {err:?}"
+    );
+    assert!(
+        !db.is_poisoned(),
+        "ReadOnlyMode is an operational error; rotate_key must not poison the handle"
+    );
+    assert_eq!(db.read(h).unwrap(), b"secret");
+}
+
 // ── revocation durability against a torn slot (TESTS-CI-5, issue #111) ───────
 //
 // The key-slot table is CLEARTEXT at bytes 332..1356 of every superblock image,

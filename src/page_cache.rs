@@ -76,6 +76,54 @@ use crate::stats::ChiselCounters;
 // max_pages itself, with no elasticity. See spec
 // 2026-05-03-chisel-spillway-design.md.
 
+/// Where commit-drain rehydrated pages are inserted into the LRU.
+///
+/// `LruTail` makes the just-drained pages the first eviction candidates
+/// after commit; preserves any pre-transaction warm pages. The default,
+/// per spec §"Drain insertion policy".
+///
+/// `Mru` treats drained pages as recently touched. Useful when the
+/// caller expects to read them again next transaction.
+///
+/// I36: `#[non_exhaustive]` so a third drain policy (e.g. a hint-based
+/// split between recently-touched and cold) can land without breaking
+/// callers. External `match` arms need a `_ => …` catchall.
+///
+/// Defined here rather than in `lib.rs` (issue #161): the policy is a leaf
+/// with no dependencies of its own, and the only code that acts on it is
+/// `flush`'s drain phase a few hundred lines below. `lib.rs` re-exports it,
+/// so `chisel::DrainInsertion` is unchanged — it is the same
+/// define-low/re-export-high shape the eight `pub use` statements at the top
+/// of `lib.rs` already establish.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainInsertion {
+    LruTail,
+    Mru,
+}
+
+/// How to open a spillway sidecar. `Path` for file-backed databases
+/// (path is the main db path; spillway will be at `<path>.spillway`),
+/// `InMemory` for memory-backed.
+///
+/// I37 (ISSUES.md, 2026-05-22): pub(crate) because the only legitimate
+/// constructors are inside `Chisel::open` and
+/// `Chisel::open_in_memory_with_options`. External callers route
+/// through those — there's no API path that needs them to construct
+/// a `SpillwayLocation` directly.
+///
+/// Lives here for the same reason as `DrainInsertion` above (LAYER-1, issue
+/// #161): a leaf enum this module matches on belongs at this module's layer,
+/// not above it. Declaring it in `lib.rs` made layer 3 name a layer 8 item —
+/// the one upward edge the amended layer rule would otherwise have had to
+/// carry as a standing exception. `lib.rs` re-exports it `pub(crate)`, so
+/// every existing `crate::SpillwayLocation` spelling still resolves.
+#[derive(Debug, Clone)]
+pub(crate) enum SpillwayLocation {
+    Path(std::path::PathBuf),
+    InMemory,
+}
+
 struct CacheEntry {
     buf: Box<[u8; PAGE_SIZE]>,
     // `dirty` means "modified since last flush, must be written on commit".
@@ -148,7 +196,7 @@ pub struct PageCache {
     /// LruTail = first eviction candidate (good when drained pages are
     /// unlikely to be needed again soon); Mru = recently-touched
     /// semantics (good when the workload revisits recently-committed pages).
-    drain_insertion: crate::DrainInsertion,
+    drain_insertion: DrainInsertion,
     /// How to lazily open the spillway when a first spill happens. Held
     /// here rather than opening eagerly because no-spill workloads
     /// shouldn't pay any filesystem cost for a feature they never use.
@@ -202,7 +250,7 @@ impl PageCache {
         io: PageIo,
         cache_max_bytes: u64,
         spillway_max_bytes: u64,
-        drain_insertion: crate::DrainInsertion,
+        drain_insertion: DrainInsertion,
         spillway_location: crate::SpillwayLocation,
     ) -> PageCache {
         let max_pages = (cache_max_bytes / PAGE_SIZE as u64).max(1) as usize;
@@ -625,8 +673,8 @@ impl PageCache {
                     // Not present: insert and register in the LRU index.
                     e.insert(entry);
                     match drain_policy {
-                        crate::DrainInsertion::LruTail => self.lru.push_back(page_id),
-                        crate::DrainInsertion::Mru => self.lru.push_front(page_id),
+                        DrainInsertion::LruTail => self.lru.push_back(page_id),
+                        DrainInsertion::Mru => self.lru.push_front(page_id),
                     }
                 }
                 // If already present — a same-id spill within a batch — skip:
@@ -1058,7 +1106,7 @@ impl PageCache {
     /// keep `Result<()>` because they perform real fallibility checks
     /// (poison + active-txn). Only the bottom layer can honestly
     /// shed the `Result`.
-    pub fn set_drain_insertion(&mut self, policy: crate::DrainInsertion) {
+    pub fn set_drain_insertion(&mut self, policy: DrainInsertion) {
         self.drain_insertion = policy;
     }
 
@@ -1587,6 +1635,85 @@ mod tests {
         // Spillway holds the overflow.
         let spw = cache.spillway.as_ref().unwrap();
         assert_eq!(spw.slot_count(), 4);
+    }
+
+    /// Run one spilling commit under `policy`; return the allocated page ids and
+    /// the LRU contents (LRU end first) once `flush` has returned.
+    ///
+    /// Exactly ONE page spills, and that is what makes the outcome
+    /// deterministic: `Spillway::slots` is a `HashMap`, so `drain_batch` yields
+    /// its ids in randomized order, and a multi-page drain would rehydrate — and
+    /// therefore evict — a different set per process. With a single slot there
+    /// is no order to depend on. The end-to-end probes in
+    /// `python/tests/test_runtime_config.py` reach this policy through
+    /// `open()` / `set_drain_insertion` and so must calibrate a workload whose
+    /// whole spill fits in one drain batch; constructing the cache directly
+    /// removes that constraint rather than managing it.
+    ///
+    /// The shape: cap 4, five dirty allocations. The fifth overflows an
+    /// all-dirty cache, so `maybe_evict` Phase B spills the LRU-tail page — the
+    /// first one allocated. `flush` then cleans the four resident pages (Phase
+    /// 1a, which does not touch the LRU), reinserts the spilled page per
+    /// `policy` (Phase 1b), and runs `evict_clean_to_cap`, which is over the cap
+    /// by exactly one page and takes its victim from the LRU end. So the policy
+    /// decides both where the page lands and which page the trim removes.
+    fn spill_one_page_and_drain(policy: crate::DrainInsertion) -> (Vec<u64>, Vec<u64>) {
+        let max_pages = 4;
+        let (_dir, mut cache) = fresh_cache_with_spillway(max_pages, 8 * PAGE_SIZE as u64);
+        cache.set_drain_insertion(policy);
+
+        let ids: Vec<u64> = (0..max_pages + 1)
+            .map(|_| cache.new_page().expect("allocation must spill, not fail"))
+            .collect();
+        assert_eq!(
+            cache.spillway.as_ref().unwrap().slot_count(),
+            1,
+            "probe requires exactly one spilled page — more than one makes the \
+             drain order a HashMap's business"
+        );
+        assert!(
+            !cache.entries.contains_key(&ids[0]),
+            "the first-allocated page is the LRU tail and must be the spill victim"
+        );
+
+        cache.flush().unwrap();
+        (ids, cache.lru.iter_lru_to_mru().collect())
+    }
+
+    /// `DrainInsertion::LruTail` puts the rehydrated page at the LRU end, so the
+    /// post-drain trim reclaims it immediately and every never-spilled page
+    /// survives.
+    ///
+    /// Behavioural coverage for `flush` Phase 1b's `push_back` arm, which the
+    /// Rust suite otherwise only reached incidentally (every other test runs on
+    /// the `LruTail` default without asserting anything about where drained
+    /// pages land).
+    #[test]
+    fn drain_insertion_lru_tail_puts_the_rehydrated_page_at_the_lru_end() {
+        let (ids, order) = spill_one_page_and_drain(crate::DrainInsertion::LruTail);
+        assert_eq!(
+            order,
+            vec![ids[1], ids[2], ids[3], ids[4]],
+            "LruTail must land the drained page at the LRU end, where the trim \
+             takes it back out, leaving the four never-spilled pages in order"
+        );
+    }
+
+    /// `DrainInsertion::Mru` puts the same page at the MRU head instead, so the
+    /// trim takes the oldest never-spilled page and the rehydrated one stays
+    /// resident — the residency inversion the policy exists to produce.
+    ///
+    /// Transposing the two match arms in Phase 1b swaps this outcome with its
+    /// sibling above; nothing else in the Rust suite would notice.
+    #[test]
+    fn drain_insertion_mru_puts_the_rehydrated_page_at_the_mru_head() {
+        let (ids, order) = spill_one_page_and_drain(crate::DrainInsertion::Mru);
+        assert_eq!(
+            order,
+            vec![ids[2], ids[3], ids[4], ids[0]],
+            "Mru must land the drained page at the MRU head, so the trim evicts \
+             the oldest never-spilled page instead"
+        );
     }
 
     #[test]
