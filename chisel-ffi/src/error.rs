@@ -491,14 +491,6 @@ mod tests {
             (E::DecryptionFailed { page_id: 0 }, "DecryptionFailed"),
         ];
 
-        // Tripwire: if the engine grows a variant, this list must grow too (the
-        // point of the whole test). 35 is the current count in src/error.rs.
-        assert_eq!(
-            cases.len(),
-            35,
-            "expected all 35 current engine variants to be covered"
-        );
-
         for (engine, expected) in cases {
             let got = ChiselError::from(engine);
             let name = ffi_name(&got);
@@ -570,5 +562,84 @@ mod tests {
             );
             assert_eq!(ffi_name(&ChiselError::from(engine)), expected);
         }
+    }
+
+    // SWIFT-13. `chisel::ChiselError` is `#[non_exhaustive]`, so no downstream
+    // crate may match it exhaustively and the compiler cannot enforce this.
+    // The list-based test above can only check variants it already names —
+    // which is precisely how five variants went unmapped.
+    //
+    // `chisel-ffi` is `publish = false` and workspace-only, so the engine's
+    // source is always at a fixed path relative to this manifest. Parsing it
+    // is the only way to learn the true variant set without adding a
+    // test-only helper to the engine's public API.
+    //
+    // A parse that finds implausibly few variants is itself a failure, so a
+    // reformatting of `src/error.rs` breaks this loudly rather than quietly
+    // passing on an empty set.
+    #[test]
+    fn every_engine_variant_has_an_explicit_ffi_arm() {
+        let engine_src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/error.rs"))
+                .expect("engine src/error.rs must be readable from within the workspace");
+
+        let enum_body = engine_src
+            .split_once("pub enum ChiselError {")
+            .expect("engine error.rs must declare `pub enum ChiselError {`")
+            .1
+            .split_once("\n}")
+            .expect("the ChiselError enum must end with a line-start closing brace")
+            .0;
+
+        // Variant lines are exactly those at 4-space indent starting with an
+        // uppercase ASCII letter. Doc comments (`///`), attributes (`#[`),
+        // and field lines (8-space indent, lowercase) are all excluded.
+        let variants: Vec<String> = enum_body
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                line.len() - trimmed.len() == 4
+                    && trimmed.starts_with(|c: char| c.is_ascii_uppercase())
+            })
+            .map(|line| {
+                line.trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect()
+            })
+            .collect();
+
+        assert!(
+            variants.len() >= 30,
+            "parsed only {} variants out of src/error.rs — the parser is \
+             broken, not the enum. Fix this test before trusting it.",
+            variants.len()
+        );
+
+        // Our own source, so the check tracks the real `From` impl rather
+        // than a second list that can drift from it.
+        let from_impl = include_str!("error.rs")
+            .split_once("impl From<chisel::ChiselError> for ChiselError {")
+            .expect("this file must contain the From impl")
+            .1
+            .split_once("\n}")
+            .expect("the From impl must end with a line-start closing brace")
+            .0;
+
+        let unmapped: Vec<&String> = variants
+            .iter()
+            .filter(|v| !from_impl.contains(&format!("E::{v}")))
+            .collect();
+
+        assert!(
+            unmapped.is_empty(),
+            "engine ChiselError variants with no explicit arm in \
+             `From<chisel::ChiselError>`: {unmapped:?}\n\
+             Add an arm for each, plus a matching FFI case, a `message()` \
+             arm, an `ffi_name` arm, and a `category` arm in \
+             swift/Sources/Chisel/Extensions.swift. The `Other` fallback \
+             exists for variants added after this crate was last updated — \
+             it is not a resting place for one that already exists."
+        );
     }
 }
