@@ -15,6 +15,12 @@
 These apply to **every** task. They are not repeated per task.
 
 - **MSRV is 1.82.** `chisel-ffi` inherits it via the path dependency. Do not introduce a dependency requiring edition2024 / Rust 1.85+.
+- **UniFFI's Swift case naming is split, and the split is not obvious.** Regular
+  `uniffi::Enum` cases are lowerCamelCased (`ChiselKey::Raw` → `.raw(bytes:)`,
+  `DrainInsertion::LruTail` → `.lruTail`), but `uniffi::Error` cases keep their Rust
+  spelling (`ChiselError::InvalidHandle` → `.InvalidHandle(message:)`). Writing
+  `ChiselKey.Passphrase(...)` does not compile. When in doubt, grep the generated
+  `swift/Sources/Chisel/Generated/chisel_ffi.swift` for `case ` rather than guessing.
 - **Never write comma-grouped `case .A, .B, .C:` arms in a Swift `switch` over `ChiselError`.** It compiles and then SIGSEGVs at runtime in **debug builds only** — a Swift 6.0.3 `-Onone` codegen bug on a large mixed-arity enum with payloads. One `case:` per line, always. This is documented in `swift/Sources/Chisel/Extensions.swift`'s header; do not "clean it up".
 - **The engine crate (`src/`) is not modified.** If a task appears to require an engine change, stop and escalate rather than editing `src/`.
 - **`swift/Sources/Chisel/Generated/chisel_ffi.swift` is a build product.** Regenerate it with `swift/build-xcframework.sh`. Never hand-edit it. It is committed so SwiftPM consumers do not need Rust.
@@ -1033,7 +1039,7 @@ final class RekeyTests: XCTestCase {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let path = dir.appendingPathComponent("rk.db")
-        let key = ChiselKey.Passphrase(phrase: "correct horse")
+        let key = ChiselKey.passphrase(phrase: "correct horse")
 
         var opts = Options()
         opts.encryptionKey = key
@@ -1060,7 +1066,7 @@ final class RekeyTests: XCTestCase {
     // rekeying the path component on the local filesystem.
     func testRekeyRejectsNonFileURL() {
         let url = URL(string: "https://example.com/prod.db")!
-        XCTAssertThrowsError(try rekey(at: url, key: .Passphrase(phrase: "x"))) { error in
+        XCTAssertThrowsError(try rekey(at: url, key: .passphrase(phrase: "x"))) { error in
             guard let e = error as? ChiselError else { return XCTFail("expected ChiselError") }
             XCTAssertEqual(e.category, .operational)
         }
@@ -2216,7 +2222,7 @@ final class EncryptionTests: XCTestCase {
 
     func testEncryptedRoundTripAndWrongKeyRejected() throws {
         let path = try tempDir().appendingPathComponent("enc.db")
-        let good = ChiselKey.Passphrase(phrase: "correct horse battery staple")
+        let good = ChiselKey.passphrase(phrase: "correct horse battery staple")
 
         let db = try opened(at: path, key: good)
         try db.transaction { txn in
@@ -2231,7 +2237,7 @@ final class EncryptionTests: XCTestCase {
         try reopened.close()
 
         XCTAssertThrowsError(
-            try opened(at: path, key: .Passphrase(phrase: "wrong"))
+            try opened(at: path, key: .passphrase(phrase: "wrong"))
         ) { error in
             guard let e = error as? ChiselError else { return XCTFail("expected ChiselError") }
             // A wrong credential is operational: supply the right key and retry.
@@ -2241,9 +2247,9 @@ final class EncryptionTests: XCTestCase {
 
     func testAddRotateAndRemoveKey() throws {
         let path = try tempDir().appendingPathComponent("keys.db")
-        let first = ChiselKey.Passphrase(phrase: "first credential")
-        let second = ChiselKey.Passphrase(phrase: "second credential")
-        let third = ChiselKey.Passphrase(phrase: "third credential")
+        let first = ChiselKey.passphrase(phrase: "first credential")
+        let second = ChiselKey.passphrase(phrase: "second credential")
+        let third = ChiselKey.passphrase(phrase: "third credential")
 
         let db = try opened(at: path, key: first)
         try db.transaction { txn in
@@ -2274,7 +2280,7 @@ final class EncryptionTests: XCTestCase {
     // permanently unopenable, so the engine refuses.
     func testRemovingTheLastKeyIsRefused() throws {
         let path = try tempDir().appendingPathComponent("last.db")
-        let only = ChiselKey.Passphrase(phrase: "the only one")
+        let only = ChiselKey.passphrase(phrase: "the only one")
         let db = try opened(at: path, key: only)
         XCTAssertThrowsError(try db.removeKey(only)) { error in
             guard let e = error as? ChiselError else { return XCTFail("expected ChiselError") }
@@ -2286,7 +2292,7 @@ final class EncryptionTests: XCTestCase {
     // A raw 32-byte key takes the HKDF path rather than Argon2; both must work.
     func testRawKeyRoundTrip() throws {
         let path = try tempDir().appendingPathComponent("raw.db")
-        let raw = ChiselKey.Raw(bytes: Data(repeating: 0xAB, count: 32))
+        let raw = ChiselKey.raw(bytes: Data(repeating: 0xAB, count: 32))
         let db = try opened(at: path, key: raw)
         try db.transaction { txn in
             let h = try txn.allocate(Data("bytes".utf8))
@@ -2294,7 +2300,7 @@ final class EncryptionTests: XCTestCase {
         }
         try db.close()
 
-        let again = try opened(at: path, key: .Raw(bytes: Data(repeating: 0xAB, count: 32)))
+        let again = try opened(at: path, key: .raw(bytes: Data(repeating: 0xAB, count: 32)))
         XCTAssertNotNil(try again.getRootName("root"))
         try again.close()
     }
