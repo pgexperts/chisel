@@ -1,0 +1,454 @@
+// error.rs — FFI error surface. Role in system: the only place that
+// translates the engine's `chisel::ChiselError` into the UniFFI `Error` enum
+// Swift receives via `throws`. See
+// docs/specs/2026-07-18-swift-binding-design.md §4.2: Swift enums cannot
+// subclass, so Python's `ChiselError -> Operational|Fatal -> <specific>`
+// class tree flattens to one enum here; `.category`/`.isPoisoning` are
+// computed properties added on the Swift side (Extensions.swift), not
+// represented in this type.
+//
+// Post-review fix: every variant now carries `message: String` (the engine
+// error's `Display` text, captured in `From` below), so a Swift caller
+// catching e.g. `.checksumMismatch` still gets "checksum mismatch on page
+// 42" instead of a bare case name. This brings the FFI surface to parity
+// with python/src/errors.rs, which has always attached `err.to_string()`.
+// Structured fields (page ids, byte limits, expected/actual counts) are
+// still NOT carried as typed per-case payloads — `message` is a
+// forward-compatible stopgap; adding typed fields later is additive and can
+// wait for post-1.0, per the project owner's call on this review finding.
+//
+// Two variants keep their pre-existing structured fields alongside the new
+// `message`: `Io { kind, errno, message }` (I42 — lets callers distinguish
+// e.g. ENOSPC from EACCES without string-parsing `message`). The two
+// `*Savepoint` cases DROP their old `{ name }` field in favor of the
+// uniform `{ message }` shape — the name is already embedded in the engine's
+// Display text ("savepoint not found: foo"), so keeping a separate `name`
+// field would be redundant with `message` for every other variant's shape.
+
+/// Result alias for exported fallible methods.
+pub type FfiResult<T> = Result<T, ChiselError>;
+
+#[derive(Debug, uniffi::Error)]
+pub enum ChiselError {
+    // --- operational: database state intact ---
+    InvalidHandle {
+        message: String,
+    },
+    NoActiveTransaction {
+        message: String,
+    },
+    TransactionAlreadyActive {
+        message: String,
+    },
+    SavepointNotFound {
+        message: String,
+    },
+    DuplicateSavepoint {
+        message: String,
+    },
+    ReadOnlyMode {
+        message: String,
+    },
+    DatabaseFileNotFound {
+        message: String,
+    },
+    InvalidRootName {
+        message: String,
+    },
+    RootNameTableFull {
+        message: String,
+    },
+    InvalidSuperblockCount {
+        message: String,
+    },
+    CacheFull {
+        message: String,
+    },
+    SpillwayFull {
+        message: String,
+    },
+    TransactionInProgress {
+        message: String,
+    },
+    // NOT produced by `From<chisel::ChiselError>` below — the engine has no
+    // equivalent variant. Raised directly by the `NativeDatabase` wrapper
+    // (`Mutex<Option<Chisel>>`) via `closed_err()` in database.rs when a
+    // method is called after `close()`, mirroring the Python binding's
+    // `ClosedError` (ISSUES.md I25).
+    Closed {
+        message: String,
+    },
+    // Ditto: reserved for the transaction/savepoint wrapper's one-shot
+    // "finished" guard, mirroring Python's `AlreadyFinishedError`
+    // (ISSUES.md I22/I24).
+    AlreadyFinished {
+        message: String,
+    },
+    TagMismatch {
+        message: String,
+    },
+    NoEncryptionKey {
+        message: String,
+    },
+    InvalidEncryptionKey {
+        message: String,
+    },
+    EncryptionNotSupported {
+        message: String,
+    },
+    NoFreeKeySlot {
+        message: String,
+    },
+    LastKeySlot {
+        message: String,
+    },
+    // --- fatal: database poisoned / on-disk state suspect ---
+    Io {
+        kind: String,
+        errno: Option<i32>,
+        message: String,
+    },
+    ChecksumMismatch {
+        message: String,
+    },
+    CorruptSuperblock {
+        message: String,
+    },
+    FileSizeMismatch {
+        message: String,
+    },
+    LockFailed {
+        message: String,
+    },
+    UnsupportedFormatVersion {
+        message: String,
+    },
+    UnsupportedPageSize {
+        message: String,
+    },
+    CorruptPage {
+        message: String,
+    },
+    InvalidPageId {
+        message: String,
+    },
+    Poisoned {
+        message: String,
+    },
+    DecryptionFailed {
+        message: String,
+    },
+}
+
+impl ChiselError {
+    /// The human-readable message every variant carries — either the
+    /// engine's own `Display` text (`From` below) or, for the two
+    /// FFI-only variants (`Closed`, `AlreadyFinished`), whatever the
+    /// Swift wrapper set when it raised them directly.
+    fn message(&self) -> &str {
+        match self {
+            Self::InvalidHandle { message }
+            | Self::NoActiveTransaction { message }
+            | Self::TransactionAlreadyActive { message }
+            | Self::SavepointNotFound { message }
+            | Self::DuplicateSavepoint { message }
+            | Self::ReadOnlyMode { message }
+            | Self::DatabaseFileNotFound { message }
+            | Self::InvalidRootName { message }
+            | Self::RootNameTableFull { message }
+            | Self::InvalidSuperblockCount { message }
+            | Self::CacheFull { message }
+            | Self::SpillwayFull { message }
+            | Self::TransactionInProgress { message }
+            | Self::Closed { message }
+            | Self::AlreadyFinished { message }
+            | Self::TagMismatch { message }
+            | Self::NoEncryptionKey { message }
+            | Self::InvalidEncryptionKey { message }
+            | Self::EncryptionNotSupported { message }
+            | Self::NoFreeKeySlot { message }
+            | Self::LastKeySlot { message }
+            | Self::Io { message, .. }
+            | Self::ChecksumMismatch { message }
+            | Self::CorruptSuperblock { message }
+            | Self::FileSizeMismatch { message }
+            | Self::LockFailed { message }
+            | Self::UnsupportedFormatVersion { message }
+            | Self::UnsupportedPageSize { message }
+            | Self::CorruptPage { message }
+            | Self::InvalidPageId { message }
+            | Self::Poisoned { message }
+            | Self::DecryptionFailed { message } => message,
+        }
+    }
+}
+
+impl std::fmt::Display for ChiselError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message())
+    }
+}
+impl std::error::Error for ChiselError {}
+
+impl From<chisel::ChiselError> for ChiselError {
+    fn from(e: chisel::ChiselError) -> Self {
+        use chisel::ChiselError as E;
+        // Captured before the match moves fields out of `e` (e.g. IoError's
+        // io::Error, CorruptSuperblock's Vec<SlotDefect>) — Display only
+        // needs `&e`, so this borrow is dropped before the match takes
+        // ownership.
+        let message = e.to_string();
+        match e {
+            E::InvalidHandle(_) => Self::InvalidHandle { message },
+            E::NoActiveTransaction => Self::NoActiveTransaction { message },
+            E::TransactionAlreadyActive => Self::TransactionAlreadyActive { message },
+            E::SavepointNotFound(_) => Self::SavepointNotFound { message },
+            E::DuplicateSavepoint(_) => Self::DuplicateSavepoint { message },
+            E::ReadOnlyMode => Self::ReadOnlyMode { message },
+            // Engine name is `FileNotFound`; FFI keeps the more explicit
+            // `DatabaseFileNotFound` name from the Swift design spec.
+            E::FileNotFound => Self::DatabaseFileNotFound { message },
+            E::InvalidRootName => Self::InvalidRootName { message },
+            E::RootNameTableFull => Self::RootNameTableFull { message },
+            E::InvalidSuperblockCount { .. } => Self::InvalidSuperblockCount { message },
+            E::CacheFull { .. } => Self::CacheFull { message },
+            E::SpillwayFull { .. } => Self::SpillwayFull { message },
+            E::TransactionInProgress => Self::TransactionInProgress { message },
+            E::TagMismatch { .. } => Self::TagMismatch { message },
+            E::NoEncryptionKey => Self::NoEncryptionKey { message },
+            E::InvalidEncryptionKey => Self::InvalidEncryptionKey { message },
+            E::EncryptionNotSupported => Self::EncryptionNotSupported { message },
+            E::NoFreeKeySlot => Self::NoFreeKeySlot { message },
+            E::LastKeySlot => Self::LastKeySlot { message },
+            E::IoError(io) => Self::Io {
+                kind: format!("{:?}", io.kind()),
+                errno: io.raw_os_error(),
+                message,
+            },
+            E::ChecksumMismatch { .. } => Self::ChecksumMismatch { message },
+            E::CorruptSuperblock { .. } => Self::CorruptSuperblock { message },
+            E::FileSizeMismatch { .. } => Self::FileSizeMismatch { message },
+            E::LockFailed => Self::LockFailed { message },
+            E::UnsupportedFormatVersion { .. } => Self::UnsupportedFormatVersion { message },
+            E::UnsupportedPageSize { .. } => Self::UnsupportedPageSize { message },
+            E::CorruptPage { .. } => Self::CorruptPage { message },
+            E::InvalidPageId { .. } => Self::InvalidPageId { message },
+            E::Poisoned => Self::Poisoned { message },
+            E::DecryptionFailed { .. } => Self::DecryptionFailed { message },
+            // `chisel::ChiselError` is `#[non_exhaustive]` (src/error.rs), so
+            // this match needs a wildcard even though every variant that
+            // exists today is listed explicitly above. Route any future,
+            // not-yet-mapped variant to `Poisoned` regardless of its actual
+            // fatality: this crate's mapping is stale for that variant by
+            // definition, and guessing "operational" risks telling a Swift
+            // caller a real integrity problem is safe to retry. Fatal is the
+            // conservative default (reopen always recovers) — same
+            // fail-toward-fatal principle the engine documents for I105.
+            // `message` (captured above from the still-real Display) is
+            // preserved even on this fallback, so a not-yet-mapped variant
+            // still surfaces its actual diagnostic text, not just "Poisoned".
+            // TODO: add an explicit arm mapping the new variant instead of
+            // relying on this fallback.
+            _ => Self::Poisoned { message },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Every engine error must map to exactly one FFI variant. This guards
+    // against a silently-dropped variant when the engine grows a new error.
+    #[test]
+    fn io_error_maps_and_carries_kind() {
+        let e = chisel::ChiselError::from(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "nope",
+        ));
+        match ChiselError::from(e) {
+            ChiselError::Io {
+                kind,
+                errno,
+                message,
+            } => {
+                assert_eq!(kind, "PermissionDenied");
+                // Synthetic (non-OS-backed) io::Error, so no raw errno — the
+                // field still exists and round-trips None rather than panicking.
+                assert_eq!(errno, None);
+                assert!(!message.is_empty(), "message must be non-empty");
+                assert!(message.contains("I/O error"));
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_handle_maps() {
+        // Engine's InvalidHandle carries the offending handle id (u64); the
+        // FFI variant drops the typed id but keeps it in `message` via the
+        // engine's Display (see module doc comment) so any id round-trips to
+        // the same case with its diagnostic text intact.
+        match ChiselError::from(chisel::ChiselError::InvalidHandle(7)) {
+            ChiselError::InvalidHandle { message } => assert_eq!(message, "invalid handle: 7"),
+            other => panic!("expected InvalidHandle, got {other:?}"),
+        }
+    }
+
+    // Discriminant name of an FFI ChiselError. Exhaustive with NO wildcard, so
+    // adding an FFI ChiselError variant fails to compile here until it is named
+    // — a compile-time tripwire complementing the runtime coverage below.
+    fn ffi_name(e: &ChiselError) -> &'static str {
+        match e {
+            ChiselError::InvalidHandle { .. } => "InvalidHandle",
+            ChiselError::NoActiveTransaction { .. } => "NoActiveTransaction",
+            ChiselError::TransactionAlreadyActive { .. } => "TransactionAlreadyActive",
+            ChiselError::SavepointNotFound { .. } => "SavepointNotFound",
+            ChiselError::DuplicateSavepoint { .. } => "DuplicateSavepoint",
+            ChiselError::ReadOnlyMode { .. } => "ReadOnlyMode",
+            ChiselError::DatabaseFileNotFound { .. } => "DatabaseFileNotFound",
+            ChiselError::InvalidRootName { .. } => "InvalidRootName",
+            ChiselError::RootNameTableFull { .. } => "RootNameTableFull",
+            ChiselError::InvalidSuperblockCount { .. } => "InvalidSuperblockCount",
+            ChiselError::CacheFull { .. } => "CacheFull",
+            ChiselError::SpillwayFull { .. } => "SpillwayFull",
+            ChiselError::TransactionInProgress { .. } => "TransactionInProgress",
+            ChiselError::Closed { .. } => "Closed",
+            ChiselError::AlreadyFinished { .. } => "AlreadyFinished",
+            ChiselError::TagMismatch { .. } => "TagMismatch",
+            ChiselError::NoEncryptionKey { .. } => "NoEncryptionKey",
+            ChiselError::InvalidEncryptionKey { .. } => "InvalidEncryptionKey",
+            ChiselError::EncryptionNotSupported { .. } => "EncryptionNotSupported",
+            ChiselError::NoFreeKeySlot { .. } => "NoFreeKeySlot",
+            ChiselError::LastKeySlot { .. } => "LastKeySlot",
+            ChiselError::Io { .. } => "Io",
+            ChiselError::ChecksumMismatch { .. } => "ChecksumMismatch",
+            ChiselError::CorruptSuperblock { .. } => "CorruptSuperblock",
+            ChiselError::FileSizeMismatch { .. } => "FileSizeMismatch",
+            ChiselError::LockFailed { .. } => "LockFailed",
+            ChiselError::UnsupportedFormatVersion { .. } => "UnsupportedFormatVersion",
+            ChiselError::UnsupportedPageSize { .. } => "UnsupportedPageSize",
+            ChiselError::CorruptPage { .. } => "CorruptPage",
+            ChiselError::InvalidPageId { .. } => "InvalidPageId",
+            ChiselError::Poisoned { .. } => "Poisoned",
+            ChiselError::DecryptionFailed { .. } => "DecryptionFailed",
+        }
+    }
+
+    // Spec §7.1: "every chisel::ChiselError variant maps to a distinct
+    // ChiselError UniFFI case ... the mapping must be total". Constructs one
+    // instance of EVERY current engine variant (template: src/error.rs's
+    // is_fatal_matches_documented_classification_for_every_variant) and asserts
+    // `From` yields the exact expected FFI case. Because the engine enum is
+    // #[non_exhaustive], the `From` match ends in a `_ => Poisoned` wildcard, so
+    // a deleted arm, a duplicated arm, or a variant silently falling through the
+    // wildcard would all be invisible to the compiler — this test is the only
+    // CI signal that catches them for every known variant.
+    #[test]
+    fn every_engine_variant_maps_to_its_ffi_case() {
+        use chisel::ChiselError as E;
+
+        // (engine variant instance, expected FFI case name). Covers all 30
+        // current engine variants. `Poisoned` is the only pair whose target is
+        // "Poisoned" — every OTHER variant mapping to "Poisoned" would mean it
+        // fell through the non_exhaustive wildcard, which the exact-name assert
+        // (and the explicit non-Poisoned guard) below flags.
+        let cases: Vec<(E, &'static str)> = vec![
+            (E::InvalidHandle(0), "InvalidHandle"),
+            (E::NoActiveTransaction, "NoActiveTransaction"),
+            (E::TransactionAlreadyActive, "TransactionAlreadyActive"),
+            (E::SavepointNotFound("s".into()), "SavepointNotFound"),
+            (E::DuplicateSavepoint("s".into()), "DuplicateSavepoint"),
+            (E::ReadOnlyMode, "ReadOnlyMode"),
+            (E::FileNotFound, "DatabaseFileNotFound"),
+            (E::InvalidRootName, "InvalidRootName"),
+            (E::RootNameTableFull, "RootNameTableFull"),
+            (
+                E::InvalidSuperblockCount { value: 0 },
+                "InvalidSuperblockCount",
+            ),
+            (E::CacheFull { limit: 0 }, "CacheFull"),
+            (E::SpillwayFull { limit_bytes: 0 }, "SpillwayFull"),
+            (E::TransactionInProgress, "TransactionInProgress"),
+            (
+                E::TagMismatch {
+                    handle: 0,
+                    expected: 0,
+                    actual: 0,
+                },
+                "TagMismatch",
+            ),
+            (E::NoEncryptionKey, "NoEncryptionKey"),
+            (E::InvalidEncryptionKey, "InvalidEncryptionKey"),
+            (E::EncryptionNotSupported, "EncryptionNotSupported"),
+            (E::NoFreeKeySlot, "NoFreeKeySlot"),
+            (E::LastKeySlot, "LastKeySlot"),
+            (E::IoError(std::io::Error::other("io")), "Io"),
+            (E::ChecksumMismatch { page_id: 0 }, "ChecksumMismatch"),
+            (
+                E::CorruptSuperblock { defects: vec![] },
+                "CorruptSuperblock",
+            ),
+            (
+                E::FileSizeMismatch {
+                    expected: 0,
+                    actual: 0,
+                },
+                "FileSizeMismatch",
+            ),
+            (E::LockFailed, "LockFailed"),
+            (
+                E::UnsupportedFormatVersion {
+                    found: 0,
+                    expected: 0,
+                },
+                "UnsupportedFormatVersion",
+            ),
+            (
+                E::UnsupportedPageSize {
+                    stored: 0,
+                    compiled: 0,
+                },
+                "UnsupportedPageSize",
+            ),
+            (E::CorruptPage { page_id: 0 }, "CorruptPage"),
+            (E::InvalidPageId { page_id: 0 }, "InvalidPageId"),
+            (E::Poisoned, "Poisoned"),
+            (E::DecryptionFailed { page_id: 0 }, "DecryptionFailed"),
+        ];
+
+        // Tripwire: if the engine grows a variant, this list must grow too (the
+        // point of the whole test). 30 is the current count in src/error.rs.
+        assert_eq!(
+            cases.len(),
+            30,
+            "expected all 30 current engine variants to be covered"
+        );
+
+        for (engine, expected) in cases {
+            let got = ChiselError::from(engine);
+            let name = ffi_name(&got);
+            assert_eq!(
+                name, expected,
+                "engine variant expected to map to {expected}, got {name}"
+            );
+            // Every variant must carry the engine's diagnostic text now — a
+            // blank message would mean the `message` field was constructed
+            // wrong for this arm (e.g. from a fresh default instead of
+            // `e.to_string()`).
+            assert!(
+                !got.message().is_empty(),
+                "{expected} produced an empty message"
+            );
+            // Spec §7.1 "no silently-dropped error": any variant whose intended
+            // target is NOT Poisoned must not surface as Poisoned — i.e. must
+            // not have fallen through the non_exhaustive `_ => Poisoned` arm.
+            if expected != "Poisoned" {
+                assert_ne!(
+                    name, "Poisoned",
+                    "{expected} fell through to the wildcard instead of its own arm"
+                );
+            }
+        }
+    }
+}

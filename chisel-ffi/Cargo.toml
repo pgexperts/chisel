@@ -1,0 +1,29 @@
+[package]
+name = "chisel-ffi"
+version = "0.1.0"
+edition = "2021"
+# MSRV mirrors the root crate's (1.82 conservative pin; see python/Cargo.toml
+# and bench/Cargo.toml for the same note). The path-dep on the root crate
+# makes 1.82 this crate's floor too.
+rust-version = "1.82"
+authors = ["Christophe Pettus <cpettus@pgexperts.com>"]
+description = "UniFFI binding for the Chisel transactional storage engine (Swift/iOS/macOS)"
+license = "MIT"
+repository = "https://github.com/pgexperts/chisel"
+publish = false
+
+[lib]
+name = "chisel_ffi"
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+# The root package is published as "chisel-storage" (the bare "chisel" name was
+# taken on crates.io); its [lib] name is still "chisel", so `package =` here
+# keeps every `use chisel::...` in this crate compiling unchanged.
+chisel = { package = "chisel-storage", path = ".." }
+uniffi = { version = "0.29", features = ["cli"] }
+zeroize = "1"
