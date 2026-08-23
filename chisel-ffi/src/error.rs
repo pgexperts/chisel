@@ -626,9 +626,20 @@ mod tests {
             .expect("the From impl must end with a line-start closing brace")
             .0;
 
+        // Strip comment lines before searching. The scan is a substring match,
+        // so a variant named inside a comment — a commented-out arm, or prose
+        // like "E::Foo is handled above" — would otherwise count as mapped and
+        // exempt that variant from this guard permanently. A guard defeated by
+        // a `//` is the same flaw as the hand-maintained list this replaced.
+        let from_impl_code: String = from_impl
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
         let unmapped: Vec<&String> = variants
             .iter()
-            .filter(|v| !from_impl.contains(&format!("E::{v}")))
+            .filter(|v| !from_impl_code.contains(&format!("E::{v}")))
             .collect();
 
         assert!(
