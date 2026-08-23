@@ -23,11 +23,16 @@ These apply to **every** task. They are not repeated per task.
 - **Every commit message ends with:** `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`
 - **Gating checks** (must pass before any PR is opened):
   ```
-  cargo test --workspace
-  cargo clippy --workspace -- -D warnings
+  cargo test                                # engine + bench; honours default-members
+  cargo test -p chisel-ffi                  # NOT covered by the line above
+  cargo clippy --workspace -- -D warnings   # --workspace is correct here: linting does not link
   cargo fmt --check
-  cargo test -p chisel-ffi
   ```
+  **Never `cargo test --workspace`.** It pulls in `chisel-py`, whose pyo3
+  `extension-module` feature deliberately leaves Python symbols undefined for the
+  interpreter to resolve at load time; only maturin supplies the linker flags that
+  make that work. This is exactly what `default-members` exists to prevent, and the
+  repo's own README documents `cargo test` for the same reason.
   plus, for any task touching `swift/` or `chisel-ffi/`:
   ```
   swift/build-xcframework.sh && (cd swift && swift test)
@@ -3031,10 +3036,10 @@ Expected: exit 0; `docs/adr/README.md` regenerated. **Never edit README.md by ha
 Run:
 
 ```bash
-cargo test --workspace && \
+cargo test && \
+cargo test -p chisel-ffi && \
 cargo clippy --workspace -- -D warnings && \
 cargo fmt --check && \
-cargo test -p chisel-ffi && \
 swift/build-xcframework.sh && \
 CHISEL_LOCAL_XCFRAMEWORK=1 swift test
 ```
