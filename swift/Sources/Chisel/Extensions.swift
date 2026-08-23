@@ -1,7 +1,7 @@
 // Extensions.swift — hand-written Swift ergonomics layer over the UniFFI-
 // generated bindings (Generated/chisel_ffi.swift). This is the first file in
 // that layer: `ChiselError.category` / `.isPoisoning` / `.message`, so
-// callers can react to an error without special-casing all 32 generated
+// callers can react to an error without special-casing all 38 generated
 // cases individually.
 //
 // Classification source of truth: the CALLER-FACING tiering in the Python
@@ -55,6 +55,7 @@ extension ChiselError {
         case .InvalidRootName: return .operational
         case .RootNameTableFull: return .operational
         case .InvalidSuperblockCount: return .operational
+        case .InvalidArgon2Params: return .operational
         case .CacheFull: return .operational
         case .SpillwayFull: return .operational
         case .TransactionInProgress: return .operational
@@ -88,6 +89,14 @@ extension ChiselError {
         case .CorruptPage: return .fatal
         case .InvalidPageId: return .fatal
         case .DecryptionFailed: return .fatal
+        case .InvalidFreemapDepth: return .fatal
+        case .InvalidNextHandle: return .fatal
+        case .TxnCounterExhausted: return .fatal
+        case .HandleSpaceExhausted: return .fatal
+        // The Rust side sets `fatal` from the engine's own is_fatal(), so an
+        // engine variant added after this binding was last regenerated still
+        // reaches the caller at the right tier instead of being guessed.
+        case .Other(_, let fatal): return fatal ? .fatal : .operational
         }
     }
 
@@ -112,6 +121,7 @@ extension ChiselError {
         case .InvalidRootName(let m): return m
         case .RootNameTableFull(let m): return m
         case .InvalidSuperblockCount(let m): return m
+        case .InvalidArgon2Params(let m): return m
         case .CacheFull(let m): return m
         case .SpillwayFull(let m): return m
         case .TransactionInProgress(let m): return m
@@ -134,6 +144,11 @@ extension ChiselError {
         case .InvalidPageId(let m): return m
         case .Poisoned(let m): return m
         case .DecryptionFailed(let m): return m
+        case .InvalidFreemapDepth(let m): return m
+        case .InvalidNextHandle(let m): return m
+        case .TxnCounterExhausted(let m): return m
+        case .HandleSpaceExhausted(let m): return m
+        case .Other(let m, _): return m
         }
     }
 }

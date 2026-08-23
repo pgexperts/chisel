@@ -37,4 +37,25 @@ final class ErrorTests: XCTestCase {
         XCTAssertEqual(ChiselError.InvalidHandle(message: "bad handle").message, "bad handle")
         XCTAssertEqual(ChiselError.Io(kind: "NotFound", errno: nil, message: "file missing").message, "file missing")
     }
+
+    // The five variants the engine grew after this binding was written. Before
+    // the SWIFT-13 fix every one of them arrived as `.Poisoned`, so
+    // InvalidArgon2Params — a rejected cost parameter, with the database
+    // untouched — was reported to callers as a fatal poisoning.
+    func testVariantsAddedAfterTheBindingClassifyCorrectly() {
+        XCTAssertEqual(ChiselError.InvalidArgon2Params(message: "x").category, .operational)
+        XCTAssertEqual(ChiselError.InvalidFreemapDepth(message: "x").category, .fatal)
+        XCTAssertEqual(ChiselError.InvalidNextHandle(message: "x").category, .fatal)
+        XCTAssertEqual(ChiselError.TxnCounterExhausted(message: "x").category, .fatal)
+        XCTAssertEqual(ChiselError.HandleSpaceExhausted(message: "x").category, .fatal)
+    }
+
+    // `.Other` carries the engine's is_fatal() verdict rather than a constant,
+    // so a future unmapped variant still reaches the caller at the right tier.
+    func testOtherCarriesItsTier() {
+        XCTAssertEqual(ChiselError.Other(message: "x", fatal: false).category, .operational)
+        XCTAssertEqual(ChiselError.Other(message: "x", fatal: true).category, .fatal)
+        XCTAssertTrue(ChiselError.Other(message: "x", fatal: true).isPoisoning)
+        XCTAssertEqual(ChiselError.Other(message: "boom", fatal: true).message, "boom")
+    }
 }
