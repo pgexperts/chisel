@@ -71,4 +71,29 @@ final class DatabaseTests: XCTestCase {
         XCTAssertEqual(try reopened.read(root), Data("durable".utf8))
         try reopened.close()
     }
+
+    // ADR 0025 chose this shape for Python and names SWIFT-3 as the
+    // mirror-image defect to fix the same way. The engine keeps a savepoint
+    // mark after a rollback_to, so a scope that rolls back without releasing
+    // leaves the name occupied — and the second attempt of a retry loop fails
+    // with DuplicateSavepoint, which reads as a bug in the caller's own loop.
+    func testSavepointScopeIsReusableAfterItsBodyThrows() throws {
+        struct Boom: Error {}
+        let db = try ChiselDatabase(path: nil)
+        try db.transaction { txn in
+            for attempt in 0..<2 {
+                XCTAssertThrowsError(
+                    try txn.savepoint("attempt") { _ in throw Boom() },
+                    "attempt \(attempt) should surface Boom, not DuplicateSavepoint"
+                ) { error in
+                    XCTAssertTrue(error is Boom, "got \(error) on attempt \(attempt)")
+                }
+            }
+            // And the scope still works when the body succeeds.
+            let h = try txn.savepoint("attempt") { _ in
+                try txn.allocate(Data("kept".utf8))
+            }
+            XCTAssertEqual(try txn.read(h), Data("kept".utf8))
+        }
+    }
 }

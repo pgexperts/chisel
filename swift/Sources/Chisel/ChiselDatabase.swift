@@ -191,7 +191,18 @@ public struct Transaction {
             try native.release(name: name)
             return result
         } catch {
+            // Both calls, in this order. The engine keeps the mark after a
+            // rollback_to — deliberately, so a caller can roll back to the
+            // same point twice — which means rolling back alone leaves the
+            // name occupied for the rest of the transaction and the next
+            // `savepoint(name)` throws DuplicateSavepoint. Releasing after
+            // the rollback makes the scope symmetric on both exit paths,
+            // which is the whole point of the closure form.
+            //
+            // Both are best-effort: a cleanup failure must not mask the error
+            // the caller actually needs to see.
             try? native.rollbackTo(name: name)
+            try? native.release(name: name)
             throw error
         }
     }
