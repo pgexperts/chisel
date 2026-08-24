@@ -618,7 +618,7 @@ mod tests {
             .collect();
 
         assert!(
-            variants.len() >= 30,
+            variants.len() >= 35,
             "parsed only {} variants out of src/error.rs — the parser is \
              broken, not the enum. Fix this test before trusting it.",
             variants.len()
@@ -634,20 +634,44 @@ mod tests {
             .expect("the From impl must end with a line-start closing brace")
             .0;
 
-        // Strip comment lines before searching. The scan is a substring match,
-        // so a variant named inside a comment — a commented-out arm, or prose
-        // like "E::Foo is handled above" — would otherwise count as mapped and
-        // exempt that variant from this guard permanently. A guard defeated by
-        // a `//` is the same flaw as the hand-maintained list this replaced.
+        // Strip whole-line `//` comments before searching, so a variant named
+        // only in a commented-out arm or in prose like "E::Foo is handled
+        // above" does not count as mapped. This is a partial defense, not a
+        // full one, and the two gaps are accepted deliberately rather than
+        // hidden: a *trailing* comment on a code line (`E::Foo => ..., //
+        // mentions E::Bar`) and a `/* */` block comment both survive this
+        // filter and could still exempt a variant permanently. Handling
+        // either properly needs a real comment-aware tokenizer, which is out
+        // of scope for a workspace-only (`publish = false`), single-file test
+        // helper — this crate's `From` impl does not use either form today,
+        // and a reviewer adding one would be the one introducing the gap.
         let from_impl_code: String = from_impl
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
 
+        // Plain `.contains(needle)` would also pass a variant whose name is a
+        // strict prefix of a mapped one (an `Io` variant would be satisfied
+        // by the text `E::IoError`), since the substring match does not care
+        // what follows it. Require the byte right after `E::{variant}` to not
+        // be an identifier-continuation character (alphanumeric or `_`) —
+        // i.e. the match must end the identifier — or to be the end of the
+        // impl body. `is_ascii_alphanumeric`/`_` matches how `variants` above
+        // was tokenized (`take_while(is_ascii_alphanumeric)`), so the check
+        // uses the same notion of "identifier character".
         let unmapped: Vec<&String> = variants
             .iter()
-            .filter(|v| !from_impl_code.contains(&format!("E::{v}")))
+            .filter(|v| {
+                let needle = format!("E::{v}");
+                !from_impl_code.match_indices(&needle).any(|(idx, _)| {
+                    from_impl_code[idx + needle.len()..]
+                        .as_bytes()
+                        .first()
+                        .map(|&b| !(b.is_ascii_alphanumeric() || b == b'_'))
+                        .unwrap_or(true)
+                })
+            })
             .collect();
 
         assert!(
