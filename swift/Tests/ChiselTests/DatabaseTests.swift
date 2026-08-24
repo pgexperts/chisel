@@ -37,4 +37,38 @@ final class DatabaseTests: XCTestCase {
             _ = try txn.defrag()
         }
     }
+
+    // `URL.path` on a non-file URL silently drops the scheme and host, so
+    // `https://example.com/prod.db` created and flocked `/prod.db` on the
+    // local filesystem, and `URL(string: "data.db")!` resolved against the
+    // process cwd — which on iOS is not a writable container location. Both
+    // succeeded silently instead of failing at the boundary.
+    func testNonFileURLIsRejected() {
+        XCTAssertThrowsError(
+            try ChiselDatabase(path: URL(string: "https://example.com/prod.db")!)
+        )
+        XCTAssertThrowsError(
+            try ChiselDatabase(path: URL(string: "data.db")!)
+        )
+    }
+
+    func testFileURLOpensCommitsAndReopens() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("chisel-swift-file-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("db.chisel")
+
+        let db = try ChiselDatabase(path: path)
+        try db.transaction { txn in
+            let h = try txn.allocate(Data("durable".utf8))
+            try txn.setRootName("root", h)
+        }
+        try db.close()
+
+        let reopened = try ChiselDatabase(path: path)
+        let root = try XCTUnwrap(try reopened.getRootName("root"))
+        XCTAssertEqual(try reopened.read(root), Data("durable".utf8))
+        try reopened.close()
+    }
 }

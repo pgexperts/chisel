@@ -45,9 +45,11 @@ extension Options {
 public final class ChiselDatabase {
     let native: NativeDatabase
 
-    /// `path: nil` opens an in-memory database.
+    /// `path: nil` opens an in-memory database. A non-nil `path` must be a
+    /// file URL — see `chiselFilePath`.
     public init(path: URL?, options: Options = Options()) throws {
-        self.native = try NativeDatabase(path: path?.path, options: options)
+        let resolved = try path.map { try chiselFilePath($0) }
+        self.native = try NativeDatabase(path: resolved, options: options)
     }
 
     /// True if a fatal error has poisoned the underlying engine handle.

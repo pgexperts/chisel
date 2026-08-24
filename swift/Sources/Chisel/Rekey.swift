@@ -27,14 +27,5 @@ import Foundation
 ///   `.InvalidEncryptionKey` if `key` unlocks no slot, `.InvalidArgon2Params`
 ///   if `argon2Params` carries unusable cost values.
 public func rekey(at path: URL, key: ChiselKey, argon2Params: Argon2Params? = nil) throws {
-    // `URL.path` on a non-file URL silently discards the scheme and host, so
-    // `https://example.com/prod.db` would rekey `/prod.db` on the local disk.
-    // Reject anything that is not a file URL at the boundary. PR 4 extracts
-    // this into a shared helper once the initializers need it too (SWIFT-5).
-    guard path.isFileURL else {
-        throw ChiselError.DatabaseFileNotFound(
-            message: "rekey requires a file URL, got scheme \(path.scheme ?? "none")"
-        )
-    }
-    try Chisel.rekey(path: path.path, key: key, argon2Params: argon2Params)
+    try Chisel.rekey(path: chiselFilePath(path), key: key, argon2Params: argon2Params)
 }
