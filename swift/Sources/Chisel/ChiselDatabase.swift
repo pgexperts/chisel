@@ -52,7 +52,15 @@ public final class ChiselDatabase {
         self.native = try NativeDatabase(path: resolved, options: options)
     }
 
-    /// True if a fatal error has poisoned the underlying engine handle.
+    /// True if this handle can no longer do work — either a fatal error has
+    /// poisoned the engine, OR the handle has already been closed.
+    ///
+    /// The second condition is easy to misread: a database closed cleanly
+    /// reports `true` here. The flag answers "can this handle still work",
+    /// not "is the file on disk damaged", so a diagnostics screen that checks
+    /// it after shutdown — or the drop-and-reopen recovery flow in
+    /// swift/README.md, which closes first — must not conclude the database
+    /// is corrupt from a `true` alone.
     public var isPoisoned: Bool { native.isPoisoned() }
     /// Close the database (drops the flock, closes the file). One-shot —
     /// see the type doc comment above for why there is no deinit-close.
@@ -112,10 +120,19 @@ public final class ChiselDatabase {
     /// Change the drain-insertion policy applied at the next commit.
     public func setDrainInsertion(_ policy: DrainInsertion) throws { try native.setDrainInsertion(policy: policy) }
 
-    /// Run `body` inside a transaction. Commits on normal return; on a thrown
-    /// error, rolls back (best-effort — a rollback failure must not mask the
-    /// original error, so it's swallowed via `try?`) and rethrows what `body`
-    /// threw.
+    /// Run `body` inside a transaction, committing on normal return.
+    ///
+    /// The error path covers a throw from `body` OR from the `commit()` that
+    /// follows it, and rethrows whichever one threw — the commit is inside the
+    /// guarded region deliberately, so a failed commit still attempts a
+    /// rollback. Note that a commit failure has already poisoned the engine
+    /// (`Chisel::commit`: a failure inside the fsync/superblock protocol is
+    /// fatal), so that rollback is expected to fail too; it is best-effort via
+    /// `try?` for that reason, and a cleanup failure never masks the error the
+    /// caller needs.
+    ///
+    /// Anything added to the error path therefore runs for commit failures as
+    /// well as caller failures — do not put "user code failed" handling there.
     public func transaction<R>(_ body: (Transaction) throws -> R) throws -> R {
         try native.begin()
         let state = TransactionState()
@@ -213,10 +230,14 @@ public struct Transaction {
     /// Consolidate sparse data pages.
     public func defrag(_ options: DefragOptions = DefragOptions()) throws -> DefragStats { try live().defrag(options: options) }
 
-    /// Nested rollback point within the active transaction. Releases (keeps
-    /// the work, drops the rollback target) on normal return; on a thrown
-    /// error, rolls back to `name` — undoing only what happened since this
-    /// savepoint, not the whole transaction — then rethrows.
+    /// Nested rollback point within the active transaction. Releases on normal
+    /// return, keeping the work and dropping the rollback target.
+    ///
+    /// The error path covers a throw from `body` OR from the `release()` that
+    /// follows it, and rethrows whichever one threw. It rolls back to `name` —
+    /// undoing only what happened since this savepoint, not the whole
+    /// transaction — and then releases the name, so the scope is symmetric and
+    /// the same name can be used again in this transaction.
     public func savepoint<R>(_ name: String, _ body: (Savepoint) throws -> R) throws -> R {
         try live().savepoint(name: name)
         let sp = Savepoint(native: native, name: name)
