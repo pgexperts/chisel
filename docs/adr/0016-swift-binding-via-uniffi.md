@@ -77,3 +77,15 @@ touched: the single-client invariant relocates from the borrow checker to the
   into the xctest helper.
 - Relates to ADR-2 (single-writer), ADR-6 (poison model), ADR-15 (encryption).
   Supersedes nothing.
+
+## Addendum (2026-08-23)
+
+The binding described above landed on `main` on this date. It had been written on
+`design/swift-binding`, a branch with no common ancestor with the published
+lineage, so it arrived as a file graft rather than a merge; that branch remains
+the record of the original 24 commits.
+
+The design held up against a month of engine drift: the consumed API surface
+needed no changes beyond the root package's rename to `chisel-storage`. Two
+decisions taken during the port are recorded separately — see the ADRs on the
+`is_fatal()`-driven error fallback and on SwiftPM distribution.
