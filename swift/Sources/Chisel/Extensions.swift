@@ -73,6 +73,7 @@ extension ChiselError {
         // operational case.
         case .Closed: return .operational
         case .AlreadyFinished: return .operational
+        case .InvalidTag: return .operational
         // FATAL. `Poisoned` means the manager already hit an integrity/I-O
         // failure and refuses further work; the only recovery is to drop the
         // handle and reopen. Fatal here even though the engine's `is_fatal()`
@@ -127,6 +128,7 @@ extension ChiselError {
         case .TransactionInProgress(let m): return m
         case .Closed(let m): return m
         case .AlreadyFinished(let m): return m
+        case .InvalidTag(let m): return m
         case .TagMismatch(let m): return m
         case .NoEncryptionKey(let m): return m
         case .InvalidEncryptionKey(let m): return m
