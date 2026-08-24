@@ -14,18 +14,18 @@ iOS 15+ / macOS 12+, Swift tools version 5.9. No Linux or Windows support — th
 
 ### Development (local build)
 
-The package's `Package.swift` currently points `ChiselFFI` at a local `.binaryTarget(path: "Chisel.xcframework")`. `Chisel.xcframework` is `.gitignore`'d — build it yourself before opening the package:
+The `Package.swift` manifest lives at the **repository root**, not here — SwiftPM requires that for the remote-URL form below to work. Its `ChiselFFI` binary target has two modes, selected by the `CHISEL_LOCAL_XCFRAMEWORK` environment variable: unset (the default) resolves a prebuilt `Chisel.xcframework.zip` from a GitHub release asset by URL and checksum; set to any value, it points at a local `.binaryTarget(path: "swift/Chisel.xcframework")` instead. `Chisel.xcframework` is `.gitignore`'d — build it yourself, then opt into the local path:
 
 ```bash
-swift/build-xcframework.sh   # cargo builds + uniffi-bindgen + xcodebuild -create-xcframework
-cd swift && swift test
+swift/build-xcframework.sh              # cargo builds + uniffi-bindgen + xcodebuild -create-xcframework
+CHISEL_LOCAL_XCFRAMEWORK=1 swift test   # from the repository root — the manifest is not in swift/
 ```
 
-The script builds `chisel-ffi` for all five Apple target triples, regenerates `Sources/Chisel/Generated/chisel_ffi.swift` from the engine's UniFFI metadata, and assembles `Chisel.xcframework`. Add the package to another project as a local Swift package (`.package(path: "path/to/chisel/swift")` or Xcode's "Add Local Package") once the xcframework exists.
+The script builds `chisel-ffi` for all five Apple target triples, regenerates `Sources/Chisel/Generated/chisel_ffi.swift` from the engine's UniFFI metadata, and assembles `Chisel.xcframework`. Add the package to another project as a local Swift package (`.package(path: "path/to/chisel")` — the repository root, not `swift/` — or Xcode's "Add Local Package") once the xcframework exists, and set `CHISEL_LOCAL_XCFRAMEWORK=1` in that project's environment too, since no release exists yet for the default mode to fall back to.
 
 ### Release (tagged versions)
 
-Not yet available — no tagged release has been cut. When one is, `Package.swift`'s `ChiselFFI` target switches to a checksummed remote binary target:
+Not yet available — no tagged release has been cut. The manifest's default `ChiselFFI` target is already the checksummed remote binary target below (currently carrying a placeholder checksum, rewritten when a release is cut):
 
 ```swift
 .binaryTarget(
@@ -35,7 +35,7 @@ Not yet available — no tagged release has been cut. When one is, `Package.swif
 )
 ```
 
-`Chisel.xcframework.zip` is uploaded to the GitHub Release rather than committed to the repository; SPM downloads and verifies it against the checksum on first resolve.
+`Chisel.xcframework.zip` is uploaded to the GitHub Release rather than committed to the repository; SPM downloads and verifies it against the checksum on first resolve. `swift/release/prepare.sh vX.Y.Z` rewrites the url/checksum above and drives the rest of the cut — see the root [`README.md`](../README.md#swift-binding) for the full release flow.
 
 ## Quick start
 
@@ -155,13 +155,14 @@ Every method on the Python binding's `Chisel`, `Transaction`, and `Savepoint` cl
 
 ## Building and testing
 
+Run these from the **repository root** — `Package.swift` lives there, not in `swift/` — with `CHISEL_LOCAL_XCFRAMEWORK=1` set so the manifest resolves the xcframework you just built instead of trying to fetch a release asset that does not exist yet:
+
 ```bash
-swift/build-xcframework.sh    # required once before the package will build at all
-cd swift
-swift build                   # debug
-swift build -c release        # release
-swift test                    # XCTest suite
-swift test --sanitize=thread  # best-effort; some macOS hosts block sanitizer injection into xctest
+swift/build-xcframework.sh                               # required once before the package will build at all
+CHISEL_LOCAL_XCFRAMEWORK=1 swift build                    # debug
+CHISEL_LOCAL_XCFRAMEWORK=1 swift build -c release         # release
+CHISEL_LOCAL_XCFRAMEWORK=1 swift test                     # XCTest suite
+CHISEL_LOCAL_XCFRAMEWORK=1 swift test --sanitize=thread   # best-effort; some macOS hosts block sanitizer injection into xctest
 ```
 
 CI (`.github/workflows/swift.yml`) runs the `chisel-ffi` Rust test suite, a cross-compile check for the iOS device/simulator targets, the full xcframework build, and the Swift test suite on `macos-14`.
