@@ -8,6 +8,8 @@ For the theory of operation and the rationale behind these decisions — why sha
 
 This is a living document; update it when the architecture changes. Decisions documented here should be supportable by the code at the time you read it — if a claim and the code disagree, trust the code and update the doc.
 
+This document covers the engine crate (`src/`) only. Two bindings sit outside it: `python/` (PyO3) and `chisel-ffi/` + `swift/` (UniFFI) — see their own READMEs. The one fact worth carrying over here: `chisel-ffi` is the only crate that speaks the C ABI, and it wraps `chisel::Chisel` in `Mutex<Option<Chisel>>` — the `Option` lets a `&self` method move the engine out when `close(self)` is called, and the `Mutex` makes the wrapper `Sync`, which a UniFFI-exported object must be, since the bare engine type is `Send + !Sync`. Every ergonomic construct built on top of it (transaction closures, the async `ChiselStore` actor) lives in Swift, not Rust.
+
 ## Table of contents
 
 1. [Design commitments](#design-commitments)
