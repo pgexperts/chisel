@@ -124,6 +124,21 @@ also runs `cargo test -p chisel-ffi` — a root `cargo test` honours
 `default-members` and skips it. See [`swift/README.md`](swift/README.md) for
 usage and [`swift/PARITY.md`](swift/PARITY.md) for the Python↔Swift map.
 
+**Consuming it from another package.** Add the dependency:
+
+```swift
+.package(url: "https://github.com/pgexperts/chisel.git", from: "1.1.0")
+```
+
+SwiftPM fetches a prebuilt xcframework from the release asset, so consumers need
+no Rust toolchain. Note that this requires a **published GitHub release** — until
+one exists, build from a clone with `swift/build-xcframework.sh` and set
+`CHISEL_LOCAL_XCFRAMEWORK=1`, which is also how this repo's own CI runs.
+
+To cut a release: `swift/release/prepare.sh vX.Y.Z`, commit, tag, push, then
+publish the release on GitHub. `swift-release.yml` re-runs the tests, verifies
+the committed checksum against a rebuild, and uploads the asset.
+
 ### Benchmark suite
 
 The `bench/` subcrate provides Criterion micro-grid + YCSB-style scenario benchmarks comparing Chisel against redb and SQLite:
