@@ -35,10 +35,17 @@ use chisel::{Handle, Tag};
 // `into()` lower both resolve without an explicit closure.
 uniffi::custom_type!(Handle, u64, { remote });
 
-// Tag bridges as u32. try_lift rejects 0 via the engine's real
-// `TryFrom<u32> for Tag` (Err(ZeroTagError) on zero) — the shorthand's
-// generated `try_into()` calls exactly that impl, so "0 is untagged" is
-// enforced by the engine's own type, not reimplemented here.
+// Tag bridges as u32, but only in the RETURN direction: no exported method
+// takes `chisel::Tag` as a parameter, so this lift never actually runs on
+// input. Every method that accepts a tag from Swift (`allocate_tagged`,
+// `handles_with_tag`, `delete_tagged`, `delete_with_tag`) takes a plain u32
+// and validates it explicitly via `tag_from` in database.rs instead —
+// deliberately, because a `try_lift` failure surfaces to Swift as an
+// untyped UniFFI internal error, not a `ChiselError`, and the binding's
+// contract is that every throwing call raises `ChiselError`. `tag_from` is
+// what makes "0 is untagged" rejectable as a typed error; this custom_type!
+// only exists so `chisel::Tag` can lower cleanly out of `db.tag()`'s
+// `Option<chisel::Tag>` return value.
 uniffi::custom_type!(Tag, u32, { remote });
 
 #[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]

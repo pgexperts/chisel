@@ -314,8 +314,6 @@ impl From<chisel::ChiselError> for ChiselError {
 mod tests {
     use super::*;
 
-    // Every engine error must map to exactly one FFI variant. This guards
-    // against a silently-dropped variant when the engine grows a new error.
     #[test]
     fn io_error_maps_and_carries_kind() {
         let e = chisel::ChiselError::from(std::io::Error::new(
@@ -403,7 +401,7 @@ mod tests {
     // instance of EVERY current engine variant (template: src/error.rs's
     // is_fatal_matches_documented_classification_for_every_variant) and asserts
     // `From` yields the exact expected FFI case. Because the engine enum is
-    // #[non_exhaustive], the `From` match ends in a `_ => Poisoned` wildcard, so
+    // #[non_exhaustive], the `From` match ends in a `_ => Other` wildcard, so
     // a deleted arm, a duplicated arm, or a variant silently falling through the
     // wildcard would all be invisible to the compiler — this test is the only
     // CI signal that catches them for every known variant.
@@ -411,7 +409,7 @@ mod tests {
     fn every_engine_variant_maps_to_its_ffi_case() {
         use chisel::ChiselError as E;
 
-        // (engine variant instance, expected FFI case name). Covers all 30
+        // (engine variant instance, expected FFI case name). Covers all 35
         // current engine variants. `Poisoned` is the only pair whose target is
         // "Poisoned" — every OTHER variant mapping to "Poisoned" would mean it
         // fell through the non_exhaustive wildcard, which the exact-name assert
