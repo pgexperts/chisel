@@ -28,3 +28,7 @@ swift/*.o
 swift/*.d
 swift/*.swiftdeps
 swift/*.swiftdeps~
+
+# SwiftPM resolves the root manifest, so its build directory is at the root too.
+/.build/
+/.swiftpm/

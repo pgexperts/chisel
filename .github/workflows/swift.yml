@@ -55,9 +55,14 @@ jobs:
       - name: Build xcframework
         run: swift/build-xcframework.sh
 
-      # Hard gate: this must pass for the pipeline to be green.
+      # Hard gate: this must pass for the pipeline to be green. The env var
+      # selects the xcframework just built above; without it the manifest
+      # resolves the release asset by URL, which is wrong for testing the
+      # working tree and impossible before the first release exists.
       - name: Swift tests
-        run: cd swift && swift test
+        env:
+          CHISEL_LOCAL_XCFRAMEWORK: "1"
+        run: swift test
 
       # Best-effort: attempts the same suite under ThreadSanitizer. On a
       # host where SIP blocks sanitizer-dylib injection into the xctest
@@ -66,7 +71,11 @@ jobs:
       # blocking; the plain `swift test` above remains the true gate.
       - name: Swift tests (ThreadSanitizer, best-effort)
         continue-on-error: true
-        run: cd swift && swift test --sanitize=thread
+        env:
+          CHISEL_LOCAL_XCFRAMEWORK: "1"
+        run: swift test --sanitize=thread
 
       - name: Swift build (release config)
-        run: cd swift && swift build -c release
+        env:
+          CHISEL_LOCAL_XCFRAMEWORK: "1"
+        run: swift build -c release
