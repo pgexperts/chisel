@@ -118,7 +118,11 @@ public final class ChiselDatabase {
     /// threw.
     public func transaction<R>(_ body: (Transaction) throws -> R) throws -> R {
         try native.begin()
-        let txn = Transaction(native: native)
+        let state = TransactionState()
+        let txn = Transaction(native: native, state: state)
+        // Both exits, including the commit-failure path. After this returns,
+        // any copy of `txn` that escaped the closure refuses work.
+        defer { state.finished = true }
         do {
             let result = try body(txn)
             try native.commit()
@@ -130,6 +134,21 @@ public final class ChiselDatabase {
     }
 }
 
+/// One-shot liveness flag shared by every copy of a `Transaction` value.
+///
+/// `Transaction` stays a struct so its value semantics and its
+/// `@Sendable`-closure usage in `ChiselStore` are unchanged; only the flag is
+/// a reference. Copying the struct out of its closure copies this reference,
+/// so an escaped copy observes the same `finished` and refuses work exactly as
+/// a class-based façade would.
+///
+/// Not synchronized, and does not need to be: the sync `ChiselDatabase` is
+/// thread-confined by contract, and `ChiselStore` funnels every access through
+/// one serial queue — the same confinement invariant `DatabaseBox` documents.
+final class TransactionState {
+    var finished = false
+}
+
 /// Operations valid only inside a `transaction { }` block. Forwards to the
 /// same engine object as the enclosing `ChiselDatabase`; not escapable
 /// (don't store this past the closure — the transaction it refers to may
@@ -139,52 +158,67 @@ public final class ChiselDatabase {
 // closure; see ChiselStore's serial-queue confinement.
 public struct Transaction {
     let native: NativeDatabase
+    let state: TransactionState
+
+    /// The engine object, or a throw if this transaction's scope has exited.
+    ///
+    /// Every forwarder below goes through here. The FFI has reserved
+    /// `.AlreadyFinished` for exactly this guard since the binding was written
+    /// and nothing ever raised it; this is the Python shape ADR 0025 chose.
+    private func live() throws -> NativeDatabase {
+        guard !state.finished else {
+            throw ChiselError.AlreadyFinished(
+                message: "transaction has already been committed or rolled back"
+            )
+        }
+        return native
+    }
 
     /// Store a value; returns its handle.
-    public func allocate(_ value: Data) throws -> Handle { try native.allocate(value: value) }
+    public func allocate(_ value: Data) throws -> Handle { try live().allocate(value: value) }
     /// Retrieve a value by handle.
-    public func read(_ handle: Handle) throws -> Data { try native.read(handle: handle) }
+    public func read(_ handle: Handle) throws -> Data { try live().read(handle: handle) }
     /// Replace a value in place; the handle is preserved.
-    public func update(_ handle: Handle, _ value: Data) throws { try native.update(handle: handle, value: value) }
+    public func update(_ handle: Handle, _ value: Data) throws { try live().update(handle: handle, value: value) }
     /// Remove a handle.
-    public func delete(_ handle: Handle) throws { try native.delete(handle: handle) }
+    public func delete(_ handle: Handle) throws { try live().delete(handle: handle) }
     /// Batch-delete several handles in this transaction.
-    public func deleteMany(_ handles: [Handle]) throws { try native.deleteMany(handles: handles) }
+    public func deleteMany(_ handles: [Handle]) throws { try live().deleteMany(handles: handles) }
     /// Store a value with an immutable tag; returns its handle.
-    public func allocateTagged(_ value: Data, tag: Tag) throws -> Handle { try native.allocateTagged(value: value, tag: tag) }
+    public func allocateTagged(_ value: Data, tag: Tag) throws -> Handle { try live().allocateTagged(value: value, tag: tag) }
     /// Read a handle's tag, or `nil` if untagged.
-    public func tag(_ handle: Handle) throws -> Tag? { try native.tag(handle: handle) }
+    public func tag(_ handle: Handle) throws -> Tag? { try live().tag(handle: handle) }
     /// Enumerate live handles carrying `tag`; repeatable within a session, order unspecified.
-    public func handlesWithTag(_ tag: Tag) throws -> [Handle] { try native.handlesWithTag(tag: tag) }
+    public func handlesWithTag(_ tag: Tag) throws -> [Handle] { try live().handlesWithTag(tag: tag) }
     /// Delete only if the handle's stored tag matches; else throws `.TagMismatch`.
-    public func deleteTagged(_ handle: Handle, tag: Tag) throws { try native.deleteTagged(handle: handle, tag: tag) }
+    public func deleteTagged(_ handle: Handle, tag: Tag) throws { try live().deleteTagged(handle: handle, tag: tag) }
     /// Bounded relation-drop: delete up to `max` chunks carrying `tag`.
-    public func deleteWithTag(_ tag: Tag, max: UInt64) throws -> TagDropProgress { try native.deleteWithTag(tag: tag, max: max) }
+    public func deleteWithTag(_ tag: Tag, max: UInt64) throws -> TagDropProgress { try live().deleteWithTag(tag: tag, max: max) }
     /// Read the handle's opaque client byte, `0` if unset.
-    public func clientByte(_ handle: Handle) throws -> UInt8 { try native.clientByte(handle: handle) }
+    public func clientByte(_ handle: Handle) throws -> UInt8 { try live().clientByte(handle: handle) }
     /// Set the opaque client byte; `update()` preserves it.
-    public func setClientByte(_ handle: Handle, _ byte: UInt8) throws { try native.setClientByte(handle: handle, byte: byte) }
+    public func setClientByte(_ handle: Handle, _ byte: UInt8) throws { try live().setClientByte(handle: handle, byte: byte) }
     /// Bind a name to a handle in the named-root table.
-    public func setRootName(_ name: String, _ handle: Handle) throws { try native.setRootName(name: name, handle: handle) }
+    public func setRootName(_ name: String, _ handle: Handle) throws { try live().setRootName(name: name, handle: handle) }
     /// Look up a named root; `nil` if unbound.
-    public func getRootName(_ name: String) throws -> Handle? { try native.getRootName(name: name) }
+    public func getRootName(_ name: String) throws -> Handle? { try live().getRootName(name: name) }
     /// Remove a named root.
-    public func clearRootName(_ name: String) throws { try native.clearRootName(name: name) }
+    public func clearRootName(_ name: String) throws { try live().clearRootName(name: name) }
     /// Enumerate all live handles; repeatable within a session, order unspecified.
-    public func handles() throws -> [Handle] { try native.handles() }
+    public func handles() throws -> [Handle] { try live().handles() }
     /// Handle count, page count, and file size.
-    public func stats() throws -> Stats { try native.stats() }
+    public func stats() throws -> Stats { try live().stats() }
     /// Cumulative cache/fsync activity counters since the most recent open.
-    public func counters() throws -> Counters { try native.counters() }
+    public func counters() throws -> Counters { try live().counters() }
     /// Consolidate sparse data pages.
-    public func defrag(_ options: DefragOptions = DefragOptions()) throws -> DefragStats { try native.defrag(options: options) }
+    public func defrag(_ options: DefragOptions = DefragOptions()) throws -> DefragStats { try live().defrag(options: options) }
 
     /// Nested rollback point within the active transaction. Releases (keeps
     /// the work, drops the rollback target) on normal return; on a thrown
     /// error, rolls back to `name` — undoing only what happened since this
     /// savepoint, not the whole transaction — then rethrows.
     public func savepoint<R>(_ name: String, _ body: (Savepoint) throws -> R) throws -> R {
-        try native.savepoint(name: name)
+        try live().savepoint(name: name)
         let sp = Savepoint(native: native, name: name)
         do {
             let result = try body(sp)
@@ -209,10 +243,16 @@ public struct Transaction {
 }
 
 /// A named savepoint scope. It carries no operations of its own — use the
-/// enclosing `Transaction` for reads/writes, same engine, same active
+/// enclosing `Transaction` for reads and writes, same engine, same active
 /// transaction. This type exists only so `savepoint { }` has something
-/// distinct from `Transaction` to hand the body, scoping release/rollback to
-/// the right name.
+/// distinct from `Transaction` to hand the body.
+///
+/// Deliberately has NO one-shot `finished` guard, unlike `Transaction`: it has
+/// no forwarders for such a guard to protect. Python's `Savepoint` does need
+/// one (ADR 0025) because it exposes `release` / `rollback_to` as callable
+/// methods; here those are reachable only through the closure's own exit
+/// paths, so an escaped `Savepoint` can do nothing at all with it. If this
+/// type ever gains an operation, it needs the `Transaction` treatment first.
 //
 // IMPORTANT: do not make Sendable — a Savepoint must not escape its
 // closure; see ChiselStore's serial-queue confinement.

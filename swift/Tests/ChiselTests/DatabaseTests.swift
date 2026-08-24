@@ -96,4 +96,57 @@ final class DatabaseTests: XCTestCase {
             XCTAssertEqual(try txn.read(h), Data("kept".utf8))
         }
     }
+
+    // `var escaped: Transaction?; try db.transaction { escaped = $0 }` compiles
+    // today, and calling through the escaped copy afterwards did NOT error:
+    // NativeDatabase.with_db just takes the lock and dispatches to whatever
+    // transaction the engine currently has open, so a write meant for the
+    // finished transaction silently joined and committed with the next one.
+    //
+    // Python guards this with a per-object finished flag raising
+    // AlreadyFinishedError (ADR 0025). The FFI reserved the matching case from
+    // the start and nothing ever constructed it.
+    func testEscapedTransactionRefusesWork() throws {
+        let db = try ChiselDatabase(path: nil)
+        var escaped: Transaction?
+        try db.transaction { txn in escaped = txn }
+        let stale = try XCTUnwrap(escaped)
+
+        XCTAssertThrowsError(try stale.allocate(Data("late".utf8))) { error in
+            guard let e = error as? ChiselError else { return XCTFail("expected ChiselError") }
+            XCTAssertEqual(e.category, .operational)
+            // Pattern-match the case rather than comparing a string.
+            // `String(describing:)` would return the MESSAGE here, not the
+            // case name — Extensions.swift makes ChiselError
+            // CustomStringConvertible with `description == message`.
+            guard case .AlreadyFinished = e else {
+                return XCTFail("expected .AlreadyFinished, got \(e)")
+            }
+        }
+        XCTAssertThrowsError(try stale.read(Handle(0)))
+        XCTAssertThrowsError(try stale.handles())
+    }
+
+    // A write through a stale handle must not join a LATER transaction — the
+    // specific silent-corruption path SWIFT-4 describes.
+    func testEscapedTransactionCannotJoinTheNextTransaction() throws {
+        let db = try ChiselDatabase(path: nil)
+        var escaped: Transaction?
+        try db.transaction { txn in escaped = txn }
+        let stale = try XCTUnwrap(escaped)
+
+        try db.transaction { txn in
+            XCTAssertThrowsError(try stale.allocate(Data("intruder".utf8)))
+            _ = try txn.allocate(Data("legitimate".utf8))
+        }
+        let all = try db.handles()
+        XCTAssertEqual(all.count, 1, "the stale write must not have joined")
+    }
+
+    // The guard must not fire during the scope it belongs to.
+    func testTransactionWorksNormallyInsideItsScope() throws {
+        let db = try ChiselDatabase(path: nil)
+        let h = try db.transaction { txn in try txn.allocate(Data("fine".utf8)) }
+        XCTAssertEqual(try db.read(h), Data("fine".utf8))
+    }
 }
