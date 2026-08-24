@@ -156,3 +156,26 @@ extension ChiselError {
 extension ChiselError: CustomStringConvertible {
     public var description: String { message }
 }
+
+// ChiselKey carries the user's plaintext credential, so it must never render
+// its payload. Swift's default enum reflection prints associated values, which
+// means `print(key)`, `"\(key)"`, `os_log("\(key)")`, and XCTest failure
+// messages would all disclose a passphrase verbatim — and on iOS those
+// destinations are routinely uploaded off-device.
+//
+// Both conformances are required: `description` covers interpolation and
+// print; `debugDescription` covers String(reflecting:), dump, and the
+// debugger. Mirrors the Rust-side redaction in chisel-ffi/src/types.rs and the
+// engine's own hand-written Debug for crypto::Key.
+//
+// The variant name is safe and useful — it says which credential KIND was
+// supplied. The length is not: key length is a fingerprint.
+extension ChiselKey: CustomStringConvertible, CustomDebugStringConvertible {
+    public var description: String {
+        switch self {
+        case .raw: return "ChiselKey.raw(<redacted>)"
+        case .passphrase: return "ChiselKey.passphrase(<redacted>)"
+        }
+    }
+    public var debugDescription: String { description }
+}
