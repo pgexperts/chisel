@@ -28,7 +28,8 @@ contract:
   joined, and committed with, the *next* transaction. The FFI had reserved
   `.AlreadyFinished` for this guard, but nothing ever raised it.
 
-The Python binding had already settled the analogous questions (ADR 0025).
+The Python binding had already settled the transaction and savepoint
+questions (ADR 0025), and validates tags explicitly in `python/src/db.rs`.
 
 ## Decision
 
@@ -55,9 +56,12 @@ a `ChiselError` case:
 
 - **Keep zero-tag rejection in the `custom_type!` lift.** Rejected: the lift
   cannot produce a typed error, which was the defect.
-- **A Swift `Tag` struct with a failable initializer.** Rejected: it validates
-  only on the Swift side, adds a wrapper type to every tagged call site, and
-  would still need the FFI check for any other UniFFI consumer.
+- **A Swift `Tag` struct with a failable initializer.** The 2026-07-18 binding
+  design planned this, and the 2026-07-29 review offered it as one fix. The
+  port spec chose the FFI check without recording why the struct lost.
+  > Rationale not recovered from project sources. An evident difference: a
+  > Swift-side type protects only Swift callers, while the FFI check protects
+  > any UniFFI consumer.
 - **Match Python's `ValueError` for zero tags.** Not possible in Swift's error
   model. The stronger "always `ChiselError`" contract was kept, accepting exact
   parity loss here.

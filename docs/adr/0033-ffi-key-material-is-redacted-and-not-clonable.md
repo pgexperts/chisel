@@ -3,7 +3,7 @@ id: 0033
 title: FFI key material is redacted in every rendering and is not clonable
 date: 2026-10-15
 status: Accepted
-summary: ChiselKey and Options in chisel-ffi hand-write a redacting Debug and drop Clone, and the Swift ChiselKey conforms to CustomStringConvertible and CustomDebugStringConvertible with redacted output, so no formatting path prints a secret and no copy escapes zeroization.
+summary: ChiselKey and Options in chisel-ffi hand-write a redacting Debug and drop Clone, and the Swift ChiselKey redacts its description, debugDescription and Mirror, so no rendering or reflection path prints a secret and no Rust-side copy escapes zeroization.
 ---
 
 # 0033. FFI key material is redacted in every rendering and is not clonable
@@ -35,28 +35,37 @@ The Swift side had the same exposure through string interpolation, `print`,
   reintroduce the leak.
 - `Clone` is removed from both. Every consumer takes them by value and
   `into_engine(self)` consumes them.
-- The Swift `ChiselKey` conforms to both `CustomStringConvertible` and
-  `CustomDebugStringConvertible`, returning `ChiselKey.raw(<redacted>)` /
-  `ChiselKey.passphrase(<redacted>)`. Both conformances are needed:
-  `description` covers interpolation and `print`; `debugDescription` covers
-  `String(reflecting:)`, `dump` and the debugger. `Options` redacts through its
-  embedded key via Swift reflection. A test asserts this.
+- The Swift `ChiselKey` conforms to `CustomStringConvertible`,
+  `CustomDebugStringConvertible` and `CustomReflectable`. The first two return
+  `ChiselKey.raw(<redacted>)` / `ChiselKey.passphrase(<redacted>)`, covering
+  interpolation, `print` and `String(reflecting:)`. The third returns a Mirror
+  with no children. That is required because `dump` prints the custom
+  description as a header and then walks the Mirror, and an enum's associated
+  value is one of its children. Without it, `dump(key)` and `dump(options)`
+  printed the passphrase directly beneath `<redacted>`. That gap shipped with
+  the stack and was found and closed while recording this ADR.
+- `Options` has no Swift conformance of its own; it redacts through its
+  embedded key. Tests cover interpolation, `String(describing:)`,
+  `String(reflecting:)`, `dump` and a bare Mirror walk, both on the key and
+  through `Options`.
 
 ## Alternatives considered
 
 - **Keep the derives and rely on call-site discipline.** Rejected: that is the
   trap the issue describes. The first careless `{:?}` leaks.
-- **Wrap the payload in a `Secret`-style newtype across the FFI.** Rejected:
-  UniFFI records and enums must carry plain lowerable types. A newtype would
-  need a `custom_type!` conversion and still reach Swift as plain `Data`/`String`.
+- **Wrap the payload in a `Secret`-style newtype across the FFI.** Not
+  recorded as considered in the spec, plan or review. If revisited, note that
+  UniFFI lowers a `custom_type!` to its underlying type (as it does for `Tag`,
+  `chisel-ffi/src/types.rs`), so the payload would still reach Swift as plain
+  `Data`/`String`. That is an observation, not the recorded reason.
 - **Redact in Rust only.** Rejected: the Swift values are generated
   independently and render through Swift's own protocols, so Rust-side
   redaction does not cover them.
 
 ## Consequences
 
-- No formatting path in Rust or Swift prints key material, and logging
-  `Options` is safe.
+- No `Debug`, description, or Mirror-based rendering in Rust or Swift prints
+  key material, and logging `Options` is safe.
 - A caller who needs two `Options` values must construct both. Nothing in the
   binding or its tests needed `Clone`.
 - Swift's generated `ChiselKey` still exposes its associated values to pattern
