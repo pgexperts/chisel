@@ -2818,7 +2818,7 @@ Cross-phase dependencies (flagged, not invented):
 - `crate::crypto::{PageCipher, ENC_PAGE_SIZE, random_dek}` and `page::stamp_checksum` are Phase-1 / existing `page.rs` symbols consumed verbatim.
 - Engine wiring (call `io.set_stride(ENC_PAGE_SIZE)` + `cache.set_cipher(...)` at open after the DEK is unwrapped) is Phase 2's `TransactionManager`/`Chisel::open` responsibility; Phase 3 only provides the `set_stride`/`set_cipher` entry points.
 
-Relevant files: `/Users/xof/Documents/Dev/chisel/src/page_io.rs`, `/Users/xof/Documents/Dev/chisel/src/spillway.rs`, `/Users/xof/Documents/Dev/chisel/src/page_cache.rs`.
+Relevant files: `/Users/xof/Documents/Dev/PVC/chisel/src/page_io.rs`, `/Users/xof/Documents/Dev/PVC/chisel/src/spillway.rs`, `/Users/xof/Documents/Dev/PVC/chisel/src/page_cache.rs`.
 
 ---
 
