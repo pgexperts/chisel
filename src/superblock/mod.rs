@@ -37,9 +37,10 @@ use std::fmt;
 use zeroize::Zeroizing;
 
 mod crypto_header;
-// Re-export the crypto-header API for consumers (open/create code in later
-// phases, key-management tools, tests). Items not yet referenced in non-test
-// module code are still public API surface — the allow is intentional.
+// Re-export the crypto-header API for the open/create, rekey and
+// key-management paths. `CRYPTO_HEADER_OFFSET`, `CRYPTO_HEADER_SIZE` and
+// `KEY_SLOT_SIZE` are referenced only from tests (they locate the slots to
+// corrupt them), so a non-test build sees them as unused — hence the allow.
 #[allow(unused_imports)]
 pub use crypto_header::{
     CryptoHeader, KeySlot, ALGO_XCHACHA20POLY1305, CRYPTO_HEADER_OFFSET, CRYPTO_HEADER_SIZE,

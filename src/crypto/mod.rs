@@ -4,7 +4,9 @@
 // PageCipher (whole-page + variable-length body seal/open), the envelope KDF
 // (HKDF-SHA256 for raw keys, Argon2id for passphrases), DEK wrap/unwrap, and
 // the zeroizing key types. Nothing here touches page_io, the cache, or the
-// superblock — those layers consume this module in later phases. See
+// superblock; the dependency runs the other way (the page cache holds a
+// `PageCipher`, the superblock seals its sensitive body with it and wraps the
+// DEK into its key slots with `wrap_dek`/`unwrap_dek`). See
 // docs/specs/2026-06-29-on-disk-encryption-design.md §3.
 //
 // All randomness is OS-sourced (getrandom). Rolling our own crypto is
@@ -430,7 +432,8 @@ pub fn random_dek() -> Dek {
 
 /// Holds the DEK and performs the two seal/open transforms the engine needs:
 /// whole-page (fixed 8192→8232) and variable-length body (superblock sub-blob).
-/// Lives in the page-cache layer in later phases; here it is fully standalone.
+/// The page cache holds the engine's instance (`PageCache::set_cipher`); the
+/// type itself has no engine coupling.
 /// The AEAD cipher is derived from the DEK on each `seal`/`open` call; this is
 /// cheap for XChaCha20-Poly1305 and avoids holding any additional per-call state.
 ///
