@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status (2026-10-15):** Tasks 1–18 are done. The Closing-out items remain open until the PR stack merges.
+
 **Goal:** Land the Chisel Swift/UniFFI binding on `main` as a fully tested, CI-gated, SwiftPM-consumable workspace member with every filed defect closed.
 
 **Architecture:** `chisel-ffi` is the only crate speaking the C ABI; it wraps `chisel::Chisel` in `Mutex<Option<Chisel>>` and exports a flat synchronous surface to UniFFI. All ergonomics (transaction closures, the async actor) live in the hand-written Swift layer above the generated bindings. The engine crate is not modified by any task in this plan.
@@ -112,7 +114,7 @@ port regression stays distinguishable from a fix regression.
 - Consumes: nothing.
 - Produces: the crate `chisel-ffi` with `NativeDatabase`, `ChiselError`, `FfiResult<T>`, `Options`, `Stats`, `Counters`, `DefragOptions`, `DefragStats`, `DrainInsertion`, `ChiselKey`, `Argon2Params`, `TagDropProgress`, and `library_version() -> String`. Every later task builds on these exact names.
 
-- [ ] **Step 1: Graft the files**
+- [x] **Step 1: Graft the files**
 
 ```bash
 git archive design/swift-binding chisel-ffi | tar -x -C .
@@ -122,12 +124,12 @@ git archive design/swift-binding \
   docs/plans/2026-07-18-swift-binding.md | tar -x -C .
 ```
 
-- [ ] **Step 2: Verify the graft is complete and nothing else moved**
+- [x] **Step 2: Verify the graft is complete and nothing else moved**
 
 Run: `git status --short`
 Expected: exactly `?? chisel-ffi/`, `?? swift/`, and the two `?? docs/` files. No modifications to `src/`, `python/`, or `bench/`. If `src/` shows changes, the archive extracted the wrong tree — reset and redo.
 
-- [ ] **Step 3: Rename the engine dependency**
+- [x] **Step 3: Rename the engine dependency**
 
 `main` renamed the root package `chisel` → `chisel-storage` (v1.0.0) while keeping `[lib] name = "chisel"`. The `package =` key preserves every `use chisel::…` in the source unchanged.
 
@@ -146,7 +148,7 @@ with:
 chisel = { package = "chisel-storage", path = ".." }
 ```
 
-- [ ] **Step 4: Add the workspace member and correct the stale comments (SWIFT-10)**
+- [x] **Step 4: Add the workspace member and correct the stale comments (SWIFT-10)**
 
 In the root `Cargo.toml`, replace:
 
@@ -181,17 +183,17 @@ Then replace the opening sentence of the `default-members` paragraph — `` `def
 
 (The nine existing lines about pyo3's `extension-module` follow unchanged.)
 
-- [ ] **Step 5: Verify the crate compiles and its tests pass against `main`'s engine**
+- [x] **Step 5: Verify the crate compiles and its tests pass against `main`'s engine**
 
 Run: `cargo test -p chisel-ffi`
 Expected: PASS, 18 tests. If `From<chisel::ChiselError>` fails to compile, the graft picked up a stale tree — recheck Step 1.
 
-- [ ] **Step 6: Verify the workspace is clean**
+- [x] **Step 6: Verify the workspace is clean**
 
 Run: `cargo clippy --workspace -- -D warnings && cargo fmt --check`
 Expected: both clean. `--workspace` overrides `default-members`, so this does lint `chisel-ffi`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add chisel-ffi Cargo.toml docs/specs/2026-07-18-swift-binding-design.md docs/plans/2026-07-18-swift-binding.md
@@ -221,12 +223,12 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: `chisel-ffi` from Task 1.
 - Produces: `ChiselDatabase`, `ChiselStore`, `Transaction`, `Savepoint`, `ChiselError.category`/`.isPoisoning`/`.message`, `ChiselKey.keychain(service:account:)`. A green `swift test`.
 
-- [ ] **Step 1: Build the xcframework and confirm the Swift suite passes**
+- [x] **Step 1: Build the xcframework and confirm the Swift suite passes**
 
 Run: `swift/build-xcframework.sh && (cd swift && swift test)`
 Expected: PASS, 12 test methods across 6 files. This is the first time the grafted Swift layer meets `main`'s engine; a failure here is a real drift signal, not a flake.
 
-- [ ] **Step 2: Add the CI workflow**
+- [x] **Step 2: Add the CI workflow**
 
 Create `.github/workflows/swift.yml` with the content of `git show design/swift-binding:.github/workflows/swift.yml`, changing **only** the trigger block. Replace:
 
@@ -252,12 +254,12 @@ on:
   pull_request:
 ```
 
-- [ ] **Step 3: Verify the workflow parses**
+- [x] **Step 3: Verify the workflow parses**
 
 Run: `python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/swift.yml')); print('ok')"`
 Expected: `ok`
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add swift .github/workflows/swift.yml
@@ -276,7 +278,7 @@ filter matches the PR base and silently gave stacked PRs zero checks.
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
 
-- [ ] **Step 5: Open the PR**
+- [x] **Step 5: Open the PR**
 
 ```bash
 git push -u origin feat/swift-binding-port
@@ -324,7 +326,7 @@ Branch: `fix/swift-13-error-mapping`, cut from the PR 1 branch.
 - Consumes: `chisel-ffi` from Task 1.
 - Produces: FFI `ChiselError` cases `InvalidArgon2Params { message }`, `InvalidFreemapDepth { message }`, `InvalidNextHandle { message }`, `TxnCounterExhausted { message }`, `HandleSpaceExhausted { message }`, and `Other { message: String, fatal: bool }`. Tasks 5 and 11 switch over these exact names.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the `tests` module in `chisel-ffi/src/error.rs`:
 
@@ -369,12 +371,12 @@ Append to the `tests` module in `chisel-ffi/src/error.rs`:
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p chisel-ffi new_engine_variants_map_to_their_own_cases_at_the_right_tier`
 Expected: FAIL — `assertion failed: left == right`, with `"Poisoned"` on the left for the first assertion. That failure *is* the bug.
 
-- [ ] **Step 3: Add the five variants and the tiered fallback to the enum**
+- [x] **Step 3: Add the five variants and the tiered fallback to the enum**
 
 In `chisel-ffi/src/error.rs`, add `InvalidArgon2Params` to the **operational** group (immediately after `InvalidSuperblockCount`):
 
@@ -424,7 +426,7 @@ At the very end of the enum, after `DecryptionFailed`, add the fallback:
     },
 ```
 
-- [ ] **Step 4: Add the explicit `From` arms and retire the wildcard**
+- [x] **Step 4: Add the explicit `From` arms and retire the wildcard**
 
 In `impl From<chisel::ChiselError> for ChiselError`, add after the `E::InvalidSuperblockCount` arm:
 
@@ -464,7 +466,7 @@ Then replace the whole trailing wildcard arm — the comment block plus `_ => Se
             },
 ```
 
-- [ ] **Step 5: Extend `message()` and `ffi_name`**
+- [x] **Step 5: Extend `message()` and `ffi_name`**
 
 In `ChiselError::message()`, add these to the or-pattern chain (they bind `message` identically, so they join the existing chain):
 
@@ -488,7 +490,7 @@ In the test helper `ffi_name`, add the six arms (it has no wildcard, so it will 
             ChiselError::Other { .. } => "Other",
 ```
 
-- [ ] **Step 6: Update the legacy coverage test's five new cases and its count**
+- [x] **Step 6: Update the legacy coverage test's five new cases and its count**
 
 The existing `every_engine_variant_maps_to_its_ffi_case` asserts `cases.len() == 30` with the message `"expected all 30 current engine variants to be covered"`. Add the five new pairs to its `cases` vec:
 
@@ -541,12 +543,12 @@ with:
             );
 ```
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 Run: `cargo test -p chisel-ffi`
 Expected: PASS, 19 tests (18 existing plus this one; Task 4 adds the twentieth). Confirm `new_engine_variants_map_to_their_own_cases_at_the_right_tier` passes.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add chisel-ffi/src/error.rs
@@ -576,7 +578,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: the `From` impl from Task 3.
 - Produces: `every_engine_variant_has_an_explicit_ffi_arm`, the test that fails when a future engine variant has no arm.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 The existing guard is a hand-maintained `Vec` — it can only check variants it already names, which is why five went unnoticed. This one derives the variant set from the engine's source. Append to the `tests` module:
 
@@ -663,7 +665,7 @@ The existing guard is a hand-maintained `Vec` — it can only check variants it 
     }
 ```
 
-- [ ] **Step 2: Run it to verify it passes now, and would have failed before**
+- [x] **Step 2: Run it to verify it passes now, and would have failed before**
 
 Run: `cargo test -p chisel-ffi every_engine_variant_has_an_explicit_ffi_arm`
 Expected: PASS (Task 3 added all five arms).
@@ -671,16 +673,16 @@ Expected: PASS (Task 3 added all five arms).
 To confirm the test has teeth rather than passing vacuously, temporarily comment out the `E::TxnCounterExhausted { .. } => …` arm added in Task 3 and rerun:
 Expected: FAIL, naming `["TxnCounterExhausted"]`. **Restore the arm afterwards** and rerun to confirm PASS.
 
-- [ ] **Step 3: Delete the superseded count assertion**
+- [x] **Step 3: Delete the superseded count assertion**
 
 The list-based test's `assert_eq!(cases.len(), 35, ...)` is now redundant — the scanning test enforces coverage, and a hardcoded count is exactly the thing that went stale. Remove that assertion and its message, keeping the rest of the test (it still verifies each variant maps to the *correct* case, which the scan does not check).
 
-- [ ] **Step 4: Run the full crate suite**
+- [x] **Step 4: Run the full crate suite**
 
 Run: `cargo test -p chisel-ffi && cargo clippy --workspace -- -D warnings && cargo fmt --check`
 Expected: PASS, 20 tests; clippy and fmt clean.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add chisel-ffi/src/error.rs
@@ -715,17 +717,17 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: the FFI cases from Task 3.
 - Produces: `ChiselError.category` and `.message` total over the new cases.
 
-- [ ] **Step 1: Regenerate the bindings**
+- [x] **Step 1: Regenerate the bindings**
 
 Run: `swift/build-xcframework.sh`
 Expected: succeeds; `git diff --stat swift/Sources/Chisel/Generated/chisel_ffi.swift` shows the six new cases.
 
-- [ ] **Step 2: Run the Swift build to see the compile-time tripwire fire**
+- [x] **Step 2: Run the Swift build to see the compile-time tripwire fire**
 
 Run: `cd swift && swift build`
 Expected: FAIL — `switch must be exhaustive` in `Extensions.swift`, twice (`category` and `message`). Both switches deliberately have no `default:` arm precisely so this happens.
 
-- [ ] **Step 3: Classify the new cases**
+- [x] **Step 3: Classify the new cases**
 
 **Do not use comma-grouped `case` arms** — see Global Constraints.
 
@@ -764,7 +766,7 @@ In `message`, add:
         case .Other(let m, _): return m
 ```
 
-- [ ] **Step 4: Write the failing test**
+- [x] **Step 4: Write the failing test**
 
 Add to `swift/Tests/ChiselTests/ErrorTests.swift`:
 
@@ -791,17 +793,17 @@ Add to `swift/Tests/ChiselTests/ErrorTests.swift`:
     }
 ```
 
-- [ ] **Step 5: Run the Swift suite**
+- [x] **Step 5: Run the Swift suite**
 
 Run: `cd swift && swift test`
 Expected: PASS, 14 test methods.
 
-- [ ] **Step 6: Run the debug-build check that the SIGSEGV bug hides behind**
+- [x] **Step 6: Run the debug-build check that the SIGSEGV bug hides behind**
 
 Run: `cd swift && swift test 2>&1 | tail -5`
 Expected: PASS, no SIGSEGV. If the suite crashes here but passes under `swift test -c release`, a comma-grouped `case` arm was introduced — see Global Constraints.
 
-- [ ] **Step 7: Commit and open the PR**
+- [x] **Step 7: Commit and open the PR**
 
 ```bash
 git add swift/Sources/Chisel/Extensions.swift swift/Sources/Chisel/Generated/chisel_ffi.swift swift/Tests/ChiselTests/ErrorTests.swift
@@ -859,7 +861,7 @@ binding was written. Branch: `feat/swift-rekey`, cut from the PR 2 branch.
 - Consumes: `ChiselKey`, `Argon2Params`, `FfiResult` from Task 1; `ChiselError` cases from Task 3.
 - Produces: Rust `pub fn rekey(path: String, key: ChiselKey, argon2_params: Option<Argon2Params>) -> FfiResult<()>`; Swift `public func rekey(at:key:argon2Params:) throws`.
 
-- [ ] **Step 1: Write the failing Rust test**
+- [x] **Step 1: Write the failing Rust test**
 
 Append a `tests` module to `chisel-ffi/src/lib.rs`:
 
@@ -922,12 +924,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo test -p chisel-ffi rekey`
 Expected: FAIL to compile — `cannot find function 'rekey' in this scope`.
 
-- [ ] **Step 3: Export the free function**
+- [x] **Step 3: Export the free function**
 
 Add to `chisel-ffi/src/lib.rs`, after `library_version()`:
 
@@ -969,12 +971,12 @@ pub fn rekey(
 
 **No new `use` statement is needed.** `lib.rs` already has `pub use types::{Argon2Params, ChiselKey, …}`, which brings both names into this module's scope; adding `use crate::types::{Argon2Params, ChiselKey};` alongside it is `E0252: the name is defined multiple times`.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p chisel-ffi`
 Expected: PASS, 22 tests.
 
-- [ ] **Step 5: Regenerate bindings and add the Swift wrapper**
+- [x] **Step 5: Regenerate bindings and add the Swift wrapper**
 
 Run: `swift/build-xcframework.sh`
 
@@ -1023,7 +1025,7 @@ public func rekey(at path: URL, key: ChiselKey, argon2Params: Argon2Params? = ni
 }
 ```
 
-- [ ] **Step 6: Write the Swift test**
+- [x] **Step 6: Write the Swift test**
 
 Create `swift/Tests/ChiselTests/RekeyTests.swift`:
 
@@ -1074,12 +1076,12 @@ final class RekeyTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 7: Run the Swift suite**
+- [x] **Step 7: Run the Swift suite**
 
 Run: `cd swift && swift test`
 Expected: PASS, 16 test methods.
 
-- [ ] **Step 8: Add the PARITY.md row**
+- [x] **Step 8: Add the PARITY.md row**
 
 In `swift/PARITY.md`, add to the module-level table (directly under the `open(path, **opts)` row):
 
@@ -1096,7 +1098,7 @@ and add to the "Swift-only additions" section:
   re-hardens during the rewrite, which is the natural moment to do it.
 ```
 
-- [ ] **Step 9: Commit and open the PR**
+- [x] **Step 9: Commit and open the PR**
 
 ```bash
 git add chisel-ffi/src/lib.rs swift/Sources/Chisel/Rekey.swift swift/Sources/Chisel/Generated/chisel_ffi.swift swift/Tests/ChiselTests/RekeyTests.swift swift/PARITY.md
@@ -1147,7 +1149,7 @@ correctness half of #104.
 - Consumes: `ChiselKey`, `Options` from Task 1.
 - Produces: `ChiselKey` and `Options` with hand-written redacting `Debug`; `ChiselKey` no longer `Clone`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the `tests` module in `chisel-ffi/src/types.rs`:
 
@@ -1186,12 +1188,12 @@ Append to the `tests` module in `chisel-ffi/src/types.rs`:
     }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo test -p chisel-ffi debug_never_prints_key_material`
 Expected: FAIL — `raw key leaked: Raw { bytes: [48, 49, ...] }`. (The `Raw` arm leaks as a byte array; the `Passphrase` arm leaks as literal text.)
 
-- [ ] **Step 3: Replace the derives with a redacting impl**
+- [x] **Step 3: Replace the derives with a redacting impl**
 
 In `chisel-ffi/src/types.rs`, change the `ChiselKey` derive from:
 
@@ -1270,12 +1272,12 @@ impl std::fmt::Debug for Options {
 }
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p chisel-ffi`
 Expected: PASS. If the build fails with `ChiselKey: Clone` required, a call site does need it — find it, and if it is genuinely necessary keep `Clone` but wrap the payloads in `Zeroizing` first. Do not silently restore the derive.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add chisel-ffi/src/types.rs
@@ -1307,7 +1309,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: `ChiselError` from Task 3.
 - Produces: FFI case `InvalidTag { message }`; `NativeDatabase` tag-taking methods accept `u32` and validate.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the `tests` module in `chisel-ffi/src/database.rs`:
 
@@ -1348,12 +1350,12 @@ Append to the `tests` module in `chisel-ffi/src/database.rs`:
     }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo test -p chisel-ffi zero_tag_is_a_typed_error_on_every_tag_taking_method`
 Expected: FAIL to compile — `expected chisel::Tag, found integer`. That signature mismatch is the finding: the type never let a `0` be rejected in a typed way.
 
-- [ ] **Step 3: Add the FFI error case**
+- [x] **Step 3: Add the FFI error case**
 
 In `chisel-ffi/src/error.rs`, add to the operational group (after `AlreadyFinished`):
 
@@ -1374,7 +1376,7 @@ Add the `message()` or-pattern arm `| Self::InvalidTag { message }` and the `ffi
             ChiselError::InvalidTag { .. } => "InvalidTag",
 ```
 
-- [ ] **Step 4: Validate at the boundary instead of in the lift**
+- [x] **Step 4: Validate at the boundary instead of in the lift**
 
 In `chisel-ffi/src/database.rs`, add a helper next to `closed_err`:
 
@@ -1418,7 +1420,7 @@ Change these five exported methods to take `u32` and convert (bodies otherwise u
 
 `tag(&self, handle)` keeps returning `Option<chisel::Tag>` — lowering a `Tag` to `u32` is infallible, and `Tag` is a `typealias` for `UInt32` in Swift, so the Swift-visible types are identical either way.
 
-- [ ] **Step 5: Fix the existing test that passes a `chisel::Tag`**
+- [x] **Step 5: Fix the existing test that passes a `chisel::Tag`**
 
 In `tag_and_root_name_round_trip`, replace `let tag = chisel::Tag::new(7).unwrap();` and its uses so the tag-taking calls pass `7u32` while the `db.tag(h)` assertion still compares against `chisel::Tag::new(7).unwrap()`:
 
@@ -1429,12 +1431,12 @@ In `tag_and_root_name_round_trip`, replace `let tag = chisel::Tag::new(7).unwrap
         assert_eq!(db.handles_with_tag(7).unwrap(), vec![h]);
 ```
 
-- [ ] **Step 6: Run the Rust tests**
+- [x] **Step 6: Run the Rust tests**
 
 Run: `cargo test -p chisel-ffi`
 Expected: PASS.
 
-- [ ] **Step 7: Regenerate, classify, and test on the Swift side**
+- [x] **Step 7: Regenerate, classify, and test on the Swift side**
 
 Run: `swift/build-xcframework.sh`
 Expected: `cd swift && swift build` then FAILS with a non-exhaustive switch in `Extensions.swift` — the tripwire again.
@@ -1472,7 +1474,7 @@ Add to `swift/Tests/ChiselTests/ErrorTests.swift`:
 Run: `cd swift && swift test`
 Expected: PASS, 17 test methods.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add chisel-ffi/src/error.rs chisel-ffi/src/database.rs swift/Sources/Chisel/Extensions.swift swift/Sources/Chisel/Generated/chisel_ffi.swift swift/Tests/ChiselTests/ErrorTests.swift
@@ -1505,7 +1507,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: `ChiselDatabase.init`, `ChiselStore.init`, `rekey(at:)` from earlier tasks.
 - Produces: `internal func chiselFilePath(_ url: URL) throws -> String`, used by all three entry points.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `swift/Tests/ChiselTests/DatabaseTests.swift`:
 
@@ -1545,12 +1547,12 @@ Add to `swift/Tests/ChiselTests/DatabaseTests.swift`:
     }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cd swift && swift test --filter testNonFileURLIsRejected`
 Expected: FAIL — no error thrown. (Depending on sandbox permissions the `https:` case may instead fail while *creating* `/prod.db`, which is the same defect wearing a different mask.)
 
-- [ ] **Step 3: Add the shared helper**
+- [x] **Step 3: Add the shared helper**
 
 Create `swift/Sources/Chisel/FileURL.swift`:
 
@@ -1582,7 +1584,7 @@ func chiselFilePath(_ url: URL) throws -> String {
 }
 ```
 
-- [ ] **Step 4: Route the three entry points through it**
+- [x] **Step 4: Route the three entry points through it**
 
 In `ChiselDatabase.swift`, replace the initializer body:
 
@@ -1611,12 +1613,12 @@ In `Rekey.swift`, replace the inline guard added in Task 6 with the shared helpe
 
 and delete the now-duplicated `guard path.isFileURL` block and its comment.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cd swift && swift test`
 Expected: PASS, 19 test methods (including `RekeyTests.testRekeyRejectsNonFileURL`, which now exercises the shared helper).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add swift/Sources/Chisel/FileURL.swift swift/Sources/Chisel/ChiselDatabase.swift swift/Sources/Chisel/Rekey.swift swift/Tests/ChiselTests/DatabaseTests.swift
@@ -1646,7 +1648,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: `Transaction.savepoint(_:_:)` from Task 2.
 - Produces: a savepoint scope that is symmetric on both exit paths.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 The engine deliberately keeps the mark after a rollback (`src/transaction/savepoints.rs`: "The named savepoint itself remains on the stack and can be rolled back to again or released"), so a scope that only rolls back leaks the name for the rest of the transaction.
 
@@ -1679,12 +1681,12 @@ Add to `swift/Tests/ChiselTests/DatabaseTests.swift`:
     }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cd swift && swift test --filter testSavepointScopeIsReusableAfterItsBodyThrows`
 Expected: FAIL on attempt 1 — the error is `ChiselError.DuplicateSavepoint`, not `Boom`, because the first attempt left `"attempt"` on the stack.
 
-- [ ] **Step 3: Make the scope symmetric**
+- [x] **Step 3: Make the scope symmetric**
 
 In `ChiselDatabase.swift`, replace the `catch` arm of `savepoint`:
 
@@ -1715,12 +1717,12 @@ with:
         }
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cd swift && swift test`
 Expected: PASS, 20 test methods.
 
-- [ ] **Step 5: Commit and open the PR**
+- [x] **Step 5: Commit and open the PR**
 
 ```bash
 git add swift/Sources/Chisel/ChiselDatabase.swift swift/Tests/ChiselTests/DatabaseTests.swift
@@ -1791,7 +1793,7 @@ concurrency-checking change, not just a storage change. Same guarantee, smaller 
 - Consumes: `Transaction` from Task 2, `.AlreadyFinished` from Task 1.
 - Produces: `Transaction` whose forwarders throw `.AlreadyFinished` once its scope has exited.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```swift
     // `var escaped: Transaction?; try db.transaction { escaped = $0 }` compiles
@@ -1853,12 +1855,12 @@ use `guard case .X = e`. `String(describing:)` is a trap here — `Extensions.sw
 declares `ChiselError: CustomStringConvertible` with `description == message`, so
 it yields the engine's diagnostic text rather than the case name.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cd swift && swift test --filter testEscapedTransactionRefusesWork`
 Expected: FAIL — `XCTAssertThrowsError` fails because the allocate *succeeds*. That success is the defect.
 
-- [ ] **Step 3: Add the shared one-shot state**
+- [x] **Step 3: Add the shared one-shot state**
 
 In `ChiselDatabase.swift`, add above `public struct Transaction`:
 
@@ -1879,7 +1881,7 @@ final class TransactionState {
 }
 ```
 
-- [ ] **Step 4: Guard every forwarder**
+- [x] **Step 4: Guard every forwarder**
 
 Change the `Transaction` declaration to:
 
@@ -1929,7 +1931,7 @@ Then change every forwarder from `try native.X(…)` to `try live().X(…)`. All
 
 And in `savepoint`, change the opening `try native.savepoint(name: name)` to `try live().savepoint(name: name)`. Its `release`/`rollbackTo` calls stay on `native` — they are cleanup running while the scope is still live, and routing them through `live()` would make cleanup depend on the very flag it is unwinding.
 
-- [ ] **Step 5: Mark the transaction finished on both exit paths**
+- [x] **Step 5: Mark the transaction finished on both exit paths**
 
 In `ChiselDatabase.transaction`, replace the body:
 
@@ -1952,7 +1954,7 @@ In `ChiselDatabase.transaction`, replace the body:
     }
 ```
 
-- [ ] **Step 6: Document why `Savepoint` needs no guard**
+- [x] **Step 6: Document why `Savepoint` needs no guard**
 
 `Savepoint` carries no operations — it exposes only `name`, and all release/rollback control is folded into the closure — so a "finished" flag on it would guard nothing. Replace the comment above `public struct Savepoint` with:
 
@@ -1970,17 +1972,17 @@ In `ChiselDatabase.transaction`, replace the body:
 /// type ever gains an operation, it needs the `Transaction` treatment first.
 ```
 
-- [ ] **Step 7: Run the tests**
+- [x] **Step 7: Run the tests**
 
 Run: `cd swift && swift test`
 Expected: PASS, 23 test methods.
 
-- [ ] **Step 8: Verify strict concurrency is clean**
+- [x] **Step 8: Verify strict concurrency is clean**
 
 Run: `cd swift && swift build -Xswiftc -strict-concurrency=complete 2>&1 | grep -E 'error|warning: .*Sendable' | head -20`
 Expected: no errors. Warnings about `DatabaseBox`'s `@unchecked Sendable` are pre-existing and expected. If `TransactionState` is flagged as non-Sendable crossing a boundary, that is a real finding — stop and escalate rather than adding `@unchecked`.
 
-- [ ] **Step 9: Commit and open the PR**
+- [x] **Step 9: Commit and open the PR**
 
 ```bash
 git add swift/Sources/Chisel/ChiselDatabase.swift swift/Tests/ChiselTests/DatabaseTests.swift
@@ -2048,7 +2050,7 @@ savepoint throw path, escaped transaction); this PR closes the rest.
 - Consumes: `ChiselDatabase`, `ChiselStore` from Task 2.
 - Produces: coverage only; no source changes.
 
-- [ ] **Step 1: Write the tests**
+- [x] **Step 1: Write the tests**
 
 Create `swift/Tests/ChiselTests/LifecycleTests.swift`:
 
@@ -2157,12 +2159,12 @@ Add to `swift/Tests/ChiselTests/StoreTests.swift` — the async layer had exactl
     }
 ```
 
-- [ ] **Step 2: Run the tests**
+- [x] **Step 2: Run the tests**
 
 Run: `cd swift && swift test`
 Expected: PASS, 32 test methods. A failure in `testIsPoisonedIsTrueAfterACleanClose` means the Rust `is_poisoned` no longer treats `None` as poisoned — that is a behaviour change, not a bad test.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add swift/Tests/ChiselTests/LifecycleTests.swift swift/Tests/ChiselTests/StoreTests.swift
@@ -2188,7 +2190,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: `ChiselDatabase`, `ChiselKey`, `Options` from Task 2; `chiselFilePath` from Task 9.
 - Produces: coverage only.
 
-- [ ] **Step 1: Write the tests**
+- [x] **Step 1: Write the tests**
 
 Create `swift/Tests/ChiselTests/EncryptionTests.swift`:
 
@@ -2307,12 +2309,12 @@ final class EncryptionTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: Run the tests**
+- [x] **Step 2: Run the tests**
 
 Run: `cd swift && swift test`
 Expected: PASS, 36 test methods. `testAddRotateAndRemoveKey` is the slowest — each passphrase open runs Argon2id.
 
-- [ ] **Step 3: Commit and open the PR**
+- [x] **Step 3: Commit and open the PR**
 
 ```bash
 git add swift/Tests/ChiselTests/EncryptionTests.swift
@@ -2360,7 +2362,7 @@ Branch: `docs/swift-accuracy`, cut from the PR 6 branch. Closes #121.
 
 **Interfaces:** none — comment and test-comment changes only.
 
-- [ ] **Step 1: SWIFT-8 — say that a closed handle also reports poisoned**
+- [x] **Step 1: SWIFT-8 — say that a closed handle also reports poisoned**
 
 The Rust side documents both conditions and its test asserts the closed case; both Swift docs dropped the second half. Replace `ChiselDatabase.swift`'s:
 
@@ -2396,7 +2398,7 @@ with:
     /// store reports `true`; see `ChiselDatabase.isPoisoned`.
 ```
 
-- [ ] **Step 2: SWIFT-9 — say that the catch arm also covers commit failure**
+- [x] **Step 2: SWIFT-9 — say that the catch arm also covers commit failure**
 
 The commit sits inside the `do`, so a body that returns normally and a commit that then fails still runs the catch arm — issuing a rollback on an engine that just poisoned itself on the commit path, and rethrowing the commit error rather than "what `body` threw". Replace `transaction`'s doc:
 
@@ -2447,7 +2449,7 @@ with:
     /// the same name can be used again in this transaction.
 ```
 
-- [ ] **Step 3: SWIFT-12 — make the cast test match its claim**
+- [x] **Step 3: SWIFT-12 — make the cast test match its claim**
 
 `1_000_000` is ~0.02% of `u32::MAX`, so it round-trips identically through a 32-bit `usize`; the test cannot fail for the reason its comment gives, on any platform. In `chisel-ffi/src/types.rs`, replace the comment and the `large` case of `defrag_options_convert_usize_boundary`:
 
@@ -2488,12 +2490,12 @@ with:
     }
 ```
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run: `cargo test -p chisel-ffi && (cd swift && swift build)`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add swift/Sources/Chisel/ChiselDatabase.swift swift/Sources/Chisel/ChiselStore.swift chisel-ffi/src/types.rs
@@ -2525,7 +2527,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Interfaces:** none — documentation only.
 
-- [ ] **Step 1: SWIFT-11 — replace rotting line numbers with symbol names**
+- [x] **Step 1: SWIFT-11 — replace rotting line numbers with symbol names**
 
 Eight `ChiselDatabase.swift` citations point at blank lines and mid-comment text, in a table whose header claims it was "verified by reading each file directly". The drift is confined to the block that shifted when a seven-line comment was inserted — which is the argument against line numbers, not against that particular edit.
 
@@ -2546,14 +2548,14 @@ lines, and inserting one comment block into ChiselDatabase.swift silently
 invalidated eight of them while the "verified" claim above stayed put.
 ```
 
-- [ ] **Step 2: Update the source-of-truth reference**
+- [x] **Step 2: Update the source-of-truth reference**
 
 `main` renamed the stub file. Replace `python/chisel/chisel.pyi` with `python/chisel/__init__.pyi` throughout `PARITY.md`, and update the count sentence to match the current file:
 
 Run: `git show origin/main:python/chisel/__init__.pyi | grep -cE '^\s+def [a-z_]+'`
 Use that number in the header rather than the stale one.
 
-- [ ] **Step 3: Verify every symbol cited actually exists**
+- [x] **Step 3: Verify every symbol cited actually exists**
 
 Run:
 
@@ -2564,7 +2566,7 @@ done
 ```
 Expected: no `MISSING:` lines.
 
-- [ ] **Step 4: Integrate into the repo's own docs**
+- [x] **Step 4: Integrate into the repo's own docs**
 
 In `README.md`:
 - Replace `Cargo workspace with three members` with `Cargo workspace with four members`, and add `the `chisel-ffi/` UniFFI binding` to the member list in that paragraph.
@@ -2594,7 +2596,7 @@ usage and [`swift/PARITY.md`](swift/PARITY.md) for the Python↔Swift map.
 
 In `ARCHITECTURE.md` and `THEORY.md`, add the binding to the layer map wherever the Python binding is described, stating the one structural fact a reader needs: `chisel-ffi` is the only crate that speaks the C ABI, it wraps `chisel::Chisel` in `Mutex<Option<Chisel>>` because the engine is `Send + !Sync`, and every ergonomic construct (transaction closures, the async actor) lives in Swift rather than in Rust.
 
-- [ ] **Step 5: Verify no dangling references**
+- [x] **Step 5: Verify no dangling references**
 
 Run: `grep -rn 'chisel\.pyi' swift/ README.md ARCHITECTURE.md THEORY.md || echo "clean"`
 Expected: `clean`
@@ -2602,7 +2604,7 @@ Expected: `clean`
 Run: `grep -rn 'three members' README.md ARCHITECTURE.md THEORY.md || echo "clean"`
 Expected: `clean`
 
-- [ ] **Step 6: Commit and open the PR**
+- [x] **Step 6: Commit and open the PR**
 
 ```bash
 git add swift/PARITY.md README.md ARCHITECTURE.md THEORY.md
@@ -2666,7 +2668,7 @@ asset exists.
 **Interfaces:**
 - Produces: a root manifest resolvable both from a clone (local artifact) and by URL (release asset).
 
-- [ ] **Step 1: Create the root manifest**
+- [x] **Step 1: Create the root manifest**
 
 ```swift
 // swift-tools-version:5.9
@@ -2721,7 +2723,7 @@ let package = Package(
 
 The placeholder checksum is deliberate and is replaced by `prepare.sh` at the first release. Until then, only the `CHISEL_LOCAL_XCFRAMEWORK=1` path is usable — which is documented in the README step below.
 
-- [ ] **Step 2: Remove the old manifest and update ignores**
+- [x] **Step 2: Remove the old manifest and update ignores**
 
 ```bash
 git rm swift/Package.swift
@@ -2735,7 +2737,7 @@ Add to `.gitignore`:
 /.swiftpm/
 ```
 
-- [ ] **Step 3: Verify both modes**
+- [x] **Step 3: Verify both modes**
 
 Run: `swift/build-xcframework.sh && CHISEL_LOCAL_XCFRAMEWORK=1 swift test`
 Expected: PASS, 36 test methods, run from the **repo root**.
@@ -2743,7 +2745,7 @@ Expected: PASS, 36 test methods, run from the **repo root**.
 Run: `swift package dump-package > /dev/null && echo "manifest parses in consumer mode"`
 Expected: prints the message. (Parsing does not fetch the asset; resolution would.)
 
-- [ ] **Step 4: Point CI at the local artifact**
+- [x] **Step 4: Point CI at the local artifact**
 
 In `.github/workflows/swift.yml`, replace the three `cd swift && swift …` steps with root-relative ones carrying the environment variable:
 
@@ -2769,7 +2771,7 @@ In `.github/workflows/swift.yml`, replace the three `cd swift && swift …` step
         run: swift build -c release
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Package.swift .gitignore .github/workflows/swift.yml
@@ -2800,7 +2802,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces: `swift/release/prepare.sh <version>`, and a workflow gating the release on a checksum match.
 
-- [ ] **Step 1: Write the prepare script**
+- [x] **Step 1: Write the prepare script**
 
 Create `swift/release/prepare.sh` (`chmod +x`):
 
@@ -2858,13 +2860,13 @@ The zip is NOT committed — it is built again by the workflow and uploaded ther
 MSG
 ```
 
-- [ ] **Step 2: Add the zip to `.gitignore`**
+- [x] **Step 2: Add the zip to `.gitignore`**
 
 ```
 swift/Chisel.xcframework.zip
 ```
 
-- [ ] **Step 3: Write the release workflow**
+- [x] **Step 3: Write the release workflow**
 
 Create `.github/workflows/swift-release.yml`:
 
@@ -2936,12 +2938,12 @@ jobs:
         run: gh release upload "${{ github.event.release.tag_name }}" swift/Chisel.xcframework.zip --clobber
 ```
 
-- [ ] **Step 4: Verify both files**
+- [x] **Step 4: Verify both files**
 
 Run: `bash -n swift/release/prepare.sh && python3 -c "import yaml; yaml.safe_load(open('.github/workflows/swift-release.yml')); print('ok')"`
 Expected: `ok`
 
-- [ ] **Step 5: Document consumption in the README**
+- [x] **Step 5: Document consumption in the README**
 
 Add to the `### Swift binding` section added in Task 15:
 
@@ -2962,7 +2964,7 @@ publish the release on GitHub. `swift-release.yml` re-runs the tests, verifies
 the committed checksum against a rebuild, and uploads the asset.
 ````
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add swift/release/prepare.sh .github/workflows/swift-release.yml .gitignore README.md
@@ -2991,12 +2993,12 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Interfaces:** none.
 
-- [ ] **Step 1: Get the next ADR ids**
+- [x] **Step 1: Get the next ADR ids**
 
 Run: `python3 ~/.claude/skills/codebase-memory/scripts/adr_index.py docs/adr --next`
 Expected: prints the next id. **Never derive the id by eye.** Run it again after writing the first record to get the second id.
 
-- [ ] **Step 2: Write the error-fallback ADR**
+- [x] **Step 2: Write the error-fallback ADR**
 
 Copy `references/template.md` from the codebase-memory skill to `docs/adr/NNNN-tier-unmapped-engine-errors-by-is-fatal.md` and fill it in:
 
@@ -3005,7 +3007,7 @@ Copy `references/template.md` from the codebase-memory skill to `docs/adr/NNNN-t
 - **Alternatives considered:** keep fail-toward-fatal (rejected: mistiers every future operational variant and asserts an engine state that is not true); add a `#[doc(hidden)]` exhaustive-match helper to the engine (rejected: puts a test-only concern in the public API, and `#[doc(hidden)]` is no semver guarantee).
 - **Consequences:** Swift's `category` for the fallback is data rather than a constant. The guard is a text scan coupled to `src/error.rs`'s formatting and fails loudly if that changes.
 
-- [ ] **Step 3: Write the distribution ADR**
+- [x] **Step 3: Write the distribution ADR**
 
 `docs/adr/NNNN-swiftpm-distribution-via-release-asset.md`:
 
@@ -3014,7 +3016,7 @@ Copy `references/template.md` from the codebase-memory skill to `docs/adr/NNNN-t
 - **Alternatives considered:** commit the xcframework (rejected: ~974 MB of build output, the exact thing SWIFT-2's `.gitignore` rules exist to prevent); have the workflow patch `Package.swift` after upload (rejected: the tag would carry a manifest describing a different artifact than the one consumers pinning that tag receive).
 - **Consequences:** cutting a release is a scripted two-phase operation rather than a tag push. The checksum gate can fail on a legitimate re-tag because Rust staticlib builds are not bit-reproducible; the fallback is to upload `prepare.sh`'s artifact rather than a rebuild.
 
-- [ ] **Step 4: Add the addendum to ADR 0016**
+- [x] **Step 4: Add the addendum to ADR 0016**
 
 ADR 0016 is Accepted; **do not rewrite its body**. Append:
 
@@ -3032,12 +3034,12 @@ decisions taken during the port are recorded separately — see the ADRs on the
 `is_fatal()`-driven error fallback and on SwiftPM distribution.
 ```
 
-- [ ] **Step 5: Regenerate the index and verify**
+- [x] **Step 5: Regenerate the index and verify**
 
 Run: `python3 ~/.claude/skills/codebase-memory/scripts/adr_index.py docs/adr`
 Expected: exit 0; `docs/adr/README.md` regenerated. **Never edit README.md by hand.**
 
-- [ ] **Step 6: Final full verification**
+- [x] **Step 6: Final full verification**
 
 Run:
 
@@ -3051,7 +3053,7 @@ CHISEL_LOCAL_XCFRAMEWORK=1 swift test
 ```
 Expected: all green. This is the spec's verification oracle.
 
-- [ ] **Step 7: Commit and open the PR**
+- [x] **Step 7: Commit and open the PR**
 
 ```bash
 git add docs/adr

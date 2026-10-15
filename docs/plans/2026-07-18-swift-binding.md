@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status (2026-10-15):** Superseded. This plan was executed on the orphaned `design/swift-binding` branch; `2026-08-23-swift-binding-port.md` carried that work onto the published lineage. Its checkboxes are left as they were.
+
 **Goal:** Ship a reusable, published Swift package that exposes the Chisel storage engine to iOS and macOS apps through an idiomatic sync + async API, bridged from Rust via UniFFI.
 
 **Architecture:** A new `chisel-ffi` Rust crate wraps `chisel::Chisel` in `Mutex<Option<Chisel>>` and exports flat, synchronous methods with `#[uniffi::export]`. UniFFI generates a C-ABI static library plus idiomatic Swift. A `swift/` SPM package ships that library as a prebuilt `.xcframework` and layers hand-written ergonomics on top: a synchronous `ChiselDatabase`, an `async` `ChiselStore` actor backed by a dedicated serial queue, and transaction/savepoint closures. The engine crate is never modified.

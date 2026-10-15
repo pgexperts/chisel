@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status (2026-10-15):** Tasks 1–5 are done; the sweep is `TransactionManager::reclaim_freemap_orphans`, a thin wrapper over `FreemapRecycle::reclaim_orphans` (`src/transaction/freemap.rs`). Conditional Task 6 was skipped: the three-`Vec` recycle state is still in place.
+
 **Goal:** Finish the multi-page-freemap integration against the *revised* structural-reclamation design: validate the salvaged hot path (in-memory recycle + session-COW dedup), add the defrag orphan-sweep that makes crash-orphaned freemap pages reclaimable, and add the tests the revised spec requires.
 
 **Architecture:** The integration already landed on this branch (commit `6c81d4d`): the freemap lives in the page cache; allocation/`persist_freemap` route through `FreeMapTree`; freemap-structural COW reuses dead pages from an in-memory one-commit-deferred recycle pool (`structural_reuse` / `structural_superseded` / `pending_structural_frees`) before extending; a per-transaction `session_owned` set COWs each freemap node once per commit. This phase **adds the missing crash-recovery story** — a `defrag` sweep that reclaims freemap-typed pages orphaned when an in-memory pool is lost to a crash — and the spec's missing tests.
@@ -31,15 +33,15 @@ This is a verify-then-fix task on the existing `6c81d4d` integration — confirm
 
 **Files:** read `src/transaction.rs` (`cow_alloc`, `structural_extend`, `allocate_data_page`, `ht_insert`, the membership site, `persist_freemap`, `take_freemap_tree`/`put_freemap_tree`, `begin_inner`, `rollback_inner`, commit's promotion of `structural_superseded`→`pending_structural_frees`, the field docs ~256-310) and `src/freemap_tree.rs` (`cow_node`, `session_owned`).
 
-- [ ] **Step 1: Verify the one-commit-defer crash-safety by reading + asserting.** Confirm a page superseded in transaction T is NOT reused as a structural COW target until AFTER T's superblock fsync (i.e. `structural_reuse` for T+1 is sourced only from `pending_structural_frees` promoted at T's commit, never from `structural_superseded` of the in-flight T). Write a focused test in `transaction.rs` tests that: commits a structural churn (T), records the pool ids promoted at T's commit, runs T+1, and asserts T+1's structural COW targets are drawn from exactly that promoted set (not from T+1's own fresh supersedes). If the code reuses a same-transaction supersede, that is a crash-safety BUG — fix it.
+- [x] **Step 1: Verify the one-commit-defer crash-safety by reading + asserting.** Confirm a page superseded in transaction T is NOT reused as a structural COW target until AFTER T's superblock fsync (i.e. `structural_reuse` for T+1 is sourced only from `pending_structural_frees` promoted at T's commit, never from `structural_superseded` of the in-flight T). Write a focused test in `transaction.rs` tests that: commits a structural churn (T), records the pool ids promoted at T's commit, runs T+1, and asserts T+1's structural COW targets are drawn from exactly that promoted set (not from T+1's own fresh supersedes). If the code reuses a same-transaction supersede, that is a crash-safety BUG — fix it.
 
-- [ ] **Step 2: Verify rollback resets the pools.** Write a test: begin, do a structural churn (mutating `structural_reuse`/`structural_superseded`), then `rollback`; assert `structural_reuse` is restored to what `pending_structural_frees` held at begin (the committed recycle state) and `structural_superseded` is cleared, and `freemap_session_owned` is cleared. A rollback that leaks pool state into the next transaction is a BUG — fix it.
+- [x] **Step 2: Verify rollback resets the pools.** Write a test: begin, do a structural churn (mutating `structural_reuse`/`structural_superseded`), then `rollback`; assert `structural_reuse` is restored to what `pending_structural_frees` held at begin (the committed recycle state) and `structural_superseded` is cleared, and `freemap_session_owned` is cleared. A rollback that leaks pool state into the next transaction is a BUG — fix it.
 
-- [ ] **Step 3: Verify no lost/double frees across a reuse cycle.** Extend the existing `persist_freemap_does_not_reuse_committed_live_pages` reasoning with a multi-commit test: churn for several commits (each freeing whole pages), and after each commit assert (a) every committed-free page reads `is_free` true via a fresh `FreeMapTree::from_roots`, and (b) no page id appears simultaneously reachable-in-the-live-tree AND in `structural_reuse` (a reuse pool page must be dead). Any violation is a BUG.
+- [x] **Step 3: Verify no lost/double frees across a reuse cycle.** Extend the existing `persist_freemap_does_not_reuse_committed_live_pages` reasoning with a multi-commit test: churn for several commits (each freeing whole pages), and after each commit assert (a) every committed-free page reads `is_free` true via a fresh `FreeMapTree::from_roots`, and (b) no page id appears simultaneously reachable-in-the-live-tree AND in `structural_reuse` (a reuse pool page must be dead). Any violation is a BUG.
 
-- [ ] **Step 4: Run the full suite + clippy.** `cargo test`, `cargo clippy --workspace --all-targets -- -D warnings`. Green.
+- [x] **Step 4: Run the full suite + clippy.** `cargo test`, `cargo clippy --workspace --all-targets -- -D warnings`. Green.
 
-- [ ] **Step 5: Commit** (tests + any fixes): `test: verify freemap recycle one-commit defer, rollback reset, no double-free`. If you found and fixed a real defect, say so explicitly in the commit body.
+- [x] **Step 5: Commit** (tests + any fixes): `test: verify freemap recycle one-commit defer, rollback reset, no double-free`. If you found and fixed a real defect, say so explicitly in the commit body.
 
 > If any of Steps 1-3 reveals a defect you cannot cleanly fix within the existing design, STOP and report it — it may mean the salvage was unsound and we revisit.
 
@@ -51,7 +53,7 @@ The sweep needs the set of page ids the live tree occupies.
 
 **Files:** Modify `src/freemap_tree.rs` (+ inline test).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -73,9 +75,9 @@ fn reachable_pages_collects_every_node() {
 }
 ```
 
-- [ ] **Step 2: Run, expect compile failure** — `cargo test --lib reachable_pages_collects_every_node` → no method `reachable_pages`.
+- [x] **Step 2: Run, expect compile failure** — `cargo test --lib reachable_pages_collects_every_node` → no method `reachable_pages`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
     /// Collect every page id the live tree occupies (root + all interiors +
@@ -115,9 +117,9 @@ fn reachable_pages_collects_every_node() {
     }
 ```
 
-- [ ] **Step 4: Run, expect PASS** — `cargo test --lib freemap_tree`.
+- [x] **Step 4: Run, expect PASS** — `cargo test --lib freemap_tree`.
 
-- [ ] **Step 5: Commit** — `feat: FreeMapTree::reachable_pages (live-tree page set for the orphan sweep)`.
+- [x] **Step 5: Commit** — `feat: FreeMapTree::reachable_pages (live-tree page set for the orphan sweep)`.
 
 ---
 
@@ -127,7 +129,7 @@ fn reachable_pages_collects_every_node() {
 
 Semantics (from the spec): an orphan is a `FreeMap`/`FreeMapInterior`-typed page that is **(a)** within `total_pages`, **(b)** not reachable from the live tree, **(c)** not already free in the bitmap, **AND (d)** not currently in the in-memory recycle pool** (`structural_reuse` ∪ `structural_superseded` ∪ `pending_structural_frees`) — those are *live* recycling state, not orphans. After a crash the pool is empty, so the crash-lost pages are correctly flagged; in a normal defrag the live pool is excluded so we never double-hand-out a page.
 
-- [ ] **Step 1: Write the failing test** (simulate an orphan by leaking a page the way a crash would, then sweep)
+- [x] **Step 1: Write the failing test** (simulate an orphan by leaking a page the way a crash would, then sweep)
 
 ```rust
 #[test]
@@ -162,9 +164,9 @@ fn reclaim_freemap_orphans_marks_lost_freemap_pages_free() {
 
 (Adjust the exact test-helper names to the codebase's `#[cfg(test)]` accessor conventions; `fresh_manager`, `MAX_INLINE_VALUE` already exist. Add `#[cfg(test)] test_forge_freemap_orphan` that extends a page via the cache, writes `buf[0]=FreeMapInterior`, stamps the checksum, and returns the id; and small `#[cfg(test)]` accessors for the committed freemap root/depth and a cache handle, mirroring existing test accessors.)
 
-- [ ] **Step 2: Run, expect failure** — method missing.
+- [x] **Step 2: Run, expect failure** — method missing.
 
-- [ ] **Step 3: Implement** (collect orphans read-only, then mark them free)
+- [x] **Step 3: Implement** (collect orphans read-only, then mark them free)
 
 ```rust
     /// Reclaim freemap-typed pages orphaned by a crash that lost the in-memory
@@ -220,9 +222,9 @@ Notes for the implementer:
 - Reading each page through the cache checksum-verifies it; a corrupt page surfaces as a fatal error (consistent with the engine's fail-closed stance for a maintenance pass). That is acceptable — note it in a comment.
 - The scan is O(total_pages) I/O — off the hot path (defrag), bounded, fine.
 
-- [ ] **Step 4: Run, expect PASS** — `cargo test --lib reclaim_freemap_orphans_marks_lost_freemap_pages_free`. Add a second test asserting a page CURRENTLY in `structural_reuse` is NOT reclaimed (exclusion works): seed the pool, forge no orphan, assert `reclaim_freemap_orphans()` returns 0 and the pool is untouched.
+- [x] **Step 4: Run, expect PASS** — `cargo test --lib reclaim_freemap_orphans_marks_lost_freemap_pages_free`. Add a second test asserting a page CURRENTLY in `structural_reuse` is NOT reclaimed (exclusion works): seed the pool, forge no orphan, assert `reclaim_freemap_orphans()` returns 0 and the pool is untouched.
 
-- [ ] **Step 5: Commit** — `feat: reclaim_freemap_orphans (defrag sweep for crash-lost freemap pages)`.
+- [x] **Step 5: Commit** — `feat: reclaim_freemap_orphans (defrag sweep for crash-lost freemap pages)`.
 
 ---
 
@@ -230,7 +232,7 @@ Notes for the implementer:
 
 **Files:** Modify `src/defrag.rs`.
 
-- [ ] **Step 1: Write the failing test** (in `tests/` or defrag's module): a defrag run after a forged orphan reports it reclaimed.
+- [x] **Step 1: Write the failing test** (in `tests/` or defrag's module): a defrag run after a forged orphan reports it reclaimed.
 
 ```rust
 #[test]
@@ -241,9 +243,9 @@ fn defrag_reports_freemap_orphans_reclaimed() {
 }
 ```
 
-- [ ] **Step 2: Run, expect failure** — no field `freemap_orphans_reclaimed`.
+- [x] **Step 2: Run, expect failure** — no field `freemap_orphans_reclaimed`.
 
-- [ ] **Step 3: Implement** — add `pub freemap_orphans_reclaimed: u64` to `DefragStats` (init 0 in the constructor; it is `#[non_exhaustive]`, so external construction is unaffected). After the data-page relocation loop in `defrag()`, call:
+- [x] **Step 3: Implement** — add `pub freemap_orphans_reclaimed: u64` to `DefragStats` (init 0 in the constructor; it is `#[non_exhaustive]`, so external construction is unaffected). After the data-page relocation loop in `defrag()`, call:
 
 ```rust
     // Reclaim freemap pages orphaned by a prior crash that lost the in-memory
@@ -253,9 +255,9 @@ fn defrag_reports_freemap_orphans_reclaimed() {
 
 Update the `defrag` doc comment's "What this does NOT do" list — it currently says handle-table/overflow COW garbage isn't reclaimed; add that freemap orphans now ARE swept (and that handle-table/overflow garbage still is not).
 
-- [ ] **Step 4: Run, expect PASS** — `cargo test --test <defrag test file>` and `cargo test --lib defrag`.
+- [x] **Step 4: Run, expect PASS** — `cargo test --test <defrag test file>` and `cargo test --lib defrag`.
 
-- [ ] **Step 5: Commit** — `feat: defrag sweeps crash-orphaned freemap pages (DefragStats.freemap_orphans_reclaimed)`.
+- [x] **Step 5: Commit** — `feat: defrag sweeps crash-orphaned freemap pages (DefragStats.freemap_orphans_reclaimed)`.
 
 ---
 
@@ -263,7 +265,7 @@ Update the `defrag` doc comment's "What this does NOT do" list — it currently 
 
 **Files:** Create `tests/freemap_multipage.rs`.
 
-- [ ] **Step 1: Write the tests**
+- [x] **Step 1: Write the tests**
 
 ```rust
 use chisel::{Chisel, Options, DefragOptions};
@@ -351,9 +353,9 @@ fn crash_orphans_are_reclaimed_by_defrag() {
 
 (Use the real public defrag entry point — `db.defrag(&opts)` if exposed, else the `chisel::defrag` free function; fix the placeholder call sites. The crash test's value is the **idempotence** assertion: after one sweep, a second finds zero — proving the sweep actually reclaimed whatever the crash orphaned.)
 
-- [ ] **Step 2: Run, expect PASS** — `cargo test --test freemap_multipage`. If `steady_state_file_is_flat_under_churn` shows growth, the recycle is not actually bounding the file — that is a real regression; debug before continuing.
+- [x] **Step 2: Run, expect PASS** — `cargo test --test freemap_multipage`. If `steady_state_file_is_flat_under_churn` shows growth, the recycle is not actually bounding the file — that is a real regression; debug before continuing.
 
-- [ ] **Step 3: Commit** — `test: multi-page freemap reclamation, steady-state flat file, crash->defrag reclaim`.
+- [x] **Step 3: Commit** — `test: multi-page freemap reclamation, steady-state flat file, crash->defrag reclaim`.
 
 ---
 

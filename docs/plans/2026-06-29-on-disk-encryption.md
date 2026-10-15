@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status (2026-10-15):** Implemented. Task 6.3 is obsolete: `ISSUES.md` was retired in favour of GitHub issues (ADR 0017), and bulk DEK rotation was later built (`src/rekey.rs`, ADR 0018).
+
 **Goal:** Add client-supplied, authenticated on-disk encryption (XChaCha20-Poly1305 with envelope key management) to the Chisel storage engine, with O(1) credential rotation.
 
 **Architecture:** Encryption is a transform at the page-I/O boundary. The page cache and every layer above keep producing byte-identical 8192-byte pages; a `PageCipher` holding a random per-database Data Encryption Key (DEK) seals each page into an 8232-byte on-disk blob (`ciphertext ‖ tag ‖ nonce`) with `AAD = page_id` (anti-relocation). The DEK is wrapped under a Key Encryption Key (KEK) derived from the client's key — HKDF-SHA256 for raw keys, Argon2id for passphrases — and stored in an 8-slot table in the superblock's plaintext reserved region, so rotating a credential is an O(1) re-wrap, not a re-encryption. The sensitive superblock fields (including `named_roots`) are DEK-sealed; the crypto-header stays plaintext to bootstrap. Encrypted databases stamp a MAJOR format-version bump so encryption-unaware binaries refuse to open them.
@@ -68,7 +70,7 @@ ponytail note: one file, not a directory tree of `kdf.rs`/`aead.rs`/`wrap.rs`. T
 - Consumes: nothing
 - Produces: a compilable, registered `crypto` module; the six crypto crates resolved in `Cargo.lock`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 This task's deliverable is "the workspace builds with the new deps and module present." The runnable check is `cargo build`. Create the module file with a single trivial item so the `mod crypto;` line has something to point at, and a compile-time assertion that one dep links:
 ```rust
 // src/crypto/mod.rs — Crypto core (layer 1, no engine coupling).
@@ -99,10 +101,10 @@ mod tests {
     }
 }
 ```
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo build`  Expected: FAIL — `error[E0432]: unresolved import` for `chacha20poly1305` (dep not added yet) and/or `file not found for module crypto` until `mod crypto;` is registered.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 Add to `Cargo.toml` immediately after line 66 (`rustc-hash = "2"`), inside the existing `[dependencies]` block:
 ```toml
 # On-disk encryption (spec 2026-06-29). All pure-Rust, well-vetted RustCrypto
@@ -123,10 +125,10 @@ pub(crate) mod crypto;
 ```
 (The `src/crypto/mod.rs` file from Step 1 already exists.)
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test deps_link`  Expected: PASS (and `cargo build` succeeds, resolving the six new crates into `Cargo.lock`).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "build: add RustCrypto deps and register crypto core module"
 ```
@@ -158,7 +160,7 @@ pub fn random_dek() -> Dek;
 pub fn random_array<const N: usize>() -> [u8; N];
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 Replace the placeholder `tests` module in `src/crypto/mod.rs` with:
 ```rust
 #[cfg(test)]
@@ -215,10 +217,10 @@ mod tests {
     }
 }
 ```
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test --package chisel crypto::tests`  Expected: FAIL — `cannot find type Argon2Params`, `random_dek`, etc. (not yet defined).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 Insert above the `#[cfg(test)] mod tests` block in `src/crypto/mod.rs`:
 ```rust
 use zeroize::Zeroizing;
@@ -338,10 +340,10 @@ pub fn random_dek() -> Dek {
     Dek::from_bytes(random_array::<DEK_LEN>())
 }
 ```
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test --package chisel crypto::tests`  Expected: PASS (6 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(crypto): key types, KdfId, Argon2Params, CryptoError, OS randomness"
 ```
@@ -361,7 +363,7 @@ git add -A && git commit -m "feat(crypto): key types, KdfId, Argon2Params, Crypt
 pub fn derive_kek(key: &Key, kdf: KdfId, salt: &[u8; SALT_LEN], params: &Argon2Params) -> Result<Kek, CryptoError>;
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 Add to the `tests` module in `src/crypto/mod.rs`. The HKDF case uses RFC 5869 Test Case 1 to prove the wiring (IKM = 22×0x0b, salt = 0x000102…0c, info = `b"chisel-kek-v1"` — note: we pin our own info string, so the assertion is determinism + correct length + salt-sensitivity, plus a direct-against-`hkdf` cross-check using our exact info, which is the honest known-answer for our construction):
 ```rust
     #[test]
@@ -420,10 +422,10 @@ Add to the `tests` module in `src/crypto/mod.rs`. The HKDF case uses RFC 5869 Te
         assert_eq!(err, CryptoError::Kdf);
     }
 ```
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test --package chisel crypto::tests::derive_kek`  Expected: FAIL — `cannot find function derive_kek`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 Add to `src/crypto/mod.rs` (above the `tests` module):
 ```rust
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -471,10 +473,10 @@ pub fn derive_kek(
     Ok(Kek::from_bytes(okm))
 }
 ```
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test --package chisel crypto::tests::derive_kek`  Expected: PASS (5 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(crypto): derive_kek dispatching HKDF-SHA256 and Argon2id"
 ```
@@ -500,7 +502,7 @@ fn seal_detached(key: &[u8; 32], nonce: &[u8; NONCE_LEN], aad: &[u8], plaintext:
 fn open_detached(key: &[u8; 32], nonce: &[u8; NONCE_LEN], aad: &[u8], ciphertext: &[u8], tag: &[u8; TAG_LEN]) -> Result<Vec<u8>, CryptoError>;
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 Add to the `tests` module:
 ```rust
     #[test]
@@ -547,10 +549,10 @@ Add to the `tests` module:
         assert_eq!(err, CryptoError::Auth);
     }
 ```
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test --package chisel crypto::tests`  Expected: FAIL — `cannot find function wrap_dek` / `unwrap_dek`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 Add to `src/crypto/mod.rs` (above the `tests` module):
 ```rust
 use chacha20poly1305::aead::AeadInPlace;
@@ -629,10 +631,10 @@ pub fn unwrap_dek(
     Ok(Dek::from_bytes(dek))
 }
 ```
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test --package chisel crypto::tests`  Expected: PASS (wrap/unwrap tests green alongside earlier ones).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(crypto): DEK wrap/unwrap under KEK with detached XChaCha20-Poly1305"
 ```
@@ -659,7 +661,7 @@ impl PageCipher {
 }
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 Add to the `tests` module:
 ```rust
     #[test]
@@ -736,10 +738,10 @@ Add to the `tests` module:
         assert_eq!(pc.open_body(b"sb-B", &nonce, &tag, &ct).unwrap_err(), CryptoError::Auth);
     }
 ```
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test --package chisel crypto::tests`  Expected: FAIL — `cannot find type PageCipher`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 Add to `src/crypto/mod.rs` (above the `tests` module). Reuses `seal_detached`/`open_detached` from Task 1.4 and `random_array` from Task 1.2:
 ```rust
 /// Holds the DEK and performs the two seal/open transforms the engine needs:
@@ -808,10 +810,10 @@ impl PageCipher {
     }
 }
 ```
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test --package chisel crypto`  Expected: PASS (all PageCipher tests plus every prior crypto test).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(crypto): PageCipher whole-page and body seal/open"
 ```
@@ -828,7 +830,7 @@ git add -A && git commit -m "feat(crypto): PageCipher whole-page and body seal/o
 - Consumes: all Phase-1 types
 - Produces: nothing new — this task certifies the module against the full suite and lint gate, matching the project's "lint + full `cargo test` before push" rule.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 Add a test asserting the zeroizing wrappers are wired (compile-level proof that `Dek`/`Kek` hold `Zeroizing`, and a behavioral proof that `Key` drops without leaking via a public accessor). `Zeroizing` zeroes on drop; we cannot observe freed memory safely, so the honest, runnable check is that the types expose no owned-bytes copy that escapes and that a `Zeroizing`-backed clone is independent:
 ```rust
     #[test]
@@ -850,22 +852,22 @@ Add a test asserting the zeroizing wrappers are wired (compile-level proof that 
         let _r2 = _raw.clone();
     }
 ```
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test --package chisel crypto::tests::dek_clone_is_independent_zeroizing_copy`  Expected: FAIL only if Step-1 names don't yet exist — if `Dek::clone` and `Key::clone` from Tasks 1.2 are already present, this compiles; in that case the gating signal for this task is the lint/full-suite step below. (Write the test first regardless; it is the deliverable's assertion.)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 No new production code is expected — the zeroizing types were defined in Task 1.2. If `cargo clippy` flags anything in `src/crypto/mod.rs` (e.g. a needless `to_vec`, a doc-list indent), fix it minimally here. Example fix shape if clippy wants `Default` derived or a lint silenced:
 ```rust
 // (apply only the specific clippy fix reported; no speculative changes)
 ```
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run the full gate the project requires before any push (plain `cargo test`, not `--lib`, plus clippy with warnings-as-errors):
 ```bash
 cargo test && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --check
 ```
 Expected: PASS — every crypto test green, no clippy warnings, formatted.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "test(crypto): zeroization guards; clippy/fmt clean for crypto core"
 ```
@@ -909,7 +911,7 @@ Verified offsets used below (read from `src/superblock.rs`): reserved region sta
   impl KeySlot { pub const EMPTY: KeySlot; pub fn is_active(&self) -> bool; }
   ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 ```rust
 #[cfg(test)]
 mod tests {
@@ -966,9 +968,9 @@ mod tests {
     }
 }
 ```
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test crypto_header_round_trips_through_reserved_region`  Expected: FAIL (module does not exist yet)
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Create `src/superblock/crypto_header.rs`:
 ```rust
@@ -1136,9 +1138,9 @@ pub use crypto_header::{
 ```
 (Move `src/superblock.rs` to `src/superblock/mod.rs` so the submodule resolves; no other edits to that file's body.)
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test crypto_header`  Expected: PASS
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(superblock): add crypto-header key-slot table in the reserved region"
 ```
@@ -1170,7 +1172,7 @@ git add -A && git commit -m "feat(superblock): add crypto-header key-slot table 
 
 The sealed body holds the sensitive fields (`root_handle_table_page`, `root_freemap_page`, `root_membership_index_page`, `total_pages`, `next_handle`, `freemap_depth`, `named_roots[8x32]`); in an encrypted serialization those byte ranges in the plaintext page are left zero, so `named_roots` are not visible in cleartext.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 ```rust
 // inside src/superblock/mod.rs tests module
 #[test]
@@ -1230,9 +1232,9 @@ fn wrong_dek_fails_body_authentication() {
     assert!(back.decrypt_body(&wrong, &buf).is_err());
 }
 ```
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test encrypted_superblock_hides_sensitive_fields_and_round_trips`  Expected: FAIL (`encryption` field / methods do not exist)
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add the field to the struct (after `freemap_depth` at line ~214):
 ```rust
@@ -1408,9 +1410,9 @@ In `deserialize` (line ~314), branch on the crypto-header: read it first, and wh
 
 Add `encryption: None` to: `new_empty` (line ~449), every `Superblock { .. }` literal in `mod.rs`'s tests, and the literal in `src/transaction/commit.rs:116`.
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test superblock`  Expected: PASS (plaintext round-trip tests still pass; new encrypted tests pass)
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(superblock): DEK-sealed body and Superblock.encryption field"
 ```
@@ -1441,7 +1443,7 @@ pub fn format_version_encrypted() -> u32 {
 }
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 ```rust
 // tests/encryption_create.rs
 use chisel::crypto::Key;
@@ -1477,9 +1479,9 @@ fn create_encrypted_db_writes_plaintext_header_and_hidden_named_roots() {
     assert_eq!(bytes[324], 1, "crypto-header algorithm byte not set");
 }
 ```
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test --test encryption_create`  Expected: FAIL (`with_encryption_key` / encrypted create path not implemented)
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `new_empty_encrypted` in `src/superblock/mod.rs`:
 ```rust
@@ -1640,9 +1642,9 @@ impl From<crate::crypto::CryptoError> for ChiselError {
 }
 ```
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test --test encryption_create`  Expected: PASS
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(engine): create encrypted database — wrap DEK into slot 0, stamp MAJOR=2"
 ```
@@ -1663,7 +1665,7 @@ git add -A && git commit -m "feat(engine): create encrypted database — wrap DE
 
 Wrong key → `InvalidEncryptionKey` (operational, NOT fatal — must not poison). Missing key on an encrypted DB → `NoEncryptionKey`. Key supplied for a plaintext DB → `EncryptionNotSupported`. All three are defined in **Task 4.1 (implemented first)**, so they are used directly here; the test asserts the open simply `is_err()` for each, so it does not depend on the exact variant.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 ```rust
 // tests/encryption_open.rs
 use chisel::crypto::Key;
@@ -1758,9 +1760,9 @@ fn key_on_plaintext_db_errors() {
     assert!(err.is_err(), "supplying a key to a plaintext DB must fail");
 }
 ```
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test --test encryption_open`  Expected: FAIL (open key flow not implemented)
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `open_existing`, after the `select()` winner is chosen and BEFORE the page-size / total-pages checks that read sensitive fields, add the key-flow branch. The version gate at line ~171 must accept MAJOR 2 when a key is present:
 ```rust
@@ -1853,9 +1855,9 @@ fn unwrap_first_matching_slot(
 
 The `NoEncryptionKey`, `InvalidEncryptionKey`, and `EncryptionNotSupported` variants are already defined (operational, `is_fatal() == false`) by **Task 4.1, implemented first** — do NOT re-add them here (that would duplicate the enum arms). Just wire `options.encryption_key.clone()` into the `open_existing` call at `src/lib.rs:344`.
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test --test encryption_open`  Expected: PASS
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(engine): open encrypted database — unwrap DEK from key-slot, decrypt body"
 ```
@@ -1873,7 +1875,7 @@ git add -A && git commit -m "feat(engine): open encrypted database — unwrap DE
 - Consumes: everything above.
 - Produces: `TransactionManager` consistently constructed with `cipher`; a session-held zeroizing DEK reachable for Phase 3's PageCache wiring.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 ```rust
 // in src/transaction/mod.rs tests module (or a small test in recovery.rs)
 #[test]
@@ -1903,14 +1905,14 @@ fn plaintext_manager_has_no_cipher() {
 ```
 (If `PageCache::new_for_test`/`PageIo::open_in_memory` differ from the actual in-memory test constructors, substitute the real ones the existing `mod tests` already uses — grep `create_new(` in `src/transaction/tests` for the established pattern and reuse it verbatim.)
 
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test encrypted_manager_holds_session_cipher`  Expected: FAIL until all call sites updated and the field is wired
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 Update every `TransactionManager::create_new(cache, N)` call to `create_new(cache, N, None)` and every `open_existing(cache)` to `open_existing(cache, None)` flagged by the compiler (in-memory paths in `lib.rs` lines ~404 and the transaction test module). The `cipher` field is set on each constructor as shown in Tasks 2.3/2.4. No `Drop` impl is needed: `PageCipher` owns a `Dek(Zeroizing<[u8; 32]>)` (Phase 1), so the key is zeroed on the manager's drop automatically.
-- [ ] **Step 4: Run the full suite**
+- [x] **Step 4: Run the full suite**
 Run: `cargo test`  Expected: PASS (all existing plaintext tests, plus the new encryption create/open/manager tests; integration tests in `tests/` run because we use plain `cargo test`)
 Run: `cargo clippy --all-targets -- -D warnings`  Expected: clean
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(engine): hold session DEK (zeroizing) on TransactionManager; green full suite"
 ```
@@ -1939,7 +1941,7 @@ Notes on deliberate simplifications (`ponytail`): only **slot 0** is populated a
 
 Note: page_io stays crypto-agnostic. It only knows a `stride` (the on-disk unit size). The cache passes already-sealed blobs in; page_io never seals. `stride` defaults to `PAGE_SIZE`; the engine calls `set_stride(ENC_PAGE_SIZE)` when the superblock says encrypted. The page-count cache now counts *units* of `stride` bytes, not `PAGE_SIZE` — `page_id * stride` is the only offset math that exists, so the seed at open must divide by `stride`, and `set_stride` must be called BEFORE the first read on an encrypted DB (the engine does this right after reading page 0's plaintext bootstrap header).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 ```rust
 #[cfg(test)]
 mod stride_tests {
@@ -1992,9 +1994,9 @@ mod stride_tests {
     }
 }
 ```
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test stride_8232_offsets_and_unit_roundtrip`  Expected: FAIL (no `set_stride`/`read_page_unit`/`write_page_unit` yet)
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 The `Memory` backing currently stores `Vec<[u8; PAGE_SIZE]>`. A stride-aware unit store needs variable-length rows, so switch it to a flat `Vec<u8>` addressed by `page_id * stride`. Change the struct and the three I/O entry points. Replace `Backing::Memory { pages: Vec<[u8; PAGE_SIZE]> }` with a flat byte vec; the existing `read_page`/`write_page` become thin wrappers that copy into/out of a `PAGE_SIZE` array via the unit functions when `stride == PAGE_SIZE`.
 
@@ -2183,9 +2185,9 @@ The `Memory` backing currently stores `Vec<[u8; PAGE_SIZE]>`. A stride-aware uni
 
 Note: the existing memory-backing tests construct pages as `[u8; PAGE_SIZE]` and call `read_page`/`write_page` — those keep working unchanged because the default stride is `PAGE_SIZE` and the wrappers preserve the exact byte semantics. The `read_page` unchecked-index comment block at old lines 262-266 is removed with the rewrite.
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test stride_8232_offsets_and_unit_roundtrip default_stride_is_page_size write_unit_wrong_length_is_invalid`  Expected: PASS. Also run `cargo test` to confirm the existing `read_page`/`write_page` memory + file tests still pass under the wrapper rewrite.
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(page_io): stride-aware raw on-disk page units (8232 encrypted, 8192 plaintext)"
 ```
@@ -2207,7 +2209,7 @@ git add -A && git commit -m "feat(page_io): stride-aware raw on-disk page units 
 
 The spillway carries the SEALED blob for encrypted DBs (seal-once: the page was sealed when evicted, the spillway stores ciphertext, drain copies it verbatim). `slot_checksum` covers `page_id ‖ blob` so a torn spillway write is caught before the blob reaches the main file — this is the slot's integrity check, NOT the AEAD tag (which lives inside the sealed blob and is verified by PageCipher::open only on the cold main-file read path).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 ```rust
     #[test]
     fn wide_slot_round_trips_sealed_blob() {
@@ -2239,9 +2241,9 @@ The spillway carries the SEALED blob for encrypted DBs (seal-once: the page was 
         ));
     }
 ```
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test wide_slot_round_trips_sealed_blob wide_slot_checksum_catches_tampered_payload`  Expected: FAIL (open_memory takes one arg; spill takes `[u8; PAGE_SIZE]`)
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 The slot size is now runtime, not a `const`. Keep `SLOT_HEADER_SIZE`; remove the fixed `SLOT_SIZE` const (or keep it as the plaintext-default for any remaining caller) and compute `slot_size = SLOT_HEADER_SIZE + payload_size` from a new field. The `[u8; PAGE_SIZE]` signatures become `&[u8]` / `Vec<u8>`.
 
@@ -2429,9 +2431,9 @@ fn read_slot(
 
 Every existing spillway test that calls `open_memory(n)` / `spill(id, &page(b))` / compares `rehydrate` to `[u8; PAGE_SIZE]` must be updated: add `PAGE_SIZE` as the `payload_size` arg, pass `&page(b)[..]` (a slice), and compare against the page slice. The `page()` helper returns `[u8; PAGE_SIZE]`; `&page(0xAA)` coerces to `&[u8]`. `logical_bytes`/cap tests already use `PAGE_SIZE` arithmetic, which now equals `payload_size`. PageCache callers are updated in Task 3.3/3.4.
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test --test '*' wide_slot ; cargo test`  Expected: PASS (run the full suite — the spillway and page_cache call sites are coupled).
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(spillway): runtime payload_size so slots carry sealed 8232-byte blobs"
 ```
@@ -2452,7 +2454,7 @@ git add -A && git commit -m "feat(spillway): runtime payload_size so slots carry
 
 Seal-once invariant: the plaintext page is sealed exactly once — at flush (Phase 1a) and at evict-to-spillway (Task 3.4). The cache always holds PLAINTEXT (`[u8; PAGE_SIZE]`); the on-disk unit and the spillway hold ciphertext. Cold load opens the unit back to plaintext and runs `verify_checksum` on the plaintext (the page's internal XXH3), exactly as today.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 ```rust
     use crate::crypto::{PageCipher, random_dek, ENC_PAGE_SIZE};
 
@@ -2520,9 +2522,9 @@ Seal-once invariant: the plaintext page is sealed exactly once — at flush (Pha
         );
     }
 ```
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test encrypted_page_round_trips_through_seal_open tampered_ciphertext_surfaces_decryption_failed`  Expected: FAIL (no `set_cipher`; flush/load_page not crypto-aware; `DecryptionFailed` is Phase 4 — if not yet merged, this task depends on Phase 4's error variant).
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 // PageCache struct (src/page_cache.rs:65), add after `io: PageIo,`:
@@ -2611,9 +2613,9 @@ Note: the borrow shape changes — copy the plaintext out (`*entry.buf`, an 8 KB
 ```
 Add `use crate::crypto::ENC_PAGE_SIZE;` to the module imports (near `src/page_cache.rs:46`).
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test encrypted_page_round_trips_through_seal_open tampered_ciphertext_surfaces_decryption_failed`  Expected: PASS
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(page_cache): seal on flush, open+verify on cold load for encrypted DBs"
 ```
@@ -2632,7 +2634,7 @@ git add -A && git commit -m "feat(page_cache): seal on flush, open+verify on col
 
 Seal-once invariant on the spill path: evict seals the plaintext ONCE into the spillway as ciphertext. Drain reads that ciphertext and `write_page_unit`s it to the main file verbatim — no second seal (a second seal would generate a fresh nonce and re-encrypt needlessly, and would force the cache to hold plaintext through drain anyway). Re-loading a spilled page from the spillway (`load_page`) must `open` the ciphertext back to plaintext before it re-enters `entries`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 ```rust
     #[test]
     fn encrypted_spill_and_drain_round_trips() {
@@ -2672,9 +2674,9 @@ Seal-once invariant on the spill path: evict seals the plaintext ONCE into the s
         }
     }
 ```
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test encrypted_spill_and_drain_round_trips`  Expected: FAIL (spill takes a slice now but ensure_spillway opens with the old single-arg signature / PAGE_SIZE payload; drain re-routes through write_page; cipher not applied on spill)
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 // ensure_spillway (src/page_cache.rs:1084): open with the correct payload_size.
@@ -2802,9 +2804,9 @@ Note: a re-loaded spilled page is marked `dirty: true` and the spillway slot is 
 
 Existing plaintext `fresh_cache_with_spillway` spillway tests still pass: no cipher, `payload_size == PAGE_SIZE`, `spill`/`rehydrate` carry the page image, drain copies it verbatim — byte-identical to the old `write_page` path.
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test encrypted_spill_and_drain_round_trips ; cargo test`  Expected: PASS (full suite — confirms the plaintext spill/drain regression set still passes under the seal-once routing).
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(page_cache): seal-once on spill, verbatim sealed-blob copy on drain"
 ```
@@ -2818,7 +2820,7 @@ Cross-phase dependencies (flagged, not invented):
 - `crate::crypto::{PageCipher, ENC_PAGE_SIZE, random_dek}` and `page::stamp_checksum` are Phase-1 / existing `page.rs` symbols consumed verbatim.
 - Engine wiring (call `io.set_stride(ENC_PAGE_SIZE)` + `cache.set_cipher(...)` at open after the DEK is unwrapped) is Phase 2's `TransactionManager`/`Chisel::open` responsibility; Phase 3 only provides the `set_stride`/`set_cipher` entry points.
 
-Relevant files: `/Users/xof/Documents/Dev/chisel/src/page_io.rs`, `/Users/xof/Documents/Dev/chisel/src/spillway.rs`, `/Users/xof/Documents/Dev/chisel/src/page_cache.rs`.
+Relevant files: `/Users/xof/Documents/Dev/PVC/chisel/src/page_io.rs`, `/Users/xof/Documents/Dev/PVC/chisel/src/spillway.rs`, `/Users/xof/Documents/Dev/PVC/chisel/src/page_cache.rs`.
 
 ---
 
@@ -2843,7 +2845,7 @@ Relevant files: `/Users/xof/Documents/Dev/chisel/src/page_io.rs`, `/Users/xof/Do
   - `ChiselError::LastKeySlot` (operational; key-management — refusing to remove the only active credential)
   - `ChiselError::DecryptionFailed { page_id: u64 }` (fatal; `is_fatal() == true`)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `src/error.rs`'s `mod tests`:
 ```rust
@@ -2881,11 +2883,11 @@ Add to `src/error.rs`'s `mod tests`:
 ```
 Also extend the existing exhaustiveness test `is_fatal_matches_documented_classification_for_every_variant`: add the six new variants to `documented_is_fatal`'s blocks (five operational, one fatal), to the `all` array, and bump the fatal-count tripwire from `9` to `10` (the one new fatal variant is `DecryptionFailed`).
 
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 
 Run: `cargo test encryption_error_classification`  Expected: FAIL (variants don't exist — compile error)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In the enum, after the `UnsupportedPageSize { stored, compiled }` variant (src/error.rs:161, inside the Operational/Fatal region — place the three operational ones with the operational block and the fatal one with the fatal block; placement is by comment-block only since the enum is flat):
 ```rust
@@ -2958,11 +2960,11 @@ In `Display` (after the `UnsupportedPageSize` arm at src/error.rs:281):
 
 In the exhaustiveness test `documented_is_fatal`: add `NoEncryptionKey | InvalidEncryptionKey | EncryptionNotSupported` to the operational (`=> false`) block and `ChiselError::DecryptionFailed { .. }` to the fatal (`=> true`) block; add all four to the `all` array; change `assert_eq!(all.iter().filter(|e| e.is_fatal()).count(), 9)` to `10`.
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 
 Run: `cargo test`  Expected: PASS (both the new test and the updated exhaustiveness test)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(error): add encryption error variants (NoEncryptionKey, InvalidEncryptionKey, EncryptionNotSupported, NoFreeKeySlot, LastKeySlot, fatal DecryptionFailed)"
 ```
@@ -2988,7 +2990,7 @@ git add -A && git commit -m "feat(error): add encryption error variants (NoEncry
   - `Options::encryption_key(self, key: Key) -> Self`
   - `Options::argon2_params(self, params: Argon2Params) -> Self`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `src/lib.rs`:
 ```rust
@@ -3020,11 +3022,11 @@ mod options_encryption_tests {
 }
 ```
 
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 
 Run: `cargo test encryption_options_default_none_and_set`  Expected: FAIL (fields/setters/re-exports don't exist)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add the module (src/lib.rs, in the `pub(crate) mod` block ~line 39):
 ```rust
@@ -3077,11 +3079,11 @@ Add the two setters to `impl Options` (after the `superblock_count` setter, src/
 
 Add `zeroize` as a dev/normal dep if not already present (Phase 1 adds it to `[dependencies]`; the test above uses `zeroize::Zeroizing` through the public `Key`). No Cargo change needed here if Phase 1 landed it.
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 
 Run: `cargo test encryption_options_default_none_and_set`  Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(api): re-export Key/Argon2Params and add encryption_key/argon2_params to Options"
 ```
@@ -3102,7 +3104,7 @@ git add -A && git commit -m "feat(api): re-export Key/Argon2Params and add encry
   These extend the current 2-arg / 1-arg signatures at `src/lib.rs:344` and `:346`. Phase 2 is responsible for adding the `encryption_key` parameter; this task passes `options.encryption_key` into them.
 - Produces: end-to-end encrypted open behavior the public API guarantees.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `tests/encryption_roundtrip.rs`:
 ```rust
@@ -3180,11 +3182,11 @@ fn encrypted_roundtrip_and_wrong_key() {
 ```
 Ensure `tempfile` is a `[dev-dependencies]` entry (it is already used by the existing integration tests; if not, add `tempfile = "3"`).
 
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 
 Run: `cargo test --test encryption_roundtrip`  Expected: FAIL (open ignores `encryption_key`; create/open signatures don't take it yet — compile error until Phase 2 lands, then a behavior failure)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `Chisel::open` (src/lib.rs:341), pass the key into both arms:
 ```rust
@@ -3225,11 +3227,11 @@ Update the `# Errors` rustdoc on `open` (src/lib.rs:303) to add the new operatio
     /// `FileSizeMismatch`, or `IoError`.
 ```
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 
 Run: `cargo test --test encryption_roundtrip`  Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(api): wire encryption_key through open() and open_in_memory_with_options()"
 ```
@@ -3249,7 +3251,7 @@ git add -A && git commit -m "feat(api): wire encryption_key through open() and o
 - Consumes (Phase 4 Task 4.2 / 4.3): `chisel::Key`, `Options::encryption_key`.
 - Produces: `chisel.open(path, *, encryption_key=...)` where `bytes` → `Key::Raw`, `str` → `Key::Passphrase`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `python/tests/test_encryption.py`:
 ```python
@@ -3308,11 +3310,11 @@ def test_passphrase_key_roundtrip(tmp_path: pathlib.Path):
 
 This depends on the three new Python exception classes (`NoEncryptionKeyError`, `InvalidEncryptionKeyError`, `EncryptionNotSupportedError`) and a `DecryptionFailedError` — added in Task 4.5. Run order: 4.5 lands the exception classes, 4.4 the kwarg; commit 4.4 after 4.5 or fold the exception additions in first. (They are independent files; do 4.5's `errors.rs` edits before running this test.)
 
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 
 Run: `cd python && maturin develop && python -m pytest tests/test_encryption.py`  Expected: FAIL (`open()` has no `encryption_key` kwarg)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add to the signature (python/src/db.rs:140, after `superblock_count = 2`):
 ```rust
@@ -3366,11 +3368,11 @@ Add `.encryption_key(...)` to the builder chain (python/src/db.rs:208). Because 
 
 Add `zeroize` to `python/Cargo.toml` `[dependencies]` (`zeroize = "1"`) if not already present — needed for `Zeroizing` here.
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 
 Run: `cd python && maturin develop && python -m pytest tests/test_encryption.py`  Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(python): add encryption_key kwarg to open() (bytes->raw, str->passphrase)"
 ```
@@ -3391,7 +3393,7 @@ git add -A && git commit -m "feat(python): add encryption_key kwarg to open() (b
 - Consumes: `ChiselError::{NoEncryptionKey, InvalidEncryptionKey, EncryptionNotSupported, DecryptionFailed}` (Task 4.1).
 - Produces: Python `NoEncryptionKeyError`, `InvalidEncryptionKeyError`, `EncryptionNotSupportedError` (under `OperationalError`); `DecryptionFailedError` (under `FatalError`).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 The two assertions in `python/tests/test_encryption.py` (Task 4.4) already require `chisel.InvalidEncryptionKeyError` and `chisel.NoEncryptionKeyError` to exist and be raised. Add one direct-classification check to that file:
 ```python
@@ -3404,11 +3406,11 @@ def test_encryption_exception_hierarchy():
     assert issubclass(chisel.DecryptionFailedError, chisel.FatalError)
 ```
 
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 
 Run: `cd python && maturin develop && python -m pytest tests/test_encryption.py::test_encryption_exception_hierarchy`  Expected: FAIL (`AttributeError`: classes don't exist)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Declare the classes (python/src/errors.rs, after `create_exception!(_chisel, TagMismatchError, OperationalError);` at line 116 for the operational ones, and after `create_exception!(_chisel, PoisonedError, FatalError);` at line 144 for the fatal one):
 ```rust
@@ -3455,11 +3457,11 @@ Extend the hierarchy doc comment (python/src/errors.rs:34-50): add the three ope
 
 In `python/chisel/__init__.py` and `python/chisel/_chisel.pyi`, add the four class names to the re-export list and stub declarations, mirroring the format of the existing `InvalidHandleError` / `PoisonedError` entries. (Grep them for `InvalidHandleError` to find every list that needs the additions.)
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 
 Run: `cd python && maturin develop && python -m pytest tests/test_encryption.py`  Expected: PASS (all of Task 4.4's tests now pass too)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(python): map encryption errors to NoEncryptionKeyError/InvalidEncryptionKeyError/EncryptionNotSupportedError/DecryptionFailedError"
 ```
@@ -3502,7 +3504,7 @@ Phase-4 errors consumed verbatim: `ChiselError::InvalidEncryptionKey` (no slot u
   - `CryptoHeader::active_count(&self) -> usize`
   - `CryptoHeader::wrap_into(&mut self, slot: usize, key: &Key, dek: &crypto::Dek)` — fills `slots[slot]` with a fresh salt + (HKDF default) KDF params, wrapping `dek` under the KEK derived from `key`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 ```rust
 #[cfg(test)]
 mod crypto_header_tests {
@@ -3570,10 +3572,10 @@ mod crypto_header_tests {
 ```
 (`KeySlot::EMPTY`, `crypto::Dek::expose()`, and `crypto::ENC_PAGE_SIZE` are Phase-1/Phase-2 surface; `Dek::expose(&self) -> &[u8; DEK_LEN]` is the test-only accessor Phase 1 defines under `#[cfg(test)]`.)
 
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test crypto_header_tests`  Expected: FAIL (methods not yet implemented)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 ```rust
 // In src/superblock.rs, after the CryptoHeader struct (Phase 2).
 use crate::crypto::{self, Argon2Params, KdfId, Key, SALT_LEN, NONCE_LEN};
@@ -3686,10 +3688,10 @@ impl CryptoHeader {
 }
 ```
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test crypto_header_tests`  Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(crypto): key-slot table helpers (unlock/free_slot/wrap_into) on CryptoHeader"
 ```
@@ -3707,7 +3709,7 @@ git add -A && git commit -m "feat(crypto): key-slot table helpers (unlock/free_s
 - Consumes: `TransactionManager` fields `cache: RefCell<PageCache>`, `committed_roots: Roots`, `txn_counter: u64`, `superblock_count: u32`, `poisoned: Cell<bool>`, and the Phase-2 fields `crypto: Option<CryptoHeader>`, `dek: Option<crypto::Dek>`. Consumes `Superblock::serialize` (it serializes `self.encryption: Option<CryptoHeader>` in Phase 2) and `PageCache::io_mut().{write_page, fsync}`. Consumes `TransactionManager::poison_on_fatal` (existing).
 - Produces: `pub(crate) fn rewrite_crypto_header(&mut self, new_header: CryptoHeader) -> Result<()>` — refuses if `active_txn`, bumps `txn_counter`, writes the inactive slot, fsyncs, then commits `new_header` into `self.crypto`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 ```rust
 #[cfg(test)]
 mod tests {
@@ -3740,10 +3742,10 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test rewritten_header_persists_across_reopen`  Expected: FAIL (`add_key`/`encryption_key` not yet present)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 ```rust
 //! transaction::keys — out-of-band key-slot management. Each operation rewrites
 //! ONLY the in-superblock CryptoHeader and commits it via the ordinary A/B
@@ -3820,10 +3822,10 @@ impl TransactionManager {
 ```
 (`Superblock` gains `encryption: Option<CryptoHeader>` and `serialize_encrypted(&self, dek: Option<&crypto::Dek>) -> [u8; PAGE_SIZE]` in Phase 2; `total_pages` is re-read rather than assumed because a prior data commit may have grown the file.)
 
-- [ ] **Step 4: Run test, verify it passes** (passes once Tasks 5.3 wires `add_key`)
+- [x] **Step 4: Run test, verify it passes** (passes once Tasks 5.3 wires `add_key`)
 Run: `cargo test rewritten_header_persists_across_reopen`  Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(crypto): rewrite_crypto_header metadata-only superblock commit"
 ```
@@ -3845,7 +3847,7 @@ git add -A && git commit -m "feat(crypto): rewrite_crypto_header metadata-only s
   - `Chisel::add_key(&mut self, existing: &Key, new: &Key) -> Result<()>`
   - `Chisel::rotate_key(&mut self, old: &Key, new: &Key) -> Result<()>`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 ```rust
 // tests/encryption_keys.rs
 use chisel::{Chisel, Options};
@@ -3922,10 +3924,10 @@ fn rotate_key_revokes_old_and_admits_new() {
 ```
 (`Chisel::open` mapping a failed all-slot unlock to `ChiselError::InvalidEncryptionKey` is Phase 2/4.)
 
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test --test encryption_keys`  Expected: FAIL (`add_key`/`rotate_key` not present)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 ```rust
 // src/transaction/keys.rs — append to the impl block.
 use crate::crypto::Key;
@@ -4001,10 +4003,10 @@ use crypto::Key;
     }
 ```
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test --test encryption_keys`  Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(crypto): Chisel::add_key and rotate_key"
 ```
@@ -4022,7 +4024,7 @@ git add -A && git commit -m "feat(crypto): Chisel::add_key and rotate_key"
 - Consumes: `CryptoHeader::{unlock, active_count}` (Task 5.1), `KeySlot::EMPTY` (Task 5.1), `rewrite_crypto_header` (Task 5.2).
 - Produces: `TransactionManager::remove_key(&mut self, key: &Key) -> Result<()>`, `Chisel::remove_key(&mut self, key: &Key) -> Result<()>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 ```rust
 // tests/encryption_keys.rs — append.
 #[test]
@@ -4073,10 +4075,10 @@ fn remove_unknown_key_is_wrongkey() {
 }
 ```
 
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test --test encryption_keys`  Expected: FAIL (`remove_key` not present)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 ```rust
 // src/transaction/keys.rs — append to the impl block.
 impl TransactionManager {
@@ -4117,10 +4119,10 @@ impl TransactionManager {
     }
 ```
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test --test encryption_keys`  Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(crypto): Chisel::remove_key with last-slot guard"
 ```
@@ -4137,7 +4139,7 @@ git add -A && git commit -m "feat(crypto): Chisel::remove_key with last-slot gua
 - Consumes: `Chisel::{add_key, rotate_key, remove_key}` (Tasks 5.3/5.4); the existing `to_py_err` (`python/src/db.rs:50`) and the `Mutex<Option<Chisel>>` accessor pattern (`python/src/db.rs:87`). Python passes keys as `bytes` (32-byte raw) or `str` (passphrase); map to `crypto::Key` exactly as the Phase-2 `open()` kwarg does.
 - Produces: `PyChisel.add_key(self, existing, new)`, `PyChisel.rotate_key(self, old, new)`, `PyChisel.remove_key(self, key)`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 ```python
 # python/tests/test_encryption_keys.py
 import tempfile, os, pytest, chisel
@@ -4175,10 +4177,10 @@ def test_remove_last_key_rejected():
         db.close()
 ```
 
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test -p chisel-python 2>/dev/null; (cd python && maturin develop && python -m pytest tests/test_encryption_keys.py)`  Expected: FAIL (methods not bound)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 ```rust
 // python/src/db.rs — inside #[pymethods] impl PyChisel.
 
@@ -4226,10 +4228,10 @@ fn py_key(obj: &Bound<'_, PyAny>) -> PyResult<chisel::crypto::Key> {
 ```
 (`with_db_mut` is the existing locked-mutable accessor that takes `FnOnce(&mut Chisel) -> Result<_>` and applies `to_py_err`; it is the helper at `python/src/db.rs:564`/`573`. If that helper is `&self`/`&mut self`-shaped differently in the real file, match its exact signature — the three methods above only need "lock, take `&mut Chisel`, map_err to_py_err".)
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `(cd python && maturin develop && python -m pytest tests/test_encryption_keys.py)`  Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(python): bind add_key/rotate_key/remove_key on PyChisel"
 ```
@@ -4263,7 +4265,7 @@ This phase carries no new engine logic. The MAJOR-version gate at `src/transacti
 - Consumes: `page::pack_format_version(major, minor) -> u32` (`src/page.rs:117`), `page::format_major(version) -> u16` (`src/page.rs:122`), `page::FORMAT_MAJOR_VERSION: u16 = 1` (`src/page.rs:113`).
 - Produces: `pub const ENCRYPTED_FORMAT_MAJOR_VERSION: u16 = 2;` and `pub const ENCRYPTED_FORMAT_VERSION: u32` — consumed by the Phase 2 create path when `Options.encryption_key.is_some()`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the existing test module in `src/transaction/recovery.rs` (the gate under test is the `format_major` check at line 171). The test stamps an encrypted-DB MAJOR (2) into a freshly serialized superblock, writes it as page 0, and asserts open fails with `UnsupportedFormatVersion`. This proves an *encryption-unaware* binary (whose `FORMAT_MAJOR_VERSION` is 1) hard-rejects a MAJOR=2 file, exactly as spec §7/§8 require.
 
@@ -4303,10 +4305,10 @@ fn encrypted_major_version_is_rejected_by_plaintext_binary() {
 
 (Use whatever `Superblock` constructor the existing recovery tests already use — `Superblock::new_empty()` is named here per `src/superblock.rs:562`-area test constructors; if the in-tree name differs, match the sibling tests in this module rather than inventing one. The gate assertion is the load-bearing part.)
 
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 Run: `cargo test encrypted_major_version_is_rejected_by_plaintext_binary`  Expected: FAIL — `page::ENCRYPTED_FORMAT_VERSION` does not exist yet (does not compile).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `src/page.rs`, immediately after the `FORMAT_MINOR_VERSION` line (currently `src/page.rs:114`), add the encrypted-DB version constants. Do **not** change `FORMAT_MAJOR_VERSION` — plaintext DBs (the default) must keep MAJOR=1 or their own binary would reject them.
 
@@ -4330,10 +4332,10 @@ pub const ENCRYPTED_FORMAT_VERSION: u32 =
 
 No gate change is needed: `recovery.rs:171` already does `if page::format_major(sb.format_version) != page::FORMAT_MAJOR_VERSION`. An encryption-unaware binary has `FORMAT_MAJOR_VERSION == 1`, so a MAJOR-2 file fails the comparison and returns `UnsupportedFormatVersion`. (When the engine later learns encryption, that gate grows a second accepted MAJOR — out of scope for this docs phase; the constant defined here is what Phase 2's create path stamps.)
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 Run: `cargo test encrypted_major_version_is_rejected_by_plaintext_binary`  Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "feat(format): add encrypted-DB MAJOR version constant and gate-rejection test"
 ```
@@ -4351,7 +4353,7 @@ git add -A && git commit -m "feat(format): add encrypted-DB MAJOR version consta
 - Consumes: the approved spec `docs/specs/2026-06-29-on-disk-encryption-design.md` (§3 envelope, §4 stride, §8 versioning, §9 threat model).
 - Produces: durable architecture documentation; no code symbols.
 
-- [ ] **Step 1: Write the failing check**
+- [x] **Step 1: Write the failing check**
 
 There is no Rust test for prose. The "failing test" is a grep that must find the new heading and TOC entry; before the edit it returns nothing.
 
@@ -4361,10 +4363,10 @@ grep -n "On-disk encryption" ARCHITECTURE.md   # expect a TOC line too
 ```
 Expected before the edit: no match (exit 1).
 
-- [ ] **Step 2: Run check, verify it fails**
+- [x] **Step 2: Run check, verify it fails**
 Run: `grep -c "### On-disk encryption" ARCHITECTURE.md`  Expected: `0` (section absent).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 First add the TOC entry. The TOC lists "Cross-cutting concepts" subsections around `ARCHITECTURE.md:7`; add a line in that subsection list (keep the existing indentation/style of sibling TOC lines):
 
@@ -4442,10 +4444,10 @@ size, page count, and access patterns are visible). Bulk DEK rotation / full
 re-encryption is deferred (see ISSUES.md).
 ```
 
-- [ ] **Step 4: Run check, verify it passes**
+- [x] **Step 4: Run check, verify it passes**
 Run: `grep -c "### On-disk encryption" ARCHITECTURE.md && grep -c "On-disk encryption](#on-disk-encryption)" ARCHITECTURE.md && cargo build`  Expected: section grep `1`, TOC grep `1`, build succeeds.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add -A && git commit -m "docs(architecture): document the on-disk encryption envelope scheme and threat boundary"
 ```
@@ -4529,10 +4531,10 @@ This task is **not** code — it is a procedure the implementer runs by hand usi
 > *only* that fragment; every other section is destroyed. The `sections` argument
 > does **not** scope the write. Always snapshot-then-read-modify-write.
 
-- [ ] **Step 1: Snapshot the current ADR (makes the overwrite reversible)**
+- [x] **Step 1: Snapshot the current ADR (makes the overwrite reversible)**
 Run the `codebase-memory` skill's `manage_adr(mode=get)` for the Chisel project. Save the **entire returned document verbatim** to the session scratchpad (e.g. `…/scratchpad/adr-snapshot-pre-encryption.md`) BEFORE editing anything. This snapshot is the only thing that makes Step 3 reversible.
 
-- [ ] **Step 2: Compose the new section inside the full document**
+- [x] **Step 2: Compose the new section inside the full document**
 In a working copy of the full snapshot, add ONE new ADR section for on-disk encryption, leaving every other section byte-for-byte unchanged. The new section records the load-bearing decisions (cite the spec for each):
   - **Decision:** opt-in, per-DB authenticated at-rest encryption.
   - **AEAD:** XChaCha20-Poly1305, random 192-bit nonce per page write, `AAD = page_id` (spec §2.1 — why random-nonce over deterministic, given shadow-paging page reuse).
@@ -4541,13 +4543,13 @@ In a working copy of the full snapshot, add ONE new ADR section for on-disk encr
   - **Format version:** MAJOR 1→2 for encrypted DBs only; the existing MAJOR gate hard-rejects old binaries (spec §8).
   - **Boundaries:** no rollback/replay protection, no in-memory protection beyond zeroize, no size hiding; bulk DEK rotation deferred → ISSUES.md I142 (spec §9).
 
-- [ ] **Step 3: Write the ENTIRE edited document back**
+- [x] **Step 3: Write the ENTIRE edited document back**
 Call `manage_adr(mode=update, content=<the full edited document>)` — the complete text from Step 2, not just the new section. Never pass a section fragment to `mode=update`.
 
-- [ ] **Step 4: Verify nothing was lost**
+- [x] **Step 4: Verify nothing was lost**
 Call `manage_adr(mode=get)` again and confirm the new encryption section is present **and** every section that existed in the Step 1 snapshot still exists, unchanged. If any prior section is missing, recover by re-running `manage_adr(mode=update)` with the Step 1 snapshot (rebuilt to include the new section) — never hand-edit the codebase-memory SQLite store (it is shared across all indexed projects).
 
-- [ ] **Step 5: (no commit)**
+- [x] **Step 5: (no commit)**
 The ADR lives in the untracked `.codebase-memory/` store, not in git — there is nothing to commit for this task. With Tasks 6.1–6.3 committed and the ADR updated, the encryption feature is documented and the branch is ready for `gh pr create --base master`.
 
 ---

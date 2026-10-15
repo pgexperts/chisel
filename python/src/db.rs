@@ -125,6 +125,10 @@ pub struct PyChisel {
 // and the Rust source stays mechanical. `eq` / `eq_int` give Python users
 // `chisel.DrainInsertion.LruTail == chisel.DrainInsertion.LruTail` and
 // efficient int-based comparison under the hood.
+//
+// Deliberately not `Copy`: `from_py_object` extracts by calling `.clone()`,
+// and from Rust 1.99 clippy's `clone_on_copy` flags that generated call on a
+// `Copy` type. Nothing here needs the enum to be `Copy`.
 #[pyclass(
     eq,
     eq_int,
@@ -132,7 +136,7 @@ pub struct PyChisel {
     module = "chisel._chisel",
     name = "DrainInsertion"
 )]
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum PyDrainInsertion {
     LruTail,
     Mru,

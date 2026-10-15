@@ -12,7 +12,7 @@
 //     no operations of its own (use the enclosing `Transaction` — same
 //     engine, same active transaction).
 //
-// `ChiselStore` (the async/actor layer, a later task) wraps `ChiselDatabase`
+// `ChiselStore` (the async/actor layer, `ChiselStore.swift`) wraps `ChiselDatabase`
 // and moves every call onto a private serial queue; this file assumes nothing
 // about concurrency beyond "the caller does not call in from two threads at
 // once" (see `ChiselDatabase`'s doc comment).

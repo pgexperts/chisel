@@ -665,8 +665,7 @@ mod tests {
             .filter(|v| {
                 let needle = format!("E::{v}");
                 !from_impl_code.match_indices(&needle).any(|(idx, _)| {
-                    from_impl_code[idx + needle.len()..]
-                        .as_bytes()
+                    from_impl_code.as_bytes()[idx + needle.len()..]
                         .first()
                         .map(|&b| !(b.is_ascii_alphanumeric() || b == b'_'))
                         .unwrap_or(true)

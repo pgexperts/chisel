@@ -1,6 +1,6 @@
 # Client Byte — Design
 
-**Status:** Approved 2026-06-05 (brainstorming). Pre-implementation.
+**Status:** Approved 2026-06-05 (brainstorming). Implemented.
 
 **Goal:** Give each chunk a single client-owned `u8` ("client byte") that Chisel
 persists and returns verbatim but never interprets — no search, no filter, no

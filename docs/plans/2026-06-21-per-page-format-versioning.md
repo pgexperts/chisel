@@ -29,7 +29,7 @@
 **Files:**
 - Modify: `src/page.rs` (add `format_minor` after `format_major`; add `current_version` + `page_format_version` after the `PageType` enum; add tests in the existing `#[cfg(test)] mod tests`)
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the `#[cfg(test)] mod tests` block in `src/page.rs`:
 
@@ -82,12 +82,12 @@ Add to the `#[cfg(test)] mod tests` block in `src/page.rs`:
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test --lib page::tests::page_format_version_dispatches_offset_on_page_type page::tests::current_version_is_zero_for_all_types_today page::tests::format_minor_extracts_low_16_bits`
 Expected: FAIL to compile — `cannot find function page_format_version` / `current_version` / `format_minor`.
 
-- [ ] **Step 3: Implement the three functions**
+- [x] **Step 3: Implement the three functions**
 
 In `src/page.rs`, immediately after `format_major` (the `pub const fn format_major(...)` block) and before `pub const FORMAT_VERSION`, add:
 
@@ -138,12 +138,12 @@ pub fn page_format_version(buf: &[u8; PAGE_SIZE]) -> u8 {
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --lib page::tests::page_format_version_dispatches_offset_on_page_type page::tests::current_version_is_zero_for_all_types_today page::tests::format_minor_extracts_low_16_bits`
 Expected: PASS (3 passed).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/page.rs
@@ -173,16 +173,16 @@ This is a mechanical refactor (no behavior change — `current_version` returns 
 
 (Note: `membership_index.rs:47` is inside a fn whose `page_type` parameter is what `buf[0] = page_type as u8` uses; `:235` uses the local `pt`. Leave any `PAGE_FORMAT_VERSION_CURRENT` occurrences that are inside `#[cfg(test)]` modules — e.g. `membership_index.rs` ~950/~1007 and any in `handle_table.rs` test fixtures — untouched: they build test pages and the constant remains valid. Confirm with `grep -n PAGE_FORMAT_VERSION_CURRENT src/handle_table.rs` whether a site sits in a `#[cfg(test)]` block before editing.)
 
-- [ ] **Step 1: Apply the ten production-site edits above.**
+- [x] **Step 1: Apply the ten production-site edits above.**
 
 Use the table verbatim. Re-grep first in case line numbers drifted: `grep -rn "PAGE_FORMAT_VERSION_CURRENT" src/ --include='*.rs'` — match each production write-site to its row by the surrounding `buf[0] = <type>` assignment.
 
-- [ ] **Step 2: Run the full suite to verify no regression**
+- [x] **Step 2: Run the full suite to verify no regression**
 
 Run: `cargo test`
 Expected: PASS — the change is behavior-preserving (`current_version` returns the same 0). In particular `page::tests::fresh_pages_report_current_version` still passes (fresh pages stamp `current_version(type) == 0`).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/data_page.rs src/overflow.rs src/freemap.rs src/membership_index.rs src/handle_table.rs
@@ -196,7 +196,7 @@ git commit -m "refactor(format): init sites stamp current_version(type), establi
 **Files:**
 - Modify: `src/page_io.rs` (add `force_read_only` near `is_read_only` at ~line 137; add a test in the `read_only_tests` module)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `#[cfg(test)] mod read_only_tests` block in `src/page_io.rs` (it already imports `NamedTempFile` and `PAGE_SIZE`):
 
@@ -215,12 +215,12 @@ Add to the `#[cfg(test)] mod read_only_tests` block in `src/page_io.rs` (it alre
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test --lib page_io::read_only_tests::force_read_only_blocks_writes_after_a_read_write_open`
 Expected: FAIL to compile — `no method named force_read_only`.
 
-- [ ] **Step 3: Implement the setter**
+- [x] **Step 3: Implement the setter**
 
 In `src/page_io.rs`, immediately after the `pub fn is_read_only(&self) -> bool { self.read_only }` method, add:
 
@@ -237,12 +237,12 @@ In `src/page_io.rs`, immediately after the `pub fn is_read_only(&self) -> bool {
     }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test --lib page_io::read_only_tests::force_read_only_blocks_writes_after_a_read_write_open`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/page_io.rs
@@ -256,7 +256,7 @@ git commit -m "feat(io): add PageIo::force_read_only for the I29 format-minor wr
 **Files:**
 - Modify: `src/transaction.rs` (add the gate in `open_existing` right after the MAJOR gate; add a test in the same `#[cfg(test)]` module as `format_version_gate_is_major_only`)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `#[cfg(test)]` module in `src/transaction.rs`, next to `format_version_gate_is_major_only`:
 
@@ -316,12 +316,12 @@ Add to the `#[cfg(test)]` module in `src/transaction.rs`, next to `format_versio
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test --lib file_minor_newer_than_binary_is_forced_read_only`
 Expected: FAIL — `tm.begin()` returns `Ok` (no gate yet), so the `matches!(... ReadOnlyMode)` assertion fails.
 
-- [ ] **Step 3: Implement the gate**
+- [x] **Step 3: Implement the gate**
 
 In `src/transaction.rs`, in `open_existing`, immediately after the MAJOR-gate block (the `if page::format_major(sb.format_version) != page::FORMAT_MAJOR_VERSION { ... }` that ends near line 462), add:
 
@@ -339,12 +339,12 @@ In `src/transaction.rs`, in `open_existing`, immediately after the MAJOR-gate bl
         }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test --lib file_minor_newer_than_binary_is_forced_read_only`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/transaction.rs
@@ -359,7 +359,7 @@ git commit -m "feat(format): I29 file-minor write-gate forces read-only on a new
 - Modify: `ARCHITECTURE.md` (the `page::page_format_version()` reference is live again; the load path does not validate the version)
 - Modify: `ISSUES.md` (record that I31 read-dispatch + I29 write-gate landed; eager-upgrade sweep remains deferred)
 
-- [ ] **Step 1: Fix the ARCHITECTURE.md reference**
+- [x] **Step 1: Fix the ARCHITECTURE.md reference**
 
 Find the line `See page::page_format_version() for the dispatch.` (around `ARCHITECTURE.md:246`) and replace it with:
 
@@ -370,11 +370,11 @@ dispatch is per-module decode-only; see
 docs/specs/2026-06-21-per-page-format-versioning-design.md.
 ```
 
-- [ ] **Step 2: Add an ISSUES.md note**
+- [x] **Step 2: Add an ISSUES.md note**
 
 Append to the I31 and I29 entries in `ISSUES.md` (or add a dated sub-note) that the per-page version read-dispatch helpers (`page_format_version`, `current_version`) and the file-MINOR write-gate (forced read-only via `PageIo::force_read_only`) landed on 2026-06-21; the eager-upgrade sweep remains deferred. Match the file's existing entry style (do not invent a new format).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add ARCHITECTURE.md ISSUES.md
@@ -387,7 +387,7 @@ git commit -m "docs: record per-page version dispatch (I31) + minor write-gate (
 
 ## Task 6: Final verification
 
-- [ ] **Step 1: Format, lint, build, test (the CI gates)**
+- [x] **Step 1: Format, lint, build, test (the CI gates)**
 
 Run:
 ```bash
@@ -397,12 +397,12 @@ cargo test
 ```
 Expected: fmt makes no changes (or only trivial); clippy clean (no warnings); all tests pass, including the three new ones (`page_format_version_dispatches_offset_on_page_type`, `force_read_only_blocks_writes_after_a_read_write_open`, `file_minor_newer_than_binary_is_forced_read_only`).
 
-- [ ] **Step 2: Confirm the seam is dormant (no behavior change today)**
+- [x] **Step 2: Confirm the seam is dormant (no behavior change today)**
 
 Run: `grep -rn "page_format_version(" src/ --include='*.rs' | grep -v "fn page_format_version\|tests\|//"`
 Expected: **no production caller** — the read-dispatch is documented but unused until the first real version bump (per the spec). This confirms the change adds the seam without changing any read path.
 
-- [ ] **Step 3: Commit any fmt fixups (if cargo fmt changed anything)**
+- [x] **Step 3: Commit any fmt fixups (if cargo fmt changed anything)**
 
 ```bash
 git add -A

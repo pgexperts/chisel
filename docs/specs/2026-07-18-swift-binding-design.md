@@ -1,7 +1,7 @@
 # Swift Binding — Design
 
 Date: 2026-07-18
-Status: Approved (design), pending implementation plan
+Status: Approved (design). Superseded by `2026-08-23-swift-binding-port-design.md`.
 Topic: A reusable, published Swift package exposing the Chisel storage engine to iOS and macOS applications
 
 ---

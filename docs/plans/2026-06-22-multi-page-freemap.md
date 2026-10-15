@@ -45,7 +45,7 @@ Land each phase as its own PR off `main` (merge-first between phases, per the pr
 - Modify: `src/page.rs:147-172` (the `PageType` enum and `current_version`)
 - Test: `src/page.rs` (inline `#[cfg(test)]`)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `src/page.rs`'s test module:
 
@@ -61,12 +61,12 @@ fn freemap_interior_type_tag_and_version() {
 }
 ```
 
-- [ ] **Step 2: Run it, expect a compile failure**
+- [x] **Step 2: Run it, expect a compile failure**
 
 Run: `cargo test --lib freemap_interior_type_tag_and_version`
 Expected: FAIL — `no variant named FreeMapInterior`.
 
-- [ ] **Step 3: Add the variant and the match arm**
+- [x] **Step 3: Add the variant and the match arm**
 
 `src/page.rs`, in `enum PageType`:
 
@@ -94,12 +94,12 @@ In `current_version`, add `FreeMapInterior` to the existing all-arms-return-curr
         | PageType::FreeMapInterior => PAGE_FORMAT_VERSION_CURRENT,
 ```
 
-- [ ] **Step 4: Run it, expect PASS**
+- [x] **Step 4: Run it, expect PASS**
 
 Run: `cargo test --lib freemap_interior_type_tag_and_version`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/page.rs
@@ -116,7 +116,7 @@ git commit -m "feat: add PageType::FreeMapInterior (0x07) for the multi-page fre
 
 Byte layout reminder (from `serialize`): `page_size` ends at 52; named-roots 52..308; `superblock_count` 308..312; `root_membership_index_page` 312..320. **`freemap_depth` goes at byte 320** (the next reserved-zero region). Existing databases read 0 there.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -139,12 +139,12 @@ fn freemap_depth_round_trips_and_defaults_zero() {
 }
 ```
 
-- [ ] **Step 2: Run it, expect a compile failure**
+- [x] **Step 2: Run it, expect a compile failure**
 
 Run: `cargo test --lib freemap_depth_round_trips_and_defaults_zero`
 Expected: FAIL — `no field freemap_depth`.
 
-- [ ] **Step 3: Add the field, an offset const, and serialize/deserialize**
+- [x] **Step 3: Add the field, an offset const, and serialize/deserialize**
 
 Near the other offset consts in `src/superblock.rs`:
 
@@ -181,12 +181,12 @@ In `deserialize`, where the struct is built, add:
 
 Add `freemap_depth: 0` to every other `Superblock { .. }` literal in the file (the `new` constructor at ~line 390 and the test fixtures at ~525/545/565). `cargo build` will name each missing one.
 
-- [ ] **Step 4: Run it, expect PASS, and confirm nothing else broke**
+- [x] **Step 4: Run it, expect PASS, and confirm nothing else broke**
 
 Run: `cargo test --lib superblock`
 Expected: PASS (the new test plus all existing superblock tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/superblock.rs
@@ -203,7 +203,7 @@ The tree's `allocate_first` needs to *find* the lowest free bit in a leaf withou
 - Modify: `src/freemap.rs` (the `impl FreeMap` block)
 - Test: `src/freemap.rs` (inline `#[cfg(test)]`)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -220,12 +220,12 @@ fn first_free_bit_finds_lowest_without_clearing() {
 }
 ```
 
-- [ ] **Step 2: Run it, expect compile failure**
+- [x] **Step 2: Run it, expect compile failure**
 
 Run: `cargo test --lib first_free_bit_finds_lowest_without_clearing`
 Expected: FAIL — `no function first_free_bit`.
 
-- [ ] **Step 3: Implement (factor out of `allocate_first`)**
+- [x] **Step 3: Implement (factor out of `allocate_first`)**
 
 In `src/freemap.rs`:
 
@@ -247,12 +247,12 @@ In `src/freemap.rs`:
 
 (Leave `allocate_first` as-is; the single-page callers in `transaction.rs` still use it until Phase 2.)
 
-- [ ] **Step 4: Run it, expect PASS**
+- [x] **Step 4: Run it, expect PASS**
 
 Run: `cargo test --lib freemap`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/freemap.rs
@@ -270,7 +270,7 @@ git commit -m "feat: FreeMap::first_free_bit (non-mutating finder for the tree)"
 
 This task builds the read-only skeleton: the struct, constants, interior child-pointer helpers, leaf/interior init, descent to a leaf, and `is_free`. Growth and mutation come in Tasks 5–6.
 
-- [ ] **Step 1: Add the module declaration**
+- [x] **Step 1: Add the module declaration**
 
 `src/lib.rs`, alongside the other `mod` lines:
 
@@ -278,7 +278,7 @@ This task builds the read-only skeleton: the struct, constants, interior child-p
 mod freemap_tree;
 ```
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Create `src/freemap_tree.rs` with only the test module first (so it fails to compile against missing items):
 
@@ -318,12 +318,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run it, expect compile failure**
+- [x] **Step 3: Run it, expect compile failure**
 
 Run: `cargo test --lib freemap_tree`
 Expected: FAIL — `FreeMapTree` undefined. (`mark_free` is stubbed in Task 5; to keep this task self-contained, the test above also exercises `mark_free`, so this task and Task 5 are committed together — see Step 5. If you prefer a strictly read-only first commit, temporarily delete the `mark_free` lines, land descent + `is_free`, then restore them in Task 5.)
 
-- [ ] **Step 4: Implement the skeleton**
+- [x] **Step 4: Implement the skeleton**
 
 Prepend to `src/freemap_tree.rs` (above the test module):
 
@@ -480,7 +480,7 @@ impl FreeMapTree {
 }
 ```
 
-- [ ] **Step 5: (Implement Task 5's `mark_free` first if landing together) then run**
+- [x] **Step 5: (Implement Task 5's `mark_free` first if landing together) then run**
 
 Run: `cargo test --lib freemap_tree`
 Expected: PASS once `mark_free` (Task 5) exists. Commit at the end of Task 5.
@@ -495,7 +495,7 @@ Expected: PASS once `mark_free` (Task 5) exists. Commit at the end of Task 5.
 
 `mark_free(id)` descends to `id`'s leaf, COW-rewriting the spine, materializing any absent interior/leaf along the way via `extend`, then sets the bit. **All structural allocation goes through `extend`.** Growth (id beyond capacity) is Task 6; for now assume in-range.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // COW: marking a fresh id materializes a leaf+spine and the bit reads back.
@@ -535,12 +535,12 @@ fn mark_free_structural_alloc_is_extend_only() {
 }
 ```
 
-- [ ] **Step 2: Run, expect compile failure** (`mark_free` / `grow` undefined)
+- [x] **Step 2: Run, expect compile failure** (`mark_free` / `grow` undefined)
 
 Run: `cargo test --lib freemap_tree`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement `mark_free` (and a private `cow_page` helper)**
+- [x] **Step 3: Implement `mark_free` (and a private `cow_page` helper)**
 
 Add to `impl FreeMapTree`:
 
@@ -631,12 +631,12 @@ Add to `impl FreeMapTree`:
     }
 ```
 
-- [ ] **Step 4: Run (with Task 6's `grow` present), expect PASS**
+- [x] **Step 4: Run (with Task 6's `grow` present), expect PASS**
 
 Run: `cargo test --lib freemap_tree`
 Expected: PASS (this task's tests reference `grow` from Task 6 — implement Task 6 before running, or temporarily construct a depth-1 tree by hand).
 
-- [ ] **Step 5: Commit (Tasks 4–6 together)**
+- [x] **Step 5: Commit (Tasks 4–6 together)**
 
 ```bash
 git add src/freemap_tree.rs src/lib.rs
@@ -653,7 +653,7 @@ git commit -m "feat: freemap_tree descent, is_free, and COW mark_free (extend-on
 
 Growing adds a level: a fresh interior becomes the new root with the old root reparented as child 0. The old root is **not** superseded (it is reparented, not copied), so it contributes nothing to free.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -672,12 +672,12 @@ fn grow_increases_depth_and_preserves_existing_frees() {
 }
 ```
 
-- [ ] **Step 2: Run, expect compile failure**
+- [x] **Step 2: Run, expect compile failure**
 
 Run: `cargo test --lib grow_increases_depth_and_preserves_existing_frees`
 Expected: FAIL — `no method grow`.
 
-- [ ] **Step 3: Implement `grow`**
+- [x] **Step 3: Implement `grow`**
 
 ```rust
     /// Add one level: a fresh interior root with the old root reparented as
@@ -704,12 +704,12 @@ Expected: FAIL — `no method grow`.
     }
 ```
 
-- [ ] **Step 4: Run, expect PASS**
+- [x] **Step 4: Run, expect PASS**
 
 Run: `cargo test --lib freemap_tree`
 Expected: PASS (all of Tasks 4–6).
 
-- [ ] **Step 5: Commit** — folded into the Task 5 commit if landing together; otherwise:
+- [x] **Step 5: Commit** — folded into the Task 5 commit if landing together; otherwise:
 
 ```bash
 git add src/freemap_tree.rs
@@ -726,7 +726,7 @@ git commit -m "feat: freemap_tree grow (depth increase, reparent old root)"
 
 Two pieces: (a) a public `mark_free_growing` that grows until `id` is in range then marks it (the manager's entry point); (b) `allocate_first` that descends to the lowest free bit using the hint, COW-clears it, and returns the id.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -759,12 +759,12 @@ fn allocate_first_returns_lowest_free_and_clears_it() {
 }
 ```
 
-- [ ] **Step 2: Run, expect compile failure**
+- [x] **Step 2: Run, expect compile failure**
 
 Run: `cargo test --lib freemap_tree`
 Expected: FAIL — `mark_free_growing` / `allocate_first` undefined.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
     /// Grow until `id` is in range, then mark it free. The manager's entry point
@@ -908,12 +908,12 @@ This introduces three small helpers to add for cohesion:
 
 Implement those (in `freemap.rs` and `freemap_tree.rs` respectively), mirroring the patterns already shown. Add unit tests for `first_free_bit_from` (lowest >= lo, and None when all below lo) and `clear_bit` (clears the named id, leaves others) in `freemap.rs`.
 
-- [ ] **Step 4: Run, expect PASS**
+- [x] **Step 4: Run, expect PASS**
 
 Run: `cargo test --lib freemap_tree freemap`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/freemap.rs src/freemap_tree.rs
@@ -927,7 +927,7 @@ git commit -m "feat: freemap_tree allocate_first + lowest-free hint, auto-grow m
 **Files:**
 - Modify: `src/freemap_tree.rs` (inline `#[cfg(test)]`)
 
-- [ ] **Step 1: Write the proptest**
+- [x] **Step 1: Write the proptest**
 
 ```rust
 proptest::proptest! {
@@ -967,12 +967,12 @@ proptest::proptest! {
 }
 ```
 
-- [ ] **Step 2: Run, expect PASS** (the implementation already exists)
+- [x] **Step 2: Run, expect PASS** (the implementation already exists)
 
 Run: `cargo test --lib prop_tree_matches_oracle`
 Expected: PASS. If it fails, the failure is a real bug in Tasks 4–7 — fix before continuing (this oracle test is the correctness backbone).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/freemap_tree.rs
@@ -992,9 +992,9 @@ git commit -m "test: freemap_tree proptest vs BTreeSet oracle across depths"
 **Files:**
 - Modify: `src/transaction.rs` (`Roots`, the manager struct, `new`/`open_existing`, `begin`, `rollback`)
 
-- [ ] **Step 1:** Add `freemap_depth: u32` to `struct Roots` (next to `freemap_page`) and `freemap_depth: 0` to every `Roots { .. }` literal (the `new` default at ~350 and the `open_existing` build at ~525). Set `freemap_depth: sb.freemap_depth` in the `open_existing` `Roots`.
+- [x] **Step 1:** Add `freemap_depth: u32` to `struct Roots` (next to `freemap_page`) and `freemap_depth: 0` to every `Roots { .. }` literal (the `new` default at ~350 and the `open_existing` build at ~525). Set `freemap_depth: sb.freemap_depth` in the `open_existing` `Roots`.
 
-- [ ] **Step 2:** Replace the two `Box<[u8; PAGE_SIZE]>` fields:
+- [x] **Step 2:** Replace the two `Box<[u8; PAGE_SIZE]>` fields:
 
 Remove:
 ```rust
@@ -1009,15 +1009,15 @@ Add:
     freemap_hint: u64,
 ```
 
-- [ ] **Step 3:** In `new` (fresh DB), replace the `FreeMap::init_page` Box setup with: create a depth-0 tree lazily — set `freemap_page: PAGE_ID_NONE`, `freemap_depth: 0` in roots (already the default) and `freemap_hint: 0`. The first `mark_free`/`allocate` materializes the leaf (Task 10/11).
+- [x] **Step 3:** In `new` (fresh DB), replace the `FreeMap::init_page` Box setup with: create a depth-0 tree lazily — set `freemap_page: PAGE_ID_NONE`, `freemap_depth: 0` in roots (already the default) and `freemap_hint: 0`. The first `mark_free`/`allocate` materializes the leaf (Task 10/11).
 
-- [ ] **Step 4:** In `open_existing`, delete the `committed_freemap` load block (lines ~565-571). The committed tree is now `{ sb.root_freemap_page, sb.freemap_depth }`, already captured in `committed_roots`. Set `freemap_hint: 0`.
+- [x] **Step 4:** In `open_existing`, delete the `committed_freemap` load block (lines ~565-571). The committed tree is now `{ sb.root_freemap_page, sb.freemap_depth }`, already captured in `committed_roots`. Set `freemap_hint: 0`.
 
-- [ ] **Step 5:** In `begin_inner`, delete `self.current_freemap = self.committed_freemap.clone();` (the freemap root+depth ride in `current_roots = committed_roots.clone()` for free). In `rollback`, delete any `current_freemap` reset (same reason). Reset is automatic via `current_roots`.
+- [x] **Step 5:** In `begin_inner`, delete `self.current_freemap = self.committed_freemap.clone();` (the freemap root+depth ride in `current_roots = committed_roots.clone()` for free). In `rollback`, delete any `current_freemap` reset (same reason). Reset is automatic via `current_roots`.
 
-- [ ] **Step 6:** `cargo build`. Expect errors at every `current_freemap`/`committed_freemap` use site (the `cow_alloc` callers and `persist_freemap`); these are fixed in Tasks 10–11. Comment them out or `todo!()` *temporarily* only if needed to reach a clean build between tasks — but prefer doing Tasks 10–11 before re-running the suite.
+- [x] **Step 6:** `cargo build`. Expect errors at every `current_freemap`/`committed_freemap` use site (the `cow_alloc` callers and `persist_freemap`); these are fixed in Tasks 10–11. Comment them out or `todo!()` *temporarily* only if needed to reach a clean build between tasks — but prefer doing Tasks 10–11 before re-running the suite.
 
-- [ ] **Step 7: Commit** (with Tasks 10–11; this task alone does not build).
+- [x] **Step 7: Commit** (with Tasks 10–11; this task alone does not build).
 
 ---
 
@@ -1026,7 +1026,7 @@ Add:
 **Files:**
 - Modify: `src/transaction.rs` (`cow_alloc`, `allocate_data_page`, `ht_insert`, the membership-insert site)
 
-- [ ] **Step 1:** Replace the free function `cow_alloc` with a tree-based one:
+- [x] **Step 1:** Replace the free function `cow_alloc` with a tree-based one:
 
 ```rust
 /// Allocate a page id for COW work. With reuse enabled, draw the lowest free id
@@ -1050,7 +1050,7 @@ fn cow_alloc(
 }
 ```
 
-- [ ] **Step 2:** `allocate_data_page`:
+- [x] **Step 2:** `allocate_data_page`:
 
 ```rust
     fn allocate_data_page(&mut self) -> Result<u64> {
@@ -1068,7 +1068,7 @@ fn cow_alloc(
     }
 ```
 
-- [ ] **Step 3:** `ht_insert` (and the structurally-identical membership insert site): build the tree from current roots, pass a closure to `handle_table.insert` that calls `cow_alloc` on `&mut tree`/`&mut self.freemap_hint` via disjoint field borrows, then write `tree.root`/`tree.depth` back and drain `pending_superseded`:
+- [x] **Step 3:** `ht_insert` (and the structurally-identical membership insert site): build the tree from current roots, pass a closure to `handle_table.insert` that calls `cow_alloc` on `&mut tree`/`&mut self.freemap_hint` via disjoint field borrows, then write `tree.root`/`tree.depth` back and drain `pending_superseded`:
 
 ```rust
     fn ht_insert(&mut self, handle: u64, entry: &HandleEntry) -> Result<()> {
@@ -1102,9 +1102,9 @@ fn cow_alloc(
 
 Apply the same shape to the membership-index insert/remove site(s) that currently capture `fm = &mut *self.current_freemap`.
 
-- [ ] **Step 4:** `cargo build` should now be clean except `persist_freemap` (Task 11).
+- [x] **Step 4:** `cargo build` should now be clean except `persist_freemap` (Task 11).
 
-- [ ] **Step 5: Commit** (with Task 11).
+- [x] **Step 5: Commit** (with Task 11).
 
 ---
 
@@ -1116,7 +1116,7 @@ Apply the same shape to the membership-index insert/remove site(s) that currentl
 
 The new commit-time job: apply this transaction's frees to the tree. Allocation-side COW already happened incrementally during the txn (Task 10). The superseded freemap pages from those COWs are already in `txn_freed_pages` (drained from `pending_superseded`). So `persist_freemap` marks every `txn_freed_pages` id free — but marking frees *also* COWs the tree, producing *new* superseded pages. Those new superseded pages are queued for the **next** commit (the one-cycle reclamation lag the spec specifies), via a manager field `pending_structural_frees: Vec<u64>` applied at the *start* of the next `persist_freemap`.
 
-- [ ] **Step 1:** Add `pending_structural_frees: Vec<u64>` to the manager (init `Vec::new()`), and write the new method:
+- [x] **Step 1:** Add `pending_structural_frees: Vec<u64>` to the manager (init `Vec::new()`), and write the new method:
 
 ```rust
     fn persist_freemap(&mut self) -> Result<()> {
@@ -1148,14 +1148,14 @@ The new commit-time job: apply this transaction's frees to the tree. Allocation-
     }
 ```
 
-- [ ] **Step 2:** In `commit`, ensure the new superblock writes `freemap_depth`: where the superblock is built (around line 1060), add `freemap_depth: self.current_roots.freemap_depth` next to `root_freemap_page: self.current_roots.freemap_page`.
+- [x] **Step 2:** In `commit`, ensure the new superblock writes `freemap_depth`: where the superblock is built (around line 1060), add `freemap_depth: self.current_roots.freemap_depth` next to `root_freemap_page: self.current_roots.freemap_page`.
 
-- [ ] **Step 3:** Run the existing freemap/transaction suite:
+- [x] **Step 3:** Run the existing freemap/transaction suite:
 
 Run: `cargo test --lib transaction && cargo test --test page_reclamation`
 Expected: PASS. The single-page reclamation behavior is preserved at depth 0. Fix any regression before continuing (the `persist_freemap_does_not_reuse_committed_live_pages` test at transaction.rs:3032 is the I18 guardrail — it must stay green).
 
-- [ ] **Step 4: Commit (Tasks 9–11 together):**
+- [x] **Step 4: Commit (Tasks 9–11 together):**
 
 ```bash
 git add src/transaction.rs
@@ -1169,7 +1169,7 @@ git commit -m "feat: integrate multi-page freemap tree into the transaction/comm
 **Files:**
 - Create: `tests/freemap_multipage.rs`
 
-- [ ] **Step 1: Write the failing/again-passing tests**
+- [x] **Step 1: Write the failing/again-passing tests**
 
 ```rust
 // The exact scenario the single-page ceiling broke: free a page in a high
@@ -1246,14 +1246,14 @@ fn multipage_freemap_survives_reopen() {
 
 > **Note on the "past 65,344 pages" assertion:** a true past-ceiling test needs > 65,344 pages, which is slow. Add one `#[ignore]`d heavy test that allocates enough 8 KB-overflow values to cross `LEAF_CAPACITY`, frees a page in the second leaf-span, and asserts reuse, runnable on demand (`cargo test -- --ignored multipage_crosses_leaf_boundary`). The fast tests above prove the depth-0→1 path through the public API; the ignored test proves the literal ceiling removal.
 
-- [ ] **Step 2: Run, expect PASS**
+- [x] **Step 2: Run, expect PASS**
 
 Run: `cargo test --test freemap_multipage`
 Expected: PASS. If `pages_after - pages_before` is not below the threshold, reclamation regressed — debug `persist_freemap` (Task 11) before continuing.
 
-- [ ] **Step 3:** Add the heavy `#[ignore]` test `multipage_crosses_leaf_boundary` (allocate > `LEAF_CAPACITY` pages via overflow values, free a high page, assert depth ≥ 1 via `stats` if exposed or via reuse behavior). Run it once: `cargo test --test freemap_multipage -- --ignored`. Expected: PASS.
+- [x] **Step 3:** Add the heavy `#[ignore]` test `multipage_crosses_leaf_boundary` (allocate > `LEAF_CAPACITY` pages via overflow values, free a high page, assert depth ≥ 1 via `stats` if exposed or via reuse behavior). Run it once: `cargo test --test freemap_multipage -- --ignored`. Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/freemap_multipage.rs
@@ -1271,11 +1271,11 @@ git commit -m "test: multi-page freemap reclamation past the single-page ceiling
 **Files:**
 - Modify: `bench/src/` (add a freemap bench alongside the existing harness)
 
-- [ ] **Step 1:** Add a bench that, for depths 0/1/2, measures `mark_free` + `allocate_first` throughput on a cache-resident tree (in-memory backing, `black_box` the results, per the bench-harness conventions in the `chisel-performance` skill). Record both in-memory and file backings.
+- [x] **Step 1:** Add a bench that, for depths 0/1/2, measures `mark_free` + `allocate_first` throughput on a cache-resident tree (in-memory backing, `black_box` the results, per the bench-harness conventions in the `chisel-performance` skill). Record both in-memory and file backings.
 
-- [ ] **Step 2:** Run `cargo bench` (report-only per CI policy), capture baseline numbers, and note them in the bench results file the repo tracks.
+- [x] **Step 2:** Run `cargo bench` (report-only per CI policy), capture baseline numbers, and note them in the bench results file the repo tracks.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add bench/
@@ -1287,9 +1287,9 @@ git commit -m "bench: freemap tree mark_free/allocate_first across depths"
 **Files:**
 - Modify: `ARCHITECTURE.md`
 
-- [ ] **Step 1:** Update the freemap section: it is now a COW radix tree of bitmap leaves (depth 0 = single page = historical format); document `FreeMapInterior = 0x07`, the `freemap_depth` superblock field (byte 320), the extend-only structural-COW termination invariant, and the one-cycle structural-free reclamation lag. Remove the stale "a multi-page freemap is not yet implemented" framing wherever it appears (e.g. the `freemap.rs` header note and `overflow.rs:47`).
+- [x] **Step 1:** Update the freemap section: it is now a COW radix tree of bitmap leaves (depth 0 = single page = historical format); document `FreeMapInterior = 0x07`, the `freemap_depth` superblock field (byte 320), the extend-only structural-COW termination invariant, and the one-cycle structural-free reclamation lag. Remove the stale "a multi-page freemap is not yet implemented" framing wherever it appears (e.g. the `freemap.rs` header note and `overflow.rs:47`).
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add ARCHITECTURE.md src/freemap.rs src/overflow.rs

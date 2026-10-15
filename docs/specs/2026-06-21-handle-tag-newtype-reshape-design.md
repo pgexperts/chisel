@@ -1,6 +1,6 @@
 # `Handle` / `Tag` Newtype Reshape — Design
 
-**Status:** Approved 2026-06-21 (brainstorming). Pre-implementation.
+**Status:** Approved 2026-06-21 (brainstorming). Implemented.
 
 **Goal:** Replace the primitive-obsessed public surface — handles as raw `u64`, tags as raw `u32`,
 "no tag" as the in-band sentinel `0` — with opaque `Handle` / `Tag` newtypes at the API skin, so
