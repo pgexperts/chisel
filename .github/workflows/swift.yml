@@ -1,0 +1,72 @@
+name: swift
+
+# macOS job: builds chisel-ffi + the xcframework and runs the Swift package
+# test suite. This is the only workflow that touches the Swift binding;
+# ci.yml's Linux jobs never see swift/ or chisel-ffi's Apple-target builds.
+#
+# TSan step note (Task 13, ISSUES.md / progress.md 2026-07-18): some macOS
+# hosts' SIP policy blocks dyld from injecting the TSan runtime into the
+# xctest helper ("Sanitizer load violates platform policy"). That is a
+# host limitation, not a code bug, so the TSan step below is best-effort
+# (continue-on-error) and never gates the pipeline. The plain `swift test`
+# step is the real gate.
+on:
+  push:
+    branches: [main]
+  # Deliberately NOT filtered to `branches: [main]`, matching ci.yml. That
+  # filter matches the PR's BASE, so a stacked PR — which is how this
+  # binding's fixes land — got no CI at all, silently: the PR showed no
+  # checks, reading as "nothing to run" rather than "never triggered". See
+  # the same note in ci.yml (issue #151).
+  pull_request:
+
+jobs:
+  swift:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust Apple targets
+        run: |
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim \
+            x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin
+
+      # ci.yml's `clippy` job already runs `cargo clippy --workspace -- -D
+      # warnings` on Linux, which covers chisel-ffi (--workspace overrides
+      # default-members). Re-running clippy here would be redundant.
+      # `cargo test`, however, is NOT covered: ci.yml's `test` job runs
+      # plain `cargo test --verbose`, which honors
+      # `default-members = [".", "bench"]` and excludes chisel-ffi. So
+      # chisel-ffi's Rust test suite needs its own gate, and this is the
+      # only macOS-capable job available to run it.
+      - name: chisel-ffi Rust tests
+        run: cargo test -p chisel-ffi
+
+      # Compile-only check for the device/sim slices: `cargo test` above
+      # only exercises the host target. An iOS binding's CI must still
+      # verify the cross-compiled slices build, since the xcframework step
+      # below builds them with a plain `cargo build` that would otherwise
+      # be the first place a target-specific compile error surfaces.
+      - name: iOS target compile check
+        run: |
+          cargo build -p chisel-ffi --release --target aarch64-apple-ios
+          cargo build -p chisel-ffi --release --target aarch64-apple-ios-sim
+
+      - name: Build xcframework
+        run: swift/build-xcframework.sh
+
+      # Hard gate: this must pass for the pipeline to be green.
+      - name: Swift tests
+        run: cd swift && swift test
+
+      # Best-effort: attempts the same suite under ThreadSanitizer. On a
+      # host where SIP blocks sanitizer-dylib injection into the xctest
+      # helper, this step fails at launch (not from a data race) and must
+      # not redden CI. `continue-on-error` reports the failure without
+      # blocking; the plain `swift test` above remains the true gate.
+      - name: Swift tests (ThreadSanitizer, best-effort)
+        continue-on-error: true
+        run: cd swift && swift test --sanitize=thread
+
+      - name: Swift build (release config)
+        run: cd swift && swift build -c release

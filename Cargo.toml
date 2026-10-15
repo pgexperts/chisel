@@ -1,7 +1,7 @@
 # I61 (ISSUES.md, 2026-05-22): Cargo workspace declaration. Members
 # share one Cargo.lock (at workspace root) and one target/ directory,
 # so `cargo build --workspace` / `cargo test --workspace` exercise
-# the engine, the PyO3 binding, and the bench harness in one shot.
+# the engine, the PyO3 binding, the bench harness, and the UniFFI binding in one shot.
 #
 # `resolver = "2"` is the post-edition-2021 default but spelled
 # explicitly here. The 2021 resolver does NOT unify feature flags
@@ -18,9 +18,20 @@
 # work unchanged (the root package is named "chisel-storage" on crates.io;
 # see [lib] below for why `use chisel::...` is unaffected).
 [workspace]
-members = [".", "python", "bench"]
-# `default-members` excludes `python` from `cargo build` / `cargo test`
-# from the workspace root. The Python crate uses pyo3's
+members = [".", "python", "bench", "chisel-ffi"]
+# `default-members` excludes BOTH `python` and `chisel-ffi` from `cargo build` /
+# `cargo test` at the workspace root, for different reasons.
+#
+# `chisel-ffi` builds `staticlib`/`cdylib` artifacts for Apple targets and is
+# consumed by the Swift package, not by any Rust binary here; a root `cargo
+# test` therefore does NOT run its unit tests. That gap is covered by the
+# explicit `cargo test -p chisel-ffi` step in .github/workflows/swift.yml,
+# which is the only CI job on a macOS runner. Anyone running the documented
+# local pre-push checks must run that command too or they are shipping an
+# untested FFI crate.
+#
+# The `python` exclusion is a linker constraint:
+# The Python crate uses pyo3's
 # `extension-module` feature, which expects the linker to leave Python
 # symbols (Py_None, Py_True, etc.) undefined — they're resolved at
 # runtime by the loading Python interpreter. cargo doesn't know how
