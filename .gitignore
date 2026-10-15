@@ -28,3 +28,8 @@ swift/*.o
 swift/*.d
 swift/*.swiftdeps
 swift/*.swiftdeps~
+swift/Chisel.xcframework.zip
+
+# SwiftPM resolves the root manifest, so its build directory is at the root too.
+/.build/
+/.swiftpm/

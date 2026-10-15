@@ -1,0 +1,72 @@
+name: Swift release
+
+# Mirrors publish-crate.yml: fires on a PUBLISHED GitHub Release, a deliberate
+# "ship this" action, so a stray or draft tag never uploads an artifact.
+on:
+  release:
+    types: [published]
+
+jobs:
+  # A release can be cut against a commit that never went through swift.yml
+  # (a hand-pushed tag), so re-verify rather than trusting the release event.
+  test-gate:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p chisel-ffi
+      - name: Build xcframework
+        run: swift/build-xcframework.sh
+      - name: Swift tests
+        env:
+          CHISEL_LOCAL_XCFRAMEWORK: "1"
+        run: swift test
+
+  upload:
+    needs: test-gate
+    runs-on: macos-14
+    permissions:
+      contents: write # required to upload a release asset
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build and zip the xcframework
+        run: |
+          swift/build-xcframework.sh
+          (cd swift && zip -qr Chisel.xcframework.zip Chisel.xcframework)
+
+      # The tag's own Package.swift must describe the asset consumers will
+      # fetch, so the committed checksum is the contract and this rebuild is
+      # checked against it.
+      #
+      # NOTE: Rust staticlib builds are not bit-reproducible, so this gate can
+      # fail on a legitimate re-tag. If that happens, it is not a supply-chain
+      # alarm: re-run swift/release/prepare.sh, commit the new checksum, and
+      # move the tag. If it proves chronic, switch this job to uploading the
+      # artifact prepare.sh produced rather than rebuilding here.
+      - name: Verify the committed checksum matches the built artifact
+        run: |
+          BUILT="$(swift package compute-checksum swift/Chisel.xcframework.zip)"
+          COMMITTED="$(grep -oE 'checksum: "[0-9a-f]{64}"' Package.swift | grep -oE '[0-9a-f]{64}')"
+          echo "built:     $BUILT"
+          echo "committed: $COMMITTED"
+          if [ "$BUILT" != "$COMMITTED" ]; then
+            echo "::error::Package.swift's checksum does not match the built xcframework."
+            echo "::error::Re-run swift/release/prepare.sh, commit, and move the tag."
+            exit 1
+          fi
+
+      - name: Attach the asset to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Passed via env rather than interpolated into `run:`. ${{ }}
+          # substitution happens before the shell parses the line, so a tag
+          # name spliced directly in is command text, not an argument — the
+          # script-injection pattern GitHub's hardening guide calls out.
+          # Quoting the template does not help; only keeping the value out of
+          # the command line does.
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" swift/Chisel.xcframework.zip --clobber
