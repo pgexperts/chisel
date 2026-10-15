@@ -145,7 +145,8 @@ impl NativeDatabase {
         self.with_db(|db| db.delete_many(&handles))
     }
 
-    pub fn allocate_tagged(&self, value: Vec<u8>, tag: chisel::Tag) -> FfiResult<chisel::Handle> {
+    pub fn allocate_tagged(&self, value: Vec<u8>, tag: u32) -> FfiResult<chisel::Handle> {
+        let tag = tag_from(tag)?;
         self.with_db(|db| db.allocate_tagged(&value, tag))
     }
 
@@ -153,18 +154,21 @@ impl NativeDatabase {
         self.with_db(|db| db.tag(handle))
     }
 
-    pub fn handles_with_tag(&self, tag: chisel::Tag) -> FfiResult<Vec<chisel::Handle>> {
+    pub fn handles_with_tag(&self, tag: u32) -> FfiResult<Vec<chisel::Handle>> {
+        let tag = tag_from(tag)?;
         self.with_db(|db| db.handles_with_tag(tag))
     }
 
-    pub fn delete_tagged(&self, handle: chisel::Handle, tag: chisel::Tag) -> FfiResult<()> {
+    pub fn delete_tagged(&self, handle: chisel::Handle, tag: u32) -> FfiResult<()> {
+        let tag = tag_from(tag)?;
         self.with_db(|db| db.delete_tagged(handle, tag))
     }
 
     /// `max` is `u64` at the FFI boundary (usize never crosses it); cast down
     /// for the engine call. `.map(TagDropProgress::from)` runs on the Ok path
     /// only, converting the engine's progress struct to the FFI record.
-    pub fn delete_with_tag(&self, tag: chisel::Tag, max: u64) -> FfiResult<TagDropProgress> {
+    pub fn delete_with_tag(&self, tag: u32, max: u64) -> FfiResult<TagDropProgress> {
+        let tag = tag_from(tag)?;
         self.with_db(|db| db.delete_with_tag(tag, max as usize))
             .map(TagDropProgress::from)
     }
@@ -263,6 +267,17 @@ fn closed_err() -> ChiselError {
     }
 }
 
+// Tag validation lives here rather than in the `custom_type!` lift because a
+// lift failure surfaces to Swift as an untyped UniFFI internal error, not as a
+// `ChiselError` — and the binding's documented contract is that every throwing
+// call raises `ChiselError`. Taking `u32` and converting explicitly is what
+// makes the rejection expressible.
+fn tag_from(raw: u32) -> Result<chisel::Tag, ChiselError> {
+    chisel::Tag::new(raw).ok_or_else(|| ChiselError::InvalidTag {
+        message: "tag must be non-zero (0 means untagged)".into(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,9 +324,9 @@ mod tests {
         let db = NativeDatabase::new_in_memory(Options::default_ffi()).unwrap();
         db.begin().unwrap();
         let tag = chisel::Tag::new(7).unwrap();
-        let h = db.allocate_tagged(b"v".to_vec(), tag).unwrap();
+        let h = db.allocate_tagged(b"v".to_vec(), 7).unwrap();
         assert_eq!(db.tag(h).unwrap(), Some(tag));
-        assert_eq!(db.handles_with_tag(tag).unwrap(), vec![h]);
+        assert_eq!(db.handles_with_tag(7).unwrap(), vec![h]);
         db.set_client_byte(h, 42).unwrap();
         assert_eq!(db.client_byte(h).unwrap(), 42);
         db.set_root_name("root".into(), h).unwrap();
@@ -371,5 +386,40 @@ mod tests {
             Err(ChiselError::InvalidEncryptionKey { .. })
         ));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // UniFFI lowers Tag to a bare u32 alias with no validation, so a Swift
+    // caller can pass 0. Rejection happened only inside the custom_type! lift,
+    // via the engine's TryFrom<u32> — whose ZeroTagError is NOT a
+    // chisel::ChiselError, so it never reached the FFI error enum and escaped
+    // as an untyped failure. swift/README.md promises "every throwing call
+    // raises ChiselError"; Python raises a documented error for this input.
+    #[test]
+    fn zero_tag_is_a_typed_error_on_every_tag_taking_method() {
+        let db = NativeDatabase::new_in_memory(Options::default_ffi()).unwrap();
+        db.begin().unwrap();
+        let h = db.allocate(b"v".to_vec()).unwrap();
+
+        assert!(matches!(
+            db.allocate_tagged(b"v".to_vec(), 0),
+            Err(ChiselError::InvalidTag { .. })
+        ));
+        assert!(matches!(
+            db.handles_with_tag(0),
+            Err(ChiselError::InvalidTag { .. })
+        ));
+        assert!(matches!(
+            db.delete_tagged(h, 0),
+            Err(ChiselError::InvalidTag { .. })
+        ));
+        assert!(matches!(
+            db.delete_with_tag(0, 10),
+            Err(ChiselError::InvalidTag { .. })
+        ));
+
+        // A nonzero tag still works — the guard rejects only 0.
+        let tagged = db.allocate_tagged(b"v".to_vec(), 7).unwrap();
+        assert_eq!(db.handles_with_tag(7).unwrap(), vec![tagged]);
+        db.rollback().unwrap();
     }
 }

@@ -37,4 +37,63 @@ final class DatabaseTests: XCTestCase {
             _ = try txn.defrag()
         }
     }
+
+    // `URL.path` on a non-file URL silently drops the scheme and host, so
+    // `https://example.com/prod.db` created and flocked `/prod.db` on the
+    // local filesystem, and `URL(string: "data.db")!` resolved against the
+    // process cwd — which on iOS is not a writable container location. Both
+    // succeeded silently instead of failing at the boundary.
+    func testNonFileURLIsRejected() {
+        XCTAssertThrowsError(
+            try ChiselDatabase(path: URL(string: "https://example.com/prod.db")!)
+        )
+        XCTAssertThrowsError(
+            try ChiselDatabase(path: URL(string: "data.db")!)
+        )
+    }
+
+    func testFileURLOpensCommitsAndReopens() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("chisel-swift-file-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("db.chisel")
+
+        let db = try ChiselDatabase(path: path)
+        try db.transaction { txn in
+            let h = try txn.allocate(Data("durable".utf8))
+            try txn.setRootName("root", h)
+        }
+        try db.close()
+
+        let reopened = try ChiselDatabase(path: path)
+        let root = try XCTUnwrap(try reopened.getRootName("root"))
+        XCTAssertEqual(try reopened.read(root), Data("durable".utf8))
+        try reopened.close()
+    }
+
+    // ADR 0025 chose this shape for Python and names SWIFT-3 as the
+    // mirror-image defect to fix the same way. The engine keeps a savepoint
+    // mark after a rollback_to, so a scope that rolls back without releasing
+    // leaves the name occupied — and the second attempt of a retry loop fails
+    // with DuplicateSavepoint, which reads as a bug in the caller's own loop.
+    func testSavepointScopeIsReusableAfterItsBodyThrows() throws {
+        struct Boom: Error {}
+        let db = try ChiselDatabase(path: nil)
+        try db.transaction { txn in
+            for attempt in 0..<2 {
+                XCTAssertThrowsError(
+                    try txn.savepoint("attempt") { _ in throw Boom() },
+                    "attempt \(attempt) should surface Boom, not DuplicateSavepoint"
+                ) { error in
+                    XCTAssertTrue(error is Boom, "got \(error) on attempt \(attempt)")
+                }
+            }
+            // And the scope still works when the body succeeds.
+            let h = try txn.savepoint("attempt") { _ in
+                try txn.allocate(Data("kept".utf8))
+            }
+            XCTAssertEqual(try txn.read(h), Data("kept".utf8))
+        }
+    }
 }

@@ -58,4 +58,20 @@ final class ErrorTests: XCTestCase {
         XCTAssertTrue(ChiselError.Other(message: "x", fatal: true).isPoisoning)
         XCTAssertEqual(ChiselError.Other(message: "boom", fatal: true).message, "boom")
     }
+
+    // A zero tag is a caller mistake with the database untouched — the same
+    // shape as every other operational case, and catchable as ChiselError,
+    // which is what swift/README.md promises for every throwing call.
+    func testZeroTagIsOperationalAndCatchable() throws {
+        let db = try ChiselDatabase(path: nil)
+        try db.transaction { txn in
+            XCTAssertThrowsError(try txn.allocateTagged(Data("x".utf8), tag: 0)) { error in
+                guard let e = error as? ChiselError else { return XCTFail("expected ChiselError") }
+                XCTAssertEqual(e.category, .operational)
+            }
+            XCTAssertThrowsError(try txn.handlesWithTag(0))
+            // A nonzero tag is unaffected.
+            _ = try txn.allocateTagged(Data("x".utf8), tag: 7)
+        }
+    }
 }

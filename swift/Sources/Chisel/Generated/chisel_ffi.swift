@@ -573,7 +573,7 @@ public protocol NativeDatabaseProtocol: AnyObject, Sendable {
     
     func allocate(value: Data) throws  -> Handle
     
-    func allocateTagged(value: Data, tag: Tag) throws  -> Handle
+    func allocateTagged(value: Data, tag: UInt32) throws  -> Handle
     
     /**
      * Begin a new transaction. Every mutating CRUD method below requires
@@ -612,14 +612,14 @@ public protocol NativeDatabaseProtocol: AnyObject, Sendable {
     
     func deleteMany(handles: [Handle]) throws 
     
-    func deleteTagged(handle: Handle, tag: Tag) throws 
+    func deleteTagged(handle: Handle, tag: UInt32) throws 
     
     /**
      * `max` is `u64` at the FFI boundary (usize never crosses it); cast down
      * for the engine call. `.map(TagDropProgress::from)` runs on the Ok path
      * only, converting the engine's progress struct to the FFI record.
      */
-    func deleteWithTag(tag: Tag, max: UInt64) throws  -> TagDropProgress
+    func deleteWithTag(tag: UInt32, max: UInt64) throws  -> TagDropProgress
     
     /**
      * Page-aligned on-disk size without the handle-table scan `stats` does.
@@ -630,7 +630,7 @@ public protocol NativeDatabaseProtocol: AnyObject, Sendable {
     
     func handles() throws  -> [Handle]
     
-    func handlesWithTag(tag: Tag) throws  -> [Handle]
+    func handlesWithTag(tag: UInt32) throws  -> [Handle]
     
     /**
      * True if the handle can no longer do work: the engine reports
@@ -803,11 +803,11 @@ open func allocate(value: Data)throws  -> Handle  {
 })
 }
     
-open func allocateTagged(value: Data, tag: Tag)throws  -> Handle  {
+open func allocateTagged(value: Data, tag: UInt32)throws  -> Handle  {
     return try  FfiConverterTypeHandle_lift(try rustCallWithError(FfiConverterTypeChiselError_lift) {
     uniffi_chisel_ffi_fn_method_nativedatabase_allocate_tagged(self.uniffiClonePointer(),
         FfiConverterData.lower(value),
-        FfiConverterTypeTag_lower(tag),$0
+        FfiConverterUInt32.lower(tag),$0
     )
 })
 }
@@ -893,10 +893,10 @@ open func deleteMany(handles: [Handle])throws   {try rustCallWithError(FfiConver
 }
 }
     
-open func deleteTagged(handle: Handle, tag: Tag)throws   {try rustCallWithError(FfiConverterTypeChiselError_lift) {
+open func deleteTagged(handle: Handle, tag: UInt32)throws   {try rustCallWithError(FfiConverterTypeChiselError_lift) {
     uniffi_chisel_ffi_fn_method_nativedatabase_delete_tagged(self.uniffiClonePointer(),
         FfiConverterTypeHandle_lower(handle),
-        FfiConverterTypeTag_lower(tag),$0
+        FfiConverterUInt32.lower(tag),$0
     )
 }
 }
@@ -906,10 +906,10 @@ open func deleteTagged(handle: Handle, tag: Tag)throws   {try rustCallWithError(
      * for the engine call. `.map(TagDropProgress::from)` runs on the Ok path
      * only, converting the engine's progress struct to the FFI record.
      */
-open func deleteWithTag(tag: Tag, max: UInt64)throws  -> TagDropProgress  {
+open func deleteWithTag(tag: UInt32, max: UInt64)throws  -> TagDropProgress  {
     return try  FfiConverterTypeTagDropProgress_lift(try rustCallWithError(FfiConverterTypeChiselError_lift) {
     uniffi_chisel_ffi_fn_method_nativedatabase_delete_with_tag(self.uniffiClonePointer(),
-        FfiConverterTypeTag_lower(tag),
+        FfiConverterUInt32.lower(tag),
         FfiConverterUInt64.lower(max),$0
     )
 })
@@ -940,10 +940,10 @@ open func handles()throws  -> [Handle]  {
 })
 }
     
-open func handlesWithTag(tag: Tag)throws  -> [Handle]  {
+open func handlesWithTag(tag: UInt32)throws  -> [Handle]  {
     return try  FfiConverterSequenceTypeHandle.lift(try rustCallWithError(FfiConverterTypeChiselError_lift) {
     uniffi_chisel_ffi_fn_method_nativedatabase_handles_with_tag(self.uniffiClonePointer(),
-        FfiConverterTypeTag_lower(tag),$0
+        FfiConverterUInt32.lower(tag),$0
     )
 })
 }
@@ -1801,6 +1801,8 @@ public enum ChiselError: Swift.Error {
     )
     case AlreadyFinished(message: String
     )
+    case InvalidTag(message: String
+    )
     case TagMismatch(message: String
     )
     case NoEncryptionKey(message: String
@@ -1925,72 +1927,75 @@ public struct FfiConverterTypeChiselError: FfiConverterRustBuffer {
         case 16: return .AlreadyFinished(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 17: return .TagMismatch(
+        case 17: return .InvalidTag(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 18: return .NoEncryptionKey(
+        case 18: return .TagMismatch(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 19: return .InvalidEncryptionKey(
+        case 19: return .NoEncryptionKey(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 20: return .EncryptionNotSupported(
+        case 20: return .InvalidEncryptionKey(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 21: return .NoFreeKeySlot(
+        case 21: return .EncryptionNotSupported(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 22: return .LastKeySlot(
+        case 22: return .NoFreeKeySlot(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 23: return .Io(
+        case 23: return .LastKeySlot(
+            message: try FfiConverterString.read(from: &buf)
+            )
+        case 24: return .Io(
             kind: try FfiConverterString.read(from: &buf), 
             errno: try FfiConverterOptionInt32.read(from: &buf), 
             message: try FfiConverterString.read(from: &buf)
             )
-        case 24: return .ChecksumMismatch(
+        case 25: return .ChecksumMismatch(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 25: return .CorruptSuperblock(
+        case 26: return .CorruptSuperblock(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 26: return .FileSizeMismatch(
+        case 27: return .FileSizeMismatch(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 27: return .LockFailed(
+        case 28: return .LockFailed(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 28: return .UnsupportedFormatVersion(
+        case 29: return .UnsupportedFormatVersion(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 29: return .UnsupportedPageSize(
+        case 30: return .UnsupportedPageSize(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 30: return .CorruptPage(
+        case 31: return .CorruptPage(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 31: return .InvalidPageId(
+        case 32: return .InvalidPageId(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 32: return .InvalidFreemapDepth(
+        case 33: return .InvalidFreemapDepth(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 33: return .InvalidNextHandle(
+        case 34: return .InvalidNextHandle(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 34: return .TxnCounterExhausted(
+        case 35: return .TxnCounterExhausted(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 35: return .HandleSpaceExhausted(
+        case 36: return .HandleSpaceExhausted(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 36: return .Poisoned(
+        case 37: return .Poisoned(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 37: return .DecryptionFailed(
+        case 38: return .DecryptionFailed(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 38: return .Other(
+        case 39: return .Other(
             message: try FfiConverterString.read(from: &buf), 
             fatal: try FfiConverterBool.read(from: &buf)
             )
@@ -2086,115 +2091,120 @@ public struct FfiConverterTypeChiselError: FfiConverterRustBuffer {
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .TagMismatch(message):
+        case let .InvalidTag(message):
             writeInt(&buf, Int32(17))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .NoEncryptionKey(message):
+        case let .TagMismatch(message):
             writeInt(&buf, Int32(18))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .InvalidEncryptionKey(message):
+        case let .NoEncryptionKey(message):
             writeInt(&buf, Int32(19))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .EncryptionNotSupported(message):
+        case let .InvalidEncryptionKey(message):
             writeInt(&buf, Int32(20))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .NoFreeKeySlot(message):
+        case let .EncryptionNotSupported(message):
             writeInt(&buf, Int32(21))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .LastKeySlot(message):
+        case let .NoFreeKeySlot(message):
             writeInt(&buf, Int32(22))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .Io(kind,errno,message):
+        case let .LastKeySlot(message):
             writeInt(&buf, Int32(23))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case let .Io(kind,errno,message):
+            writeInt(&buf, Int32(24))
             FfiConverterString.write(kind, into: &buf)
             FfiConverterOptionInt32.write(errno, into: &buf)
             FfiConverterString.write(message, into: &buf)
             
         
         case let .ChecksumMismatch(message):
-            writeInt(&buf, Int32(24))
-            FfiConverterString.write(message, into: &buf)
-            
-        
-        case let .CorruptSuperblock(message):
             writeInt(&buf, Int32(25))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .FileSizeMismatch(message):
+        case let .CorruptSuperblock(message):
             writeInt(&buf, Int32(26))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .LockFailed(message):
+        case let .FileSizeMismatch(message):
             writeInt(&buf, Int32(27))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .UnsupportedFormatVersion(message):
+        case let .LockFailed(message):
             writeInt(&buf, Int32(28))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .UnsupportedPageSize(message):
+        case let .UnsupportedFormatVersion(message):
             writeInt(&buf, Int32(29))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .CorruptPage(message):
+        case let .UnsupportedPageSize(message):
             writeInt(&buf, Int32(30))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .InvalidPageId(message):
+        case let .CorruptPage(message):
             writeInt(&buf, Int32(31))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .InvalidFreemapDepth(message):
+        case let .InvalidPageId(message):
             writeInt(&buf, Int32(32))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .InvalidNextHandle(message):
+        case let .InvalidFreemapDepth(message):
             writeInt(&buf, Int32(33))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .TxnCounterExhausted(message):
+        case let .InvalidNextHandle(message):
             writeInt(&buf, Int32(34))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .HandleSpaceExhausted(message):
+        case let .TxnCounterExhausted(message):
             writeInt(&buf, Int32(35))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .Poisoned(message):
+        case let .HandleSpaceExhausted(message):
             writeInt(&buf, Int32(36))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .DecryptionFailed(message):
+        case let .Poisoned(message):
             writeInt(&buf, Int32(37))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .Other(message,fatal):
+        case let .DecryptionFailed(message):
             writeInt(&buf, Int32(38))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case let .Other(message,fatal):
+            writeInt(&buf, Int32(39))
             FfiConverterString.write(message, into: &buf)
             FfiConverterBool.write(fatal, into: &buf)
             
@@ -2726,7 +2736,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_chisel_ffi_checksum_method_nativedatabase_allocate() != 19680) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_chisel_ffi_checksum_method_nativedatabase_allocate_tagged() != 23350) {
+    if (uniffi_chisel_ffi_checksum_method_nativedatabase_allocate_tagged() != 53921) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_chisel_ffi_checksum_method_nativedatabase_begin() != 24113) {
@@ -2756,10 +2766,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_chisel_ffi_checksum_method_nativedatabase_delete_many() != 29327) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_chisel_ffi_checksum_method_nativedatabase_delete_tagged() != 37975) {
+    if (uniffi_chisel_ffi_checksum_method_nativedatabase_delete_tagged() != 44361) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_chisel_ffi_checksum_method_nativedatabase_delete_with_tag() != 16391) {
+    if (uniffi_chisel_ffi_checksum_method_nativedatabase_delete_with_tag() != 9311) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_chisel_ffi_checksum_method_nativedatabase_file_size_bytes() != 14111) {
@@ -2771,7 +2781,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_chisel_ffi_checksum_method_nativedatabase_handles() != 59821) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_chisel_ffi_checksum_method_nativedatabase_handles_with_tag() != 36039) {
+    if (uniffi_chisel_ffi_checksum_method_nativedatabase_handles_with_tag() != 26521) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_chisel_ffi_checksum_method_nativedatabase_is_poisoned() != 17978) {

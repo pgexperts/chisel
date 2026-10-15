@@ -87,6 +87,14 @@ pub enum ChiselError {
     AlreadyFinished {
         message: String,
     },
+    // FFI-only, like `Closed` and `AlreadyFinished`: the engine has no
+    // equivalent variant because its `Tag` type makes zero unrepresentable.
+    // UniFFI cannot express that — it lowers `Tag` to a bare `u32` alias — so
+    // the check has to live at this boundary, mirroring the Python binding,
+    // which validates in `python/src/db.rs` rather than relying on the lift.
+    InvalidTag {
+        message: String,
+    },
     TagMismatch {
         message: String,
     },
@@ -196,6 +204,7 @@ impl ChiselError {
             | Self::TransactionInProgress { message }
             | Self::Closed { message }
             | Self::AlreadyFinished { message }
+            | Self::InvalidTag { message }
             | Self::TagMismatch { message }
             | Self::NoEncryptionKey { message }
             | Self::InvalidEncryptionKey { message }
@@ -363,6 +372,7 @@ mod tests {
             ChiselError::TransactionInProgress { .. } => "TransactionInProgress",
             ChiselError::Closed { .. } => "Closed",
             ChiselError::AlreadyFinished { .. } => "AlreadyFinished",
+            ChiselError::InvalidTag { .. } => "InvalidTag",
             ChiselError::TagMismatch { .. } => "TagMismatch",
             ChiselError::NoEncryptionKey { .. } => "NoEncryptionKey",
             ChiselError::InvalidEncryptionKey { .. } => "InvalidEncryptionKey",

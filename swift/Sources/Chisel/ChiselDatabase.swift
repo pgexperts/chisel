@@ -45,9 +45,11 @@ extension Options {
 public final class ChiselDatabase {
     let native: NativeDatabase
 
-    /// `path: nil` opens an in-memory database.
+    /// `path: nil` opens an in-memory database. A non-nil `path` must be a
+    /// file URL — see `chiselFilePath`.
     public init(path: URL?, options: Options = Options()) throws {
-        self.native = try NativeDatabase(path: path?.path, options: options)
+        let resolved = try path.map { try chiselFilePath($0) }
+        self.native = try NativeDatabase(path: resolved, options: options)
     }
 
     /// True if a fatal error has poisoned the underlying engine handle.
@@ -189,7 +191,18 @@ public struct Transaction {
             try native.release(name: name)
             return result
         } catch {
+            // Both calls, in this order. The engine keeps the mark after a
+            // rollback_to — deliberately, so a caller can roll back to the
+            // same point twice — which means rolling back alone leaves the
+            // name occupied for the rest of the transaction and the next
+            // `savepoint(name)` throws DuplicateSavepoint. Releasing after
+            // the rollback makes the scope symmetric on both exit paths,
+            // which is the whole point of the closure form.
+            //
+            // Both are best-effort: a cleanup failure must not mask the error
+            // the caller actually needs to see.
             try? native.rollbackTo(name: name)
+            try? native.release(name: name)
             throw error
         }
     }

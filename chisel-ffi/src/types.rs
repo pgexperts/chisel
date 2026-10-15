@@ -68,10 +68,34 @@ impl From<chisel::DrainInsertion> for DrainInsertion {
     }
 }
 
-#[derive(uniffi::Enum, Clone, Debug)]
+// No `Debug` derive and no `Clone`, both deliberate.
+//
+// `Debug` is hand-written below to redact the payload, mirroring the engine's
+// own `impl Debug for crypto::Key` (src/crypto/mod.rs). Deriving it printed
+// the plaintext secret, directly against the discipline the surrounding code
+// keeps: `into_engine` wraps everything in `Zeroizing`, and the root manifest
+// pins `zeroize` specifically to wipe key material on drop.
+//
+// `Clone` is dropped because a cloned `ChiselKey` holds a plain `Vec<u8>` /
+// `String` that is dropped WITHOUT wiping — the same leak in the other
+// direction. No call site needs it: every consumer takes the value and
+// `into_engine(self)` consumes it.
+#[derive(uniffi::Enum)]
 pub enum ChiselKey {
     Raw { bytes: Vec<u8> },
     Passphrase { phrase: String },
+}
+
+impl std::fmt::Debug for ChiselKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The variant name is safe and useful (it says which credential KIND
+        // was supplied); the payload never is. Byte length is deliberately
+        // omitted too — key length is a fingerprint.
+        match self {
+            ChiselKey::Raw { .. } => f.write_str("ChiselKey::Raw(<redacted>)"),
+            ChiselKey::Passphrase { .. } => f.write_str("ChiselKey::Passphrase(<redacted>)"),
+        }
+    }
 }
 
 impl ChiselKey {
@@ -107,7 +131,17 @@ impl From<Argon2Params> for chisel::Argon2Params {
     }
 }
 
-#[derive(uniffi::Record, Clone, Debug)]
+// `Debug` is hand-written below rather than derived: `Options` embeds
+// `Option<ChiselKey>`, so a derived impl is only as safe as its fields and a
+// future field could reintroduce the leak silently. Spelling it out makes the
+// redaction a property of this type rather than an accident of its members.
+//
+// `Clone` is dropped for the same reason it left `ChiselKey`: a derived
+// `Clone` on `Options` requires `ChiselKey: Clone`, and a cloned key holds an
+// unwiped `Vec<u8>`/`String` copy of the secret. Nothing clones `Options`
+// either — `into_engine(self)` consumes it and `NativeDatabase::new` takes it
+// by value.
+#[derive(uniffi::Record)]
 pub struct Options {
     #[uniffi(default = 8388608)]
     pub cache_max_bytes: u64,
@@ -174,6 +208,26 @@ impl Options {
             o = o.argon2_params(a.into());
         }
         Ok(o)
+    }
+}
+
+impl std::fmt::Debug for Options {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Options")
+            .field("cache_max_bytes", &self.cache_max_bytes)
+            .field("spillway_max_bytes", &self.spillway_max_bytes)
+            .field("drain_insertion", &self.drain_insertion)
+            .field("create_if_missing", &self.create_if_missing)
+            .field("read_only", &self.read_only)
+            .field("superblock_count", &self.superblock_count)
+            // Presence is operationally useful ("was this DB opened
+            // encrypted?"); the credential itself is not printable.
+            .field(
+                "encryption_key",
+                &self.encryption_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("argon2_params", &self.argon2_params)
+            .finish()
     }
 }
 
@@ -373,5 +427,47 @@ mod tests {
         let t = chisel::Tag::new(7).expect("nonzero");
         assert_eq!(u32::from(t), 7);
         assert!(chisel::Tag::new(0).is_none());
+    }
+
+    // The engine hand-writes Debug for crypto::Key to print `<redacted>`;
+    // this crate derived it, so `{:?}` on a ChiselKey — or on any struct
+    // embedding one, which Options does — printed the user's passphrase
+    // verbatim. Nothing formats these today, which is what makes it a
+    // standing trap rather than a live leak: any future tracing::debug!(?o),
+    // assert_eq! failure message, or Debug derive on an enclosing type turns
+    // it into one. On iOS those destinations are routinely uploaded.
+    #[test]
+    fn debug_never_prints_key_material() {
+        let raw = ChiselKey::Raw {
+            bytes: b"0123456789abcdef".to_vec(),
+        };
+        let printed = format!("{raw:?}");
+        assert!(
+            !printed.contains("0123456789abcdef"),
+            "raw key leaked: {printed}"
+        );
+        assert!(
+            printed.contains("redacted"),
+            "expected a redaction marker: {printed}"
+        );
+
+        let phrase = ChiselKey::Passphrase {
+            phrase: "correct horse battery staple".into(),
+        };
+        let printed = format!("{phrase:?}");
+        assert!(
+            !printed.contains("correct horse"),
+            "passphrase leaked: {printed}"
+        );
+
+        let mut opts = Options::default_ffi();
+        opts.encryption_key = Some(ChiselKey::Passphrase {
+            phrase: "correct horse battery staple".into(),
+        });
+        let printed = format!("{opts:?}");
+        assert!(
+            !printed.contains("correct horse"),
+            "passphrase leaked through Options: {printed}"
+        );
     }
 }
