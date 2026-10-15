@@ -2668,6 +2668,36 @@ public func libraryVersion() -> String  {
     )
 })
 }
+/**
+ * Re-encrypt an entire database under a freshly generated data key.
+ *
+ * Takes a path rather than an open handle, mirroring the constructor: the
+ * whole file is rewritten and published by rename, so a handle opened
+ * beforehand would afterwards refer to the original, now-unlinked inode.
+ * Close any open database first, call this, then reopen.
+ *
+ * Use this only when the DATA key itself is believed compromised. If a
+ * credential leaked, `rotateKey` is the right tool — it is O(1) and touches
+ * only the superblock.
+ *
+ * Every credential other than `key` is revoked: each key slot's wrapping key
+ * derives from its own credential and only `key` was supplied. Add the others
+ * back with `addKey` afterwards.
+ *
+ * `argon2Params` is a Swift-only addition over the Python surface, which
+ * exposes no equivalent. `None` inherits the cost parameters of the slot
+ * `key` unlocks, so a deliberately hardened database is not silently
+ * downgraded; supplying a value re-hardens as part of the rewrite, which is
+ * the natural moment to do it.
+ */
+public func rekey(path: String, key: ChiselKey, argon2Params: Argon2Params?)throws   {try rustCallWithError(FfiConverterTypeChiselError_lift) {
+    uniffi_chisel_ffi_fn_func_rekey(
+        FfiConverterString.lower(path),
+        FfiConverterTypeChiselKey_lower(key),
+        FfiConverterOptionTypeArgon2Params.lower(argon2Params),$0
+    )
+}
+}
 
 private enum InitializationResult {
     case ok
@@ -2685,6 +2715,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_chisel_ffi_checksum_func_library_version() != 23762) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_chisel_ffi_checksum_func_rekey() != 38128) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_chisel_ffi_checksum_method_nativedatabase_add_key() != 10169) {

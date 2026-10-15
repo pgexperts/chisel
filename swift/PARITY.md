@@ -78,6 +78,7 @@ difference in how "run this, then close" is spelled.
 | Python (`chisel.pyi`) | Swift equivalent | Location |
 |---|---|---|
 | `open(path, **opts)` | `ChiselDatabase.init(path:options:)` / `ChiselStore.init(path:options:) async` | ChiselDatabase.swift:49 / ChiselStore.swift:37 |
+| `rekey(path, key)` | `rekey(at:key:argon2Params:)` | Rekey.swift — `rekey(at:key:argon2Params:)` |
 
 ### `Chisel` class
 
@@ -170,3 +171,7 @@ difference in how "run this, then close" is spelled.
 - `ChiselKey.keychain(service:account:)` (`Keychain.swift`) — a Swift-only
   Keychain-backed key source; Python has no equivalent since it has no
   Keychain to bind to.
+- `rekey(at:key:argon2Params:)`'s `argon2Params` parameter — Python's `rekey`
+  exposes no cost-parameter argument. `nil` reproduces Python's behaviour
+  exactly (inherit the unlocking slot's parameters); a supplied value
+  re-hardens during the rewrite, which is the natural moment to do it.
