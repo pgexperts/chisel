@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status (2026-10-15):** Tasks 1–5 are done. Task 6 (`StagingTxn`) was deliberately not done; issue #139 (I141) tracks folding it in the next time the staging paths are touched.
+
 **Goal:** Split the 5,377-line `src/transaction.rs` god-module into a `src/transaction/` module and extract five cohesive units (SlotPacker, FreemapRecycle, FaultInjector, CommitProtocol, StagingTxn) behind narrow interfaces — a pure behavior-preserving refactor.
 
 **Architecture:** Six incremental steps, low-risk → high-risk, each its own commit/PR and each leaving the full suite green. State sub-structs own only their field cluster and take `&mut PageCache` + an `alloc` closure; behavior units operate over a context. The existing ~2,281-line test suite is the oracle — no test *behavior* changes.
@@ -39,9 +41,9 @@ Pure code movement. The `TransactionManager` struct, its fields, and every metho
 - Delete: `src/transaction.rs` (its content is distributed)
 - Modify: `src/lib.rs` (the `mod transaction;` line is unchanged — a directory module resolves the same)
 
-- [ ] **Step 1: Create the module skeleton.** Make `src/transaction/` and move the WHOLE current `src/transaction.rs` into `src/transaction/mod.rs` unchanged (so it compiles identically). Add nothing yet. Run `cargo build` — must compile. This isolates the directory-rename from the content-move.
+- [x] **Step 1: Create the module skeleton.** Make `src/transaction/` and move the WHOLE current `src/transaction.rs` into `src/transaction/mod.rs` unchanged (so it compiles identically). Add nothing yet. Run `cargo build` — must compile. This isolates the directory-rename from the content-move.
 
-- [ ] **Step 2: Move impl blocks into concern files, one file at a time.** For each concern file, cut the relevant `impl TransactionManager { ... }` methods (and any concern-private free fns) out of `mod.rs` and into the file as `impl TransactionManager { ... }` (the child module sees the parent's private fields — no `pub` needed). Add `mod <name>;` to `mod.rs`. The method→file mapping (by the method names in `mod.rs`):
+- [x] **Step 2: Move impl blocks into concern files, one file at a time.** For each concern file, cut the relevant `impl TransactionManager { ... }` methods (and any concern-private free fns) out of `mod.rs` and into the file as `impl TransactionManager { ... }` (the child module sees the parent's private fields — no `pub` needed). Add `mod <name>;` to `mod.rs`. The method→file mapping (by the method names in `mod.rs`):
   - `recovery.rs`: `create_new`, `open_existing`
   - `lifecycle.rs`: `begin`, `begin_inner`, `commit`, `commit_inner`, `rollback`, `rollback_inner`, `check_alive`, `poison_on_fatal`, `is_poisoned`, `force_poison_for_test`, `is_active`
   - `commit.rs`: (leave `commit_inner` in `lifecycle.rs` for now — Task 5 extracts it here)
@@ -57,11 +59,11 @@ Pure code movement. The `TransactionManager` struct, its fields, and every metho
   - `tests.rs`: the entire `#[cfg(test)] mod tests { ... }` block. Becomes `#[cfg(test)] mod tests;` in `mod.rs` and the file content is `use super::*;` + the test bodies. (If a single tests.rs is unwieldy, splitting per concern is allowed but optional — do it only if it falls out cleanly.)
   - After each file move: `cargo build`. Fix only `use`/visibility fallout (e.g. a concern-private helper another file now needs becomes `pub(super)`).
 
-- [ ] **Step 3: Resolve `use` and visibility.** `mod.rs` keeps the top-level `use` imports needed broadly; each concern file adds `use super::*;` (or specific imports). The free fns `cow_alloc`/`structural_extend` and any helper a sibling module calls become `pub(super)` (crate-internal, module-scoped). Run `cargo build` clean.
+- [x] **Step 3: Resolve `use` and visibility.** `mod.rs` keeps the top-level `use` imports needed broadly; each concern file adds `use super::*;` (or specific imports). The free fns `cow_alloc`/`structural_extend` and any helper a sibling module calls become `pub(super)` (crate-internal, module-scoped). Run `cargo build` clean.
 
-- [ ] **Step 4: Green gate.** Run all four checks (see discipline). The test count must equal the pre-split count exactly. `git diff main --stat` should show only moves (line counts roughly conserved) — no logic change.
+- [x] **Step 4: Green gate.** Run all four checks (see discipline). The test count must equal the pre-split count exactly. `git diff main --stat` should show only moves (line counts roughly conserved) — no logic change.
 
-- [ ] **Step 5: Commit.** `refactor: split transaction.rs into a transaction/ module by concern`
+- [x] **Step 5: Commit.** `refactor: split transaction.rs into a transaction/ module by concern`
 
 > **PR boundary:** Task 1 + Task 2 ship as **PR 1** (both low-risk). The remaining tasks are one PR each.
 
@@ -75,7 +77,7 @@ Consolidate the four test-only `Cell` flags into one test-only struct, off the p
 - Create: `src/transaction/fault.rs`
 - Modify: `src/transaction/mod.rs` (the struct's four `#[cfg(test)]` fields → one), `src/transaction/staging.rs` + `mutate.rs` (the `inject_*` consult sites), `src/transaction/tests.rs` (tests that arm the flags)
 
-- [ ] **Step 1: Define `FaultInjector`** in `fault.rs`:
+- [x] **Step 1: Define `FaultInjector`** in `fault.rs`:
 
 ```rust
 //! Test-only fault injection consolidated off the production TransactionManager
@@ -93,7 +95,7 @@ pub(super) struct FaultInjector {
 }
 ```
 
-- [ ] **Step 2: Replace the four struct fields** in `mod.rs` with one (keep the existing field doc comments, relocated to `fault.rs` or condensed):
+- [x] **Step 2: Replace the four struct fields** in `mod.rs` with one (keep the existing field doc comments, relocated to `fault.rs` or condensed):
 
 ```rust
     #[cfg(test)]
@@ -101,11 +103,11 @@ pub(super) struct FaultInjector {
 ```
 and `#[cfg(test)] fault: fault::FaultInjector::default(),` in BOTH constructors (`create_new`, `open_existing`).
 
-- [ ] **Step 3: Rewire the consult/arm sites.** Every `self.fail_next_membership_op` → `self.fault.fail_next_membership_op`, etc. (production consult sites are already behind `#[cfg(test)]`; the existing `inject_membership_failure` helper and `allocate_inner`'s `#[cfg(test)]` branches). In `tests.rs`, every `tm.fail_next_membership_op.set(true)` → `tm.fault.fail_next_membership_op.set(true)`. (grep `fail_next_|fail_membership_op_after` to find all sites.)
+- [x] **Step 3: Rewire the consult/arm sites.** Every `self.fail_next_membership_op` → `self.fault.fail_next_membership_op`, etc. (production consult sites are already behind `#[cfg(test)]`; the existing `inject_membership_failure` helper and `allocate_inner`'s `#[cfg(test)]` branches). In `tests.rs`, every `tm.fail_next_membership_op.set(true)` → `tm.fault.fail_next_membership_op.set(true)`. (grep `fail_next_|fail_membership_op_after` to find all sites.)
 
-- [ ] **Step 4: Green gate** (all four). Crucially confirm `cargo build --release` compiles (the cfg(test) field is fully absent in release).
+- [x] **Step 4: Green gate** (all four). Crucially confirm `cargo build --release` compiles (the cfg(test) field is fully absent in release).
 
-- [ ] **Step 5: Commit.** `refactor: consolidate test fault flags into a cfg(test) FaultInjector`
+- [x] **Step 5: Commit.** `refactor: consolidate test fault flags into a cfg(test) FaultInjector`
 
 ---
 
@@ -116,7 +118,7 @@ Owned state struct for the R1 slot-packing cluster.
 **Files:**
 - Modify: `src/transaction/packing.rs` (define `SlotPacker` + move the packing logic), `src/transaction/mod.rs` (replace 3 fields with `packer: SlotPacker`), `src/transaction/lifecycle.rs` (begin/commit/rollback delegate), `src/transaction/savepoints.rs` (snapshot/restore through the interface), `src/transaction/staging.rs` + `mutate.rs` (call sites)
 
-- [ ] **Step 1: Define `SlotPacker`** in `packing.rs`, owning the three fields and the packing logic:
+- [x] **Step 1: Define `SlotPacker`** in `packing.rs`, owning the three fields and the packing logic:
 
 ```rust
 pub(super) struct SlotPacker {
@@ -155,17 +157,17 @@ impl SlotPacker {
 }
 ```
 
-- [ ] **Step 2: Replace the three fields** in `mod.rs` with `packer: SlotPacker`, init `SlotPacker::new()` in both constructors.
+- [x] **Step 2: Replace the three fields** in `mod.rs` with `packer: SlotPacker`, init `SlotPacker::new()` in both constructors.
 
-- [ ] **Step 3: Move `insert_into_data_page` and `release_data_slot` bodies into `SlotPacker::insert`/`release`.** Where `insert_into_data_page` called `self.allocate_data_page()`, the caller now passes that as the `alloc` closure: in the staging/mutate call sites, `self.packer.insert(&mut cache, &mut |c| self.allocate_data_page_for(c), value)` — but `self.allocate_data_page` borrows `self.freemap`-state, disjoint from `self.packer`, so build the closure with the freemap fields borrowed as locals (the existing disjoint-borrow pattern; see `ht_insert`). The `ensure_handle_table` method stays on the manager (it touches the handle table + roots, not the packer).
+- [x] **Step 3: Move `insert_into_data_page` and `release_data_slot` bodies into `SlotPacker::insert`/`release`.** Where `insert_into_data_page` called `self.allocate_data_page()`, the caller now passes that as the `alloc` closure: in the staging/mutate call sites, `self.packer.insert(&mut cache, &mut |c| self.allocate_data_page_for(c), value)` — but `self.allocate_data_page` borrows `self.freemap`-state, disjoint from `self.packer`, so build the closure with the freemap fields borrowed as locals (the existing disjoint-borrow pattern; see `ht_insert`). The `ensure_handle_table` method stays on the manager (it touches the handle table + roots, not the packer).
 
-- [ ] **Step 4: Delegate lifecycle + savepoints.** In `lifecycle.rs`, `begin_inner`/`commit_inner`/`rollback_inner`'s handling of `current_live_slots`/`committed_live_slots`/`insert_cursor` becomes `self.packer.begin()/commit()/rollback()`. In `savepoints.rs`, where `Savepoint` is built/restored, use `self.packer.snapshot()` / `self.packer.restore(...)` instead of cloning the fields directly. The `Savepoint` struct keeps its `live_slots`/`insert_cursor` fields (they hold the snapshot tuple's parts).
+- [x] **Step 4: Delegate lifecycle + savepoints.** In `lifecycle.rs`, `begin_inner`/`commit_inner`/`rollback_inner`'s handling of `current_live_slots`/`committed_live_slots`/`insert_cursor` becomes `self.packer.begin()/commit()/rollback()`. In `savepoints.rs`, where `Savepoint` is built/restored, use `self.packer.snapshot()` / `self.packer.restore(...)` instead of cloning the fields directly. The `Savepoint` struct keeps its `live_slots`/`insert_cursor` fields (they hold the snapshot tuple's parts).
 
-- [ ] **Step 5: Rewire stats/introspection** reads of `current_live_slots` to `self.packer.current_live_slots()` and the `tm.current_live_slots.is_empty()` test assertions to `tm.packer.is_current_empty()` (or a test accessor). grep `current_live_slots|committed_live_slots|insert_cursor` to find all sites.
+- [x] **Step 5: Rewire stats/introspection** reads of `current_live_slots` to `self.packer.current_live_slots()` and the `tm.current_live_slots.is_empty()` test assertions to `tm.packer.is_current_empty()` (or a test accessor). grep `current_live_slots|committed_live_slots|insert_cursor` to find all sites.
 
-- [ ] **Step 6: Green gate** (all four) + surface check (no external access to `SlotPacker`'s private fields).
+- [x] **Step 6: Green gate** (all four) + surface check (no external access to `SlotPacker`'s private fields).
 
-- [ ] **Step 7: Commit.** `refactor: extract SlotPacker (R1 live-slot packing) as an owned unit`
+- [x] **Step 7: Commit.** `refactor: extract SlotPacker (R1 live-slot packing) as an owned unit`
 
 ---
 
@@ -176,7 +178,7 @@ Owned state struct for the structural-recycle cluster + the freemap commit/alloc
 **Files:**
 - Modify: `src/transaction/freemap.rs` (define `FreemapRecycle` + move the freemap methods), `src/transaction/mod.rs` (replace 5 fields), `src/transaction/lifecycle.rs` (recycle lifecycle), `src/transaction/savepoints.rs` (rollback interaction), call sites in `staging.rs`/`mutate.rs`/`stats.rs`
 
-- [ ] **Step 1: Define `FreemapRecycle`** in `freemap.rs`, owning the five fields:
+- [x] **Step 1: Define `FreemapRecycle`** in `freemap.rs`, owning the five fields:
 
 ```rust
 pub(super) struct FreemapRecycle {
@@ -188,7 +190,7 @@ pub(super) struct FreemapRecycle {
 }
 ```
 
-- [ ] **Step 2: Move the freemap machinery into `impl FreemapRecycle`.** Move the bodies of `take_freemap_tree`, `put_freemap_tree`, `structural_extend` (the free fn), and `cow_alloc`'s freemap portion into methods on `FreemapRecycle` that take `&mut PageCache` and the roots' `{freemap_page, freemap_depth}` (mutating them via out-params or by taking `&mut Roots`). Interface:
+- [x] **Step 2: Move the freemap machinery into `impl FreemapRecycle`.** Move the bodies of `take_freemap_tree`, `put_freemap_tree`, `structural_extend` (the free fn), and `cow_alloc`'s freemap portion into methods on `FreemapRecycle` that take `&mut PageCache` and the roots' `{freemap_page, freemap_depth}` (mutating them via out-params or by taking `&mut Roots`). Interface:
 
 ```rust
 impl FreemapRecycle {
@@ -216,15 +218,15 @@ impl FreemapRecycle {
 }
 ```
 
-- [ ] **Step 3: Replace the five fields** in `mod.rs` with `freemap: FreemapRecycle`, init `FreemapRecycle::new()` in both constructors. The `cow_alloc` free fn either becomes a `FreemapRecycle` method or a thin wrapper delegating to `self.freemap.allocate(...)`.
+- [x] **Step 3: Replace the five fields** in `mod.rs` with `freemap: FreemapRecycle`, init `FreemapRecycle::new()` in both constructors. The `cow_alloc` free fn either becomes a `FreemapRecycle` method or a thin wrapper delegating to `self.freemap.allocate(...)`.
 
-- [ ] **Step 4: Rewire the THREE allocation call sites** (`allocate_data_page`/`ht_insert`'s closure, the membership insert/remove sites in `staging.rs`). Each currently captures `let hint = &mut self.freemap_hint; let pool = &mut self.structural_reuse;` etc. — now they borrow `&mut self.freemap` (one field, disjoint from `self.handle_table`/`self.membership_index`/`self.cache`). Confirm the disjoint-borrow still satisfies the checker (it should — one field vs the structure handles). Update `allocate_data_page`, `ht_insert`, and the membership candidate/remove methods.
+- [x] **Step 4: Rewire the THREE allocation call sites** (`allocate_data_page`/`ht_insert`'s closure, the membership insert/remove sites in `staging.rs`). Each currently captures `let hint = &mut self.freemap_hint; let pool = &mut self.structural_reuse;` etc. — now they borrow `&mut self.freemap` (one field, disjoint from `self.handle_table`/`self.membership_index`/`self.cache`). Confirm the disjoint-borrow still satisfies the checker (it should — one field vs the structure handles). Update `allocate_data_page`, `ht_insert`, and the membership candidate/remove methods.
 
-- [ ] **Step 5: Delegate lifecycle + rollback interaction.** `begin_inner`/`commit_inner`/`rollback_inner` call `self.freemap.begin()/commit()/rollback()` instead of the inline stream handling. The `reclaim_freemap_orphans` exclusion set uses `self.freemap.pool_ids()`. `persist_freemap` call in commit becomes `self.freemap.persist(&mut cache, &mut self.current_roots, &self.txn_freed_pages)`.
+- [x] **Step 5: Delegate lifecycle + rollback interaction.** `begin_inner`/`commit_inner`/`rollback_inner` call `self.freemap.begin()/commit()/rollback()` instead of the inline stream handling. The `reclaim_freemap_orphans` exclusion set uses `self.freemap.pool_ids()`. `persist_freemap` call in commit becomes `self.freemap.persist(&mut cache, &mut self.current_roots, &self.txn_freed_pages)`.
 
-- [ ] **Step 6: Green gate** (all four — the recycle pins `structural_recycle_one_commit_defer`/`..rollback_resets_pools`/`..no_lost_or_double_free` and the orphan-sweep/savepoint tests are the load-bearing oracle here; they MUST stay green) + surface check.
+- [x] **Step 6: Green gate** (all four — the recycle pins `structural_recycle_one_commit_defer`/`..rollback_resets_pools`/`..no_lost_or_double_free` and the orphan-sweep/savepoint tests are the load-bearing oracle here; they MUST stay green) + surface check.
 
-- [ ] **Step 7: Commit.** `refactor: extract FreemapRecycle (structural recycle + persist/reclaim) as an owned unit`
+- [x] **Step 7: Commit.** `refactor: extract FreemapRecycle (structural recycle + persist/reclaim) as an owned unit`
 
 ---
 
@@ -235,7 +237,7 @@ The `commit_inner` sequence into a behavior unit (function-module over a context
 **Files:**
 - Modify: `src/transaction/commit.rs` (the CommitProtocol unit), `src/transaction/lifecycle.rs` (`commit_inner` delegates)
 
-- [ ] **Step 1: Move the `commit_inner` body into `commit.rs`** as a function (or `CommitProtocol::run`) taking the context it needs:
+- [x] **Step 1: Move the `commit_inner` body into `commit.rs`** as a function (or `CommitProtocol::run`) taking the context it needs:
 
 ```rust
 // The 3-fsync commit sequence (I28 pre-drain flush -> FreemapRecycle::persist ->
@@ -255,11 +257,11 @@ pub(super) fn run_commit(
 ```
 (Exact parameter set = whatever `commit_inner` touches; thread each as `&mut`/`&` rather than `self`. If the param list is unwieldy, a small `CommitCtx<'a>` struct bundling the `&mut`s is allowed.)
 
-- [ ] **Step 2: `commit_inner` (lifecycle.rs) becomes a thin caller** of `run_commit(...)`, passing its fields. The poison-on-fatal wrapper (`commit` → `poison_on_fatal(commit_inner())`) stays on the manager.
+- [x] **Step 2: `commit_inner` (lifecycle.rs) becomes a thin caller** of `run_commit(...)`, passing its fields. The poison-on-fatal wrapper (`commit` → `poison_on_fatal(commit_inner())`) stays on the manager.
 
-- [ ] **Step 3: Green gate** (all four — the fsync-count integration test `tests/spillway_integration.rs` asserting `fsync_delta == 3` and the `persist_freemap_does_not_reuse_committed_live_pages` I18 guardrail are the load-bearing oracle).
+- [x] **Step 3: Green gate** (all four — the fsync-count integration test `tests/spillway_integration.rs` asserting `fsync_delta == 3` and the `persist_freemap_does_not_reuse_committed_live_pages` I18 guardrail are the load-bearing oracle).
 
-- [ ] **Step 4: Commit.** `refactor: extract the commit protocol (3-fsync sequence) into commit.rs`
+- [x] **Step 4: Commit.** `refactor: extract the commit protocol (3-fsync sequence) into commit.rs`
 
 ---
 

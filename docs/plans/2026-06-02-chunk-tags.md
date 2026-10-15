@@ -50,7 +50,7 @@ Goal: every format type carries the new field, all literals compile, round-trips
 - Modify: `src/handle_table.rs` (struct ~115-120, `read_entry`/`write_entry` ~649-669, tombstone literal ~294, test literals)
 - Modify: `src/transaction.rs` (`HandleEntry` literals ~1141, 1148, 1295, 1302)
 
-- [ ] **Step 1: Write the failing test** — add to `src/handle_table.rs`'s `#[cfg(test)] mod tests`:
+- [x] **Step 1: Write the failing test** — add to `src/handle_table.rs`'s `#[cfg(test)] mod tests`:
 
 ```rust
 #[test]
@@ -69,9 +69,9 @@ fn handle_entry_tag_round_trips_through_a_leaf_slot() {
 
 (Note: `write_entry`/`read_entry` are private associated fns; the test is in-module so `HandleTable::write_entry` resolves. If they are not already `Self::`-qualified-callable from tests, leave them as-is — the in-module test can call them.)
 
-- [ ] **Step 2: Run test to verify it fails** — `cargo test -p chisel handle_entry_tag_round_trips -- --exact`. Expected: FAIL to compile (`HandleEntry` has no field `tag`).
+- [x] **Step 2: Run test to verify it fails** — `cargo test -p chisel handle_entry_tag_round_trips -- --exact`. Expected: FAIL to compile (`HandleEntry` has no field `tag`).
 
-- [ ] **Step 3: Add the field + serialization.** In `src/handle_table.rs`:
+- [x] **Step 3: Add the field + serialization.** In `src/handle_table.rs`:
 
 ```rust
 // struct (was 4 lines, add tag):
@@ -113,16 +113,16 @@ fn write_entry(buf: &mut [u8; PAGE_SIZE], index: usize, entry: &HandleEntry) {
 }
 ```
 
-- [ ] **Step 4: Fix every `HandleEntry { .. }` literal to add `tag`.** The tombstone in `delete_recursive` (~294) uses `tag: 0`. In `src/transaction.rs`, `allocate_inner`'s two literals (~1141 overflow, ~1148 inline) and `update`'s two literals (~1295, ~1302) get `tag: 0` for now (Phase 5 changes `allocate_inner` to carry the real tag and `update` to copy the existing tag forward). Every `HandleEntry { .. }` in `handle_table.rs`'s test module gets `tag: 0` unless the test asserts a tag.
+- [x] **Step 4: Fix every `HandleEntry { .. }` literal to add `tag`.** The tombstone in `delete_recursive` (~294) uses `tag: 0`. In `src/transaction.rs`, `allocate_inner`'s two literals (~1141 overflow, ~1148 inline) and `update`'s two literals (~1295, ~1302) get `tag: 0` for now (Phase 5 changes `allocate_inner` to carry the real tag and `update` to copy the existing tag forward). Every `HandleEntry { .. }` in `handle_table.rs`'s test module gets `tag: 0` unless the test asserts a tag.
 
 ```rust
 // handle_table.rs ~294 tombstone:
 let tombstone = HandleEntry { page_id: 0, slot_index: 0, flags: HandleFlags::Deleted, tag: 0 };
 ```
 
-- [ ] **Step 5: Run test to verify it passes** — `cargo test -p chisel handle_entry_tag_round_trips -- --exact`. Expected: PASS. Then `cargo test -p chisel` (whole crate) — Expected: PASS (all existing tests unaffected; tag defaults to 0).
+- [x] **Step 5: Run test to verify it passes** — `cargo test -p chisel handle_entry_tag_round_trips -- --exact`. Expected: PASS. Then `cargo test -p chisel` (whole crate) — Expected: PASS (all existing tests unaffected; tag defaults to 0).
 
-- [ ] **Step 6: fmt + clippy + commit**
+- [x] **Step 6: fmt + clippy + commit**
 
 ```bash
 cargo fmt && cargo clippy -p chisel --all-targets -- -D warnings
@@ -139,7 +139,7 @@ change yet — allocate sets tag 0 until allocate_tagged lands."
 **Files:**
 - Modify: `src/page.rs` (`PageType` enum ~159, `from_u8` ~172, the two `from_u8` tests ~384-397, `FORMAT_MINOR_VERSION` ~122)
 
-- [ ] **Step 1: Write the failing test** — extend the existing `test_page_type_from_u8_known_variants` (do NOT add a new fn; modify the existing assertions):
+- [x] **Step 1: Write the failing test** — extend the existing `test_page_type_from_u8_known_variants` (do NOT add a new fn; modify the existing assertions):
 
 ```rust
 #[test]
@@ -164,9 +164,9 @@ fn test_page_type_from_u8_rejects_zero_and_unknown() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails** — `cargo test -p chisel test_page_type_from_u8 -- --exact`. Expected: FAIL to compile (no `MembershipInterior`).
+- [x] **Step 2: Run to verify it fails** — `cargo test -p chisel test_page_type_from_u8 -- --exact`. Expected: FAIL to compile (no `MembershipInterior`).
 
-- [ ] **Step 3: Add the variants.** In `src/page.rs`:
+- [x] **Step 3: Add the variants.** In `src/page.rs`:
 
 ```rust
 #[repr(u8)]
@@ -195,15 +195,15 @@ impl PageType {
 }
 ```
 
-- [ ] **Step 4: Bump the minor format version** (the on-disk format gains additive fields this phase):
+- [x] **Step 4: Bump the minor format version** (the on-disk format gains additive fields this phase):
 
 ```rust
 pub const FORMAT_MINOR_VERSION: u16 = 1;
 ```
 
-- [ ] **Step 5: Run to verify it passes** — `cargo test -p chisel test_page_type_from_u8 -- --exact`. Expected: PASS. Then `cargo test -p chisel`. Expected: PASS. (The `page_format_version` dispatch test is unaffected: membership pages put their version at byte 1, which the `else` arm already returns.)
+- [x] **Step 5: Run to verify it passes** — `cargo test -p chisel test_page_type_from_u8 -- --exact`. Expected: PASS. Then `cargo test -p chisel`. Expected: PASS. (The `page_format_version` dispatch test is unaffected: membership pages put their version at byte 1, which the `else` arm already returns.)
 
-- [ ] **Step 6: fmt + clippy + commit**
+- [x] **Step 6: fmt + clippy + commit**
 
 ```bash
 cargo fmt && cargo clippy -p chisel --all-targets -- -D warnings
@@ -221,7 +221,7 @@ format changes this batch introduces."
 - Modify: `src/superblock.rs` (offset const, struct ~137, serialize ~178, deserialize ~215, new_empty ~321, all test literals + proptest)
 - Modify: `src/transaction.rs` (`Roots` struct ~75, `commit_inner` Superblock literal ~880, `open_existing` Roots literal ~401, `create_new` Roots literal ~264)
 
-- [ ] **Step 1: Write the failing test** — add to `src/superblock.rs` tests:
+- [x] **Step 1: Write the failing test** — add to `src/superblock.rs` tests:
 
 ```rust
 #[test]
@@ -241,9 +241,9 @@ fn membership_root_round_trips_through_serialize() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails** — `cargo test -p chisel membership_root_round_trips -- --exact`. Expected: FAIL to compile (no field).
+- [x] **Step 2: Run to verify it fails** — `cargo test -p chisel membership_root_round_trips -- --exact`. Expected: FAIL to compile (no field).
 
-- [ ] **Step 3: Add the field + serialization.** In `src/superblock.rs`, near `SUPERBLOCK_COUNT_OFFSET`:
+- [x] **Step 3: Add the field + serialization.** In `src/superblock.rs`, near `SUPERBLOCK_COUNT_OFFSET`:
 
 ```rust
 // Membership-index root (chunk-tags feature). 8 bytes at 312..320, the first
@@ -281,9 +281,9 @@ In `new_empty()`:
         root_membership_index_page: page::PAGE_ID_NONE,
 ```
 
-- [ ] **Step 4: Fix every `Superblock { .. }` literal.** In `superblock.rs` tests (the 6 literals + the proptest block) add `root_membership_index_page: <value>` (use `page::PAGE_ID_NONE` unless the test sets it). In the proptest round-trip, add a `prop_assert_eq!(back.root_membership_index_page, sb.root_membership_index_page);`.
+- [x] **Step 4: Fix every `Superblock { .. }` literal.** In `superblock.rs` tests (the 6 literals + the proptest block) add `root_membership_index_page: <value>` (use `page::PAGE_ID_NONE` unless the test sets it). In the proptest round-trip, add a `prop_assert_eq!(back.root_membership_index_page, sb.root_membership_index_page);`.
 
-- [ ] **Step 5: Thread it through `Roots` and the transaction.** In `src/transaction.rs`:
+- [x] **Step 5: Thread it through `Roots` and the transaction.** In `src/transaction.rs`:
 
 ```rust
 // Roots struct — add field:
@@ -314,9 +314,9 @@ struct Roots {
 
 (`begin_inner`/`rollback`/savepoint already clone the whole `Roots`, so the new field is snapshotted automatically — no edits there.)
 
-- [ ] **Step 6: Run the suite** — `cargo test -p chisel`. Expected: PASS (round-trip test green; existing durability/recovery tests unaffected because the field is always `PAGE_ID_NONE` and old files normalize 0→`PAGE_ID_NONE`).
+- [x] **Step 6: Run the suite** — `cargo test -p chisel`. Expected: PASS (round-trip test green; existing durability/recovery tests unaffected because the field is always `PAGE_ID_NONE` and old files normalize 0→`PAGE_ID_NONE`).
 
-- [ ] **Step 7: fmt + clippy + commit**
+- [x] **Step 7: fmt + clippy + commit**
 
 ```bash
 cargo fmt && cargo clippy -p chisel --all-targets -- -D warnings
@@ -343,13 +343,13 @@ Goal: a standalone, unit-tested radix tree (`u64` key → `u64` value, `0` = abs
 - Create: `src/membership_index.rs`
 - Modify: `src/lib.rs` (register the module — `mod membership_index;` near the other `mod` lines ~22-35, `pub(crate)` so transaction.rs can use it)
 
-- [ ] **Step 1: Register the module.** In `src/lib.rs` add (alongside the other engine modules):
+- [x] **Step 1: Register the module.** In `src/lib.rs` add (alongside the other engine modules):
 
 ```rust
 pub(crate) mod membership_index;
 ```
 
-- [ ] **Step 2: Write the module with `RadixU64` + its tests.** Create `src/membership_index.rs` with EXACTLY this content (the `MembershipIndex` half is added in Phase 3):
+- [x] **Step 2: Write the module with `RadixU64` + its tests.** Create `src/membership_index.rs` with EXACTLY this content (the `MembershipIndex` half is added in Phase 3):
 
 ```rust
 //! Membership index for chunk tags: maps a `u32` tag to the set of handles that
@@ -831,9 +831,9 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the tests** — `cargo test -p chisel membership_index::tests`. Expected: PASS (4 tests). If `cache()`'s `PageCache::new` signature differs, copy the exact fixture from `src/handle_table.rs`'s `ht_cache`.
+- [x] **Step 3: Run the tests** — `cargo test -p chisel membership_index::tests`. Expected: PASS (4 tests). If `cache()`'s `PageCache::new` signature differs, copy the exact fixture from `src/handle_table.rs`'s `ht_cache`.
 
-- [ ] **Step 4: fmt + clippy + commit**
+- [x] **Step 4: fmt + clippy + commit**
 
 ```bash
 cargo fmt && cargo clippy -p chisel --all-targets -- -D warnings
@@ -856,7 +856,7 @@ Goal: compose two `RadixU64` trees — an outer (tag → packed inner ref) and p
 **Files:**
 - Modify: `src/membership_index.rs` (append below `RadixU64`)
 
-- [ ] **Step 1: Write the failing tests** — append to the `#[cfg(test)] mod tests` in `src/membership_index.rs`:
+- [x] **Step 1: Write the failing tests** — append to the `#[cfg(test)] mod tests` in `src/membership_index.rs`:
 
 ```rust
     #[test]
@@ -899,9 +899,9 @@ Goal: compose two `RadixU64` trees — an outer (tag → packed inner ref) and p
     }
 ```
 
-- [ ] **Step 2: Run to verify it fails** — `cargo test -p chisel membership_insert_contains_remove`. Expected: FAIL to compile (no `MembershipIndex`).
+- [x] **Step 2: Run to verify it fails** — `cargo test -p chisel membership_insert_contains_remove`. Expected: FAIL to compile (no `MembershipIndex`).
 
-- [ ] **Step 3: Implement.** Append to `src/membership_index.rs` (above the `#[cfg(test)]` module):
+- [x] **Step 3: Implement.** Append to `src/membership_index.rs` (above the `#[cfg(test)]` module):
 
 ```rust
 // The outer tree's value bit-packs the inner tree's (depth, root): depth in the
@@ -1080,9 +1080,9 @@ impl MembershipIndex {
 }
 ```
 
-- [ ] **Step 4: Run the tests** — `cargo test -p chisel membership_index::tests`. Expected: PASS (6 tests total).
+- [x] **Step 4: Run the tests** — `cargo test -p chisel membership_index::tests`. Expected: PASS (6 tests total).
 
-- [ ] **Step 5: fmt + clippy + commit**
+- [x] **Step 5: fmt + clippy + commit**
 
 ```bash
 cargo fmt && cargo clippy -p chisel --all-targets -- -D warnings
@@ -1108,13 +1108,13 @@ Goal: the engine owns a `MembershipIndex`, recovers its outer depth on open, and
 **Files:**
 - Modify: `src/transaction.rs` (`use` line; `TransactionManager` struct; `create_new` + `open_existing` `TransactionManager { .. }` literals)
 
-- [ ] **Step 1: Import the types.** Near the other `use crate::...` lines in `src/transaction.rs`:
+- [x] **Step 1: Import the types.** Near the other `use crate::...` lines in `src/transaction.rs`:
 
 ```rust
 use crate::membership_index::{MembershipIndex, RadixU64, TagDropProgress};
 ```
 
-- [ ] **Step 2: Add the struct field.** In the `TransactionManager` struct, after `handle_table: HandleTable,`:
+- [x] **Step 2: Add the struct field.** In the `TransactionManager` struct, after `handle_table: HandleTable,`:
 
 ```rust
     /// In-memory state for the membership index (chunk tags). Owns only the
@@ -1122,13 +1122,13 @@ use crate::membership_index::{MembershipIndex, RadixU64, TagDropProgress};
     membership_index: MembershipIndex,
 ```
 
-- [ ] **Step 3: Initialize in `create_new`.** In `create_new`'s `TransactionManager { .. }` literal add:
+- [x] **Step 3: Initialize in `create_new`.** In `create_new`'s `TransactionManager { .. }` literal add:
 
 ```rust
             membership_index: MembershipIndex::new(),
 ```
 
-- [ ] **Step 4: Recover depth in `open_existing`.** After the `Roots` literal is built and before the `TransactionManager { .. }` literal, add (mirroring the handle-table depth recovery just above it):
+- [x] **Step 4: Recover depth in `open_existing`.** After the `Roots` literal is built and before the `TransactionManager { .. }` literal, add (mirroring the handle-table depth recovery just above it):
 
 ```rust
         let mut membership_index = MembershipIndex::new();
@@ -1143,13 +1143,13 @@ use crate::membership_index::{MembershipIndex, RadixU64, TagDropProgress};
 
 > If `cache` is already moved into the `TransactionManager` literal at this point, perform the `recover_depth` call earlier, right after the `Roots` literal where `cache` is still a live `&mut`. The exact binding lives next to the handle-table depth-walk (`ht.set_depth(depth)`); place this block immediately after it and add `membership_index` to the `TransactionManager` literal.
 
-- [ ] **Step 5: Add to the `open_existing` `TransactionManager { .. }` literal:**
+- [x] **Step 5: Add to the `open_existing` `TransactionManager { .. }` literal:**
 
 ```rust
             membership_index,
 ```
 
-- [ ] **Step 6: Run + commit** — `cargo test -p chisel` (Expected: PASS — no behavior change; the index is empty everywhere). Then fmt + clippy.
+- [x] **Step 6: Run + commit** — `cargo test -p chisel` (Expected: PASS — no behavior change; the index is empty everywhere). Then fmt + clippy.
 
 ```bash
 cargo fmt && cargo clippy -p chisel --all-targets -- -D warnings
@@ -1171,7 +1171,7 @@ Goal: the six engine methods. `allocate`/`delete` keep their signatures; `delete
 
 **Files:** Modify `src/transaction.rs` (`allocate`, `allocate_inner` ~1122-1168)
 
-- [ ] **Step 1: Write the failing test** in `transaction.rs` tests:
+- [x] **Step 1: Write the failing test** in `transaction.rs` tests:
 
 ```rust
     #[test]
@@ -1188,9 +1188,9 @@ Goal: the six engine methods. `allocate`/`delete` keep their signatures; `delete
     }
 ```
 
-- [ ] **Step 2: Run to verify it fails** — `cargo test -p chisel allocate_tagged_then_tag`. Expected: FAIL (no `allocate_tagged`/`tag`/`handles_with_tag`).
+- [x] **Step 2: Run to verify it fails** — `cargo test -p chisel allocate_tagged_then_tag`. Expected: FAIL (no `allocate_tagged`/`tag`/`handles_with_tag`).
 
-- [ ] **Step 3: Refactor + add.** Replace `allocate`/`allocate_inner` with:
+- [x] **Step 3: Refactor + add.** Replace `allocate`/`allocate_inner` with:
 
 ```rust
     pub fn allocate(&mut self, value: &[u8]) -> Result<u64> {
@@ -1249,7 +1249,7 @@ Goal: the six engine methods. `allocate`/`delete` keep their signatures; `delete
 
 (This also replaces the two `tag: 0` placeholders from Task 1.1 with the real `tag`.)
 
-- [ ] **Step 4: Add `tag` + `handles_with_tag`** (same file):
+- [x] **Step 4: Add `tag` + `handles_with_tag`** (same file):
 
 ```rust
     pub fn tag(&self, handle: u64) -> Result<u32> {
@@ -1292,15 +1292,15 @@ Goal: the six engine methods. `allocate`/`delete` keep their signatures; `delete
     }
 ```
 
-- [ ] **Step 5: Run to verify it passes** — `cargo test -p chisel allocate_tagged_then_tag`. Expected: PASS. Then `cargo test -p chisel`. Expected: PASS.
+- [x] **Step 5: Run to verify it passes** — `cargo test -p chisel allocate_tagged_then_tag`. Expected: PASS. Then `cargo test -p chisel`. Expected: PASS.
 
-- [ ] **Step 6: fmt + clippy + commit** (`feat(transaction): allocate_tagged, tag, handles_with_tag`).
+- [x] **Step 6: fmt + clippy + commit** (`feat(transaction): allocate_tagged, tag, handles_with_tag`).
 
 ### Task 5.2: Make `delete` self-maintain the index
 
 **Files:** Modify `src/transaction.rs` (`delete_inner` ~1331-1393)
 
-- [ ] **Step 1: Write the failing test:**
+- [x] **Step 1: Write the failing test:**
 
 ```rust
     #[test]
@@ -1317,9 +1317,9 @@ Goal: the six engine methods. `allocate`/`delete` keep their signatures; `delete
     }
 ```
 
-- [ ] **Step 2: Run to verify it fails** — Expected: the assertion fails (index still contains `h`) because `delete_inner` does not yet touch the index.
+- [x] **Step 2: Run to verify it fails** — Expected: the assertion fails (index still contains `h`) because `delete_inner` does not yet touch the index.
 
-- [ ] **Step 3: Add the index removal at the end of `delete_inner`,** right before `Ok(())` (after `self.current_roots.handle_table_page = new_root;`):
+- [x] **Step 3: Add the index removal at the end of `delete_inner`,** right before `Ok(())` (after `self.current_roots.handle_table_page = new_root;`):
 
 ```rust
         if entry.tag != 0 {
@@ -1336,13 +1336,13 @@ Goal: the six engine methods. `allocate`/`delete` keep their signatures; `delete
         }
 ```
 
-- [ ] **Step 4: Run + commit** — Expected: PASS. fmt + clippy. (`feat(transaction): delete self-maintains the membership index`).
+- [x] **Step 4: Run + commit** — Expected: PASS. fmt + clippy. (`feat(transaction): delete self-maintains the membership index`).
 
 ### Task 5.3: `delete_tagged` + `TagMismatch` error
 
 **Files:** Modify `src/error.rs` (operational variant + Display), `src/transaction.rs` (`delete_tagged`)
 
-- [ ] **Step 1: Write the failing test:**
+- [x] **Step 1: Write the failing test:**
 
 ```rust
     #[test]
@@ -1361,9 +1361,9 @@ Goal: the six engine methods. `allocate`/`delete` keep their signatures; `delete
     }
 ```
 
-- [ ] **Step 2: Run to verify it fails** — Expected: FAIL to compile (no `TagMismatch`/`delete_tagged`).
+- [x] **Step 2: Run to verify it fails** — Expected: FAIL to compile (no `TagMismatch`/`delete_tagged`).
 
-- [ ] **Step 3: Add the error variant.** In `src/error.rs`'s Operational block:
+- [x] **Step 3: Add the error variant.** In `src/error.rs`'s Operational block:
 
 ```rust
     /// `delete_tagged` was given a tag that does not match the chunk's actual
@@ -1382,7 +1382,7 @@ In the `Display` impl's match:
 
 (`is_fatal()` needs no change — operational variants are simply absent from its fatal `matches!` list. `source()`/`From` need no change.)
 
-- [ ] **Step 4: Add `delete_tagged`** in `src/transaction.rs`:
+- [x] **Step 4: Add `delete_tagged`** in `src/transaction.rs`:
 
 ```rust
     pub fn delete_tagged(&mut self, handle: u64, tag: u32) -> Result<()> {
@@ -1414,13 +1414,13 @@ In the `Display` impl's match:
     }
 ```
 
-- [ ] **Step 5: Run + commit** — Expected: PASS. fmt + clippy. (`feat: delete_tagged with tag verification (TagMismatch)`).
+- [x] **Step 5: Run + commit** — Expected: PASS. fmt + clippy. (`feat: delete_tagged with tag verification (TagMismatch)`).
 
 ### Task 5.4: `delete_with_tag` (bounded relation drop)
 
 **Files:** Modify `src/transaction.rs` (`delete_with_tag`)
 
-- [ ] **Step 1: Write the failing test:**
+- [x] **Step 1: Write the failing test:**
 
 ```rust
     #[test]
@@ -1448,9 +1448,9 @@ In the `Display` impl's match:
     }
 ```
 
-- [ ] **Step 2: Run to verify it fails** — Expected: FAIL to compile (no `delete_with_tag`).
+- [x] **Step 2: Run to verify it fails** — Expected: FAIL to compile (no `delete_with_tag`).
 
-- [ ] **Step 3: Add `delete_with_tag`** in `src/transaction.rs`:
+- [x] **Step 3: Add `delete_with_tag`** in `src/transaction.rs`:
 
 ```rust
     pub fn delete_with_tag(&mut self, tag: u32, max: usize) -> Result<TagDropProgress> {
@@ -1482,9 +1482,9 @@ In the `Display` impl's match:
     }
 ```
 
-- [ ] **Step 4: Cover the poison invariant.** In `poisoned_manager_rejects_every_public_entry_point` (~1956), add calls asserting `Err(ChiselError::Poisoned)` for `allocate_tagged`, `tag`, `handles_with_tag`, `delete_tagged`, `delete_with_tag`.
+- [x] **Step 4: Cover the poison invariant.** In `poisoned_manager_rejects_every_public_entry_point` (~1956), add calls asserting `Err(ChiselError::Poisoned)` for `allocate_tagged`, `tag`, `handles_with_tag`, `delete_tagged`, `delete_with_tag`.
 
-- [ ] **Step 5: Run + commit** — `cargo test -p chisel`. Expected: PASS. fmt + clippy. (`feat: delete_with_tag bounded relation drop`).
+- [x] **Step 5: Run + commit** — `cargo test -p chisel`. Expected: PASS. fmt + clippy. (`feat: delete_with_tag bounded relation drop`).
 
 **Phase 5 done when:** all engine tag ops pass at the `TransactionManager` level, including the poison-rejection coverage.
 
@@ -1494,7 +1494,7 @@ In the `Display` impl's match:
 
 **Files:** Modify `src/lib.rs` (re-export + 5 delegating methods)
 
-- [ ] **Step 1: Re-export the progress type.** Near the other `pub use` lines:
+- [x] **Step 1: Re-export the progress type.** Near the other `pub use` lines:
 
 ```rust
 pub use membership_index::TagDropProgress;
@@ -1511,7 +1511,7 @@ pub struct TagDropProgress {
 }
 ```
 
-- [ ] **Step 2: Add the delegating methods** to `impl Chisel` (with doc comments mirroring `allocate`/`delete`):
+- [x] **Step 2: Add the delegating methods** to `impl Chisel` (with doc comments mirroring `allocate`/`delete`):
 
 ```rust
     /// Allocate a chunk carrying an immutable `tag` (0 = untagged). Tagged
@@ -1543,7 +1543,7 @@ pub struct TagDropProgress {
     }
 ```
 
-- [ ] **Step 3: Run + commit** — `cargo test -p chisel` + clippy + fmt. (`feat: public Chisel tag API`).
+- [x] **Step 3: Run + commit** — `cargo test -p chisel` + clippy + fmt. (`feat: public Chisel tag API`).
 
 ---
 
@@ -1553,7 +1553,7 @@ pub struct TagDropProgress {
 
 ### Task 7.1: Bind the methods + the TagMismatch exception
 
-- [ ] **Step 1: Add the `#[pymethods]` wrappers** in `python/src/db.rs` (mirroring `delete`/`handles`; no `allow_threads`, the same `with_inner_*` pattern):
+- [x] **Step 1: Add the `#[pymethods]` wrappers** in `python/src/db.rs` (mirroring `delete`/`handles`; no `allow_threads`, the same `with_inner_*` pattern):
 
 ```rust
     fn allocate_tagged(&self, py: Python<'_>, value: &Bound<'_, PyAny>, tag: u32) -> PyResult<u64> {
@@ -1583,9 +1583,9 @@ pub struct TagDropProgress {
 
 (Returning a `(list, bool)` tuple avoids materializing a dataclass; the `.pyi` types it precisely. Match `coerce_value`/import paths to the existing `allocate` wrapper in this file.)
 
-- [ ] **Step 2: Add the exception** in `python/src/errors.rs`: (1) `create_exception!(_chisel, TagMismatchError, OperationalError);`; (2) register it in `register()`; (3) add a `to_py_err` arm: `RustChiselError::TagMismatch { .. } => TagMismatchError::new_err(msg),` (before the `_ =>` catchall).
+- [x] **Step 2: Add the exception** in `python/src/errors.rs`: (1) `create_exception!(_chisel, TagMismatchError, OperationalError);`; (2) register it in `register()`; (3) add a `to_py_err` arm: `RustChiselError::TagMismatch { .. } => TagMismatchError::new_err(msg),` (before the `_ =>` catchall).
 
-- [ ] **Step 3: Add `.pyi` stubs** in `python/chisel/chisel.pyi` (in the `Chisel` class and the exceptions section):
+- [x] **Step 3: Add `.pyi` stubs** in `python/chisel/chisel.pyi` (in the `Chisel` class and the exceptions section):
 
 ```python
     def allocate_tagged(self, value: Buffer, tag: int) -> int: ...
@@ -1598,7 +1598,7 @@ pub struct TagDropProgress {
 class TagMismatchError(OperationalError): ...
 ```
 
-- [ ] **Step 4: Write a pytest** in `python/tests/` (mirror an existing test file):
+- [x] **Step 4: Write a pytest** in `python/tests/` (mirror an existing test file):
 
 ```python
 def test_chunk_tags_roundtrip(tmp_path):
@@ -1617,7 +1617,7 @@ def test_chunk_tags_roundtrip(tmp_path):
     db.close()
 ```
 
-- [ ] **Step 5: Build + test + commit** — `cd python && maturin develop && pytest tests/ -q`. Expected: PASS. Then commit (`feat(python): bind chunk-tag methods + TagMismatchError`).
+- [x] **Step 5: Build + test + commit** — `cd python && maturin develop && pytest tests/ -q`. Expected: PASS. Then commit (`feat(python): bind chunk-tag methods + TagMismatchError`).
 
 ---
 
@@ -1627,7 +1627,7 @@ def test_chunk_tags_roundtrip(tmp_path):
 
 ### Task 8.1: Durability, backward-compat, and the F1/I12 drop regression
 
-- [ ] **Step 1: Write the tests.** Create `tests/tag_ops.rs`:
+- [x] **Step 1: Write the tests.** Create `tests/tag_ops.rs`:
 
 ```rust
 mod common;
@@ -1733,9 +1733,9 @@ fn old_database_opens_with_all_untagged() {
 }
 ```
 
-- [ ] **Step 2: Run** — `cargo test -p chisel --test tag_ops`. Expected: PASS. If the `dropping_a_relation_frees_pages_no_leak` threshold is too tight for slot-packing/COW overhead, relax the bound but keep it strictly less than "baseline + a full second relation with no reuse."
+- [x] **Step 2: Run** — `cargo test -p chisel --test tag_ops`. Expected: PASS. If the `dropping_a_relation_frees_pages_no_leak` threshold is too tight for slot-packing/COW overhead, relax the bound but keep it strictly less than "baseline + a full second relation with no reuse."
 
-- [ ] **Step 3: Full suite + workspace clippy + commit**
+- [x] **Step 3: Full suite + workspace clippy + commit**
 
 ```bash
 cargo test
@@ -1754,7 +1754,7 @@ relation via delete_with_tag frees pages for reuse (the original F1/I12 leak)."
 
 ## Closing checklist
 
-- [ ] Update `docs/specs/2026-06-02-chunk-tags-design.md` status to "implemented" and note the one v1 simplification recorded during planning: `delete_with_tag` enumerates members bounded (`iter_bounded`) rather than the spec's unbounded sketch, to honor the bounded-time requirement.
-- [ ] File `ISSUES.md` entries for the deferred refinements named in the spec's "Out of scope": callback enumeration (`for_each_handle_with_tag`, after I97), bitmap inner sets if profiling shows dense ranges, and a streaming drop for relations far larger than one `max` batch.
-- [ ] Re-record bench baselines if any tagged path enters the bench grid (currently none — the feature is additive and untagged workloads are unaffected).
-- [ ] Confirm `FORMAT_MINOR_VERSION` bump is called out in release notes (per the on-disk format change).
+- [x] Update `docs/specs/2026-06-02-chunk-tags-design.md` status to "implemented" and note the one v1 simplification recorded during planning: `delete_with_tag` enumerates members bounded (`iter_bounded`) rather than the spec's unbounded sketch, to honor the bounded-time requirement.
+- [x] File `ISSUES.md` entries for the deferred refinements named in the spec's "Out of scope": callback enumeration (`for_each_handle_with_tag`, after I97), bitmap inner sets if profiling shows dense ranges, and a streaming drop for relations far larger than one `max` batch.
+- [x] Re-record bench baselines if any tagged path enters the bench grid (currently none — the feature is additive and untagged workloads are unaffected).
+- [x] Confirm `FORMAT_MINOR_VERSION` bump is called out in release notes (per the on-disk format change).

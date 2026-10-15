@@ -1,6 +1,6 @@
 # Per-Page Format Versioning — Design
 
-**Status:** Approved 2026-06-21 (brainstorming). Pre-implementation.
+**Status:** Approved 2026-06-21 (brainstorming). Implemented, except the items §8 defers.
 
 **Goal:** Make the per-page format version byte (written since I31, never read) *load-bearing*,
 and add its complementary file-level MINOR write-gate (I29). Together these are the mechanism by

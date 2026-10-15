@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status (2026-10-15):** Partially implemented. The noise-gate code (Tasks 4.1–4.6) and the runbook (Task 8.1) are done. The VM, the self-hosted runner, the `bench.yml` migration and the two maintenance workflows (Phases 1–3 and 5–7, Tasks 4.7–4.8 and 8.2) are not; `bench.yml` still runs on `ubuntu-latest`.
+
 **Goal:** Stand up a single always-on dedicated Linux cloud VM that serves as the canonical home for Chisel benchmark runs, with self-hosted Actions runner integration, a setup-time noise-validation gate, and operations workflows.
 
 **Architecture:** Provisioned-IOPS cloud VM running Ubuntu 24.04 LTS, qualified by a 5-back-to-back-runs noise gate (COV ≤ 2% throughput / ≤ 5% p99). Single self-hosted GitHub Actions runner registered with `dedicated-bench` and `bench-v1` labels handles all bench workflows. Per-PR work falls back transparently to `ubuntu-latest` when the dedicated machine is offline. Companion ops workflows (disk cleanup, OS upgrade) run on the same runner.
@@ -460,7 +462,7 @@ No repo commit yet — runner setup is operator-side only.
 - Create: `bench/src/noise_gate/report.rs`
 - Modify: `bench/src/lib.rs:1-5` (add `pub mod noise_gate;` line)
 
-- [ ] **Step 1: Add module declaration to bench/src/lib.rs**
+- [x] **Step 1: Add module declaration to bench/src/lib.rs**
 
 Find the existing `pub mod` declarations (alongside `summary`, `engines`, etc.) and add:
 
@@ -470,7 +472,7 @@ pub mod noise_gate;
 
 If `bench/src/lib.rs` doesn't have the equivalent of `pub mod summary;`, place it consistently with the other public modules.
 
-- [ ] **Step 2: Create bench/src/noise_gate/mod.rs**
+- [x] **Step 2: Create bench/src/noise_gate/mod.rs**
 
 ```rust
 // noise_gate.rs — Setup-time noise-validation gate for the dedicated
@@ -491,7 +493,7 @@ pub use cov::{compute_cov, Cov};
 pub use report::render_report;
 ```
 
-- [ ] **Step 3: Create empty bench/src/noise_gate/cov.rs and report.rs**
+- [x] **Step 3: Create empty bench/src/noise_gate/cov.rs and report.rs**
 
 `bench/src/noise_gate/cov.rs`:
 
@@ -508,7 +510,7 @@ pub use report::render_report;
 // noise_gate CLI binary; tested as a pure string-rendering function.
 ```
 
-- [ ] **Step 4: Verify the crate still compiles**
+- [x] **Step 4: Verify the crate still compiles**
 
 ```bash
 cd bench && cargo build
@@ -516,7 +518,7 @@ cd bench && cargo build
 
 Expected: clean build, possibly with a "module is empty" warning that we'll eliminate in the next task.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add bench/src/lib.rs bench/src/noise_gate/
@@ -528,7 +530,7 @@ git commit -m "bench: add noise_gate module skeleton"
 **Files:**
 - Modify: `bench/src/noise_gate/cov.rs` (add tests at bottom)
 
-- [ ] **Step 1: Add the test (still no implementation)**
+- [x] **Step 1: Add the test (still no implementation)**
 
 Append to `bench/src/noise_gate/cov.rs`:
 
@@ -582,7 +584,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Add the function signature (no body — test should fail to compile)**
+- [x] **Step 2: Add the function signature (no body — test should fail to compile)**
 
 Append above the `#[cfg(test)]` block:
 
@@ -592,7 +594,7 @@ pub fn compute_cov(samples: &[f64]) -> Cov {
 }
 ```
 
-- [ ] **Step 3: Run the test, verify it fails**
+- [x] **Step 3: Run the test, verify it fails**
 
 ```bash
 cd bench && cargo test --lib noise_gate::cov::tests 2>&1 | tail -20
@@ -605,7 +607,7 @@ Expected: 4 tests panic with "not yet implemented" (the `todo!()` body).
 **Files:**
 - Modify: `bench/src/noise_gate/cov.rs` (replace `todo!()` body)
 
-- [ ] **Step 1: Implement compute_cov**
+- [x] **Step 1: Implement compute_cov**
 
 Replace the `todo!()` body with:
 
@@ -633,7 +635,7 @@ pub fn compute_cov(samples: &[f64]) -> Cov {
 }
 ```
 
-- [ ] **Step 2: Run the tests, verify they pass**
+- [x] **Step 2: Run the tests, verify they pass**
 
 ```bash
 cd bench && cargo test --lib noise_gate::cov::tests 2>&1 | tail -10
@@ -641,7 +643,7 @@ cd bench && cargo test --lib noise_gate::cov::tests 2>&1 | tail -10
 
 Expected: 4/4 pass.
 
-- [ ] **Step 3: Run full bench tests as regression check**
+- [x] **Step 3: Run full bench tests as regression check**
 
 ```bash
 cd bench && cargo test 2>&1 | tail -5
@@ -649,7 +651,7 @@ cd bench && cargo test 2>&1 | tail -5
 
 Expected: 102/102 (98 existing + 4 new).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add bench/src/noise_gate/cov.rs
@@ -661,7 +663,7 @@ git commit -m "bench: implement compute_cov for noise-gate qualification"
 **Files:**
 - Modify: `bench/src/noise_gate/report.rs`
 
-- [ ] **Step 1: Add the report struct and a failing test**
+- [x] **Step 1: Add the report struct and a failing test**
 
 Replace `bench/src/noise_gate/report.rs` content with:
 
@@ -780,7 +782,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run, verify the tests fail**
+- [x] **Step 2: Run, verify the tests fail**
 
 ```bash
 cd bench && cargo test --lib noise_gate::report::tests 2>&1 | tail -10
@@ -793,7 +795,7 @@ Expected: 5 tests fail (panic with "not yet implemented").
 **Files:**
 - Modify: `bench/src/noise_gate/report.rs` (replace `todo!()` body)
 
-- [ ] **Step 1: Implement render_report**
+- [x] **Step 1: Implement render_report**
 
 Replace the `todo!()` body in `render_report` with:
 
@@ -860,7 +862,7 @@ pub fn render_report(result: &GateResult) -> String {
 }
 ```
 
-- [ ] **Step 2: Run the tests, verify they pass**
+- [x] **Step 2: Run the tests, verify they pass**
 
 ```bash
 cd bench && cargo test --lib noise_gate::report::tests 2>&1 | tail -10
@@ -868,7 +870,7 @@ cd bench && cargo test --lib noise_gate::report::tests 2>&1 | tail -10
 
 Expected: 5/5 pass.
 
-- [ ] **Step 3: Run full bench tests**
+- [x] **Step 3: Run full bench tests**
 
 ```bash
 cd bench && cargo test 2>&1 | tail -5
@@ -876,7 +878,7 @@ cd bench && cargo test 2>&1 | tail -5
 
 Expected: 107/107 passing.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add bench/src/noise_gate/report.rs
@@ -889,7 +891,7 @@ git commit -m "bench: implement noise-gate markdown report rendering"
 - Create: `bench/src/bin/noise_gate.rs`
 - Modify: `bench/Cargo.toml` (add `[[bin]]` section if not auto-discovered)
 
-- [ ] **Step 1: Add an explicit [[bin]] block to bench/Cargo.toml**
+- [x] **Step 1: Add an explicit [[bin]] block to bench/Cargo.toml**
 
 The bench subcrate uses explicit `[[bin]]` declarations (currently `name = "summarize"` and `name = "chisel-bench-diff"`). Auto-discovery would name the new binary `noise_gate` based on filename, but we want the long form for consistency with `chisel-bench-diff`. Add a new block:
 
@@ -901,7 +903,7 @@ path = "src/bin/noise_gate.rs"
 
 (Existing-binary naming is inconsistent — `summarize` vs `chisel-bench-diff` — for historical reasons. Don't try to fix the inconsistency in this plan; that's a separate decision.)
 
-- [ ] **Step 2: Create bench/src/bin/noise_gate.rs**
+- [x] **Step 2: Create bench/src/bin/noise_gate.rs**
 
 ```rust
 // CLI entry point for chisel-bench-noise-gate.
@@ -1078,7 +1080,7 @@ fn run(cli: &Cli) -> Result<bool, Box<dyn std::error::Error>> {
 }
 ```
 
-- [ ] **Step 3: Verify the binary builds**
+- [x] **Step 3: Verify the binary builds**
 
 ```bash
 cd bench && cargo build --bin chisel-bench-noise-gate 2>&1 | tail -10
@@ -1094,7 +1096,7 @@ path = "src/bin/noise_gate.rs"
 
 Verify by listing built binaries: `ls bench/target/debug/chisel-bench*`.)
 
-- [ ] **Step 4: Verify the binary's --help works**
+- [x] **Step 4: Verify the binary's --help works**
 
 ```bash
 cd bench && cargo run --bin chisel-bench-noise-gate -- --help 2>&1 | tail -20
@@ -1102,7 +1104,7 @@ cd bench && cargo run --bin chisel-bench-noise-gate -- --help 2>&1 | tail -20
 
 Expected: clap-rendered help text showing all the CLI options.
 
-- [ ] **Step 5: Run the full bench test suite as a regression check**
+- [x] **Step 5: Run the full bench test suite as a regression check**
 
 ```bash
 cd bench && cargo test 2>&1 | tail -5
@@ -1110,7 +1112,7 @@ cd bench && cargo test 2>&1 | tail -5
 
 Expected: 107/107 still passing. (No new tests in Task 4.6 — this binary is exercised by Phase 4's Task 4.7 below.)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add bench/src/bin/noise_gate.rs bench/Cargo.toml
@@ -1889,13 +1891,13 @@ Expected: empty output, or only non-security packages.
 **Files:**
 - Create: `docs/operations/dedicated-bench-runbook.md`
 
-- [ ] **Step 1: Verify the docs/operations/ directory exists or create it**
+- [x] **Step 1: Verify the docs/operations/ directory exists or create it**
 
 ```bash
 mkdir -p docs/operations
 ```
 
-- [ ] **Step 2: Write the runbook**
+- [x] **Step 2: Write the runbook**
 
 Create `docs/operations/dedicated-bench-runbook.md` with the following content. (The outer fence below uses four backticks so the inner three-backtick fences nest correctly; when you write the file, use plain three-backtick fences inside.)
 
@@ -2063,14 +2065,14 @@ Hard reboot via cloud-provider console (Hetzner: Console → Server → Power �
 If the VM doesn't come back from reboot, attach the cloud-provider rescue console to investigate filesystem corruption.
 ````
 
-- [ ] **Step 3: Verify the file exists and renders sensibly**
+- [x] **Step 3: Verify the file exists and renders sensibly**
 
 ```bash
 ls -la docs/operations/dedicated-bench-runbook.md
 head -30 docs/operations/dedicated-bench-runbook.md
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/operations/dedicated-bench-runbook.md

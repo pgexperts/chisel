@@ -28,7 +28,7 @@ The test-only injection machinery. Everything in Tasks 2–4 depends on it.
 **Files:**
 - Modify: `src/page_io.rs` (struct + 2 constructors + 3 I/O methods + new method + new test)
 
-- [ ] **Step 1: Add the `Fault` enum.** In `src/page_io.rs`, after the existing `enum Backing { … }` block, add:
+- [x] **Step 1: Add the `Fault` enum.** In `src/page_io.rs`, after the existing `enum Backing { … }` block, add:
 
 ```rust
 /// Test-only fault plan armed via `PageIo::arm_fault` (I112). `Copy` so it
@@ -52,7 +52,7 @@ pub(crate) enum Fault {
 }
 ```
 
-- [ ] **Step 2: Add the field to `struct PageIo`.** After the `cached_page_count: Cell<u64>,` field (`page_io.rs:71`), add:
+- [x] **Step 2: Add the field to `struct PageIo`.** After the `cached_page_count: Cell<u64>,` field (`page_io.rs:71`), add:
 
 ```rust
     // I112: test-only fault injector. Checked at the top of read_page/
@@ -62,14 +62,14 @@ pub(crate) enum Fault {
     fault: Cell<Fault>,
 ```
 
-- [ ] **Step 3: Initialize the field in both constructors.** In `PageIo::open` (`:107`) and `PageIo::open_in_memory` (`:124`), inside each `PageIo { … }` struct literal, after `cached_page_count: Cell::new(…),`, add:
+- [x] **Step 3: Initialize the field in both constructors.** In `PageIo::open` (`:107`) and `PageIo::open_in_memory` (`:124`), inside each `PageIo { … }` struct literal, after `cached_page_count: Cell::new(…),`, add:
 
 ```rust
             #[cfg(test)]
             fault: Cell::new(Fault::None),
 ```
 
-- [ ] **Step 4: Add `arm_fault`.** In `impl PageIo`, after `fsync_count` (`:324-326`), add:
+- [x] **Step 4: Add `arm_fault`.** In `impl PageIo`, after `fsync_count` (`:324-326`), add:
 
 ```rust
     /// Arm a test fault (I112). The next matching I/O op returns `IoError`.
@@ -79,7 +79,7 @@ pub(crate) enum Fault {
     }
 ```
 
-- [ ] **Step 5: Hook `read_page`.** In `read_page`, immediately after the `page_id >= page_count` bounds check (`:215-217`), before `match &mut self.backing`, insert:
+- [x] **Step 5: Hook `read_page`.** In `read_page`, immediately after the `page_id >= page_count` bounds check (`:215-217`), before `match &mut self.backing`, insert:
 
 ```rust
         #[cfg(test)]
@@ -91,7 +91,7 @@ pub(crate) enum Fault {
         }
 ```
 
-- [ ] **Step 6: Hook `write_page`.** In `write_page`, immediately after the `if self.read_only { return Err(ChiselError::ReadOnlyMode); }` guard (`:248-250`), insert:
+- [x] **Step 6: Hook `write_page`.** In `write_page`, immediately after the `if self.read_only { return Err(ChiselError::ReadOnlyMode); }` guard (`:248-250`), insert:
 
 ```rust
         #[cfg(test)]
@@ -103,7 +103,7 @@ pub(crate) enum Fault {
         }
 ```
 
-- [ ] **Step 7: Hook `fsync`.** In `fsync`, immediately after the `if self.read_only { return Err(ChiselError::ReadOnlyMode); }` guard (`:299-301`), insert:
+- [x] **Step 7: Hook `fsync`.** In `fsync`, immediately after the `if self.read_only { return Err(ChiselError::ReadOnlyMode); }` guard (`:299-301`), insert:
 
 ```rust
         #[cfg(test)]
@@ -119,7 +119,7 @@ pub(crate) enum Fault {
         }
 ```
 
-- [ ] **Step 8: Write the self-tests.** In the existing `#[cfg(test)] mod tests` of `src/page_io.rs`, add (these verify the hook itself — they FAIL to compile until Steps 1–7 land, then pass):
+- [x] **Step 8: Write the self-tests.** In the existing `#[cfg(test)] mod tests` of `src/page_io.rs`, add (these verify the hook itself — they FAIL to compile until Steps 1–7 land, then pass):
 
 ```rust
     #[test]
@@ -160,14 +160,14 @@ pub(crate) enum Fault {
     }
 ```
 
-- [ ] **Step 9: Run + verify.**
+- [x] **Step 9: Run + verify.**
 
 ```bash
 cargo test -p chisel --lib page_io::tests::armed_ 2>&1 | tail -8
 ```
 Expected: 4 tests pass. Then `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --check` clean.
 
-- [ ] **Step 10: Commit.**
+- [x] **Step 10: Commit.**
 
 ```bash
 git add src/page_io.rs
@@ -183,13 +183,13 @@ Isolates the exact "dirty flags cleared before the trailing fsync" window the `p
 **Files:**
 - Modify: `src/page_cache.rs` (add one test + a `use` in the test module)
 
-- [ ] **Step 1: Add the import.** In `page_cache.rs`'s `#[cfg(test)] mod tests`, add to its `use` block:
+- [x] **Step 1: Add the import.** In `page_cache.rs`'s `#[cfg(test)] mod tests`, add to its `use` block:
 
 ```rust
     use crate::page_io::Fault;
 ```
 
-- [ ] **Step 2: Write the test.** Add to the same test module:
+- [x] **Step 2: Write the test.** Add to the same test module:
 
 ```rust
     #[test]
@@ -221,14 +221,14 @@ Isolates the exact "dirty flags cleared before the trailing fsync" window the `p
     }
 ```
 
-- [ ] **Step 3: Run + verify.**
+- [x] **Step 3: Run + verify.**
 
 ```bash
 cargo test -p chisel --lib failed_flush_fsync 2>&1 | tail -6
 ```
 Expected: 1 test passes. (If `dirty_count != 0`, flush rolls back dirty flags on error — that would itself be a finding to surface, since the spec asserts the no-rollback window.) Then clippy + fmt clean.
 
-- [ ] **Step 4: Commit.**
+- [x] **Step 4: Commit.**
 
 ```bash
 git add src/page_cache.rs
@@ -244,13 +244,13 @@ Proves a real I/O fault anywhere in commit surfaces `IoError` and poisons.
 **Files:**
 - Modify: `src/transaction.rs` (add two tests + a `use` in the test module)
 
-- [ ] **Step 1: Add the import.** In `transaction.rs`'s `#[cfg(test)] mod tests`, add to its `use` block (it already `use`s `crate::page_io::PageIo`):
+- [x] **Step 1: Add the import.** In `transaction.rs`'s `#[cfg(test)] mod tests`, add to its `use` block (it already `use`s `crate::page_io::PageIo`):
 
 ```rust
     use crate::page_io::Fault;
 ```
 
-- [ ] **Step 2: Write the fsync test.** Add to the test module:
+- [x] **Step 2: Write the fsync test.** Add to the test module:
 
 ```rust
     #[test]
@@ -280,7 +280,7 @@ Proves a real I/O fault anywhere in commit surfaces `IoError` and poisons.
     }
 ```
 
-- [ ] **Step 3: Write the write-fault test.** Add to the test module:
+- [x] **Step 3: Write the write-fault test.** Add to the test module:
 
 ```rust
     #[test]
@@ -304,14 +304,14 @@ Proves a real I/O fault anywhere in commit surfaces `IoError` and poisons.
     }
 ```
 
-- [ ] **Step 4: Run + verify.**
+- [x] **Step 4: Run + verify.**
 
 ```bash
 cargo test -p chisel --lib commit_fsync_failure commit_write_failure 2>&1 | tail -8
 ```
 Expected: 2 tests pass. Then clippy + fmt clean.
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add src/transaction.rs
@@ -327,7 +327,7 @@ Replaces the tautological `fatal_error_outside_commit_also_poisons` (which calls
 **Files:**
 - Modify: `src/transaction.rs` (rewrite one test; possibly remove `force_poison_for_test`)
 
-- [ ] **Step 1: Replace the test body.** Find `fn fatal_error_outside_commit_also_poisons` (`transaction.rs:~2849`) and replace the whole test with the version below. It reopens over the committed file so `read` is a genuine cache **miss** that reaches `read_page` (a same-session read after commit would be a cache hit and never call `read_page`):
+- [x] **Step 1: Replace the test body.** Find `fn fatal_error_outside_commit_also_poisons` (`transaction.rs:~2849`) and replace the whole test with the version below. It reopens over the committed file so `read` is a genuine cache **miss** that reaches `read_page` (a same-session read after commit would be a cache hit and never call `read_page`):
 
 ```rust
     #[test]
@@ -382,23 +382,23 @@ Replaces the tautological `fatal_error_outside_commit_also_poisons` (which calls
     }
 ```
 
-- [ ] **Step 2: Check whether `force_poison_for_test` is now dead.**
+- [x] **Step 2: Check whether `force_poison_for_test` is now dead.**
 
 ```bash
 grep -rn "force_poison_for_test" src/
 ```
 Expected: references only in its own definition (`transaction.rs:~655`). If that is the only remaining reference, proceed to Step 3; if other callers exist, SKIP Step 3 (leave the method) and note them.
 
-- [ ] **Step 3: Remove the dead helper (only if Step 2 showed no other callers).** Delete the `#[cfg(test)] pub fn force_poison_for_test(&self) { … }` method and its doc comment (`transaction.rs:~650-657`). The `poisoned` flag itself stays — only the synthetic setter is removed.
+- [x] **Step 3: Remove the dead helper (only if Step 2 showed no other callers).** Delete the `#[cfg(test)] pub fn force_poison_for_test(&self) { … }` method and its doc comment (`transaction.rs:~650-657`). The `poisoned` flag itself stays — only the synthetic setter is removed.
 
-- [ ] **Step 4: Run + verify.**
+- [x] **Step 4: Run + verify.**
 
 ```bash
 cargo test -p chisel --lib fatal_error_outside_commit 2>&1 | tail -6
 ```
 Expected: passes. Then `cargo test` (full), clippy, fmt clean.
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add src/transaction.rs
@@ -414,7 +414,7 @@ The I20 `debug_assert!` in `claim_page` vanishes under `cargo test --release` (t
 **Files:**
 - Modify: `src/page_cache.rs` (add one test; keep the existing `debug_assert!` and the debug-only `claim_page_asserts_on_dirty_page`)
 
-- [ ] **Step 1: Write the test.** Add to `page_cache.rs`'s `#[cfg(test)] mod tests` (NOT gated on `debug_assertions` — it must run in release):
+- [x] **Step 1: Write the test.** Add to `page_cache.rs`'s `#[cfg(test)] mod tests` (NOT gated on `debug_assertions` — it must run in release):
 
 ```rust
     #[test]
@@ -442,7 +442,7 @@ The I20 `debug_assert!` in `claim_page` vanishes under `cargo test --release` (t
     }
 ```
 
-- [ ] **Step 2: Run + verify in BOTH profiles.**
+- [x] **Step 2: Run + verify in BOTH profiles.**
 
 ```bash
 cargo test -p chisel --lib claim_page_keeps_dirty_count_consistent 2>&1 | tail -5
@@ -450,7 +450,7 @@ cargo test --release -p chisel --lib claim_page_keeps_dirty_count_consistent 2>&
 ```
 Expected: passes in both debug and release. Then clippy + fmt clean.
 
-- [ ] **Step 3: Commit.**
+- [x] **Step 3: Commit.**
 
 ```bash
 git add src/page_cache.rs
@@ -466,14 +466,14 @@ One test that both pins `CorruptSuperblock` as the *sole* expected variant AND p
 **Files:**
 - Modify: `src/recovery_tests.rs` (add one test; confirm/add `use crate::ChiselError;`)
 
-- [ ] **Step 1: Confirm imports.** Ensure `recovery_tests.rs` has `ChiselError` and `TempDir` in scope (it already uses `Chisel`, `Superblock`, `page`, `fs`, `SeekFrom`). If `ChiselError` or `tempfile::TempDir` are not imported, add:
+- [x] **Step 1: Confirm imports.** Ensure `recovery_tests.rs` has `ChiselError` and `TempDir` in scope (it already uses `Chisel`, `Superblock`, `page`, `fs`, `SeekFrom`). If `ChiselError` or `tempfile::TempDir` are not imported, add:
 
 ```rust
 use crate::ChiselError;
 use tempfile::TempDir;
 ```
 
-- [ ] **Step 2: Write the test.** Add to `recovery_tests.rs`:
+- [x] **Step 2: Write the test.** Add to `recovery_tests.rs`:
 
 ```rust
 // I115: corrupt the 4-byte magic (superblock offset 0..4) in EVERY superblock
@@ -507,14 +507,14 @@ fn corrupt_magic_surfaces_as_corrupt_superblock_not_invalid_magic() {
 }
 ```
 
-- [ ] **Step 3: Run + verify.**
+- [x] **Step 3: Run + verify.**
 
 ```bash
 cargo test -p chisel --lib corrupt_magic_surfaces 2>&1 | tail -6
 ```
 Expected: passes (confirming bad magic → `CorruptSuperblock`, never `InvalidMagic`). Then clippy + fmt clean.
 
-- [ ] **Step 4: Commit.**
+- [x] **Step 4: Commit.**
 
 ```bash
 git add src/recovery_tests.rs
@@ -530,7 +530,7 @@ With Task 6 proving it unreachable, remove the variant across all sites. This is
 **Files (20 sites):**
 - Modify: `src/error.rs`, `src/lib.rs`, `tests/error_and_format.rs`, `python/src/errors.rs`, `python/chisel/__init__.py`, `python/chisel/chisel.pyi`, `python/tests/test_errors.py`, `README.md`, `python/README.md`
 
-- [ ] **Step 1: Remove from `src/error.rs` (6 sites).**
+- [x] **Step 1: Remove from `src/error.rs` (6 sites).**
   - `:111` — delete the `InvalidMagic,` enum variant.
   - `:175` — delete `| ChiselError::InvalidMagic` from the `is_fatal()` match.
   - `:243` — delete the `ChiselError::InvalidMagic => write!(f, "invalid magic number"),` `Display` arm.
@@ -538,29 +538,29 @@ With Task 6 proving it unreachable, remove the variant across all sites. This is
   - `:454` — delete `ChiselError::InvalidMagic,` from the `all[]` array.
   - `:473` — the tripwire that asserts the fatal-variant count: change the expected count from **9 to 8** (read the surrounding assertion to confirm the literal and adjust it; e.g. `assert_eq!(fatal_count, 8, …)`).
 
-- [ ] **Step 2: Remove from `src/lib.rs` (1 site).**
+- [x] **Step 2: Remove from `src/lib.rs` (1 site).**
   - `:302`-ish — in the doc comment listing fatal errors, drop `InvalidMagic` from the list. (Search the file for `InvalidMagic`.)
 
-- [ ] **Step 3: Remove from `tests/error_and_format.rs` (2 sites).**
+- [x] **Step 3: Remove from `tests/error_and_format.rs` (2 sites).**
   - `:61` and `:108` — delete the `ChiselError::InvalidMagic,` entries from the two test arrays.
 
-- [ ] **Step 4: Remove from the Python binding (`python/src/errors.rs`, 4 sites).**
+- [x] **Step 4: Remove from the Python binding (`python/src/errors.rs`, 4 sites).**
   - `:45` — delete the `//         InvalidMagicError` comment line.
   - `:139` — delete `create_exception!(_chisel, InvalidMagicError, FatalError);`.
   - `:221` — delete `m.add("InvalidMagicError", py.get_type::<InvalidMagicError>())?;`.
   - `:316` — delete the `RustChiselError::InvalidMagic => InvalidMagicError::new_err(msg),` match arm.
 
-- [ ] **Step 5: Remove from the Python package.**
+- [x] **Step 5: Remove from the Python package.**
   - `python/chisel/__init__.py:43` — delete `InvalidMagicError,` from the import.
   - `python/chisel/__init__.py:138` — delete `"InvalidMagicError",` from `__all__`.
   - `python/chisel/chisel.pyi:68` — delete the `class InvalidMagicError(FatalError): ...` stub.
   - `python/tests/test_errors.py` — search for `InvalidMagicError` and delete it from the fatal-class enumeration list.
 
-- [ ] **Step 6: Remove from docs.**
+- [x] **Step 6: Remove from docs.**
   - `README.md:284` — drop `InvalidMagic` from the fatal-variants list.
   - `python/README.md` — delete the `| InvalidMagicError | … |` error-table row.
 
-- [ ] **Step 7: Build + verify the full gate.**
+- [x] **Step 7: Build + verify the full gate.**
 
 ```bash
 cargo test 2>&1 | grep -E "test result:|error\[|FAILED" | grep -v "0 failed" || echo "RUST: 0 failures"
@@ -577,7 +577,7 @@ maturin develop -q 2>&1 | tail -1 && python -m pytest -q 2>&1 | tail -3
 ```
 Expected: all Python tests pass (the binding, `__init__`, `.pyi`, and `test_errors.py` updated together).
 
-- [ ] **Step 8: Commit.**
+- [x] **Step 8: Commit.**
 
 ```bash
 git add -A
@@ -591,9 +591,9 @@ git commit -m "fix(I115): remove provably-dead InvalidMagic error variant"
 **Files:**
 - Modify: `ISSUES.md`
 
-- [ ] **Step 1: Mark I112, I114, I115 fixed.** Add a `✅ FIXED 2026-06-21` marker and a one-paragraph resolution to each of the I112, I114, I115 entries, and update the backlog handoff status note (the `Status note` line near the top) to record them done and name the next priority items (I106, I107, I113, I139, I118).
+- [x] **Step 1: Mark I112, I114, I115 fixed.** Add a `✅ FIXED 2026-06-21` marker and a one-paragraph resolution to each of the I112, I114, I115 entries, and update the backlog handoff status note (the `Status note` line near the top) to record them done and name the next priority items (I106, I107, I113, I139, I118).
 
-- [ ] **Step 2: Commit.**
+- [x] **Step 2: Commit.**
 
 ```bash
 git add ISSUES.md

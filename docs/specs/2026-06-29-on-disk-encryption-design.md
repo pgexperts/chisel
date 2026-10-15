@@ -1,7 +1,7 @@
 # On-Disk Encryption — Design
 
 Date: 2026-06-29
-Status: Approved (design), pending implementation plan
+Status: Approved (design). Implemented per `docs/plans/2026-06-29-on-disk-encryption.md`.
 Topic: Client-supplied at-rest encryption for the Chisel storage engine
 
 ---

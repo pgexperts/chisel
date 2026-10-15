@@ -1,6 +1,6 @@
 # Dedicated benchmark machine — foundation (design)
 
-Status: design approved 2026-05-04. Implementation pending.
+Status: design approved 2026-05-04. Partially implemented: the noise-gate binary and the runbook exist; the VM, the runner and the workflows do not.
 
 ## Goal
 

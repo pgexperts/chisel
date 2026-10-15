@@ -1,7 +1,7 @@
 # Stable Chunk Iteration — Design Spec
 
 - **Date:** 2026-06-04
-- **Status:** designed (pending implementation)
+- **Status:** implemented (`tests/iteration_stability.rs`, ADR 0013)
 - **Source:** brainstorm with the primary Chisel client (the relational layer); hardens the
   chunk-tags iteration APIs added 2026-06-02 (`docs/specs/2026-06-02-chunk-tags-design.md`)
 - **Shape:** contract-hardening — **documentation + tests only, no production code change.**

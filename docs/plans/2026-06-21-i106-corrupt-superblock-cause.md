@@ -24,13 +24,13 @@ Adds the new types and the shared/cold-path helpers, and refactors `deserialize`
 **Files:**
 - Modify: `src/superblock.rs`
 
-- [ ] **Step 1: Add the `fmt` import.** Near the top of `src/superblock.rs`, in the imports, add (if not already present):
+- [x] **Step 1: Add the `fmt` import.** Near the top of `src/superblock.rs`, in the imports, add (if not already present):
 
 ```rust
 use std::fmt;
 ```
 
-- [ ] **Step 2: Add the types.** Add near the top of `src/superblock.rs` (after the imports, before `impl Superblock` is fine):
+- [x] **Step 2: Add the types.** Add near the top of `src/superblock.rs` (after the imports, before `impl Superblock` is fine):
 
 ```rust
 /// Why a superblock slot failed validation (I106). These are exactly the three
@@ -63,7 +63,7 @@ pub struct SlotDefect {
 }
 ```
 
-- [ ] **Step 3: Add `validate` (free fn) and refactor `deserialize`.** In `src/superblock.rs`, add a module-level free fn and change `deserialize` to use it. Replace the three inline checks at the head of `deserialize` (the `verify_checksum` guard, the `magic != MAGIC` guard, and the `superblock_count` range guard) with a single `validate(buf).ok()?;` — **keep the `Some(Superblock { ...field parse... })` block exactly as it is**.
+- [x] **Step 3: Add `validate` (free fn) and refactor `deserialize`.** In `src/superblock.rs`, add a module-level free fn and change `deserialize` to use it. Replace the three inline checks at the head of `deserialize` (the `verify_checksum` guard, the `magic != MAGIC` guard, and the `superblock_count` range guard) with a single `validate(buf).ok()?;` — **keep the `Some(Superblock { ...field parse... })` block exactly as it is**.
 
 ```rust
 /// The three torn-slot rules, shared by the hot path (`deserialize`) and the
@@ -106,7 +106,7 @@ The refactored `deserialize` head becomes:
 
 (Preserve every field-parse line; only the leading three guards are replaced by `validate(buf).ok()?;`. The `named_roots` loop and the final `Some(Superblock { ... })` are unchanged.)
 
-- [ ] **Step 4: Add `Superblock::diagnose`.** Inside `impl Superblock`, near `select`, add:
+- [x] **Step 4: Add `Superblock::diagnose`.** Inside `impl Superblock`, near `select`, add:
 
 ```rust
     /// Explain why every candidate slot failed. Called only on the cold path,
@@ -127,7 +127,7 @@ The refactored `deserialize` head becomes:
     }
 ```
 
-- [ ] **Step 5: Write the unit tests.** Add to `src/superblock.rs`'s `#[cfg(test)] mod tests`:
+- [x] **Step 5: Write the unit tests.** Add to `src/superblock.rs`'s `#[cfg(test)] mod tests`:
 
 ```rust
     #[test]
@@ -172,7 +172,7 @@ The refactored `deserialize` head becomes:
     }
 ```
 
-- [ ] **Step 6: Run + verify.**
+- [x] **Step 6: Run + verify.**
 
 ```bash
 cargo test -p chisel --lib superblock:: 2>&1 | grep -E "test result:|FAILED"
@@ -181,7 +181,7 @@ cargo fmt --check && echo "fmt clean"
 ```
 Expected: all superblock tests pass (existing + 2 new), clippy/fmt clean. The existing `deserialize_*` tests must still pass — that confirms the `validate` refactor preserved behavior.
 
-- [ ] **Step 7: Commit.**
+- [x] **Step 7: Commit.**
 
 ```bash
 git add src/superblock.rs
@@ -196,7 +196,7 @@ The enum-shape change breaks every match/construct site, so this is ONE atomic c
 
 **Files:** `src/error.rs`, `src/transaction.rs`, `src/lib.rs`, `tests/error_and_format.rs`, `src/recovery_tests.rs`, `python/src/errors.rs`
 
-- [ ] **Step 1: Re-export the new types.** In `src/lib.rs`, extend the existing `pub use superblock::{ ... };` re-export to add `SuperblockDefect, SlotDefect`. For example:
+- [x] **Step 1: Re-export the new types.** In `src/lib.rs`, extend the existing `pub use superblock::{ ... };` re-export to add `SuperblockDefect, SlotDefect`. For example:
 
 ```rust
 pub use superblock::{
@@ -205,15 +205,15 @@ pub use superblock::{
 };
 ```
 
-- [ ] **Step 2: Reshape the variant.** In `src/error.rs`, add `use crate::superblock::SlotDefect;` to the imports, and change the enum variant:
+- [x] **Step 2: Reshape the variant.** In `src/error.rs`, add `use crate::superblock::SlotDefect;` to the imports, and change the enum variant:
 
 ```rust
     CorruptSuperblock { defects: Vec<SlotDefect> },
 ```
 
-- [ ] **Step 3: Fix `is_fatal`.** In `src/error.rs::is_fatal`, change the arm `| ChiselError::CorruptSuperblock` to `| ChiselError::CorruptSuperblock { .. }`.
+- [x] **Step 3: Fix `is_fatal`.** In `src/error.rs::is_fatal`, change the arm `| ChiselError::CorruptSuperblock` to `| ChiselError::CorruptSuperblock { .. }`.
 
-- [ ] **Step 4: Reshape `Display`.** In `src/error.rs`'s `Display` impl, replace the arm
+- [x] **Step 4: Reshape `Display`.** In `src/error.rs`'s `Display` impl, replace the arm
 `ChiselError::CorruptSuperblock => write!(f, "no valid superblock found"),`
 with:
 
@@ -230,11 +230,11 @@ with:
 
 (Empty `defects` → `"no valid superblock found"`; populated → `"no valid superblock found: slot 0: bad checksum; slot 1: bad magic"`.)
 
-- [ ] **Step 5: Fix the two error.rs test sites.** In `src/error.rs`'s test module:
+- [x] **Step 5: Fix the two error.rs test sites.** In `src/error.rs`'s test module:
   - In `non_io_variants_have_no_source`, change `ChiselError::CorruptSuperblock,` to `ChiselError::CorruptSuperblock { defects: vec![] },`.
   - In `is_fatal_matches_documented_classification_for_every_variant`: the `documented_is_fatal` Fatal block arm `| ChiselError::CorruptSuperblock` → `| ChiselError::CorruptSuperblock { .. }`, and the `all[]` array entry `ChiselError::CorruptSuperblock,` → `ChiselError::CorruptSuperblock { defects: vec![] },`.
 
-- [ ] **Step 6: Wire `diagnose` at the raise site.** In `src/transaction.rs::open_existing`, change:
+- [x] **Step 6: Wire `diagnose` at the raise site.** In `src/transaction.rs::open_existing`, change:
 `let sb = Superblock::select(&candidates).ok_or(ChiselError::CorruptSuperblock)?;`
 to:
 
@@ -248,11 +248,11 @@ to:
 
 (`ok_or_else` keeps `diagnose` off the success path.)
 
-- [ ] **Step 7: Fix `tests/error_and_format.rs`.** Change both `ChiselError::CorruptSuperblock,` entries (in the two test arrays) to `ChiselError::CorruptSuperblock { defects: vec![] },`.
+- [x] **Step 7: Fix `tests/error_and_format.rs`.** Change both `ChiselError::CorruptSuperblock,` entries (in the two test arrays) to `ChiselError::CorruptSuperblock { defects: vec![] },`.
 
-- [ ] **Step 8: Fix the recovery_tests OR-arm.** In `src/recovery_tests.rs`, the truncation-test OR-arm `| ChiselError::CorruptSuperblock` → `| ChiselError::CorruptSuperblock { .. }`.
+- [x] **Step 8: Fix the recovery_tests OR-arm.** In `src/recovery_tests.rs`, the truncation-test OR-arm `| ChiselError::CorruptSuperblock` → `| ChiselError::CorruptSuperblock { .. }`.
 
-- [ ] **Step 9: Strengthen the I115 bad-magic test.** In `src/recovery_tests.rs::corrupt_magic_surfaces_as_corrupt_superblock_not_invalid_magic`, replace the `match Chisel::open(...)` block with:
+- [x] **Step 9: Strengthen the I115 bad-magic test.** In `src/recovery_tests.rs::corrupt_magic_surfaces_as_corrupt_superblock_not_invalid_magic`, replace the `match Chisel::open(...)` block with:
 
 ```rust
     match Chisel::open(&path, Default::default()) {
@@ -272,7 +272,7 @@ to:
     };
 ```
 
-- [ ] **Step 10: Fix the Python binding (message-only).** In `python/src/errors.rs`, change the `to_py_err` arm
+- [x] **Step 10: Fix the Python binding (message-only).** In `python/src/errors.rs`, change the `to_py_err` arm
 `RustChiselError::CorruptSuperblock => CorruptSuperblockError::new_err(msg),`
 to:
 
@@ -282,7 +282,7 @@ to:
 
 (The `CorruptSuperblockError` type declaration/registration is unchanged; `msg` comes from `Display`, which now includes the per-slot defects.)
 
-- [ ] **Step 11: Build + full gate.**
+- [x] **Step 11: Build + full gate.**
 
 ```bash
 cargo test 2>&1 | grep -E "test result:|error\[|FAILED" | grep -v "0 failed" || echo "RUST OK"
@@ -299,7 +299,7 @@ cd ..
 ```
 Expected: 0 Rust failures (debug + release), clippy/fmt clean, Python all pass.
 
-- [ ] **Step 12: Commit.**
+- [x] **Step 12: Commit.**
 
 ```bash
 git add -A
@@ -312,9 +312,9 @@ git commit -m "feat(I106): CorruptSuperblock carries per-slot defect detail"
 
 **Files:** `ISSUES.md`
 
-- [ ] **Step 1: Mark I106 fixed.** Add `✅ FIXED 2026-06-21` to the I106 entry title and a one-paragraph resolution describing: the `validate`/`diagnose` split (hot path untouched), `CorruptSuperblock { defects: Vec<SlotDefect> }` with `SuperblockDefect { BadChecksum, BadMagic, BadCount(u32) }`, lazy construction via `ok_or_else`, message-only Python, and the strengthened I115 bad-magic test (now a cause-level pin). Do NOT touch the shared handoff-note paragraph (kept stable to avoid cross-PR churn).
+- [x] **Step 1: Mark I106 fixed.** Add `✅ FIXED 2026-06-21` to the I106 entry title and a one-paragraph resolution describing: the `validate`/`diagnose` split (hot path untouched), `CorruptSuperblock { defects: Vec<SlotDefect> }` with `SuperblockDefect { BadChecksum, BadMagic, BadCount(u32) }`, lazy construction via `ok_or_else`, message-only Python, and the strengthened I115 bad-magic test (now a cause-level pin). Do NOT touch the shared handoff-note paragraph (kept stable to avoid cross-PR churn).
 
-- [ ] **Step 2: Commit.**
+- [x] **Step 2: Commit.**
 
 ```bash
 git add ISSUES.md

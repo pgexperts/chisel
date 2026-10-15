@@ -28,7 +28,7 @@ Adds the field, wires byte `[15]` in `read_entry`/`write_entry`, and fixes every
 - Modify: `src/handle_table.rs` (struct `HandleEntry`, `read_entry`, `write_entry`, the byte-layout comment; add a round-trip unit test)
 - Modify: `src/transaction.rs` (two `allocate` construction sites → `client_byte: 0`; two `update_inner` construction sites → `client_byte: entry.client_byte`)
 
-- [ ] **Step 1: Write the failing unit test** (in `src/handle_table.rs`, inside the existing `#[cfg(test)] mod tests`)
+- [x] **Step 1: Write the failing unit test** (in `src/handle_table.rs`, inside the existing `#[cfg(test)] mod tests`)
 
 ```rust
     #[test]
@@ -53,12 +53,12 @@ Adds the field, wires byte `[15]` in `read_entry`/`write_entry`, and fixes every
     }
 ```
 
-- [ ] **Step 2: Run it — expect a COMPILE failure**
+- [x] **Step 2: Run it — expect a COMPILE failure**
 
 Run: `cargo test --lib insert_lookup_roundtrips_client_byte`
 Expected: FAIL — `error[E0560]: struct HandleEntry has no field named client_byte` (and the existing construction sites also fail to compile once the field is added, which the next step fixes).
 
-- [ ] **Step 3: Add the field to `HandleEntry`** (`src/handle_table.rs`)
+- [x] **Step 3: Add the field to `HandleEntry`** (`src/handle_table.rs`)
 
 ```rust
 pub struct HandleEntry {
@@ -76,7 +76,7 @@ pub struct HandleEntry {
 }
 ```
 
-- [ ] **Step 4: Wire byte `[15]` in `read_entry` and `write_entry`** (`src/handle_table.rs`)
+- [x] **Step 4: Wire byte `[15]` in `read_entry` and `write_entry`** (`src/handle_table.rs`)
 
 In `read_entry`, add the field to the constructed `HandleEntry`:
 
@@ -109,7 +109,7 @@ Replace the layout comment and the `write_entry` body's last byte:
     }
 ```
 
-- [ ] **Step 5: Fix the `allocate` construction sites** (`src/transaction.rs`, in `allocate_tagged_inner`'s value branch — the two `HandleEntry { ... tag, }` literals)
+- [x] **Step 5: Fix the `allocate` construction sites** (`src/transaction.rs`, in `allocate_tagged_inner`'s value branch — the two `HandleEntry { ... tag, }` literals)
 
 New chunks default to `client_byte: 0`. Both literals (the `Overflow` branch and the `Live` branch) gain the field:
 
@@ -132,7 +132,7 @@ New chunks default to `client_byte: 0`. Both literals (the `Overflow` branch and
             }
 ```
 
-- [ ] **Step 6: Carry the client byte forward in `update_inner`** (`src/transaction.rs` — the two `HandleEntry { ... tag: entry.tag, }` literals)
+- [x] **Step 6: Carry the client byte forward in `update_inner`** (`src/transaction.rs` — the two `HandleEntry { ... tag: entry.tag, }` literals)
 
 This is the correctness crux. `update()` relocates the value and rewrites the entry; it must preserve the client byte just as it preserves the tag (the handle is unchanged):
 
@@ -163,22 +163,22 @@ Also update the comment above these literals (currently "Tags are immutable: upd
         // membership index needs no edit — only the value's storage moves).
 ```
 
-- [ ] **Step 7: Fix any remaining construction sites the compiler flags**
+- [x] **Step 7: Fix any remaining construction sites the compiler flags**
 
 Run: `cargo build`
 Any other `HandleEntry { ... }` literals (e.g., inside `src/handle_table.rs`'s own `#[cfg(test)] mod tests`) will fail to compile with `missing field client_byte`. Set them to `client_byte: 0`. Keep building until clean.
 
-- [ ] **Step 8: Run the unit test — expect PASS**
+- [x] **Step 8: Run the unit test — expect PASS**
 
 Run: `cargo test --lib insert_lookup_roundtrips_client_byte`
 Expected: PASS.
 
-- [ ] **Step 9: Full test + clippy**
+- [x] **Step 9: Full test + clippy**
 
 Run: `cargo test` then `cargo clippy --all-targets -- -D warnings`
 Expected: all green (the existing suite still passes — the byte defaults to 0 everywhere, so no behavior changed yet).
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add src/handle_table.rs src/transaction.rs
@@ -201,7 +201,7 @@ Implements `client_byte` (read, `&self`) and `set_client_byte` (write, `&mut sel
 - Modify: `src/transaction.rs` (add `client_byte` + `client_byte_inner`, `set_client_byte` + `set_client_byte_inner`)
 - Modify: `src/lib.rs` (add the two `Chisel` delegators)
 
-- [ ] **Step 1: Write the failing integration tests** (`tests/client_byte.rs`, new file)
+- [x] **Step 1: Write the failing integration tests** (`tests/client_byte.rs`, new file)
 
 ```rust
 //! Integration tests for the per-chunk client byte: in-session set/read (both
@@ -311,12 +311,12 @@ fn invalid_and_deleted_handles_error() {
 }
 ```
 
-- [ ] **Step 2: Run them — expect FAIL (methods don't exist)**
+- [x] **Step 2: Run them — expect FAIL (methods don't exist)**
 
 Run: `cargo test --test client_byte`
 Expected: FAIL — `no method named client_byte`/`set_client_byte` found for `Chisel`.
 
-- [ ] **Step 3: Implement the engine methods** (`src/transaction.rs`, near `tag`/`update`)
+- [x] **Step 3: Implement the engine methods** (`src/transaction.rs`, near `tag`/`update`)
 
 ```rust
     /// Return the opaque client byte stored in `handle`'s entry. 0 if never
@@ -388,7 +388,7 @@ Expected: FAIL — `no method named client_byte`/`set_client_byte` found for `Ch
     }
 ```
 
-- [ ] **Step 4: Add the `Chisel` delegators** (`src/lib.rs`, near `pub fn tag` / `pub fn update`)
+- [x] **Step 4: Add the `Chisel` delegators** (`src/lib.rs`, near `pub fn tag` / `pub fn update`)
 
 ```rust
     /// Return the opaque client byte stored in the handle-table entry for
@@ -406,12 +406,12 @@ Expected: FAIL — `no method named client_byte`/`set_client_byte` found for `Ch
     }
 ```
 
-- [ ] **Step 5: Run the integration tests — expect PASS**
+- [x] **Step 5: Run the integration tests — expect PASS**
 
 Run: `cargo test --test client_byte`
 Expected: PASS (all functions, both backings).
 
-- [ ] **Step 6: Add a poison test** (append to `tests/client_byte.rs`)
+- [x] **Step 6: Add a poison test** (append to `tests/client_byte.rs`)
 
 ```rust
 #[test]
@@ -430,12 +430,12 @@ fn poisoned_manager_rejects_client_byte_ops() {
 
 NOTE: confirm the test-only poison hook's exact name/visibility before relying on it — grep `force_poison_for_test` in `src/`. If it is gated so integration tests can't reach it (see `project_chisel_test_gap_findings`), drop this test from the integration file and instead add the poison assertion to the in-crate `src/transaction.rs` tests alongside the existing per-method poison test (search for the test that asserts `tag(0)` returns `Poisoned`).
 
-- [ ] **Step 7: Full test + clippy**
+- [x] **Step 7: Full test + clippy**
 
 Run: `cargo test` then `cargo clippy --all-targets -- -D warnings`
 Expected: all green.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add src/transaction.rs src/lib.rs tests/client_byte.rs
@@ -459,7 +459,7 @@ Exposes both methods on `chisel.Database` and the `Transaction` context manager,
 - Modify: `python/src/transaction.rs` (context-manager `client_byte`/`set_client_byte`)
 - Create: `python/tests/test_client_byte.py`
 
-- [ ] **Step 1: Write the failing Python test** (`python/tests/test_client_byte.py`)
+- [x] **Step 1: Write the failing Python test** (`python/tests/test_client_byte.py`)
 
 ```python
 import chisel
@@ -507,7 +507,7 @@ def test_client_byte_durable_across_reopen(tmp_db):
     db2.close()
 ```
 
-- [ ] **Step 2: Build + run — expect FAIL (methods unbound)**
+- [x] **Step 2: Build + run — expect FAIL (methods unbound)**
 
 Run (from `python/`, with a Python ≥3.11 venv active and maturin installed):
 ```bash
@@ -516,7 +516,7 @@ python -m pytest tests/test_client_byte.py -v
 ```
 Expected: FAIL — `AttributeError: 'Database' object has no attribute 'client_byte'`. (Use `python -m pytest`, not bare `pytest`, so the maturin-editable install resolves.)
 
-- [ ] **Step 3: Add the `Database` pymethods** (`python/src/db.rs`, near the tag pymethods)
+- [x] **Step 3: Add the `Database` pymethods** (`python/src/db.rs`, near the tag pymethods)
 
 ```rust
     fn client_byte(&self, py: Python<'_>, handle: u64) -> PyResult<u8> {
@@ -528,7 +528,7 @@ Expected: FAIL — `AttributeError: 'Database' object has no attribute 'client_b
     }
 ```
 
-- [ ] **Step 4: Add the `_internal` helpers** (`python/src/db.rs`, near `tag_internal`)
+- [x] **Step 4: Add the `_internal` helpers** (`python/src/db.rs`, near `tag_internal`)
 
 ```rust
     pub(crate) fn client_byte_internal(&self, py: Python<'_>, handle: u64) -> PyResult<u8> {
@@ -545,7 +545,7 @@ Expected: FAIL — `AttributeError: 'Database' object has no attribute 'client_b
     }
 ```
 
-- [ ] **Step 5: Add the `Transaction` context-manager methods** (`python/src/transaction.rs`, near its `tag` method)
+- [x] **Step 5: Add the `Transaction` context-manager methods** (`python/src/transaction.rs`, near its `tag` method)
 
 ```rust
     fn client_byte(&self, py: Python<'_>, handle: u64) -> PyResult<u8> {
@@ -560,7 +560,7 @@ Expected: FAIL — `AttributeError: 'Database' object has no attribute 'client_b
     }
 ```
 
-- [ ] **Step 6: Rebuild + run — expect PASS**
+- [x] **Step 6: Rebuild + run — expect PASS**
 
 Run (from `python/`):
 ```bash
@@ -569,12 +569,12 @@ python -m pytest tests/test_client_byte.py -v
 ```
 Expected: PASS. If `chisel.open`/`close` differ from the guesses in the reopen test, align them with `python/tests/test_open.py` and re-run.
 
-- [ ] **Step 7: clippy (the Rust side of the binding)**
+- [x] **Step 7: clippy (the Rust side of the binding)**
 
 Run (from `python/`): `cargo clippy --all-targets -- -D warnings`
 Expected: clean.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add python/src/db.rs python/src/transaction.rs python/tests/test_client_byte.py
@@ -597,17 +597,17 @@ Records the feature in the user-facing docs and the decision record, and fixes t
 - Modify: `.codebase-memory/adr.md` (ADR-0 register row + new ADR-14)
 - Modify: `src/handle_table.rs` (the field/layout comments already done in Task 1 — verify no remaining "[15] reserved" wording anywhere)
 
-- [ ] **Step 1: ARCHITECTURE.md** — find the `HandleEntry` / handle-table-entry layout description and update byte `[15]` from "reserved" to the client byte; add `client_byte(handle)` and `set_client_byte(handle, byte)` to the operations list near `tag`/`handles_with_tag`. (Grep `ARCHITECTURE.md` for `\[15\]`, `reserved`, and `tag(` to find the spots.)
+- [x] **Step 1: ARCHITECTURE.md** — find the `HandleEntry` / handle-table-entry layout description and update byte `[15]` from "reserved" to the client byte; add `client_byte(handle)` and `set_client_byte(handle, byte)` to the operations list near `tag`/`handles_with_tag`. (Grep `ARCHITECTURE.md` for `\[15\]`, `reserved`, and `tag(` to find the spots.)
 
-- [ ] **Step 2: README.md and python/README.md** — add the two ops to the API sections that already document `tag` / `allocate_tagged`. Keep it short: `client_byte(handle) -> int` (read; 0 if unset) and `set_client_byte(handle, byte)` (write; opaque, mutable, transactional).
+- [x] **Step 2: README.md and python/README.md** — add the two ops to the API sections that already document `tag` / `allocate_tagged`. Keep it short: `client_byte(handle) -> int` (read; 0 if unset) and `set_client_byte(handle, byte)` (write; opaque, mutable, transactional).
 
-- [ ] **Step 3: ADR register row** (`.codebase-memory/adr.md`, append after the ADR-13 row in the ADR-0 table)
+- [x] **Step 3: ADR register row** (`.codebase-memory/adr.md`, append after the ADR-13 row in the ADR-0 table)
 
 ```
 | 14 | Client byte — opaque per-chunk u8 in the last reserved entry byte | Accepted (2026-06-05) | Easy — additive; reuses reserved byte [15], no format change |
 ```
 
-- [ ] **Step 4: ADR-14 section** (`.codebase-memory/adr.md`, insert before `## Out of scope (documented non-goals)`)
+- [x] **Step 4: ADR-14 section** (`.codebase-memory/adr.md`, insert before `## Out of scope (documented non-goals)`)
 
 ```markdown
 ## ADR-14: Client byte — spending the last reserved entry byte
@@ -667,17 +667,17 @@ Spec: `docs/specs/2026-06-05-client-byte-design.md`.
 
 NOTE on editing `.codebase-memory/adr.md`: a Read-gate hook blocks the `Read` tool on this path, so the `Edit` tool (which requires a prior read) will fail. Edit it with a small scripted replacement instead (Python `str.replace` with a uniqueness assertion on the anchor), the same way the ADR-7/ADR-12 rows were added.
 
-- [ ] **Step 5: Sweep for stale "reserved byte" wording**
+- [x] **Step 5: Sweep for stale "reserved byte" wording**
 
 Run: `grep -rniE "remaining reserved byte|one remaining reserved|\[15\].*reserved" src/ ARCHITECTURE.md .codebase-memory/adr.md`
 Update any hit to reflect that `[15]` is now the client byte (ADR-12's "the one remaining reserved byte" phrasing in particular). Leave the generic "5 reserved bytes" history about the *original* layout intact where it is describing history.
 
-- [ ] **Step 6: Verify docs build / tests still green**
+- [x] **Step 6: Verify docs build / tests still green**
 
 Run: `cargo test` then `cargo clippy --all-targets -- -D warnings`
 Expected: green (docs-only changes plus comment edits).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add ARCHITECTURE.md README.md python/README.md src/handle_table.rs
@@ -689,11 +689,11 @@ git commit -m "docs(client-byte): document client_byte API; ADR-14; fix [15] ref
 
 ## Final verification (after all tasks)
 
-- [ ] `cargo test` (FULL suite, both backings) — green.
-- [ ] `cargo clippy --all-targets -- -D warnings` — clean.
-- [ ] From `python/`: `maturin develop && python -m pytest -v` — green.
-- [ ] Re-read the spec (`docs/specs/2026-06-05-client-byte-design.md`) and confirm every requirement maps to a shipped test.
-- [ ] Hand off to `superpowers:finishing-a-development-branch`.
+- [x] `cargo test` (FULL suite, both backings) — green.
+- [x] `cargo clippy --all-targets -- -D warnings` — clean.
+- [x] From `python/`: `maturin develop && python -m pytest -v` — green.
+- [x] Re-read the spec (`docs/specs/2026-06-05-client-byte-design.md`) and confirm every requirement maps to a shipped test.
+- [x] Hand off to `superpowers:finishing-a-development-branch`.
 
 ---
 

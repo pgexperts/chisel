@@ -46,7 +46,7 @@ Landing convention (feature branch + PR vs. direct to `main`) is the owner's cal
 **Files:**
 - Create: `tests/iteration_stability.rs`
 
-- [ ] **Step 1: Create the file with the module header, imports, and the two back-to-back tests**
+- [x] **Step 1: Create the file with the module header, imports, and the two back-to-back tests**
 
 ```rust
 //! Within-session iteration-stability contract for `handles()` and
@@ -121,13 +121,13 @@ fn back_to_back_handles_with_tag_body(b: &Backing) {
 dual_backing_test!(back_to_back_handles_with_tag, back_to_back_handles_with_tag_body);
 ```
 
-- [ ] **Step 2: Run the new tests — expect PASS (no red phase)**
+- [x] **Step 2: Run the new tests — expect PASS (no red phase)**
 
 Run: `cargo test --test iteration_stability`
 Expected: 4 tests pass — `back_to_back_handles_file`, `back_to_back_handles_memory`, `back_to_back_handles_with_tag_file`, `back_to_back_handles_with_tag_memory`.
 If any FAIL: STOP — the repeatability claim is false; investigate before continuing.
 
-- [ ] **Step 3: Stage commit (DEFERRED — do not run until authorized)**
+- [x] **Step 3: Stage commit (DEFERRED — do not run until authorized)**
 
 Part of **Commit A**. Do not `git commit` yet.
 
@@ -138,7 +138,7 @@ Part of **Commit A**. Do not `git commit` yet.
 **Files:**
 - Modify: `tests/iteration_stability.rs` (append two test bodies + macro invocations)
 
-- [ ] **Step 1: Append the interleaved-reads and interleaved-update tests**
+- [x] **Step 1: Append the interleaved-reads and interleaved-update tests**
 
 ```rust
 fn reads_between_scans_body(b: &Backing) {
@@ -196,13 +196,13 @@ fn update_between_scans_body(b: &Backing) {
 dual_backing_test!(update_between_scans, update_between_scans_body);
 ```
 
-- [ ] **Step 2: Run — expect PASS**
+- [x] **Step 2: Run — expect PASS**
 
 Run: `cargo test --test iteration_stability`
 Expected: 8 tests pass (the 4 from Task 1 plus `reads_between_scans_{file,memory}` and `update_between_scans_{file,memory}`).
 If FAIL: STOP and investigate (a perturbation by a read or an update would be a real bug).
 
-- [ ] **Step 3: Stage commit (DEFERRED)** — part of **Commit A**.
+- [x] **Step 3: Stage commit (DEFERRED)** — part of **Commit A**.
 
 ---
 
@@ -211,7 +211,7 @@ If FAIL: STOP and investigate (a perturbation by a read or an update would be a 
 **Files:**
 - Modify: `tests/iteration_stability.rs` (append one test body + macro invocation)
 
-- [ ] **Step 1: Append the cache-eviction test**
+- [x] **Step 1: Append the cache-eviction test**
 
 ```rust
 fn cache_eviction_between_scans_body(b: &Backing) {
@@ -250,13 +250,13 @@ fn cache_eviction_between_scans_body(b: &Backing) {
 dual_backing_test!(cache_eviction_between_scans, cache_eviction_between_scans_body);
 ```
 
-- [ ] **Step 2: Run — expect PASS**
+- [x] **Step 2: Run — expect PASS**
 
 Run: `cargo test --test iteration_stability`
 Expected: 10 tests pass (adds `cache_eviction_between_scans_{file,memory}`).
 If FAIL: STOP — an eviction-order dependence would be a real bug in the page cache / walk.
 
-- [ ] **Step 3: Stage commit (DEFERRED)** — part of **Commit A**.
+- [x] **Step 3: Stage commit (DEFERRED)** — part of **Commit A**.
 
 ---
 
@@ -265,7 +265,7 @@ If FAIL: STOP — an eviction-order dependence would be a real bug in the page c
 **Files:**
 - Modify: `tests/iteration_stability.rs` (append two test bodies + macro invocations)
 
-- [ ] **Step 1: Append the rolled-back-transaction and savepoint-rollback tests**
+- [x] **Step 1: Append the rolled-back-transaction and savepoint-rollback tests**
 
 ```rust
 // Allocating this many same-tag chunks inside a transaction grows BOTH radix
@@ -354,13 +354,13 @@ fn savepoint_rollback_body(b: &Backing) {
 dual_backing_test!(savepoint_rollback, savepoint_rollback_body);
 ```
 
-- [ ] **Step 2: Run — expect PASS**
+- [x] **Step 2: Run — expect PASS**
 
 Run: `cargo test --test iteration_stability`
 Expected: 14 tests pass (adds `rolled_back_transaction_{file,memory}` and `savepoint_rollback_{file,memory}`).
 If FAIL: STOP — a post-rollback scan mismatch is a real I99/C1 depth-recovery regression, not a test bug.
 
-- [ ] **Step 3: Stage commit (DEFERRED)** — completes **Commit A** (`test(iteration): within-session stability tests for handles()/handles_with_tag()`).
+- [x] **Step 3: Stage commit (DEFERRED)** — completes **Commit A** (`test(iteration): within-session stability tests for handles()/handles_with_tag()`).
 
 ---
 
@@ -370,7 +370,7 @@ If FAIL: STOP — a post-rollback scan mismatch is a real I99/C1 depth-recovery 
 - Modify: `src/lib.rs` (doc comments only — no code change)
 - Modify: `src/membership_index.rs` (doc comment only — no code change)
 
-- [ ] **Step 1: Replace the `handles` doc comment in `src/lib.rs`**
+- [x] **Step 1: Replace the `handles` doc comment in `src/lib.rs`**
 
 Find (≈556–559):
 
@@ -397,7 +397,7 @@ Replace with:
     /// Rely on within-session repeatability; do not rely on the order.
 ```
 
-- [ ] **Step 2: Replace the `handles_with_tag` doc comment in `src/lib.rs`**
+- [x] **Step 2: Replace the `handles_with_tag` doc comment in `src/lib.rs`**
 
 Find (≈461–463):
 
@@ -420,7 +420,7 @@ Replace with:
     /// unspecified and may differ after a reopen or `defrag`.
 ```
 
-- [ ] **Step 3: Replace the `RadixU64::iter` doc comment in `src/membership_index.rs`**
+- [x] **Step 3: Replace the `RadixU64::iter` doc comment in `src/membership_index.rs`**
 
 Find (≈254–255):
 
@@ -440,12 +440,12 @@ Replace with:
     /// unspecified and must not be relied upon.
 ```
 
-- [ ] **Step 4: Verify the crate still builds and docs render**
+- [x] **Step 4: Verify the crate still builds and docs render**
 
 Run: `cargo build && cargo doc --no-deps`
 Expected: clean build; no rustdoc warnings about the edited items. (`cargo test --test iteration_stability` is unaffected — doc-only change — but re-run it if you want to confirm: still 14 passing.)
 
-- [ ] **Step 5: Stage commit (DEFERRED)** — part of **Commit B**.
+- [x] **Step 5: Stage commit (DEFERRED)** — part of **Commit B**.
 
 ---
 
@@ -455,7 +455,7 @@ Expected: clean build; no rustdoc warnings about the edited items. (`cargo test 
 - Modify: `README.md`
 - Modify: `ARCHITECTURE.md`
 
-- [ ] **Step 1: Update the README example annotation (≈193)**
+- [x] **Step 1: Update the README example annotation (≈193)**
 
 Find:
 
@@ -469,7 +469,7 @@ Replace with:
 let members = db.handles_with_tag(42)?; // both handles; order unspecified, but repeatable within a session
 ```
 
-- [ ] **Step 2: Update the two README API-table rows (≈240, 246)**
+- [x] **Step 2: Update the two README API-table rows (≈240, 246)**
 
 Find:
 
@@ -495,7 +495,7 @@ Replace with:
 | `handles()` | Enumerate all live handles; repeatable within a session, order unspecified (takes `&self`) |
 ```
 
-- [ ] **Step 3: Append the iteration-stability paragraph to ARCHITECTURE.md "Handle stability" (after ≈483)**
+- [x] **Step 3: Append the iteration-stability paragraph to ARCHITECTURE.md "Handle stability" (after ≈483)**
 
 Find (the paragraph that ends the "Handle stability" section):
 
@@ -513,11 +513,11 @@ Within-session iteration stability follows from that same handle identity. `hand
 
 (If the cross-reference anchor does not match, grep `ARCHITECTURE.md` for the heading containing "radix depth" and use its exact slug. A wrong anchor only breaks the link, not the build.)
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run: `cargo test --test iteration_stability` (unchanged: 14 passing) and visually confirm the README/ARCHITECTURE renders.
 
-- [ ] **Step 5: Stage commit (DEFERRED)** — completes **Commit B** (`docs(iteration): document within-session iteration-stability contract`).
+- [x] **Step 5: Stage commit (DEFERRED)** — completes **Commit B** (`docs(iteration): document within-session iteration-stability contract`).
 
 ---
 
@@ -525,32 +525,32 @@ Run: `cargo test --test iteration_stability` (unchanged: 14 passing) and visuall
 
 **Files:** none (verification only)
 
-- [ ] **Step 1: Confirm the exact CI lint/test invocation**
+- [x] **Step 1: Confirm the exact CI lint/test invocation**
 
 Run: `cat .github/workflows/*.yml | grep -nE "cargo (fmt|clippy|test|doc)"`
 Use whatever flags CI uses; the steps below are the standard fallback.
 
-- [ ] **Step 2: Format check**
+- [x] **Step 2: Format check**
 
 Run: `cargo fmt --all -- --check`
 Expected: no output (clean). If it reports diffs, run `cargo fmt --all` and re-check.
 
-- [ ] **Step 3: Clippy (all targets, warnings as errors)**
+- [x] **Step 3: Clippy (all targets, warnings as errors)**
 
 Run: `cargo clippy --all-targets -- -D warnings`
 Expected: clean. Watch for `clippy::useless_vec` in the eviction test (the `vec![0u8; 4000]` there is mutated, so it is legitimate) and unused-import warnings in the test file.
 
-- [ ] **Step 4: Full test suite**
+- [x] **Step 4: Full test suite**
 
 Run: `cargo test`
 Expected: the whole suite passes, including all 14 `iteration_stability` variants. (`dual_backing_test!` names each `<name>_file` and `<name>_memory`.)
 
-- [ ] **Step 5: Docs**
+- [x] **Step 5: Docs**
 
 Run: `cargo doc --no-deps`
 Expected: clean.
 
-- [ ] **Step 6: Request commit authorization (DEFERRED commits)**
+- [x] **Step 6: Request commit authorization (DEFERRED commits)**
 
 Do NOT commit unprompted. Report verification results and ask the owner to authorize **Commit A** then **Commit B** (messages above), and confirm the landing convention (feature branch + PR vs. direct to `main`).
 

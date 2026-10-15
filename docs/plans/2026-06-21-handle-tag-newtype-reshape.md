@@ -44,7 +44,7 @@ Independent of the newtypes; do it first as a self-contained green commit. The f
 - Modify: `python/src/db.rs:413-418` (the `getattr` + builder call)
 - Modify: `python/tests/test_stats_defrag.py:80` (the `max_pages=10` call site)
 
-- [ ] **Step 1: Rename in `src/defrag.rs`**
+- [x] **Step 1: Rename in `src/defrag.rs`**
 
 In the doc comment (lines 65-70), replace the `` `max_pages` `` paragraph with:
 
@@ -75,16 +75,16 @@ At the consumer (line 209):
 
 Also update the builder usage comment at line 95 (`...max_pages(100)` → `...max_values(100)`).
 
-- [ ] **Step 2: Update the Rust test call site**
+- [x] **Step 2: Update the Rust test call site**
 
 In `tests/defrag.rs`, change `DefragOptions::default().sparse_threshold(0.25).max_pages(2)` → `...max_values(2)` (and any other `.max_pages(` occurrence in that file).
 
-- [ ] **Step 3: Run the Rust gate**
+- [x] **Step 3: Run the Rust gate**
 
 Run: `cargo test --test defrag && cargo clippy --workspace -- -D warnings`
 Expected: PASS / no warnings. (`cargo build` first if you want a faster failure.)
 
-- [ ] **Step 4: Rename on the Python side**
+- [x] **Step 4: Rename on the Python side**
 
 `python/chisel/__init__.py` (lines 100-106): rename the field and rewrite the docstring:
 
@@ -103,12 +103,12 @@ Expected: PASS / no warnings. (`cargo build` first if you want a faster failure.
 
 `python/tests/test_stats_defrag.py:80`: `chisel.DefragOptions(sparse_threshold=0.5, max_pages=10)` → `max_values=10`.
 
-- [ ] **Step 5: Run the Python gate**
+- [x] **Step 5: Run the Python gate**
 
 Run (from `python/`, in the project venv): `maturin develop --release && pytest -v tests/test_stats_defrag.py`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/defrag.rs tests/defrag.rs python/chisel/__init__.py python/chisel/chisel.pyi python/src/db.rs python/tests/test_stats_defrag.py
@@ -125,7 +125,7 @@ Self-contained, unit-tested. The types are defined and re-exported but not yet u
 - Create: `src/handle.rs`
 - Modify: `src/lib.rs` (add `pub(crate) mod handle;` near the other module decls, ~line 36; add `pub use handle::{Handle, Tag};` near the other re-exports, ~line 62)
 
-- [ ] **Step 1: Write `src/handle.rs` with the newtypes and unit tests**
+- [x] **Step 1: Write `src/handle.rs` with the newtypes and unit tests**
 
 ```rust
 // src/handle.rs — public newtypes for the Chisel API surface.
@@ -311,7 +311,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Wire the module into `src/lib.rs`**
+- [x] **Step 2: Wire the module into `src/lib.rs`**
 
 Near the other `pub(crate) mod` declarations (around line 36), add:
 
@@ -327,12 +327,12 @@ pub use handle::{Handle, Tag};
 
 (`TagDropProgress` is added to this re-export in Task 3.)
 
-- [ ] **Step 3: Run the gate**
+- [x] **Step 3: Run the gate**
 
 Run: `cargo test --lib handle:: && cargo clippy --workspace -- -D warnings && cargo fmt -- --check`
 Expected: 5 handle tests PASS; no clippy warnings; fmt clean.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/handle.rs src/lib.rs
@@ -353,7 +353,7 @@ This is the atomic change. Flipping `lib.rs` breaks every Rust caller until the 
 - Modify: `tests/*.rs`, `src/recovery_tests.rs`, `bench/src/chisel_engine.rs`, `bench/tests/*.rs` (sweep)
 - Modify: `tests/tag_ops.rs` (new behavior tests)
 
-- [ ] **Step 1: Relocate `TagDropProgress` to `src/handle.rs`**
+- [x] **Step 1: Relocate `TagDropProgress` to `src/handle.rs`**
 
 Append to `src/handle.rs` (after the `Tag` impls, before `mod tests`):
 
@@ -384,7 +384,7 @@ In `src/lib.rs`, change the re-export `pub use membership_index::TagDropProgress
 pub use handle::{Handle, Tag, TagDropProgress};
 ```
 
-- [ ] **Step 2: Change the engine `delete_with_tag` to return a tuple**
+- [x] **Step 2: Change the engine `delete_with_tag` to return a tuple**
 
 In `src/transaction.rs`, the engine layer must not reference `TagDropProgress` (it now lives above the engine). Rewrite `delete_with_tag` and `delete_with_tag_inner` (lines 2087-2135) to return `(Vec<u64>, bool)`:
 
@@ -424,7 +424,7 @@ In `src/transaction.rs`, the engine layer must not reference `TagDropProgress` (
 
 Remove the now-unused `TagDropProgress` import in `transaction.rs` if one exists (search for `TagDropProgress` in the file).
 
-- [ ] **Step 3: Flip the `Chisel` method signatures in `src/lib.rs`**
+- [x] **Step 3: Flip the `Chisel` method signatures in `src/lib.rs`**
 
 Replace the bodies of the handle/tag methods (the block spanning roughly lines 451-609) with the newtyped versions below. Engine delegations are otherwise unchanged. Update each method's doc comment where it says "u64 identifiers" / "Returns 0 for untagged" to describe `Handle`/`Option<Tag>` (keep the surrounding prose).
 
@@ -506,12 +506,12 @@ Replace the bodies of the handle/tag methods (the block spanning roughly lines 4
 
 Note `stats()` (lib.rs ~616) calls `self.txm.handles()` directly (engine layer, still `Vec<u64>`) for `handle_count` — that is unaffected and must NOT be routed through the newtyped `Chisel::handles()`. Leave `stats()` as-is.
 
-- [ ] **Step 4: Run `cargo build` to enumerate the call-site breakage**
+- [x] **Step 4: Run `cargo build` to enumerate the call-site breakage**
 
 Run: `cargo build 2>&1 | tee /tmp/reshape-errors.txt`
 Expected: FAIL with type-mismatch errors across `tests/`, `src/recovery_tests.rs`, and `bench/`. This list IS the sweep worklist.
 
-- [ ] **Step 5: Sweep Rust call sites using these transform rules**
+- [x] **Step 5: Sweep Rust call sites using these transform rules**
 
 Apply per the compiler errors. Most sites compile **untouched** (a `Handle` flows straight back into the next call, and `assert_eq!(h, 1)` still works via `PartialEq<u64>`). Only these patterns break:
 
@@ -530,7 +530,7 @@ Apply per the compiler errors. Most sites compile **untouched** (a `Handle` flow
 
 Re-run `cargo build` after each file; iterate until it compiles.
 
-- [ ] **Step 6: Add new behavior tests in `tests/tag_ops.rs`**
+- [x] **Step 6: Add new behavior tests in `tests/tag_ops.rs`**
 
 ```rust
 #[test]
@@ -555,7 +555,7 @@ fn tag_of_tagged_handle_is_some() {
 
 Ensure `tests/tag_ops.rs` imports `Tag` (`use chisel::Tag;` or via the existing glob). The transposition guarantee (`delete_tagged(handle, tag)` can't swap args) is enforced by the type system at compile time and needs no runtime test.
 
-- [ ] **Step 7: Run the full Rust gate, then commit**
+- [x] **Step 7: Run the full Rust gate, then commit**
 
 Run: `cargo test && cargo clippy --workspace -- -D warnings && cargo fmt -- --check`
 Expected: entire suite PASS (note: full `cargo test`, not `--lib` — the integration tests in `tests/` are where the sweep landed); no clippy warnings; fmt clean.
@@ -578,7 +578,7 @@ The Rust core now takes `Tag` / returns `Handle`/`Option<Tag>`, so the PyO3 laye
 - Modify: `python/chisel/__init__.py` (doc the tag-0 `ValueError`)
 - Modify: `python/tests/test_tags.py` (new `ValueError` + `None` tests)
 
-- [ ] **Step 1: Add the `require_tag` helper and convert the `PyChisel` methods in `python/src/db.rs`**
+- [x] **Step 1: Add the `require_tag` helper and convert the `PyChisel` methods in `python/src/db.rs`**
 
 Add near the top of the `impl PyChisel` block (or as a free helper in the module):
 
@@ -671,7 +671,7 @@ Convert every `PyChisel` method that crosses a handle or tag (`u64`↔`Handle`, 
 
 (Match the exact existing `read` signature/body — only its engine call changes to `chisel::Handle::from(handle)`. Confirm `chisel::Handle`/`chisel::Tag` are reachable; they are re-exported from the crate root by Task 2/3.)
 
-- [ ] **Step 2: Update the `Transaction` wrapper signature in `python/src/transaction.rs`**
+- [x] **Step 2: Update the `Transaction` wrapper signature in `python/src/transaction.rs`**
 
 The wrappers delegate to `PyChisel`. Only the `tag` wrapper's return type changes:
 
@@ -683,15 +683,15 @@ The wrappers delegate to `PyChisel`. Only the `tag` wrapper's return type change
 
 All other wrappers (`allocate_tagged`, `handles_with_tag`, `delete_tagged`, `delete_with_tag`, `set_root_name`, `get_root_name`, etc.) keep their current signatures — the validation/conversion lives in `PyChisel`, which they already call.
 
-- [ ] **Step 3: Update the stubs in `python/chisel/chisel.pyi`**
+- [x] **Step 3: Update the stubs in `python/chisel/chisel.pyi`**
 
 Both the `Chisel` and `Transaction` classes: `def tag(self, handle: int) -> int: ...` → `def tag(self, handle: int) -> int | None: ...`. Leave all other handle/tag stubs as `int`/`list[int]`. Optionally add a one-line note on `allocate_tagged`/`delete_tagged`/`handles_with_tag`/`delete_with_tag` that `tag` must be `>= 1` (raises `ValueError`).
 
-- [ ] **Step 4: Document the tag-0 contract in `python/chisel/__init__.py`**
+- [x] **Step 4: Document the tag-0 contract in `python/chisel/__init__.py`**
 
 Where the tag API is described (module or class docstring), add: "Tags are integers `>= 1`. `0` is not a valid tag — an untagged value is created with `allocate` (not `allocate_tagged`), and `tag()` returns `None` for it. Passing `tag=0` raises `ValueError`."
 
-- [ ] **Step 5: Add Python behavior tests in `python/tests/test_tags.py`**
+- [x] **Step 5: Add Python behavior tests in `python/tests/test_tags.py`**
 
 ```python
 import pytest
@@ -719,12 +719,12 @@ def test_handles_with_tag_rejects_zero(mem_db):
 
 (Use the existing `mem_db` fixture from the test module/conftest; match its name. If `allocate`/`tag` outside a transaction need an implicit txn in these tests, follow the pattern already used by the other tests in `test_tags.py`.)
 
-- [ ] **Step 6: Build and run the Python gate**
+- [x] **Step 6: Build and run the Python gate**
 
 Run (from `python/`, in the project venv): `maturin develop --release && pytest -v`
 Expected: all Python tests PASS, including the four new ones.
 
-- [ ] **Step 7: Run clippy on the binding and commit**
+- [x] **Step 7: Run clippy on the binding and commit**
 
 Run: `cargo clippy --workspace -- -D warnings && cargo fmt -- --check`
 Expected: no warnings (this lints `python/src` via `--workspace`, per the I108 CI note).
@@ -741,11 +741,11 @@ git commit -m "feat: Python boundary for Tag(NonZeroU32) — tag()->int|None, ta
 **Files:**
 - Modify: `ISSUES.md` (I120, I126, I122 entries)
 
-- [ ] **Step 1: Mark the three issues resolved in `ISSUES.md`**
+- [x] **Step 1: Mark the three issues resolved in `ISSUES.md`**
 
 On the `#### I120.` heading add `✅ FIXED 2026-06-21` and a one-line resolution note (`Handle`/`Tag` newtypes at the lib.rs + PyO3 skin; engine stays raw integers; `delete_tagged` un-transposable). Same for `#### I126.` (`Tag(NonZeroU32)` + `Option<Tag>`; tag 0 unconstructable in Rust, `ValueError` in Python) and `#### I122.` (`max_pages` → `max_values`). Update the 2026-06-21 handoff status note near the top to move I120/I126/I122 from "STILL OPEN" to done.
 
-- [ ] **Step 2: Run the entire CI gate locally**
+- [x] **Step 2: Run the entire CI gate locally**
 
 Run:
 ```bash
@@ -757,14 +757,14 @@ maturin develop --release && pytest -v
 ```
 Expected: everything green.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add ISSUES.md
 git commit -m "docs: mark I120/I126/I122 resolved (Handle/Tag newtype reshape)"
 ```
 
-- [ ] **Step 4: Open the PR**
+- [x] **Step 4: Open the PR**
 
 ```bash
 git push -u origin newtype-reshape

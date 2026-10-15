@@ -1,7 +1,7 @@
 # Swift binding: port onto the published lineage and make it a repo member
 
 **Date:** 2026-08-23
-**Status:** Draft, pending review
+**Status:** Implemented per `docs/plans/2026-08-23-swift-binding-port.md`.
 **Supersedes nothing.** Extends ADR [0016](../adr/0016-swift-binding-via-uniffi.md) (Swift binding via UniFFI),
 which is already Accepted on `main` and records the *shape* of the binding. This
 spec covers only getting that shape onto the published tree and finishing it.
