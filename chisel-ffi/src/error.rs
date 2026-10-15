@@ -81,9 +81,9 @@ pub enum ChiselError {
     Closed {
         message: String,
     },
-    // Ditto: reserved for the transaction/savepoint wrapper's one-shot
-    // "finished" guard, mirroring Python's `AlreadyFinishedError`
-    // (ISSUES.md I22/I24).
+    // Ditto: raised by the Swift `Transaction`'s one-shot "finished" guard
+    // (`Transaction.live()` in swift/Sources/Chisel/ChiselDatabase.swift),
+    // mirroring Python's `AlreadyFinishedError` (ISSUES.md I22/I24).
     AlreadyFinished {
         message: String,
     },
@@ -183,9 +183,9 @@ pub enum ChiselError {
 
 impl ChiselError {
     /// The human-readable message every variant carries — either the
-    /// engine's own `Display` text (`From` below) or, for the two
-    /// FFI-only variants (`Closed`, `AlreadyFinished`), whatever the
-    /// Swift wrapper set when it raised them directly.
+    /// engine's own `Display` text (`From` below) or, for the three
+    /// FFI-only variants (`Closed`, `AlreadyFinished`, `InvalidTag`),
+    /// whatever the binding set when it raised them directly.
     fn message(&self) -> &str {
         match self {
             Self::InvalidHandle { message }

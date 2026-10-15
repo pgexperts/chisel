@@ -48,4 +48,22 @@ final class KeyRedactionTests: XCTestCase {
             XCTAssertTrue(rendered.contains("redacted"), "expected a redaction marker: \(rendered)")
         }
     }
+
+    // `dump` prints the custom description as a header and then walks the
+    // Mirror's children; without `customMirror`, the associated value printed
+    // right under "<redacted>". Covers the key directly, through `Options`,
+    // and a bare Mirror walk.
+    func testDumpAndMirrorNeverExposeKeyMaterial() {
+        let secret = "correct horse battery staple"
+        let key = ChiselKey.passphrase(phrase: secret)
+        let options = Options(drainInsertion: .lruTail, encryptionKey: key)
+        for subject in [key as Any, options as Any] {
+            var out = ""
+            dump(subject, to: &out)
+            XCTAssertFalse(out.contains(secret), "passphrase leaked via dump: \(out)")
+            XCTAssertTrue(out.contains("redacted"), "expected a redaction marker: \(out)")
+        }
+        XCTAssertTrue(Mirror(reflecting: key).children.isEmpty)
+        XCTAssertTrue(Mirror(reflecting: ChiselKey.raw(bytes: Data([0xDE, 0xAD]))).children.isEmpty)
+    }
 }

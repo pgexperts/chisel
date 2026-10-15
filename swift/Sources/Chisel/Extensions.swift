@@ -22,7 +22,7 @@
 // `case .A, .B, .C:` arms. That reads cleaner and DID compile, but crashes
 // with SIGSEGV at runtime in DEBUG builds only (`swift test` / `swift
 // build` without `-c release`) once `ChiselError` grew a `message: String`
-// payload on every case (32 cases total, one with 3 fields). Confirmed via
+// payload on every case (32 cases at the time; 39 now, one with 3 fields). Confirmed via
 // `swift test -c release`, which passes; `-Onone` codegen for a grouped
 // multi-pattern switch over a large mixed-arity enum appears to be a Swift
 // 6.0.3 compiler bug. One `case:` arm per line sidesteps it and is what's
@@ -67,8 +67,9 @@ extension ChiselError {
         case .LastKeySlot: return .operational
         // No engine variant produces these — the NativeDatabase wrapper raises
         // `.Closed` directly (via closed_err in chisel-ffi/src/database.rs) on a
-        // call after close(); `.AlreadyFinished` is reserved for a finished
-        // handle. "You used a handle you already closed or finished" is a caller
+        // call after close(); `Transaction.live()` (ChiselDatabase.swift)
+        // raises `.AlreadyFinished` on a transaction whose scope has exited.
+        // "You used a handle you already closed or finished" is a caller
         // mistake with the database untouched, the same shape as every other
         // operational case.
         case .Closed: return .operational
@@ -165,14 +166,19 @@ extension ChiselError: CustomStringConvertible {
 // messages would all disclose a passphrase verbatim — and on iOS those
 // destinations are routinely uploaded off-device.
 //
-// Both conformances are required: `description` covers interpolation and
-// print; `debugDescription` covers String(reflecting:), dump, and the
-// debugger. Mirrors the Rust-side redaction in chisel-ffi/src/types.rs and the
+// Three conformances are required: `description` covers interpolation and
+// print; `debugDescription` covers String(reflecting:) and the debugger's
+// summary line; `customMirror` covers `dump` and anything else that walks a
+// Mirror. The first two alone are NOT enough: `dump` prints the custom
+// description as a header and then walks the default mirror's children, and
+// an enum's associated value is one of them, so the payload printed directly
+// beneath "<redacted>" — through `Options` too. The empty mirror removes those
+// children. Mirrors the Rust-side redaction in chisel-ffi/src/types.rs and the
 // engine's own hand-written Debug for crypto::Key.
 //
 // The variant name is safe and useful — it says which credential KIND was
 // supplied. The length is not: key length is a fingerprint.
-extension ChiselKey: CustomStringConvertible, CustomDebugStringConvertible {
+extension ChiselKey: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
     public var description: String {
         switch self {
         case .raw: return "ChiselKey.raw(<redacted>)"
@@ -180,4 +186,5 @@ extension ChiselKey: CustomStringConvertible, CustomDebugStringConvertible {
         }
     }
     public var debugDescription: String { description }
+    public var customMirror: Mirror { Mirror(self, children: [], displayStyle: .enum) }
 }
