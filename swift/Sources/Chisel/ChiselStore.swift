@@ -59,7 +59,9 @@ public actor ChiselStore {
 
     // MARK: - Lifecycle / status
 
-    /// Whether the engine has poisoned itself (a fatal integrity/I-O failure).
+    /// True if this store can no longer do work — either a fatal error has
+    /// poisoned the engine, OR it has already been closed. A cleanly closed
+    /// store reports `true`; see `ChiselDatabase.isPoisoned`.
     /// Non-throwing, but still hopped onto the queue: the poison flag is engine
     /// state and reading it stays under the same single-queue confinement.
     public func isPoisoned() async -> Bool {

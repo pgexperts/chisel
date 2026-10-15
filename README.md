@@ -8,7 +8,7 @@
 
 A transactional, crash-durable key-value storage engine written in Rust. Chisel uses **shadow paging** (copy-on-write) to guarantee that the database file is always in a consistent state. There is no write-ahead log and no recovery procedure — after a crash, you just open the file and it's correct.
 
-Chisel is designed for single-writer embedded use: one process holds the file via `flock`, all mutations go through `&mut self`, and the API is synchronous. A PyO3 binding ships alongside the Rust crate; see [`python/README.md`](python/README.md).
+Chisel is designed for single-writer embedded use: one process holds the file via `flock`, all mutations go through `&mut self`, and the API is synchronous. A PyO3 binding ships alongside the Rust crate; see [`python/README.md`](python/README.md). A Swift package for iOS and macOS ships alongside it; see [`swift/README.md`](swift/README.md).
 
 ## Status
 
@@ -78,7 +78,7 @@ fn main() -> chisel::Result<()> {
 
 ## Building from source
 
-Cargo workspace with three members: the root `chisel` engine, the `python/` PyO3 binding, and the `bench/` benchmark suite. They share a single `Cargo.lock` and `target/` at the repo root. `default-members` is `[".", "bench"]`, so `cargo build` / `cargo test` from the workspace root exercise the engine and the bench harness together — the Python crate is workspace-resident (for Cargo.lock unification) but excluded from default builds because PyO3's `extension-module` feature needs maturin to set up linker flags. To build/install the Python binding, use `cd python && maturin develop --release`.
+Cargo workspace with four members: the root `chisel` engine, the `python/` PyO3 binding, the `bench/` benchmark suite, and the `chisel-ffi/` UniFFI binding. They share a single `Cargo.lock` and `target/` at the repo root. `default-members` is `[".", "bench"]`, so `cargo build` / `cargo test` from the workspace root exercise the engine and the bench harness together — the Python and `chisel-ffi` crates are workspace-resident (for `Cargo.lock` unification) but excluded from default builds: PyO3's `extension-module` feature needs maturin to set up linker flags, and `chisel-ffi` is exercised from `swift/` instead (see [Swift binding](#swift-binding) below). To build/install the Python binding, use `cd python && maturin develop --release`.
 
 ### Root crate
 
@@ -106,6 +106,23 @@ pytest -v
 ```
 
 See [`python/README.md`](python/README.md) for usage.
+
+### Swift binding
+
+`chisel-ffi/` is a UniFFI wrapper compiled as a static library for five Apple
+targets and packaged as an xcframework; `swift/Sources/Chisel/` is the
+hand-written ergonomic layer over the generated bindings, providing a
+synchronous `ChiselDatabase` and an async `ChiselStore` actor.
+
+```bash
+swift/build-xcframework.sh   # builds all five slices and regenerates bindings
+swift test                   # from the repo root
+```
+
+The binding is gated by `.github/workflows/swift.yml` on a macOS runner, which
+also runs `cargo test -p chisel-ffi` — a root `cargo test` honours
+`default-members` and skips it. See [`swift/README.md`](swift/README.md) for
+usage and [`swift/PARITY.md`](swift/PARITY.md) for the Python↔Swift map.
 
 ### Benchmark suite
 
@@ -490,4 +507,4 @@ chisel.rekey("my.db", key=b"\x00" * 32)   # whole-file re-encryption under a fre
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for the full text. The same license applies to the `python/` PyO3 binding and the `bench/` benchmark subcrate.
+MIT — see [LICENSE](LICENSE) for the full text. The same license applies to the `python/` PyO3 binding, the `bench/` benchmark subcrate, the `chisel-ffi/` UniFFI binding, and the `swift/` package.

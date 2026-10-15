@@ -378,11 +378,13 @@ mod tests {
         assert_eq!(e.p_cost, 3);
     }
 
-    // Exercises the u64 -> usize cast in DefragOptions::from at both ends of
-    // its range: 0 (no-op limit) and a large value that only differs from
-    // its usize form if the cast silently truncated (e.g. on a 32-bit
-    // usize). The prior version of this test used max_values: 42, which
-    // isn't a boundary of anything.
+    // Exercises the u64 -> usize cast in DefragOptions::from at the only
+    // boundary that can actually detect truncation: one past u32::MAX. On a
+    // 64-bit usize this round-trips; on a 32-bit usize the cast wraps to 0,
+    // silently turning "no limit" semantics into a zero budget. The previous
+    // version asserted 1_000_000, which is ~0.02% of u32::MAX and therefore
+    // round-trips identically on both, so it could not fail for the reason its
+    // comment claimed.
     #[test]
     fn defrag_options_convert_usize_boundary() {
         let zero = DefragOptions {
@@ -393,12 +395,22 @@ mod tests {
         assert_eq!(e.sparse_threshold, 0.5);
         assert_eq!(e.max_values, 0usize);
 
+        let past_u32 = u32::MAX as u64 + 1;
         let large = DefragOptions {
             sparse_threshold: 0.5,
-            max_values: 1_000_000,
+            max_values: past_u32,
         };
         let e: chisel::DefragOptions = large.into();
-        assert_eq!(e.max_values, 1_000_000usize);
+        // usize is 64-bit on every target this crate builds for today (all
+        // five Apple slices in build-xcframework.sh are 64-bit). The
+        // assertion is written against the cast's real contract rather than
+        // that assumption, so it becomes a genuine failure rather than a
+        // silent truncation if a 32-bit target is ever added.
+        assert_eq!(e.max_values, past_u32 as usize);
+        assert_eq!(
+            e.max_values as u64, past_u32,
+            "u64 -> usize truncated: this target's usize is too narrow for the FFI contract"
+        );
     }
 
     // No unit test for TagDropProgress::from: chisel::TagDropProgress is
