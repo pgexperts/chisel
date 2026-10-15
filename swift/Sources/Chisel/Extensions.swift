@@ -5,17 +5,17 @@
 // cases individually.
 //
 // Classification source of truth: the CALLER-FACING tiering in the Python
-// binding, `python/src/errors.rs:101-172` (`OperationalError` vs
-// `FatalError`). This whole Swift binding exists for parity with Python, so
+// binding's exception hierarchy in `python/src/errors.rs` (`OperationalError`
+// vs `FatalError`). This whole Swift binding exists for parity with Python, so
 // its two error tiers are authoritative.
 //
 // This is deliberately NOT the engine's `chisel::ChiselError::is_fatal()`
 // (src/error.rs): that is a manager-INTERNAL predicate answering "does this
 // error cause a NEW poisoning transition?", which returns FALSE for
 // `Poisoned` because an already-poisoned manager isn't a fresh event
-// (src/error.rs:204, :554). For a caller, a poisoned DB is precisely a
+// (see `is_fatal`'s doc comment in src/error.rs). For a caller, a poisoned DB is precisely a
 // drop-and-reopen (fatal) condition — so `Poisoned` is FATAL here, matching
-// Python (`python/src/errors.rs:155-172`, PoisonedError : FatalError) and
+// Python (`PoisonedError` subclasses `FatalError` in `python/src/errors.rs`) and
 // diverging from `is_fatal()` by that one case.
 //
 // IMPORTANT — do not collapse the switches below back into comma-grouped
@@ -77,8 +77,8 @@ extension ChiselError {
         // FATAL. `Poisoned` means the manager already hit an integrity/I-O
         // failure and refuses further work; the only recovery is to drop the
         // handle and reopen. Fatal here even though the engine's `is_fatal()`
-        // calls it non-fatal — see the file header and
-        // `python/src/errors.rs:155-172`.
+        // calls it non-fatal — see the file header and `PoisonedError` in
+        // `python/src/errors.rs`.
         case .Poisoned: return .fatal
         case .Io: return .fatal
         case .ChecksumMismatch: return .fatal
