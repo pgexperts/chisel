@@ -115,9 +115,13 @@ hand-written ergonomic layer over the generated bindings, providing a
 synchronous `ChiselDatabase` and an async `ChiselStore` actor.
 
 ```bash
-swift/build-xcframework.sh   # builds all five slices and regenerates bindings
-swift test                   # from the repo root
+swift/build-xcframework.sh              # builds all five slices and regenerates bindings
+CHISEL_LOCAL_XCFRAMEWORK=1 swift test   # from the repo root
 ```
+
+`CHISEL_LOCAL_XCFRAMEWORK` selects the xcframework `build-xcframework.sh` just
+built; without it, `Package.swift` resolves a published release asset instead,
+and none exists yet — a bare `swift test` fails with a 404.
 
 The binding is gated by `.github/workflows/swift.yml` on a macOS runner, which
 also runs `cargo test -p chisel-ffi` — a root `cargo test` honours

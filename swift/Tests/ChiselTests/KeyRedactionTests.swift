@@ -31,4 +31,21 @@ final class KeyRedactionTests: XCTestCase {
             XCTAssertTrue(rendered.contains("redacted"))
         }
     }
+
+    // `Options` has no `CustomStringConvertible` of its own, but it embeds
+    // `ChiselKey` as `encryptionKey`. Swift's default mirror-based
+    // description for a struct without its own conformance renders each
+    // stored property via that property's own `String(describing:)`, which
+    // dispatches to `ChiselKey`'s conformance above — so an `Options` value
+    // should redact too, with no `Options`-specific code required. This is
+    // the Swift-side counterpart to the Rust side's equivalent coverage
+    // (chisel-ffi/src/types.rs).
+    func testOptionsContainingKeyRedactsThroughDefaultReflection() {
+        let secret = "correct horse battery staple"
+        let options = Options(drainInsertion: .lruTail, encryptionKey: .passphrase(phrase: secret))
+        for rendered in ["\(options)", String(describing: options), String(reflecting: options)] {
+            XCTAssertFalse(rendered.contains(secret), "passphrase leaked via Options: \(rendered)")
+            XCTAssertTrue(rendered.contains("redacted"), "expected a redaction marker: \(rendered)")
+        }
+    }
 }

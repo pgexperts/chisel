@@ -1,7 +1,7 @@
 // Extensions.swift — hand-written Swift ergonomics layer over the UniFFI-
 // generated bindings (Generated/chisel_ffi.swift). This is the first file in
 // that layer: `ChiselError.category` / `.isPoisoning` / `.message`, so
-// callers can react to an error without special-casing all 38 generated
+// callers can react to an error without special-casing all 39 generated
 // cases individually.
 //
 // Classification source of truth: the CALLER-FACING tiering in the Python
