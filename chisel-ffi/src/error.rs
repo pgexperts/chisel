@@ -61,6 +61,9 @@ pub enum ChiselError {
     InvalidSuperblockCount {
         message: String,
     },
+    InvalidArgon2Params {
+        message: String,
+    },
     CacheFull {
         message: String,
     },
@@ -132,11 +135,41 @@ pub enum ChiselError {
     InvalidPageId {
         message: String,
     },
+    InvalidFreemapDepth {
+        message: String,
+    },
+    InvalidNextHandle {
+        message: String,
+    },
+    TxnCounterExhausted {
+        message: String,
+    },
+    HandleSpaceExhausted {
+        message: String,
+    },
     Poisoned {
         message: String,
     },
     DecryptionFailed {
         message: String,
+    },
+    /// An engine variant added AFTER this crate was last updated. `fatal`
+    /// carries the engine's own `is_fatal()` verdict, so the caller-facing
+    /// tier is never guessed.
+    ///
+    /// This replaces a `_ => Poisoned` fallback that reported every unmapped
+    /// variant as a fatal poisoning. That was wrong twice over: it mistiers
+    /// operational variants (an out-of-range Argon2 parameter is not a
+    /// corrupt database), and `Poisoned` additionally asserts an engine
+    /// state — `is_poisoned() == true` — that is not true for a handle that
+    /// merely rejected a bad argument.
+    ///
+    /// Reaching this case is not an error, but it does mean the mapping is
+    /// stale; `every_engine_variant_has_an_explicit_ffi_arm` fails as soon as
+    /// a variant exists with no arm of its own.
+    Other {
+        message: String,
+        fatal: bool,
     },
 }
 
@@ -157,6 +190,7 @@ impl ChiselError {
             | Self::InvalidRootName { message }
             | Self::RootNameTableFull { message }
             | Self::InvalidSuperblockCount { message }
+            | Self::InvalidArgon2Params { message }
             | Self::CacheFull { message }
             | Self::SpillwayFull { message }
             | Self::TransactionInProgress { message }
@@ -177,8 +211,13 @@ impl ChiselError {
             | Self::UnsupportedPageSize { message }
             | Self::CorruptPage { message }
             | Self::InvalidPageId { message }
+            | Self::InvalidFreemapDepth { message }
+            | Self::InvalidNextHandle { message }
+            | Self::TxnCounterExhausted { message }
+            | Self::HandleSpaceExhausted { message }
             | Self::Poisoned { message }
-            | Self::DecryptionFailed { message } => message,
+            | Self::DecryptionFailed { message }
+            | Self::Other { message, .. } => message,
         }
     }
 }
@@ -211,6 +250,7 @@ impl From<chisel::ChiselError> for ChiselError {
             E::InvalidRootName => Self::InvalidRootName { message },
             E::RootNameTableFull => Self::RootNameTableFull { message },
             E::InvalidSuperblockCount { .. } => Self::InvalidSuperblockCount { message },
+            E::InvalidArgon2Params { .. } => Self::InvalidArgon2Params { message },
             E::CacheFull { .. } => Self::CacheFull { message },
             E::SpillwayFull { .. } => Self::SpillwayFull { message },
             E::TransactionInProgress => Self::TransactionInProgress { message },
@@ -233,23 +273,30 @@ impl From<chisel::ChiselError> for ChiselError {
             E::UnsupportedPageSize { .. } => Self::UnsupportedPageSize { message },
             E::CorruptPage { .. } => Self::CorruptPage { message },
             E::InvalidPageId { .. } => Self::InvalidPageId { message },
+            E::InvalidFreemapDepth { .. } => Self::InvalidFreemapDepth { message },
+            E::InvalidNextHandle { .. } => Self::InvalidNextHandle { message },
+            E::TxnCounterExhausted { .. } => Self::TxnCounterExhausted { message },
+            E::HandleSpaceExhausted { .. } => Self::HandleSpaceExhausted { message },
             E::Poisoned => Self::Poisoned { message },
             E::DecryptionFailed { .. } => Self::DecryptionFailed { message },
-            // `chisel::ChiselError` is `#[non_exhaustive]` (src/error.rs), so
-            // this match needs a wildcard even though every variant that
-            // exists today is listed explicitly above. Route any future,
-            // not-yet-mapped variant to `Poisoned` regardless of its actual
-            // fatality: this crate's mapping is stale for that variant by
-            // definition, and guessing "operational" risks telling a Swift
-            // caller a real integrity problem is safe to retry. Fatal is the
-            // conservative default (reopen always recovers) — same
-            // fail-toward-fatal principle the engine documents for I105.
-            // `message` (captured above from the still-real Display) is
-            // preserved even on this fallback, so a not-yet-mapped variant
-            // still surfaces its actual diagnostic text, not just "Poisoned".
-            // TODO: add an explicit arm mapping the new variant instead of
-            // relying on this fallback.
-            _ => Self::Poisoned { message },
+            // `chisel::ChiselError` is `#[non_exhaustive]`, so this match
+            // needs a wildcard even though every variant that exists today is
+            // listed explicitly above.
+            //
+            // It does NOT guess the tier. The previous version routed
+            // everything here to `Poisoned` on a fail-toward-fatal argument,
+            // which mistiered every future operational variant and claimed an
+            // engine state that was not true. `is_fatal()` is the engine's own
+            // answer to exactly this question, so ask it — the same fix the
+            // Python binding made for the same fail-open class (I138).
+            //
+            // `message` (captured above from the still-real `Display`) is
+            // preserved, so a not-yet-mapped variant still surfaces its actual
+            // diagnostic text.
+            other => Self::Other {
+                fatal: other.is_fatal(),
+                message,
+            },
         }
     }
 }
@@ -310,6 +357,7 @@ mod tests {
             ChiselError::InvalidRootName { .. } => "InvalidRootName",
             ChiselError::RootNameTableFull { .. } => "RootNameTableFull",
             ChiselError::InvalidSuperblockCount { .. } => "InvalidSuperblockCount",
+            ChiselError::InvalidArgon2Params { .. } => "InvalidArgon2Params",
             ChiselError::CacheFull { .. } => "CacheFull",
             ChiselError::SpillwayFull { .. } => "SpillwayFull",
             ChiselError::TransactionInProgress { .. } => "TransactionInProgress",
@@ -330,8 +378,13 @@ mod tests {
             ChiselError::UnsupportedPageSize { .. } => "UnsupportedPageSize",
             ChiselError::CorruptPage { .. } => "CorruptPage",
             ChiselError::InvalidPageId { .. } => "InvalidPageId",
+            ChiselError::InvalidFreemapDepth { .. } => "InvalidFreemapDepth",
+            ChiselError::InvalidNextHandle { .. } => "InvalidNextHandle",
+            ChiselError::TxnCounterExhausted { .. } => "TxnCounterExhausted",
+            ChiselError::HandleSpaceExhausted { .. } => "HandleSpaceExhausted",
             ChiselError::Poisoned { .. } => "Poisoned",
             ChiselError::DecryptionFailed { .. } => "DecryptionFailed",
+            ChiselError::Other { .. } => "Other",
         }
     }
 
@@ -413,17 +466,30 @@ mod tests {
             ),
             (E::CorruptPage { page_id: 0 }, "CorruptPage"),
             (E::InvalidPageId { page_id: 0 }, "InvalidPageId"),
+            (
+                E::InvalidArgon2Params {
+                    m_cost: 1,
+                    t_cost: 1,
+                    p_cost: 1,
+                },
+                "InvalidArgon2Params",
+            ),
+            (
+                E::InvalidFreemapDepth { stored: 9, max: 3 },
+                "InvalidFreemapDepth",
+            ),
+            (
+                E::InvalidNextHandle { stored: 9, max: 3 },
+                "InvalidNextHandle",
+            ),
+            (E::TxnCounterExhausted { current: 7 }, "TxnCounterExhausted"),
+            (
+                E::HandleSpaceExhausted { current: 7 },
+                "HandleSpaceExhausted",
+            ),
             (E::Poisoned, "Poisoned"),
             (E::DecryptionFailed { page_id: 0 }, "DecryptionFailed"),
         ];
-
-        // Tripwire: if the engine grows a variant, this list must grow too (the
-        // point of the whole test). 30 is the current count in src/error.rs.
-        assert_eq!(
-            cases.len(),
-            30,
-            "expected all 30 current engine variants to be covered"
-        );
 
         for (engine, expected) in cases {
             let got = ChiselError::from(engine);
@@ -443,12 +509,148 @@ mod tests {
             // Spec §7.1 "no silently-dropped error": any variant whose intended
             // target is NOT Poisoned must not surface as Poisoned — i.e. must
             // not have fallen through the non_exhaustive `_ => Poisoned` arm.
-            if expected != "Poisoned" {
-                assert_ne!(
-                    name, "Poisoned",
-                    "{expected} fell through to the wildcard instead of its own arm"
-                );
-            }
+            // The wildcard's target is now `Other`, never `Poisoned`. Any
+            // variant surfacing as `Other` fell through instead of reaching
+            // its own arm — which is exactly what this test exists to catch.
+            assert_ne!(
+                name, "Other",
+                "{expected} fell through to the wildcard instead of its own arm"
+            );
         }
+    }
+
+    // SWIFT-13. The engine's `is_fatal()` is the authority on whether a
+    // variant means "the database is intact" or "integrity is in question".
+    // Before this fix all five of these fell through `_ => Poisoned`, which
+    // reports fatal unconditionally — right by luck for four of them and
+    // flatly wrong for InvalidArgon2Params, an out-of-range cost parameter
+    // rejected before the file is touched.
+    #[test]
+    fn new_engine_variants_map_to_their_own_cases_at_the_right_tier() {
+        use chisel::ChiselError as E;
+
+        let operational = E::InvalidArgon2Params {
+            m_cost: 1,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        assert!(!operational.is_fatal(), "engine tiering changed under us");
+        assert_eq!(
+            ffi_name(&ChiselError::from(operational)),
+            "InvalidArgon2Params"
+        );
+
+        let fatal: Vec<(E, &str)> = vec![
+            (
+                E::InvalidFreemapDepth { stored: 9, max: 3 },
+                "InvalidFreemapDepth",
+            ),
+            (
+                E::InvalidNextHandle { stored: 9, max: 3 },
+                "InvalidNextHandle",
+            ),
+            (E::TxnCounterExhausted { current: 7 }, "TxnCounterExhausted"),
+            (
+                E::HandleSpaceExhausted { current: 7 },
+                "HandleSpaceExhausted",
+            ),
+        ];
+        for (engine, expected) in fatal {
+            assert!(
+                engine.is_fatal(),
+                "{expected} should be fatal per the engine"
+            );
+            assert_eq!(ffi_name(&ChiselError::from(engine)), expected);
+        }
+    }
+
+    // SWIFT-13. `chisel::ChiselError` is `#[non_exhaustive]`, so no downstream
+    // crate may match it exhaustively and the compiler cannot enforce this.
+    // The list-based test above can only check variants it already names —
+    // which is precisely how five variants went unmapped.
+    //
+    // `chisel-ffi` is `publish = false` and workspace-only, so the engine's
+    // source is always at a fixed path relative to this manifest. Parsing it
+    // is the only way to learn the true variant set without adding a
+    // test-only helper to the engine's public API.
+    //
+    // A parse that finds implausibly few variants is itself a failure, so a
+    // reformatting of `src/error.rs` breaks this loudly rather than quietly
+    // passing on an empty set.
+    #[test]
+    fn every_engine_variant_has_an_explicit_ffi_arm() {
+        let engine_src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/error.rs"))
+                .expect("engine src/error.rs must be readable from within the workspace");
+
+        let enum_body = engine_src
+            .split_once("pub enum ChiselError {")
+            .expect("engine error.rs must declare `pub enum ChiselError {`")
+            .1
+            .split_once("\n}")
+            .expect("the ChiselError enum must end with a line-start closing brace")
+            .0;
+
+        // Variant lines are exactly those at 4-space indent starting with an
+        // uppercase ASCII letter. Doc comments (`///`), attributes (`#[`),
+        // and field lines (8-space indent, lowercase) are all excluded.
+        let variants: Vec<String> = enum_body
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                line.len() - trimmed.len() == 4
+                    && trimmed.starts_with(|c: char| c.is_ascii_uppercase())
+            })
+            .map(|line| {
+                line.trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect()
+            })
+            .collect();
+
+        assert!(
+            variants.len() >= 30,
+            "parsed only {} variants out of src/error.rs — the parser is \
+             broken, not the enum. Fix this test before trusting it.",
+            variants.len()
+        );
+
+        // Our own source, so the check tracks the real `From` impl rather
+        // than a second list that can drift from it.
+        let from_impl = include_str!("error.rs")
+            .split_once("impl From<chisel::ChiselError> for ChiselError {")
+            .expect("this file must contain the From impl")
+            .1
+            .split_once("\n}")
+            .expect("the From impl must end with a line-start closing brace")
+            .0;
+
+        // Strip comment lines before searching. The scan is a substring match,
+        // so a variant named inside a comment — a commented-out arm, or prose
+        // like "E::Foo is handled above" — would otherwise count as mapped and
+        // exempt that variant from this guard permanently. A guard defeated by
+        // a `//` is the same flaw as the hand-maintained list this replaced.
+        let from_impl_code: String = from_impl
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let unmapped: Vec<&String> = variants
+            .iter()
+            .filter(|v| !from_impl_code.contains(&format!("E::{v}")))
+            .collect();
+
+        assert!(
+            unmapped.is_empty(),
+            "engine ChiselError variants with no explicit arm in \
+             `From<chisel::ChiselError>`: {unmapped:?}\n\
+             Add an arm for each, plus a matching FFI case, a `message()` \
+             arm, an `ffi_name` arm, and a `category` arm in \
+             swift/Sources/Chisel/Extensions.swift. The `Other` fallback \
+             exists for variants added after this crate was last updated — \
+             it is not a resting place for one that already exists."
+        );
     }
 }

@@ -1789,6 +1789,8 @@ public enum ChiselError: Swift.Error {
     )
     case InvalidSuperblockCount(message: String
     )
+    case InvalidArgon2Params(message: String
+    )
     case CacheFull(message: String
     )
     case SpillwayFull(message: String
@@ -1829,9 +1831,35 @@ public enum ChiselError: Swift.Error {
     )
     case InvalidPageId(message: String
     )
+    case InvalidFreemapDepth(message: String
+    )
+    case InvalidNextHandle(message: String
+    )
+    case TxnCounterExhausted(message: String
+    )
+    case HandleSpaceExhausted(message: String
+    )
     case Poisoned(message: String
     )
     case DecryptionFailed(message: String
+    )
+    /**
+     * An engine variant added AFTER this crate was last updated. `fatal`
+     * carries the engine's own `is_fatal()` verdict, so the caller-facing
+     * tier is never guessed.
+     *
+     * This replaces a `_ => Poisoned` fallback that reported every unmapped
+     * variant as a fatal poisoning. That was wrong twice over: it mistiers
+     * operational variants (an out-of-range Argon2 parameter is not a
+     * corrupt database), and `Poisoned` additionally asserts an engine
+     * state — `is_poisoned() == true` — that is not true for a handle that
+     * merely rejected a bad argument.
+     *
+     * Reaching this case is not an error, but it does mean the mapping is
+     * stale; `every_engine_variant_has_an_explicit_ffi_arm` fails as soon as
+     * a variant exists with no arm of its own.
+     */
+    case Other(message: String, fatal: Bool
     )
 }
 
@@ -1879,73 +1907,92 @@ public struct FfiConverterTypeChiselError: FfiConverterRustBuffer {
         case 10: return .InvalidSuperblockCount(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 11: return .CacheFull(
+        case 11: return .InvalidArgon2Params(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 12: return .SpillwayFull(
+        case 12: return .CacheFull(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 13: return .TransactionInProgress(
+        case 13: return .SpillwayFull(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 14: return .Closed(
+        case 14: return .TransactionInProgress(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 15: return .AlreadyFinished(
+        case 15: return .Closed(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 16: return .TagMismatch(
+        case 16: return .AlreadyFinished(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 17: return .NoEncryptionKey(
+        case 17: return .TagMismatch(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 18: return .InvalidEncryptionKey(
+        case 18: return .NoEncryptionKey(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 19: return .EncryptionNotSupported(
+        case 19: return .InvalidEncryptionKey(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 20: return .NoFreeKeySlot(
+        case 20: return .EncryptionNotSupported(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 21: return .LastKeySlot(
+        case 21: return .NoFreeKeySlot(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 22: return .Io(
+        case 22: return .LastKeySlot(
+            message: try FfiConverterString.read(from: &buf)
+            )
+        case 23: return .Io(
             kind: try FfiConverterString.read(from: &buf), 
             errno: try FfiConverterOptionInt32.read(from: &buf), 
             message: try FfiConverterString.read(from: &buf)
             )
-        case 23: return .ChecksumMismatch(
+        case 24: return .ChecksumMismatch(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 24: return .CorruptSuperblock(
+        case 25: return .CorruptSuperblock(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 25: return .FileSizeMismatch(
+        case 26: return .FileSizeMismatch(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 26: return .LockFailed(
+        case 27: return .LockFailed(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 27: return .UnsupportedFormatVersion(
+        case 28: return .UnsupportedFormatVersion(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 28: return .UnsupportedPageSize(
+        case 29: return .UnsupportedPageSize(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 29: return .CorruptPage(
+        case 30: return .CorruptPage(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 30: return .InvalidPageId(
+        case 31: return .InvalidPageId(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 31: return .Poisoned(
+        case 32: return .InvalidFreemapDepth(
             message: try FfiConverterString.read(from: &buf)
             )
-        case 32: return .DecryptionFailed(
+        case 33: return .InvalidNextHandle(
             message: try FfiConverterString.read(from: &buf)
+            )
+        case 34: return .TxnCounterExhausted(
+            message: try FfiConverterString.read(from: &buf)
+            )
+        case 35: return .HandleSpaceExhausted(
+            message: try FfiConverterString.read(from: &buf)
+            )
+        case 36: return .Poisoned(
+            message: try FfiConverterString.read(from: &buf)
+            )
+        case 37: return .DecryptionFailed(
+            message: try FfiConverterString.read(from: &buf)
+            )
+        case 38: return .Other(
+            message: try FfiConverterString.read(from: &buf), 
+            fatal: try FfiConverterBool.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -2009,116 +2056,147 @@ public struct FfiConverterTypeChiselError: FfiConverterRustBuffer {
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .CacheFull(message):
+        case let .InvalidArgon2Params(message):
             writeInt(&buf, Int32(11))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .SpillwayFull(message):
+        case let .CacheFull(message):
             writeInt(&buf, Int32(12))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .TransactionInProgress(message):
+        case let .SpillwayFull(message):
             writeInt(&buf, Int32(13))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .Closed(message):
+        case let .TransactionInProgress(message):
             writeInt(&buf, Int32(14))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .AlreadyFinished(message):
+        case let .Closed(message):
             writeInt(&buf, Int32(15))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .TagMismatch(message):
+        case let .AlreadyFinished(message):
             writeInt(&buf, Int32(16))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .NoEncryptionKey(message):
+        case let .TagMismatch(message):
             writeInt(&buf, Int32(17))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .InvalidEncryptionKey(message):
+        case let .NoEncryptionKey(message):
             writeInt(&buf, Int32(18))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .EncryptionNotSupported(message):
+        case let .InvalidEncryptionKey(message):
             writeInt(&buf, Int32(19))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .NoFreeKeySlot(message):
+        case let .EncryptionNotSupported(message):
             writeInt(&buf, Int32(20))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .LastKeySlot(message):
+        case let .NoFreeKeySlot(message):
             writeInt(&buf, Int32(21))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .Io(kind,errno,message):
+        case let .LastKeySlot(message):
             writeInt(&buf, Int32(22))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case let .Io(kind,errno,message):
+            writeInt(&buf, Int32(23))
             FfiConverterString.write(kind, into: &buf)
             FfiConverterOptionInt32.write(errno, into: &buf)
             FfiConverterString.write(message, into: &buf)
             
         
         case let .ChecksumMismatch(message):
-            writeInt(&buf, Int32(23))
-            FfiConverterString.write(message, into: &buf)
-            
-        
-        case let .CorruptSuperblock(message):
             writeInt(&buf, Int32(24))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .FileSizeMismatch(message):
+        case let .CorruptSuperblock(message):
             writeInt(&buf, Int32(25))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .LockFailed(message):
+        case let .FileSizeMismatch(message):
             writeInt(&buf, Int32(26))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .UnsupportedFormatVersion(message):
+        case let .LockFailed(message):
             writeInt(&buf, Int32(27))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .UnsupportedPageSize(message):
+        case let .UnsupportedFormatVersion(message):
             writeInt(&buf, Int32(28))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .CorruptPage(message):
+        case let .UnsupportedPageSize(message):
             writeInt(&buf, Int32(29))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .InvalidPageId(message):
+        case let .CorruptPage(message):
             writeInt(&buf, Int32(30))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .Poisoned(message):
+        case let .InvalidPageId(message):
             writeInt(&buf, Int32(31))
             FfiConverterString.write(message, into: &buf)
             
         
-        case let .DecryptionFailed(message):
+        case let .InvalidFreemapDepth(message):
             writeInt(&buf, Int32(32))
             FfiConverterString.write(message, into: &buf)
+            
+        
+        case let .InvalidNextHandle(message):
+            writeInt(&buf, Int32(33))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case let .TxnCounterExhausted(message):
+            writeInt(&buf, Int32(34))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case let .HandleSpaceExhausted(message):
+            writeInt(&buf, Int32(35))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case let .Poisoned(message):
+            writeInt(&buf, Int32(36))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case let .DecryptionFailed(message):
+            writeInt(&buf, Int32(37))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case let .Other(message,fatal):
+            writeInt(&buf, Int32(38))
+            FfiConverterString.write(message, into: &buf)
+            FfiConverterBool.write(fatal, into: &buf)
             
         }
     }
