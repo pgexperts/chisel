@@ -129,6 +129,54 @@ struct CacheEntry {
     // `dirty` means "modified since last flush, must be written on commit".
     // It is also a pin against LRU eviction — see `maybe_evict`.
     dirty: bool,
+    // `needs_stamp` means "the internal checksum (bytes 8184..8192) is stale
+    // and must be recomputed before these bytes leave the cache". Only
+    // `get_mut_deferred_stamp` sets it — the data-page packing cursor (#138),
+    // which mutates one page once per packed value and would otherwise re-hash
+    // the full 8 KB body after every value instead of once per page.
+    //
+    // INVARIANT: an entry with `needs_stamp` set is stamped (and the flag
+    // cleared) before its bytes are written to the main file or the spillway.
+    // Bytes leave an entry in exactly two places, both of which go through
+    // `stamp_deferred` first: `flush` Phase 1a (before `write_sealed`) and
+    // `maybe_evict` Phase B (before the seal/spill). `flush` Phase 1b needs
+    // nothing — it copies a spilled blob verbatim, and Phase B stamped that blob
+    // before sealing it. `needs_stamp` implies `dirty` (it is set only after
+    // `get_mut` has set `dirty`, and Phase 1a clears the two together), so
+    // clean-entry eviction can never drop an unstamped page; every other entry
+    // constructor (`new_page`, `reissue_page`, cold load, rehydrate, drain
+    // re-insert) starts it false, the last two because the spilled bytes were
+    // stamped on the way out. A new path that moves an entry's bytes out of the
+    // cache MUST call `stamp_deferred` first — a miss is a fatal
+    // `ChecksumMismatch` on the next cold read of a committed page.
+    // `debug_assert_data_page_stamped` at all three exits is the tripwire.
+    needs_stamp: bool,
+}
+
+impl CacheEntry {
+    /// Settle a deferred stamp (see `needs_stamp`). Idempotent; a no-op for
+    /// every entry the packing cursor has not touched since its last stamp.
+    fn stamp_deferred(&mut self) {
+        if self.needs_stamp {
+            page::stamp_checksum(&mut self.buf);
+            self.needs_stamp = false;
+        }
+    }
+}
+
+/// Debug-only tripwire for the `needs_stamp` invariant: a DATA page leaving the
+/// cache must carry a current checksum. Scoped to data pages on purpose. Flush
+/// legitimately writes some unstamped pages (an abandoned zeroed allocation —
+/// see the Phase 1a comment), but a data-typed page is produced only by
+/// `SlotPacker::insert`, which stamps eagerly (fresh page) or defers through
+/// `get_mut_deferred_stamp`. A stale data page here therefore means some path
+/// lost the deferred stamp, which a cold read would report as fatal corruption.
+fn debug_assert_data_page_stamped(page_id: u64, buf: &[u8; PAGE_SIZE]) {
+    debug_assert!(
+        buf[0] != page::PageType::Data as u8 || page::verify_checksum(buf),
+        "data page {page_id} is leaving the cache with a stale checksum — a \
+         deferred stamp (#138) was skipped"
+    );
 }
 
 pub struct PageCache {
@@ -284,7 +332,8 @@ impl PageCache {
     /// process (enforced by the exclusive flock in `PageIo::open`) and as
     /// long as no module mutates a cached buffer without going through
     /// `get_mut`, which marks it dirty (and therefore eligible for a fresh
-    /// checksum stamp at flush time by the page-type module).
+    /// checksum stamp by the page-type module, or by the cache itself on the
+    /// way out for a `get_mut_deferred_stamp` page).
     pub fn get(&mut self, page_id: u64) -> Result<&[u8; PAGE_SIZE]> {
         if self.entries.contains_key(&page_id) {
             self.cache_hits.set(self.cache_hits.get() + 1);
@@ -330,6 +379,24 @@ impl PageCache {
             self.dirty_count += 1;
             entry.dirty = true;
         }
+        Ok(&mut entry.buf)
+    }
+
+    /// `get_mut` for a caller that will NOT restamp the checksum after its
+    /// mutation: the cache stamps the page once, when its bytes next leave the
+    /// cache (see `CacheEntry::needs_stamp` for the invariant and its
+    /// enforcement points). The only caller is the data-page packing cursor
+    /// (#138), where per-value restamping made bulk inserts
+    /// O(values × 8 KB) of hashing rather than O(pages × 8 KB).
+    ///
+    /// The flag is raised before the caller gets the buffer, so there is no
+    /// window in which a mutated page is unflagged: nothing can evict the
+    /// entry while the returned borrow is live.
+    pub(crate) fn get_mut_deferred_stamp(&mut self, page_id: u64) -> Result<&mut [u8; PAGE_SIZE]> {
+        self.get_mut(page_id)?;
+        // I48 INVARIANT: `get_mut` just returned Ok, so the entry is present.
+        let entry = self.entries.get_mut(&page_id).unwrap();
+        entry.needs_stamp = true;
         Ok(&mut entry.buf)
     }
 
@@ -434,6 +501,7 @@ impl PageCache {
         let entry = CacheEntry {
             buf: Box::new([0u8; PAGE_SIZE]),
             dirty: true,
+            needs_stamp: false,
         };
         self.entries.insert(page_id, entry);
         self.dirty_count += 1;
@@ -518,8 +586,17 @@ impl PageCache {
             // needs `&mut self` (to call self.io) while `entry` borrows
             // self.entries. The 8 KB stack copy is the same cost as the COW
             // paths elsewhere in the cache that already pay it.
-            let plaintext: [u8; PAGE_SIZE] = *self.entries.get(&page_id).unwrap().buf;
-            // Deliberately NOT guarded by `debug_assert!(verify_checksum(..))`.
+            //
+            // Settle a deferred data-page stamp first (`needs_stamp`
+            // enforcement point 1 of 2): this write is the main-file copy a
+            // cold read will verify.
+            let entry = self.entries.get_mut(&page_id).unwrap();
+            entry.stamp_deferred();
+            let plaintext: [u8; PAGE_SIZE] = *entry.buf;
+            debug_assert_data_page_stamped(page_id, &plaintext);
+            // Deliberately NOT guarded by `debug_assert!(verify_checksum(..))`
+            // for every page type — only data pages, above, whose producer is
+            // known to stamp.
             // `stamp_checksum`'s "call before the page is handed to page_io"
             // rule binds pages that will be READ back; it is not an invariant
             // over everything flush writes, and asserting it here fails on live
@@ -657,14 +734,18 @@ impl PageCache {
                         }
                     }
                 };
-                // No checksum assertion here either, for the same reason as
+                // Only the data-page tripwire here, for the same reason as
                 // Phase 1a: an abandoned allocation can be spilled and drained
-                // without ever having been stamped, and that is legal.
+                // without ever having been stamped, and that is legal. The
+                // tripwire is what catches a Phase B spill that skipped the
+                // deferred stamp — this verbatim copy cannot repair it.
+                debug_assert_data_page_stamped(page_id, &plaintext);
                 // Re-insert as clean: the bytes are now on the main file,
                 // so the cache entry is a valid read-through cache.
                 let entry = CacheEntry {
                     buf: plaintext,
                     dirty: false,
+                    needs_stamp: false,
                 };
                 // Use the Entry API to avoid the clippy::map_entry pattern:
                 // a `contains_key` + `insert` pair does two hash lookups;
@@ -1036,6 +1117,7 @@ impl PageCache {
         let entry = CacheEntry {
             buf: Box::new([0u8; PAGE_SIZE]),
             dirty: true,
+            needs_stamp: false,
         };
         self.entries.insert(page_id, entry);
         self.dirty_count += 1;
@@ -1229,6 +1311,8 @@ impl PageCache {
                     CacheEntry {
                         buf,
                         dirty: true, // re-loaded spilled page is dirty
+                        // Phase B stamped these bytes before spilling them.
+                        needs_stamp: false,
                     },
                 );
                 self.dirty_count += 1;
@@ -1295,6 +1379,7 @@ impl PageCache {
             CacheEntry {
                 buf: Box::new(plaintext),
                 dirty: false,
+                needs_stamp: false,
             },
         );
         self.lru.push_front(page_id);
@@ -1353,7 +1438,13 @@ impl PageCache {
                 .find(|&id| self.entries.get(&id).is_some_and(|e| !e.dirty));
             match victim {
                 Some(id) => {
-                    self.entries.remove(&id);
+                    let evicted = self.entries.remove(&id);
+                    // Dropping a clean entry discards its bytes, so it must
+                    // not owe a stamp (`needs_stamp` implies `dirty`).
+                    debug_assert!(
+                        !evicted.is_some_and(|e| e.needs_stamp),
+                        "clean page {id} evicted with a deferred stamp outstanding"
+                    );
                     self.lru.remove(id);
                 }
                 None => break,
@@ -1413,10 +1504,17 @@ impl PageCache {
             // None here, the two-data-structure invariant broke
             // (most likely a future refactor that touches one without
             // the other), which is genuinely a corruption signal.
-            let entry = self
+            let mut entry = self
                 .entries
                 .remove(&victim_id)
                 .ok_or(ChiselError::CorruptPage { page_id: victim_id })?;
+            // `needs_stamp` enforcement point 2 of 2. Must precede the seal
+            // below: the drain copies this blob verbatim to the main file and
+            // never revisits the plaintext, so a stale checksum sealed here is
+            // baked into the committed page. On a failed spill the restored
+            // entry is simply already stamped.
+            entry.stamp_deferred();
+            debug_assert_data_page_stamped(victim_id, &entry.buf);
             self.lru.remove(victim_id);
             // The victim is dirty here (Phase B runs only when every entry is
             // dirty), so this always fires today; `untrack_dirty` (I116) guards
@@ -2660,5 +2758,139 @@ mod tests {
             matches!(err, ChiselError::DecryptionFailed { page_id } if page_id == pid),
             "expected DecryptionFailed, got {err:?}"
         );
+    }
+
+    // ---- #138: the deferred data-page stamp ----
+    //
+    // Each test drives a page through `get_mut_deferred_stamp` so its internal
+    // checksum is STALE while cached, then pushes it out through one of the two
+    // enforcement points and proves the bytes that left carry a valid checksum.
+    // Removing either `stamp_deferred` call makes the matching test fail (in a
+    // debug build at the data-page tripwire, in release at the cold read).
+
+    /// Build a data page the way `SlotPacker` does: init + first value +
+    /// eager stamp, then a second value through the deferred path. Returns the
+    /// page id; the page is dirty, flagged, and its checksum is stale.
+    fn deferred_stale_data_page(cache: &mut PageCache) -> u64 {
+        use crate::data_page::DataPage;
+        let id = cache.new_page().unwrap();
+        let buf = cache.get_mut(id).unwrap();
+        DataPage::init_page(buf);
+        DataPage::insert(buf, &[0x11; 64]).unwrap();
+        page::stamp_checksum(buf);
+        let buf = cache.get_mut_deferred_stamp(id).unwrap();
+        DataPage::insert(buf, &[0x22; 64]).unwrap();
+        let entry = &cache.entries[&id];
+        assert!(entry.needs_stamp, "the deferred path must flag the entry");
+        assert!(
+            !page::verify_checksum(&entry.buf),
+            "precondition: the deferred path must NOT restamp on mutation"
+        );
+        id
+    }
+
+    /// After `flush`, drop the (clean) entry and cold-read it: `load_page`
+    /// verifies the main-file checksum, and every value must be intact.
+    fn assert_cold_read_ok(cache: &mut PageCache, id: u64, values: &[&[u8]]) {
+        cache.test_drop_from_cache(id);
+        let buf = cache
+            .get(id)
+            .expect("cold read of a deferred-stamp page must pass the checksum gate");
+        for (slot, v) in values.iter().enumerate() {
+            assert_eq!(crate::data_page::DataPage::read(buf, slot as u16), Some(*v));
+        }
+    }
+
+    #[test]
+    fn deferred_stamp_is_settled_by_flush() {
+        let (_dir, mut cache) = fresh_cache(4);
+        let id = deferred_stale_data_page(&mut cache);
+        cache.flush().unwrap();
+        let entry = &cache.entries[&id];
+        assert!(!entry.needs_stamp, "flush must clear the flag");
+        assert!(page::verify_checksum(&entry.buf));
+        assert!(
+            page::verify_checksum(&cache.io_mut().read_page(id).unwrap()),
+            "the main-file copy must carry the settled checksum"
+        );
+        assert_cold_read_ok(&mut cache, id, &[&[0x11; 64], &[0x22; 64]]);
+    }
+
+    #[test]
+    fn deferred_stamp_is_settled_by_flush_encrypted() {
+        let (_dir, mut cache) = fresh_encrypted_cache(4);
+        let id = deferred_stale_data_page(&mut cache);
+        cache.flush().unwrap();
+        assert!(!cache.entries[&id].needs_stamp);
+        assert_cold_read_ok(&mut cache, id, &[&[0x11; 64], &[0x22; 64]]);
+    }
+
+    /// The spill path: the stale page is evicted to the spillway, the spilled
+    /// blob itself must verify (the drain copies it verbatim and never
+    /// restamps), and a rehydrate + further deferred mutation re-flags it.
+    #[test]
+    fn deferred_stamp_is_settled_before_spill() {
+        let (_dir, mut cache) = fresh_cache_with_spillway(2, 8 * PAGE_SIZE as u64);
+        let id = deferred_stale_data_page(&mut cache);
+        // Two more dirty pages overflow the 2-page cap; `id` is the LRU tail.
+        cache.new_page().unwrap();
+        cache.new_page().unwrap();
+        assert!(
+            !cache.entries.contains_key(&id),
+            "precondition: `id` spilled"
+        );
+        let blob = cache.spillway.as_mut().unwrap().rehydrate(id).unwrap();
+        let spilled: [u8; PAGE_SIZE] = blob.try_into().unwrap();
+        assert!(
+            page::verify_checksum(&spilled),
+            "the spilled image must be stamped before it leaves the cache"
+        );
+
+        // Rehydrate through the deferred path and pack one more value: the
+        // re-inserted entry starts unflagged and is re-flagged by the mutation.
+        let buf = cache.get_mut_deferred_stamp(id).unwrap();
+        crate::data_page::DataPage::insert(buf, &[0x33; 64]).unwrap();
+        assert!(cache.entries[&id].needs_stamp);
+        // Spill it again (stale) so the commit drains it rather than writing
+        // it from the cache in Phase 1a.
+        cache.new_page().unwrap();
+        cache.new_page().unwrap();
+        assert!(cache.spillway.as_ref().unwrap().is_resident(id));
+        cache.flush().unwrap();
+        assert_cold_read_ok(&mut cache, id, &[&[0x11; 64], &[0x22; 64], &[0x33; 64]]);
+    }
+
+    #[test]
+    fn deferred_stamp_is_settled_before_spill_encrypted() {
+        let (_dir, mut cache) = fresh_encrypted_cache_with_spillway(2, 8);
+        let id = deferred_stale_data_page(&mut cache);
+        cache.new_page().unwrap();
+        cache.new_page().unwrap();
+        assert!(cache.spillway.as_ref().unwrap().is_resident(id));
+        // The seal covers the plaintext checksum, so a stale stamp sealed here
+        // would be committed verbatim by the drain.
+        cache.flush().unwrap();
+        assert_cold_read_ok(&mut cache, id, &[&[0x11; 64], &[0x22; 64]]);
+    }
+
+    /// A failed spill restores the victim; it must come back stamped and
+    /// unflagged (the stamp precedes the attempt), and still commit correctly.
+    #[test]
+    fn deferred_stamp_survives_a_failed_spill() {
+        // Room for exactly one spilled page: the second spill fails.
+        let (_dir, mut cache) = fresh_cache_with_spillway(1, PAGE_SIZE as u64);
+        let first = cache.new_page().unwrap();
+        let id = deferred_stale_data_page(&mut cache); // spills `first`
+        assert!(cache.spillway.as_ref().unwrap().is_resident(first));
+        let err = cache.new_page().unwrap_err();
+        assert!(
+            matches!(err, ChiselError::SpillwayFull { .. }),
+            "got {err:?}"
+        );
+        let entry = &cache.entries[&id];
+        assert!(!entry.needs_stamp);
+        assert!(page::verify_checksum(&entry.buf));
+        cache.flush().unwrap();
+        assert_cold_read_ok(&mut cache, id, &[&[0x11; 64], &[0x22; 64]]);
     }
 }

@@ -82,24 +82,18 @@ impl SlotPacker {
     /// savepoint the cursor stays None so each insert gets its own page (the
     /// pre-R1 behavior), keeping per-savepoint snapshots cheap to restore.
     ///
-    /// Checksum is stamped eagerly after every mutation so the page carries a
-    /// valid internal checksum before any path could write it to the main
-    /// file — either the `flush` `write_page` at commit, or a spill-then-drain
-    /// write (an LRU-pressured dirty page is spilled to the spillway and later
-    /// drained back out to the main file). The next cold-load
-    /// (`page_cache::load_page`) verifies that checksum.
-    ///
-    /// Note: the spillway *transfer* does NOT rely on this. `rehydrate`
-    /// verifies the spillway's own per-slot checksum (`spillway::slot_checksum`),
-    /// never the page's internal bytes 8184..8192 — so a spilled page round-trips
-    /// safely whether or not its internal checksum is current. The internal
-    /// checksum only matters on the way to the main file.
-    ///
-    /// I78 proposes deferring this re-stamp to flush/drain time so a packed page
-    /// is hashed once, not once per value (a large bulk-insert win on fast
-    /// storage). It is deferred pending a benchmark; the difficulty is exactly
-    /// the spill-then-drain path, which would then have to re-stamp before the
-    /// main-file write. See ISSUES.md.
+    /// Checksum stamping is split by path (#138). A fresh page is stamped
+    /// eagerly, once, after its first value. An insert into the existing cursor
+    /// page does NOT restamp: it goes through `PageCache::get_mut_deferred_stamp`,
+    /// and the cache stamps the page once when its bytes next leave the cache —
+    /// at the commit `flush` write, or before an LRU-pressured spill (whose blob
+    /// the drain later copies verbatim to the main file). That makes a packed
+    /// page cost one 8 KB hash per page rather than one per value. The next
+    /// cold load (`page_cache::load_page`) verifies the checksum either way.
+    /// While the cursor page sits in the cache its internal checksum is stale;
+    /// nothing reads it there (cache hits are never re-verified, and the
+    /// spillway round-trip checks its own per-slot checksum, not bytes
+    /// 8184..8192). See `CacheEntry::needs_stamp` for the invariant.
     ///
     /// Live-slot bookkeeping: every successful insert increments
     /// `current_live_slots[page_id]`. `delete`/`update` consult this map (via
@@ -129,14 +123,11 @@ impl SlotPacker {
         // what makes the sentence above true; do not reintroduce a cursor
         // restore there.
         if let Some(cursor_page_id) = self.insert_cursor {
-            let slot_option = {
-                let buf = cache.get_mut(cursor_page_id)?;
-                let result = DataPage::insert(buf, value);
-                if result.is_some() {
-                    page::stamp_checksum(buf);
-                }
-                result
-            };
+            // Deferred stamp (#138): the cache restamps this page when it is
+            // flushed or spilled. A full page (insert returns None) leaves the
+            // bytes untouched; the flag then only costs one redundant stamp.
+            let slot_option =
+                DataPage::insert(cache.get_mut_deferred_stamp(cursor_page_id)?, value);
             if let Some(slot) = slot_option {
                 *self.current_live_slots.entry(cursor_page_id).or_insert(0) += 1;
                 return Ok((cursor_page_id, slot));
@@ -367,5 +358,54 @@ impl TransactionManager {
             self.current_roots.handle_table_page = root;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #138: an insert into the existing cursor page does NOT restamp the
+    /// checksum — that is the whole O(values × 8 KB) → O(pages × 8 KB) win —
+    /// and the cache settles the stamp when it flushes the page. Fails if the
+    /// per-insert `stamp_checksum` returns (the second assertion), and if the
+    /// cursor path stops flagging the page for the cache (the post-flush ones).
+    #[test]
+    fn cursor_inserts_defer_the_checksum_stamp_to_the_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let io = crate::page_io::PageIo::open(&dir.path().join("t.chisel"), false).unwrap();
+        let mut cache = PageCache::new(
+            io,
+            8 * PAGE_SIZE as u64,
+            0,
+            crate::DrainInsertion::LruTail,
+            crate::SpillwayLocation::InMemory,
+        );
+        let mut packer = SlotPacker::new();
+        let mut alloc = |c: &mut PageCache| c.new_page();
+
+        let (page_id, _) = packer
+            .insert(&mut cache, &mut alloc, true, &[1; 32])
+            .unwrap();
+        assert!(
+            page::verify_checksum(cache.get(page_id).unwrap()),
+            "a fresh page is still stamped eagerly, once"
+        );
+        for i in 2..=10u8 {
+            let (p, _) = packer
+                .insert(&mut cache, &mut alloc, true, &[i; 32])
+                .unwrap();
+            assert_eq!(p, page_id, "small values must pack into the cursor page");
+        }
+        assert!(
+            !page::verify_checksum(cache.get(page_id).unwrap()),
+            "cursor inserts must not rehash the page per value"
+        );
+
+        cache.flush().unwrap();
+        assert!(page::verify_checksum(cache.get(page_id).unwrap()));
+        assert!(page::verify_checksum(
+            &cache.io_mut().read_page(page_id).unwrap()
+        ));
     }
 }
