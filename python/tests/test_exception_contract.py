@@ -235,9 +235,10 @@ def test_spillway_full_exact_class(tmp_db):
 # under true concurrent lock contention.
 #
 # This test runs TWO threads that each try to begin/allocate/commit in a
-# tight loop while the other is also running.  The GIL plus the Mutex together
-# serialize all Chisel calls — no panic, no data corruption, and the
-# committed handles are all readable after both threads finish.
+# tight loop while the other is also running.  The Mutex (engine calls run
+# with the GIL released, I156) serializes all Chisel calls — no panic, no data
+# corruption, and the committed handles are all readable after both threads
+# finish.
 #
 # We do NOT try to provoke a poisoned Mutex here.  The engine never panics
 # while holding the lock (fatal conditions return ChiselError::Poisoned as a
@@ -253,21 +254,20 @@ def test_spillway_full_exact_class(tmp_db):
 
 
 def test_two_thread_mutex_contention(tmp_db):
-    # I139 / I75: the binding wraps the engine in a Mutex (required for Sync in
-    # PyO3 0.24+). Per-op calls do NOT release the GIL (see db.rs
-    # with_inner_io / with_inner_mut_io — only open() releases it); the GIL
-    # serializes every Chisel call across threads. The Mutex is a Sync-
-    # satisfying wrapper, not the primary serialization point here. Drive two
+    # I139 / I75 / I156: the binding wraps the engine in a Mutex (required for
+    # Sync in PyO3 0.24+), and every engine call releases the GIL before
+    # taking it (see db.rs with_inner_io / with_inner_mut_io), so the Mutex is
+    # what serializes these calls and it is genuinely contended here. Drive two
     # threads concurrently hammering READS of the same handles to confirm no
-    # panic, no deadlock, no data corruption — the GIL serializes their calls.
+    # panic, no deadlock, no data corruption.
     #
     # The threads do READS, not begin/commit cycles, ON PURPOSE: the single-
-    # writer transaction state is a SHARED resource. Even with GIL serialization,
-    # two threads independently transacting on one Chisel would race on
+    # writer transaction state is a SHARED resource. Even with serialized
+    # calls, two threads independently transacting on one Chisel would race on
     # `TransactionAlreadyActive` (the engine is single-writer by design — see the
     # single-client design note). Reads take `&self` and need no active
-    # transaction, so they are the correct way to exercise GIL-serialized
-    # concurrent access.
+    # transaction, so they are the correct way to exercise concurrent access.
+    # test_gil_release.py covers writers and commits under contention.
     ITERATIONS = 200
     db = chisel.open(str(tmp_db))
     # Single-threaded setup: commit a handful of handles to read concurrently.
