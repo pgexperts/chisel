@@ -515,7 +515,7 @@ fn test_recovery_corrupted_overflow_page_surfaces_fatal_error() {
 
 #[test]
 fn test_read_of_structurally_broken_data_page_returns_corrupt_page() {
-    // Regression test for the transaction.rs read path upgrade: when
+    // Regression test for the src/transaction/read.rs read path upgrade: when
     // the handle-table entry says a slot is Live but the target data
     // page is structurally nonsense (wrong page-type tag, inconsistent
     // slot directory, etc.), the read must surface `CorruptPage`
@@ -557,7 +557,7 @@ fn test_read_of_structurally_broken_data_page_returns_corrupt_page() {
         }
         ChiselError::InvalidHandle(_) => panic!(
             "structurally-broken data page was misclassified as InvalidHandle; \
-             the transaction.rs Live-slot upgrade is missing"
+             the transaction/read.rs Live-slot upgrade is missing"
         ),
         other => panic!("expected CorruptPage, got {other:?}"),
     }
@@ -880,7 +880,7 @@ fn test_poison_recovery_by_reopen() {
     // public API, so it exercises the recovery path: commit some data,
     // then verify that a fresh open after drop sees that data. The
     // in-process poison semantics are covered by the unit tests in
-    // transaction.rs.
+    // src/transaction/tests.rs.
     let file = NamedTempFile::new().unwrap();
     let path = file.path().to_owned();
 
@@ -899,179 +899,6 @@ fn test_poison_recovery_by_reopen() {
     let db = Chisel::open(&path, Default::default()).unwrap();
     assert!(!db.is_poisoned());
     assert_eq!(db.read(handle).unwrap(), b"survives recovery");
-}
-
-// --- F2: named roots ---
-
-#[test]
-fn test_named_roots_survive_commit_and_reopen() {
-    // The core F2 use case: bind a name to a handle, commit, reopen the
-    // database, and verify the name still resolves to the same handle.
-    // This is what lets the client replace the "handle 0 is always meta"
-    // convention with an explicit name → handle mapping.
-    let file = NamedTempFile::new().unwrap();
-    let path = file.path().to_owned();
-
-    let meta_handle;
-    {
-        let mut db = Chisel::open(&path, Default::default()).unwrap();
-        db.begin().unwrap();
-        meta_handle = db.allocate(b"meta btree root state").unwrap();
-        db.set_root_name("meta", meta_handle).unwrap();
-        db.commit().unwrap();
-    }
-
-    let db = Chisel::open(&path, Default::default()).unwrap();
-    assert_eq!(db.get_root_name("meta").unwrap(), Some(meta_handle));
-    assert_eq!(db.read(meta_handle).unwrap(), b"meta btree root state");
-    // Unbound names must return Ok(None), not an error.
-    assert_eq!(db.get_root_name("does_not_exist").unwrap(), None);
-}
-
-#[test]
-fn test_named_roots_revert_on_rollback() {
-    // A named-root mutation must revert when the enclosing transaction
-    // is rolled back — the whole point of F2 (from the client's
-    // perspective) is that named roots are transactional.
-    let file = NamedTempFile::new().unwrap();
-    let path = file.path().to_owned();
-
-    let mut db = Chisel::open(&path, Default::default()).unwrap();
-    db.begin().unwrap();
-    let h1 = db.allocate(b"initial").unwrap();
-    db.set_root_name("meta", h1).unwrap();
-    db.commit().unwrap();
-
-    // In a new transaction, change the binding and then roll back.
-    db.begin().unwrap();
-    let h2 = db.allocate(b"replacement").unwrap();
-    db.set_root_name("meta", h2).unwrap();
-    assert_eq!(db.get_root_name("meta").unwrap(), Some(h2));
-    db.rollback().unwrap();
-
-    // After rollback, the committed binding must be restored.
-    assert_eq!(db.get_root_name("meta").unwrap(), Some(h1));
-}
-
-#[test]
-fn test_named_roots_revert_on_rollback_to_savepoint() {
-    // Savepoints must also snapshot and restore named roots — because
-    // Savepoint captures a Roots clone, this is automatic if named_roots
-    // is part of Roots. This test guards against someone refactoring
-    // Roots and accidentally leaving named_roots out.
-    let file = NamedTempFile::new().unwrap();
-    let path = file.path().to_owned();
-
-    let mut db = Chisel::open(&path, Default::default()).unwrap();
-    db.begin().unwrap();
-    let h1 = db.allocate(b"a").unwrap();
-    db.set_root_name("meta", h1).unwrap();
-    db.savepoint("sp").unwrap();
-
-    let h2 = db.allocate(b"b").unwrap();
-    db.set_root_name("meta", h2).unwrap();
-    db.set_root_name("index", h2).unwrap();
-    assert_eq!(db.get_root_name("meta").unwrap(), Some(h2));
-    assert_eq!(db.get_root_name("index").unwrap(), Some(h2));
-
-    db.rollback_to("sp").unwrap();
-    assert_eq!(db.get_root_name("meta").unwrap(), Some(h1));
-    assert_eq!(db.get_root_name("index").unwrap(), None);
-    db.commit().unwrap();
-}
-
-#[test]
-fn test_named_roots_validation_errors() {
-    let file = NamedTempFile::new().unwrap();
-    let path = file.path().to_owned();
-
-    let mut db = Chisel::open(&path, Default::default()).unwrap();
-    db.begin().unwrap();
-
-    // Empty name.
-    assert!(matches!(
-        db.set_root_name("", crate::Handle::from(0)),
-        Err(ChiselError::InvalidRootName)
-    ));
-    // Too long (> 24 bytes).
-    let too_long = "a".repeat(25);
-    assert!(matches!(
-        db.set_root_name(&too_long, crate::Handle::from(0)),
-        Err(ChiselError::InvalidRootName)
-    ));
-    // Contains NUL.
-    assert!(matches!(
-        db.set_root_name("bad\0name", crate::Handle::from(0)),
-        Err(ChiselError::InvalidRootName)
-    ));
-    // Max length (exactly 24 bytes) is valid.
-    let exactly_24 = "a".repeat(24);
-    assert!(db
-        .set_root_name(&exactly_24, crate::Handle::from(42))
-        .is_ok());
-    assert_eq!(
-        db.get_root_name(&exactly_24).unwrap(),
-        Some(crate::Handle::from(42))
-    );
-    db.commit().unwrap();
-}
-
-#[test]
-fn test_named_roots_table_full() {
-    let file = NamedTempFile::new().unwrap();
-    let path = file.path().to_owned();
-
-    let mut db = Chisel::open(&path, Default::default()).unwrap();
-    db.begin().unwrap();
-
-    // Fill all 8 slots. The literal 8 is coupled to superblock::NAMED_ROOT_COUNT
-    // (the on-disk named-root array is fixed-size, [NamedRoot; 8]); if that
-    // constant ever changes this bound must move with it, or the "table full"
-    // assertion below stops testing the boundary.
-    for i in 0..8 {
-        let name = format!("r{i}");
-        db.set_root_name(&name, crate::Handle::from(i as u64))
-            .unwrap();
-    }
-    // Overwriting an existing name must still work even when full.
-    db.set_root_name("r3", crate::Handle::from(999)).unwrap();
-    assert_eq!(
-        db.get_root_name("r3").unwrap(),
-        Some(crate::Handle::from(999))
-    );
-
-    // Adding a NEW name must fail.
-    assert!(matches!(
-        db.set_root_name("overflow", crate::Handle::from(1234)),
-        Err(ChiselError::RootNameTableFull)
-    ));
-
-    // Clearing a slot must reopen capacity.
-    db.clear_root_name("r0").unwrap();
-    assert!(db
-        .set_root_name("new_one", crate::Handle::from(1234))
-        .is_ok());
-    assert_eq!(
-        db.get_root_name("new_one").unwrap(),
-        Some(crate::Handle::from(1234))
-    );
-    db.commit().unwrap();
-}
-
-#[test]
-fn test_named_roots_clear_is_idempotent() {
-    let file = NamedTempFile::new().unwrap();
-    let path = file.path().to_owned();
-
-    let mut db = Chisel::open(&path, Default::default()).unwrap();
-    db.begin().unwrap();
-    db.set_root_name("meta", crate::Handle::from(7)).unwrap();
-    db.clear_root_name("meta").unwrap();
-    assert_eq!(db.get_root_name("meta").unwrap(), None);
-    // Clearing a non-existent name is a no-op, not an error.
-    db.clear_root_name("meta").unwrap();
-    db.clear_root_name("never_set").unwrap();
-    db.commit().unwrap();
 }
 
 // --- R2 / I9 / I10 / I11 / F1 / I12: the freemap bundle ---
@@ -1622,7 +1449,7 @@ fn corrupt_magic_surfaces_as_corrupt_superblock_not_invalid_magic() {
 // open_existing would cause this test to panic at the `Err(...)` arm — the
 // open would return Ok and we would never see UnsupportedPageSize.
 //
-// `page_size` sits at superblock bytes 48..52 (see superblock.rs serialize()).
+// `page_size` sits at superblock bytes 48..52 (see src/superblock/mod.rs serialize()).
 // We use rewrite_page_with_valid_checksum so the checksum passes and the engine
 // reaches the page_size gate (a bad checksum would stop at CorruptSuperblock
 // first, which would not exercise this path at all).

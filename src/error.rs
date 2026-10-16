@@ -312,8 +312,8 @@ impl ChiselError {
     /// block of the enum above. Adding a fatal variant without adding it here
     /// silently leaves it classified operational, so the manager would keep
     /// serving requests over questionable on-disk state — a durability hole,
-    /// not a compile error (the `#[non_exhaustive]` enum has no exhaustiveness
-    /// check to catch the omission).
+    /// not a compile error (`matches!` has no exhaustiveness check to catch
+    /// the omission; the in-crate `variant_table!` tests below are the guard).
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
@@ -663,122 +663,128 @@ mod tests {
         );
     }
 
-    // I104 (ISSUES.md, 2026-06-21): exhaustiveness guard for is_fatal(). The
-    // `documented_is_fatal` helper classifies every variant via a match with NO
-    // `_` arm; because this is the DEFINING crate, #[non_exhaustive] does not
-    // suppress the exhaustiveness check here, so adding a ChiselError variant
-    // fails to COMPILE until it is placed in the Fatal or Operational block —
-    // the compile-time signal is_fatal()'s `matches!` cannot provide. The test
-    // then asserts is_fatal() agrees with the documented classification for a
-    // constructed instance of every variant, catching a misclassification in
-    // EITHER direction (a fatal variant left out of is_fatal(), or an operational
-    // one wrongly listed). The two encodings are independent on purpose:
-    // documented_is_fatal does NOT call is_fatal().
+    // I104 (ISSUES.md, 2026-06-21) / TESTS-CI-1: exhaustiveness guard for
+    // is_fatal() and Display. Every ChiselError variant is listed ONCE, as a
+    // row of `variant_table!` below: its name, one constructed instance, and its
+    // documented Fatal/Operational class. The macro expands the same rows into
+    // two things that therefore cannot drift apart:
+    //
+    //   * `documented_is_fatal` — a match with one `ChiselError::Variant { .. }`
+    //     arm per row and NO `_` arm. Because this is the DEFINING crate,
+    //     #[non_exhaustive] does not suppress the exhaustiveness check, so a
+    //     variant added to the enum without a row — or a row deleted — fails to
+    //     COMPILE (E0004). That is the compile-time signal is_fatal()'s
+    //     `matches!` cannot provide.
+    //   * `every_variant` — the instance list, one per row. Each row asserts its
+    //     instance really is the row's own variant, so a copy-pasted row that
+    //     builds the wrong variant is caught rather than leaving a hole.
+    //
+    // Together: the rows cover every variant (exhaustive match), and the
+    // instances cover every row (per-row assert), so `every_variant()` holds an
+    // instance of every variant. A duplicated row is caught by the
+    // distinct-discriminant assert below — the check CI actually enforces. It
+    // also trips rustc's unreachable-pattern lint, but that is only a warning
+    // under `cargo test`, and is denied only by `clippy --all-targets -D
+    // warnings` as run locally (CI's clippy omits --all-targets, so it never
+    // lints this #[cfg(test)] code). The `{ .. }` pattern form is used for all
+    // variant shapes (unit, tuple, struct) so one macro arm handles them.
+    //
+    // To add a variant: add a row here, and bump the 35 count tripwire (and
+    // the 14 fatal tripwire if it is fatal).
+    //
+    // The two encodings stay independent on purpose: documented_is_fatal does
+    // NOT call is_fatal(), so a misclassification in EITHER direction (a fatal
+    // variant left out of is_fatal(), or an operational one wrongly listed)
+    // shows up as a disagreement.
+    macro_rules! variant_table {
+        ($( $variant:ident => $instance:expr, $fatal:literal; )*) => {
+            #[allow(clippy::unneeded_struct_pattern)]
+            fn documented_is_fatal(e: &ChiselError) -> bool {
+                match e {
+                    $( ChiselError::$variant { .. } => $fatal, )*
+                }
+            }
+
+            #[allow(clippy::unneeded_struct_pattern)]
+            fn every_variant() -> Vec<ChiselError> {
+                vec![$({
+                    let e: ChiselError = $instance;
+                    assert!(
+                        matches!(e, ChiselError::$variant { .. }),
+                        concat!("variant_table row `", stringify!($variant),
+                                "` builds a different variant: {:?}"),
+                        e
+                    );
+                    e
+                }),*]
+            }
+        };
+    }
+
+    variant_table! {
+        // Operational — database file is intact; caller can recover.
+        InvalidHandle => ChiselError::InvalidHandle(0), false;
+        NoActiveTransaction => ChiselError::NoActiveTransaction, false;
+        TransactionAlreadyActive => ChiselError::TransactionAlreadyActive, false;
+        SavepointNotFound => ChiselError::SavepointNotFound("s".to_string()), false;
+        DuplicateSavepoint => ChiselError::DuplicateSavepoint("s".to_string()), false;
+        ReadOnlyMode => ChiselError::ReadOnlyMode, false;
+        FileNotFound => ChiselError::FileNotFound, false;
+        InvalidRootName => ChiselError::InvalidRootName, false;
+        RootNameTableFull => ChiselError::RootNameTableFull, false;
+        InvalidSuperblockCount => ChiselError::InvalidSuperblockCount { value: 0 }, false;
+        InvalidArgon2Params => ChiselError::InvalidArgon2Params {
+            m_cost: 0,
+            t_cost: 0,
+            p_cost: 0,
+        }, false;
+        CacheFull => ChiselError::CacheFull { limit: 0 }, false;
+        SpillwayFull => ChiselError::SpillwayFull { limit_bytes: 0 }, false;
+        TransactionInProgress => ChiselError::TransactionInProgress, false;
+        TagMismatch => ChiselError::TagMismatch {
+            handle: 0,
+            expected: 0,
+            actual: 0,
+        }, false;
+        // Poisoned is operational by is_fatal()'s definition: the manager is
+        // already dead, so re-seeing it must not re-poison.
+        Poisoned => ChiselError::Poisoned, false;
+        // Encryption credential errors: the DB is intact; supply the right key
+        // and retry, or manage key slots before retrying.
+        NoEncryptionKey => ChiselError::NoEncryptionKey, false;
+        InvalidEncryptionKey => ChiselError::InvalidEncryptionKey, false;
+        EncryptionNotSupported => ChiselError::EncryptionNotSupported, false;
+        NoFreeKeySlot => ChiselError::NoFreeKeySlot, false;
+        LastKeySlot => ChiselError::LastKeySlot, false;
+        // Fatal — integrity in question; close and reopen.
+        IoError => ChiselError::IoError(io::Error::other("io")), true;
+        ChecksumMismatch => ChiselError::ChecksumMismatch { page_id: 0 }, true;
+        CorruptSuperblock => ChiselError::CorruptSuperblock { defects: vec![] }, true;
+        FileSizeMismatch => ChiselError::FileSizeMismatch {
+            expected: 0,
+            actual: 0,
+        }, true;
+        LockFailed => ChiselError::LockFailed, true;
+        UnsupportedFormatVersion => ChiselError::UnsupportedFormatVersion {
+            found: 0,
+            expected: 0,
+        }, true;
+        CorruptPage => ChiselError::CorruptPage { page_id: 0 }, true;
+        InvalidPageId => ChiselError::InvalidPageId { page_id: 0 }, true;
+        UnsupportedPageSize => ChiselError::UnsupportedPageSize {
+            stored: 0,
+            compiled: 0,
+        }, true;
+        InvalidFreemapDepth => ChiselError::InvalidFreemapDepth { stored: 0, max: 0 }, true;
+        InvalidNextHandle => ChiselError::InvalidNextHandle { stored: 0, max: 0 }, true;
+        TxnCounterExhausted => ChiselError::TxnCounterExhausted { current: 0 }, true;
+        HandleSpaceExhausted => ChiselError::HandleSpaceExhausted { current: 0 }, true;
+        DecryptionFailed => ChiselError::DecryptionFailed { page_id: 0 }, true;
+    }
+
     #[test]
     fn is_fatal_matches_documented_classification_for_every_variant() {
-        fn documented_is_fatal(e: &ChiselError) -> bool {
-            match e {
-                // Operational — database file is intact; caller can recover.
-                ChiselError::InvalidHandle(_)
-                | ChiselError::NoActiveTransaction
-                | ChiselError::TransactionAlreadyActive
-                | ChiselError::SavepointNotFound(_)
-                | ChiselError::DuplicateSavepoint(_)
-                | ChiselError::ReadOnlyMode
-                | ChiselError::FileNotFound
-                | ChiselError::InvalidRootName
-                | ChiselError::RootNameTableFull
-                | ChiselError::InvalidSuperblockCount { .. }
-                | ChiselError::InvalidArgon2Params { .. }
-                | ChiselError::CacheFull { .. }
-                | ChiselError::SpillwayFull { .. }
-                | ChiselError::TransactionInProgress
-                | ChiselError::TagMismatch { .. }
-                // Poisoned is operational by is_fatal()'s definition: the manager
-                // is already dead, so re-seeing it must not re-poison.
-                | ChiselError::Poisoned
-                // Encryption credential errors: the DB is intact; supply the
-                // right key and retry, or manage key slots before retrying.
-                | ChiselError::NoEncryptionKey
-                | ChiselError::InvalidEncryptionKey
-                | ChiselError::EncryptionNotSupported
-                | ChiselError::NoFreeKeySlot
-                | ChiselError::LastKeySlot => false,
-                // Fatal — integrity in question; close and reopen.
-                ChiselError::IoError(_)
-                | ChiselError::ChecksumMismatch { .. }
-                | ChiselError::CorruptSuperblock { .. }
-                | ChiselError::FileSizeMismatch { .. }
-                | ChiselError::LockFailed
-                | ChiselError::UnsupportedFormatVersion { .. }
-                | ChiselError::CorruptPage { .. }
-                | ChiselError::InvalidPageId { .. }
-                | ChiselError::UnsupportedPageSize { .. }
-                | ChiselError::InvalidFreemapDepth { .. }
-                | ChiselError::InvalidNextHandle { .. }
-                | ChiselError::TxnCounterExhausted { .. }
-                | ChiselError::HandleSpaceExhausted { .. }
-                | ChiselError::DecryptionFailed { .. } => true,
-            }
-        }
-
-        // One instance of every variant. If a variant is added to the enum,
-        // documented_is_fatal stops compiling first; this list then needs the
-        // new variant too so is_fatal() is actually exercised against it.
-        let all = [
-            ChiselError::InvalidHandle(0),
-            ChiselError::NoActiveTransaction,
-            ChiselError::TransactionAlreadyActive,
-            ChiselError::SavepointNotFound("s".to_string()),
-            ChiselError::DuplicateSavepoint("s".to_string()),
-            ChiselError::ReadOnlyMode,
-            ChiselError::FileNotFound,
-            ChiselError::InvalidRootName,
-            ChiselError::RootNameTableFull,
-            ChiselError::InvalidSuperblockCount { value: 0 },
-            ChiselError::InvalidArgon2Params {
-                m_cost: 0,
-                t_cost: 0,
-                p_cost: 0,
-            },
-            ChiselError::CacheFull { limit: 0 },
-            ChiselError::SpillwayFull { limit_bytes: 0 },
-            ChiselError::TransactionInProgress,
-            ChiselError::TagMismatch {
-                handle: 0,
-                expected: 0,
-                actual: 0,
-            },
-            ChiselError::Poisoned,
-            ChiselError::IoError(io::Error::other("io")),
-            ChiselError::ChecksumMismatch { page_id: 0 },
-            ChiselError::CorruptSuperblock { defects: vec![] },
-            ChiselError::FileSizeMismatch {
-                expected: 0,
-                actual: 0,
-            },
-            ChiselError::LockFailed,
-            ChiselError::UnsupportedFormatVersion {
-                found: 0,
-                expected: 0,
-            },
-            ChiselError::CorruptPage { page_id: 0 },
-            ChiselError::InvalidPageId { page_id: 0 },
-            ChiselError::UnsupportedPageSize {
-                stored: 0,
-                compiled: 0,
-            },
-            ChiselError::InvalidFreemapDepth { stored: 0, max: 0 },
-            ChiselError::InvalidNextHandle { stored: 0, max: 0 },
-            ChiselError::TxnCounterExhausted { current: 0 },
-            ChiselError::HandleSpaceExhausted { current: 0 },
-            ChiselError::NoEncryptionKey,
-            ChiselError::InvalidEncryptionKey,
-            ChiselError::EncryptionNotSupported,
-            ChiselError::NoFreeKeySlot,
-            ChiselError::LastKeySlot,
-            ChiselError::DecryptionFailed { page_id: 0 },
-        ];
+        let all = every_variant();
         for e in &all {
             assert_eq!(
                 e.is_fatal(),
@@ -798,6 +804,32 @@ mod tests {
         // outside its representable range cannot be resolved by retrying —
         // every sibling slot carries the same value.
         assert_eq!(all.iter().filter(|e| e.is_fatal()).count(), 14);
+    }
+
+    // TESTS-CI-1: the companion to the classification test above, over the same
+    // `variant_table!` rows. It pins that the table holds one instance of each
+    // variant (distinct discriminants — catches a duplicated row even where the
+    // unreachable-pattern lint is not denied) and that Display renders something
+    // for every one: an empty message would make a logged error unreadable, and
+    // the copy in tests/error_and_format.rs cannot enumerate a foreign
+    // #[non_exhaustive] enum, so this is the only every-variant Display check.
+    #[test]
+    fn variant_table_holds_each_variant_once_with_nonempty_display() {
+        let all = every_variant();
+        let distinct: std::collections::HashSet<_> =
+            all.iter().map(std::mem::discriminant).collect();
+        assert_eq!(
+            distinct.len(),
+            all.len(),
+            "variant_table! lists some variant more than once"
+        );
+        // Tripwire mirroring the fatal count: 35 variants today. The exhaustive
+        // match already forces a new variant into the table; this makes the
+        // change visible in review as a deliberate count bump.
+        assert_eq!(all.len(), 35);
+        for e in &all {
+            assert!(!e.to_string().is_empty(), "empty Display for {e:?}");
+        }
     }
 
     // Phase 4: the three operational encryption errors are recoverable (the

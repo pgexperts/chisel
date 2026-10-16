@@ -131,7 +131,7 @@ fn rollback_with_spill_leaves_main_file_unchanged() {
 // ---------------------------------------------------------------- Task 15
 
 #[test]
-fn no_spill_workload_preserves_two_fsync_commit() {
+fn no_spill_workload_preserves_three_fsync_commit() {
     // Workload sized to fit comfortably in the default 8 MiB cache (1024 pages).
     // 50 × 4-byte values will not come close to the cap, so the spillway
     // is never engaged and the commit protocol must not issue any spillway-
@@ -158,10 +158,9 @@ fn no_spill_workload_preserves_two_fsync_commit() {
     // Spec §"Commit drain": "spillway itself is never fsynced — its
     // content does not need to survive a crash."
     //
-    // The test name still reads "two_fsync" because the spec used that
-    // language; the actual baseline is 3 due to the I28 pre-drain. The
-    // important invariant is "spillway adds zero fsyncs," and pinning
-    // to == 3 catches both regression directions (more fsyncs from
+    // The original spec spoke of a "two-fsync" commit; the actual baseline
+    // is 3 due to the I28 pre-drain. The important invariant is "spillway
+    // adds zero fsyncs," and pinning to == 3 catches both regression directions (more fsyncs from
     // spillway, or fewer from accidental I28 removal).
     assert_eq!(
         fsync_delta, 3,
