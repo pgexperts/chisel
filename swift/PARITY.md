@@ -21,6 +21,14 @@ No known gaps. (`Transaction.stats` / `.counters` / `.defrag` — previously the
 only omission — were added to the Swift `Transaction` struct in commit closing
 this parity table; see the table below.)
 
+## Deliberate divergence: a zero tag
+
+The calls that take a tag (`allocateTagged`, `handlesWithTag`, `deleteTagged`,
+`deleteWithTag`) reject tag `0` in both bindings, with different error types.
+Python raises the builtin `ValueError`. Swift throws `ChiselError.InvalidTag`,
+because the binding's contract is that every throwing call raises
+`ChiselError` (ADR 0032).
+
 ## Deliberate mapping: transaction/savepoint control flow
 
 Python exposes raw `Chisel.begin()` / `.commit()` / `.rollback()`,
@@ -41,7 +49,9 @@ as standalone methods. Instead:
 - `Savepoint.release` + `Savepoint.rollback_to` (and its `__enter__` /
   `__exit__`) map onto `Transaction.savepoint(name) { sp in ... }`
   (`Transaction.savepoint(_:_:)`), which calls `native.release(name:)` on
-  return and `native.rollbackTo(name:)` on throw.
+  return, and on throw calls `native.rollbackTo(name:)` then
+  `native.release(name:)` so a retried scope does not hit
+  `DuplicateSavepoint` (ADR 0032; Python's scope does the same, ADR 0025).
 
 This is a deliberate v1 choice, not a gap: it makes "one transaction, always
 resolved one way or the other" a structural guarantee (you cannot forget to
@@ -161,7 +171,7 @@ spelled.
 | `Savepoint.__enter__` | folded into `.savepoint { }` entry (see deliberate mapping above) | `Transaction.savepoint(_:_:)` |
 | `Savepoint.__exit__` | folded into `.savepoint { }` return/throw path | `Transaction.savepoint(_:_:)` |
 | `Savepoint.release` | folded into `.savepoint { }` normal-return path — no standalone early-release | `Transaction.savepoint(_:_:)` |
-| `Savepoint.rollback_to` | folded into `.savepoint { }` throw path — no standalone early-rollback | `Transaction.savepoint(_:_:)` |
+| `Savepoint.rollback_to` | folded into `.savepoint { }` throw path (rollback, then release) — no standalone early-rollback | `Transaction.savepoint(_:_:)` |
 
 ## Swift-only additions (not gaps, informational)
 
@@ -170,9 +180,9 @@ spelled.
   (Python surfaces the same number as `Stats.file_size_bytes` instead of a
   standalone call).
 - `ChiselError.category` / `.isPoisoning` (`Extensions.swift`) — a Swift-only
-  convenience for bucketing the 32 generated error cases into
-  operational/fatal, explicitly sourced from the Python tiering
-  (`python/src/errors.rs:101-172`) as its classification authority.
+  convenience for bucketing the 39 generated error cases into
+  operational/fatal, explicitly sourced from the Python exception hierarchy
+  (`python/src/errors.rs`) as its classification authority.
 - `ChiselKey.keychain(service:account:)` (`Keychain.swift`) — a Swift-only
   Keychain-backed key source; Python has no equivalent since it has no
   Keychain to bind to.

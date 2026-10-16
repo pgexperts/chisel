@@ -89,3 +89,11 @@ The design held up against a month of engine drift: the consumed API surface
 needed no changes beyond the root package's rename to `chisel-storage`. Two
 decisions taken during the port are recorded separately — see the ADRs on the
 `is_fatal()`-driven error fallback and on SwiftPM distribution.
+
+## Addendum (2026-10-15)
+
+The port's PR stack (#187–#196) merged into `main` on this date, closing #104,
+#121 and #155. Two further decisions from the stack are recorded on their own:
+boundary validation with typed errors (ADR 0032) and FFI key-material
+redaction (ADR 0033). The orphaned `design/swift-binding` branch is now only a
+historical record.
