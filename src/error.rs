@@ -681,10 +681,16 @@ mod tests {
     //
     // Together: the rows cover every variant (exhaustive match), and the
     // instances cover every row (per-row assert), so `every_variant()` holds an
-    // instance of every variant. A duplicated row is caught twice: rustc's
-    // unreachable-pattern lint (denied in CI's clippy -D warnings) and the
-    // distinct-discriminant assert below. The `{ .. }` pattern form is used for
-    // all variant shapes (unit, tuple, struct) so one macro arm handles them.
+    // instance of every variant. A duplicated row is caught by the
+    // distinct-discriminant assert below — the check CI actually enforces. It
+    // also trips rustc's unreachable-pattern lint, but that is only a warning
+    // under `cargo test`, and is denied only by `clippy --all-targets -D
+    // warnings` as run locally (CI's clippy omits --all-targets, so it never
+    // lints this #[cfg(test)] code). The `{ .. }` pattern form is used for all
+    // variant shapes (unit, tuple, struct) so one macro arm handles them.
+    //
+    // To add a variant: add a row here, and bump the 35 count tripwire (and
+    // the 14 fatal tripwire if it is fatal).
     //
     // The two encodings stay independent on purpose: documented_is_fatal does
     // NOT call is_fatal(), so a misclassification in EITHER direction (a fatal
