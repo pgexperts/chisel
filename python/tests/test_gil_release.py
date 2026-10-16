@@ -12,19 +12,65 @@ the three properties that design promises:
   3. close() and is_poisoned from other threads while a slow call holds the
      Mutex wait for it and return, rather than deadlocking.
 
-Every thread join is bounded so a deadlock fails the test instead of hanging
-the suite.
+Two layers keep a deadlock from hanging the suite:
+
+  - Every thread join is bounded. That catches hangs that leave the GIL free
+    (e.g. two threads deadlocked on the Mutex alone): the main thread's
+    join(timeout) returns and the test fails.
+  - A lock-order inversion (a thread blocked on the Mutex while holding the
+    GIL) also freezes the main thread, so join(timeout) never gets to run.
+    The autouse `_deadlock_watchdog` fixture arms faulthandler's watchdog,
+    which runs on a C thread that needs no GIL: if a test overruns it, the
+    process dumps every thread's traceback and exits non-zero.
 """
 
 from __future__ import annotations
 
+import faulthandler
+import os
 import pathlib
+import sys
 import threading
 import time
+from collections.abc import Iterator
+from typing import TextIO
 
 import chisel
+import pytest
 
 JOIN_TIMEOUT = 10.0
+# Far above any healthy run (each test takes well under a second) and above
+# the bounded joins, so the watchdog only fires when the joins cannot.
+WATCHDOG_SECONDS = 30.0
+
+
+@pytest.fixture(scope="module")
+def _real_stderr(request: pytest.FixtureRequest) -> Iterator[TextIO]:
+    # The watchdog exits the process with os._exit, so anything it writes to
+    # pytest's captured fd 2 is lost with the capture buffer. Duplicate the
+    # terminal's stderr while capture is briefly suspended so the traceback
+    # dump reaches the CI log.
+    capman = request.config.pluginmanager.getplugin("capturemanager")
+    if capman is None:  # pragma: no cover - only under `-p no:capture`
+        yield sys.stderr
+        return
+    with capman.global_and_fixture_disabled():
+        fd = os.dup(sys.stderr.fileno())
+    with os.fdopen(fd, "w") as stream:
+        yield stream
+
+
+@pytest.fixture(autouse=True)
+def _deadlock_watchdog(_real_stderr: TextIO) -> Iterator[None]:
+    # faulthandler has a single process-wide timer, so this replaces any timer
+    # already armed (e.g. by pytest's faulthandler_timeout, unset in this
+    # project) for the duration of each test here. Cancelling in teardown
+    # keeps it from firing during any later test.
+    faulthandler.dump_traceback_later(WATCHDOG_SECONDS, exit=True, file=_real_stderr)
+    try:
+        yield
+    finally:
+        faulthandler.cancel_dump_traceback_later()
 
 
 class _Ticker:
