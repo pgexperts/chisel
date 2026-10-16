@@ -9,7 +9,7 @@
 //! routes through the freemap-aware allocator so dropped-tag pages are reused
 //! on re-create rather than extending the file. General data-page reclamation
 //! is covered by focused freemap unit tests (`src/freemap.rs`,
-//! `persist_freemap_*` in `src/transaction.rs`). The F1/I12 concern these
+//! `persist_freemap_*` in `src/transaction/tests.rs`). The F1/I12 concern these
 //! tests guard is orphan-handle integrity, which is deterministic.
 mod common;
 

@@ -4,7 +4,7 @@
 // over `TransactionManager`; it owns no storage logic of its own. Its job is
 // to (a) present a stable public API, (b) translate `Options` into the right
 // open/create path, and (c) re-export error and result types. All real work
-// lives below in `transaction.rs` and further down.
+// lives below in `transaction/` and further down.
 //
 // Concurrency model: a `Chisel` value is NOT `Sync` and is intended for
 // single-threaded use. All mutating methods take `&mut self`, which by
@@ -16,7 +16,7 @@
 // a given database file at a time. A second `open()` on the same path returns
 // `LockFailed` rather than blocking.
 //
-// Durability model: see `transaction.rs`. Commits are shadow-paged and
+// Durability model: see `transaction/` (commit protocol in `transaction/lifecycle.rs`). Commits are shadow-paged and
 // finalized by a superblock swap; there is no WAL and no background writer.
 
 // I124: enforce `# Errors` rustdoc on every public fallible method. The lint

@@ -37,15 +37,16 @@
 //   * sum of payload bytes across the chain == total_length. The final page
 //     may carry fewer than OVERFLOW_PAYLOAD bytes of actual data; the trailing
 //     bytes are undefined but included in the checksum.
-//   * A chain is reachable from exactly one handle; delete() frees all pages.
+//   * A chain is reachable from exactly one handle; all its pages are freed together.
 //
 // Endianness: little-endian for all multi-byte integers.
 //
 // COW / durability: write() allocates fresh pages via PageCache::new_page(),
 // so under shadow paging the entire chain is new and never modifies existing
-// on-disk pages. delete() returns the list of page ids to free; the caller
-// (transaction.rs) folds those into txn_freed_pages, which persist_freemap
-// marks free in the COW radix freemap tree at commit.
+// on-disk pages. collect_chain_pages() only enumerates the chain's page ids (no
+// side effects); the caller (transaction/mutate.rs) pushes them onto
+// txn_freed_pages, which persist_freemap marks free in the COW radix freemap
+// tree at commit.
 
 use crate::error::{ChiselError, Result};
 use crate::page::{self, PageType, CHECKSUM_OFFSET};
@@ -419,10 +420,10 @@ mod tests {
         }
     }
 
-    // I14: the same cycle must be detected by delete(), which
+    // I14: the same cycle must be detected by collect_chain_pages(), which
     // otherwise would accumulate page ids indefinitely.
     #[test]
-    fn delete_detects_cycle_in_chain() {
+    fn collect_chain_pages_detects_cycle_in_chain() {
         let mut cache = make_cache();
         let (first, _) = write_three_page_chain(&mut cache);
         let second = read_next_page(&mut cache, first);
@@ -500,8 +501,8 @@ mod tests {
     }
 
     #[test]
-    fn delete_returns_every_chain_page() {
-        // delete must return the ids of every page it freed so the
+    fn collect_chain_pages_returns_every_chain_page() {
+        // collect_chain_pages must return the ids of every chain page so the
         // caller can merge them into txn_freed_pages. For a 20000-byte
         // value the chain is at least 3 pages.
         let mut cache = make_cache();
@@ -511,12 +512,12 @@ mod tests {
         assert!(freed.len() >= 3);
     }
 
-    // Review 2026-06-22: read/delete must reject a checksum-valid page of the
+    // Review 2026-06-22: read/collect_chain_pages must reject a checksum-valid page of the
     // WRONG type (reached via a stale/buggy handle entry) instead of parsing its
     // bytes as overflow metadata. Mirrors data_page::corruption_tests, which
     // defends the same failure mode for data pages.
     #[test]
-    fn read_and_delete_reject_wrong_page_type_at_first_page() {
+    fn read_and_collect_chain_pages_reject_wrong_page_type_at_first_page() {
         let mut cache = make_cache();
         // A checksum-valid non-overflow page carrying a HUGE total_length in
         // bytes 16..24. The first-page guard must reject it BEFORE the code

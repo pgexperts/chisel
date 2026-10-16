@@ -137,7 +137,7 @@ dual_backing_test!(test_nested_savepoints, test_nested_savepoints_body);
 
 // Note: test_reopen_preserves_data (which exercised TransactionManager /
 // PageCache / PageIo directly to verify the open_existing path)
-// migrated 2026-05-22 to src/transaction.rs as `reopen_preserves_committed_data`
+// migrated 2026-05-22 to src/transaction/tests.rs as `reopen_preserves_committed_data`
 // under the I35 pub→pub(crate) reshape. The Chisel-public-API equivalent
 // (open path + commit + reopen + read) is covered by `test_chisel_reopen`
 // in tests/basic_ops.rs.

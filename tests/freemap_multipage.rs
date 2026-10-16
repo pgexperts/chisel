@@ -207,7 +207,7 @@ fn crash_orphans_are_reclaimed_by_defrag() {
     // into the recycle pool, which the crash then orphaned. The sweep MUST find
     // it. (If a future change makes this non-deterministic, do NOT relax to >= 0
     // without first restoring determinism — see the unit-test coverage in
-    // transaction.rs for the forge-based deterministic path.)
+    // src/transaction/tests.rs for the forge-based deterministic path.)
     assert!(
         first.freemap_orphans_reclaimed >= 1,
         "first defrag must reclaim >= 1 crash-orphaned freemap page \

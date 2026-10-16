@@ -4,7 +4,7 @@
 //! bit-packs `(inner_depth:6 | inner_root:58)`, and per-tag inner trees keyed by
 //! handle storing `1` for "present". See docs/specs/2026-06-02-chunk-tags-design.md.
 //!
-//! Layer dependency: page + page_cache only (strictly below transaction.rs).
+//! Layer dependency: page + page_cache only (strictly below transaction/).
 //! Like the handle table, this module returns the new root page id after a COW
 //! mutation; all page dirtiness lives in `PageCache`, flushed at commit.
 

@@ -1,4 +1,4 @@
-// transaction.rs — Transaction lifecycle, savepoints, commit protocol, and data operations.
+// transaction/mod.rs — Transaction lifecycle, savepoints, commit protocol, and data operations.
 // This is the orchestration layer (layer 6 in the module graph per ARCHITECTURE.md) that ties
 // together the handle table, data pages, overflow pages, freemap, superblock, and page
 // cache into a coherent transactional API.
@@ -10,7 +10,7 @@
 //     the new superblock supersedes them.
 //   - A commit becomes visible atomically when a new superblock with a higher
 //     txn_counter and a valid checksum is fsync'd to its (alternating) slot.
-//   - Crash recovery = open_existing() runs Superblock::select() and picks the
+//   - Crash recovery = open_existing() picks the
 //     highest-txn_counter superblock with a valid checksum. A torn/partially-written
 //     new superblock fails its checksum, so the previous committed state wins —
 //     no log replay, no undo.

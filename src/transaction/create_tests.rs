@@ -4,7 +4,9 @@
 //! the open path. Concretely:
 //!   - MAJOR is 2 in the on-disk superblock
 //!   - slot 0 is populated (state=active)
-//!   - sensitive fields (named_roots names) are NOT in cleartext
+//!   - the sealed body region of page 0 is populated (nonce non-zero); that the
+//!     named-root NAMES are absent from cleartext is checked elsewhere, by
+//!     `superblock::tests::encrypted_named_root_name_absent_from_cleartext`
 //!   - the wrapped DEK round-trips: unwrap_dek under the same key recovers
 //!     a valid DEK (smoke-tests the wrap/AAD path without going through open)
 //!

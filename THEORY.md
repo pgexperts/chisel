@@ -33,7 +33,7 @@ What follows is the spine of the document: the eighteen design decisions that, i
 
 ### Durability model: shadow paging over WAL (ADR-1)
 
-**Chosen.** Every mutation allocates a fresh page. Commit writes the new pages, fsyncs, writes a new superblock into a *different* slot, and fsyncs again. Recovery is `Superblock::select` scanning N candidate slots and picking the highest valid `txn_counter`.
+**Chosen.** Every mutation allocates a fresh page. Commit writes the new pages, fsyncs, writes a new superblock into a *different* slot, and fsyncs again. Recovery is a scan of N candidate slots (inlined in `TransactionManager::open_existing`) and picking the highest valid `txn_counter`.
 
 **Rejected.** A write-ahead log with in-place updates — the PostgreSQL/SQLite standard. WAL recovery is a substantial subsystem in its own right: a replay state machine, checkpoint handling, log truncation. That machinery adds a risk surface comparable to *the entire rest of Chisel*. A hybrid (WAL for small changes, shadow for large) was also rejected, as combining the worst of both — the recovery paths multiply and the mode boundary becomes another correctness obligation nobody asked for.
 
@@ -185,9 +185,11 @@ It is worth being precise about what the AEAD does buy, because "cryptographic t
 
 ### MSRV pinned at 1.82 with tilde-pins on edition2024 deps (Cargo.toml, I55/I61/I110)
 
-**Chosen.** `rust-version = 1.82` in all three subcrates; a CI `msrv` job builds `-p chisel` library-only against `dtolnay/rust-toolchain@1.82`. Dependencies are tilde-pinned to hold that floor: `zeroize ~1.8` (with the derive feature dropped entirely — only `Zeroizing<T>` is used) and the transitive `base64ct ~1.6` (via `argon2 0.5`). The RustCrypto deps are unconditional (seal/open is always compiled) but meaningfully reach the dependency tree only when a database is opened with a key.
+**Chosen.** `rust-version = 1.82` in the workspace crates; a CI `msrv` job builds `-p chisel` library-only against `dtolnay/rust-toolchain@1.82`. Dependencies are tilde-pinned to hold that floor: `zeroize ~1.8` (with the derive feature dropped entirely — only `Zeroizing<T>` is used) and the transitive `base64ct ~1.6` (via `argon2 0.5`). The RustCrypto deps are unconditional (seal/open is always compiled) but meaningfully reach the dependency tree only when a database is opened with a key.
 
-**Rejected.** A floating MSRV on stable — rejected because an unannounced 1.x bump can land silently (README's "Rust stable" is not a pinned promise). Running the msrv job with `--tests` — tried and reverted, because proptest's transitive `getrandom` needs edition2024 (1.85+); the MSRV promise is about the *published library* (no getrandom/proptest in its tree), so the job stays lib-only. Adopting a real Cargo workspace — deferred (I61): members would share edition/rust-version/feature resolution, too restrictive for the PyO3 abi3 binding, and the bench floats its floor faster than the engine wants.
+**Rejected.** A floating MSRV on stable — rejected because an unannounced 1.x bump can land silently (README's "Rust stable" is not a pinned promise). Running the msrv job with `--tests` — tried and reverted, because proptest's transitive `getrandom` needs edition2024 (1.85+); the MSRV promise is about the *published library* (no getrandom/proptest in its tree), so the job stays lib-only. A Cargo workspace was first deferred on the grounds that members would share edition/rust-version/feature resolution, too restrictive for the PyO3 abi3 binding, and the bench floats its floor faster than the engine wants; it was later adopted under I61 (`members` = root, `python`, `bench`, `chisel-ffi`), and each member keeps its own `[package]` block, so MSRV and edition stay per-crate.
+
+> Rationale for reversing the deferral not recovered from project sources.
 
 **Why.** 1.82 is a conservative pin driven by actual language usage (`is_none_or` is 1.82+; the true stdlib floor is nearer 1.74). Pinning gives a stable, published MSRV promise you bump only with a release-notes call-out. The tilde pins are what *hold* that floor: `zeroize 1.9` and `base64ct 1.7+` both adopted edition2024 (Rust 1.85+), which would drag the library MSRV above 1.82; the pinned lines are the last edition-2021 releases, and the un-exercised code paths (no `#[derive(Zeroize)]`, never emitting PHC hash strings) make the pins safe.
 
@@ -199,7 +201,7 @@ This section is history, framed to explain *why the code looks the way it does* 
 
 ### The benchmark suite, PRs 1–8
 
-The benchmark infrastructure was built incrementally across eight PRs, and its shape is deliberate. It lives in a `bench/` subcrate that is a *sibling* to `python/`, not a plain workspace member drawn into the engine's own build in a way that would auto-run its 10–25 minutes of tests on every `cargo test`. (This is also the concrete reason plain `cargo test` versus `cargo test --lib` matters in this repo — see the memory note `feedback_cargo_test_full`.) The subcrate depends on `redb` and `rusqlite` for cross-engine comparison; keeping it a sibling is what keeps the *engine's* dependency graph minimal — the storage engine itself needs neither.
+The benchmark infrastructure was built incrementally across eight PRs, and its shape is deliberate. It lives in a `bench/` subcrate that is a workspace member (adopted under I61) listed in `default-members` alongside the root crate; `python/` is also a member but is excluded from `default-members` because the PyO3 `extension-module` feature leaves Python symbols undefined, which only maturin's linker flags can resolve. (This is also the concrete reason plain `cargo test` versus `cargo test --lib` matters in this repo — see the memory note `feedback_cargo_test_full`.) The subcrate depends on `redb` and `rusqlite` for cross-engine comparison; keeping it a separate crate is what keeps the *engine's* dependency graph minimal — the storage engine itself needs neither.
 
 The suite has three layers, and they exist because no single tool fits all three jobs:
 
@@ -207,7 +209,7 @@ The suite has three layers, and they exist because no single tool fits all three
 2. **A Criterion micro-grid** — 165 cells of small, isolated operations. Criterion's many-samples statistical model is exactly right for micro-measurement.
 3. **A YCSB-style scenario tier** — realistic mixed workloads, timed with `Instant::now()` rather than Criterion, because Criterion's sampling model *exceeds* the 1–6 minute scenario budget. This is why you'll see a hand-rolled timing hybrid there instead of "just use Criterion everywhere."
 
-That three-layer split (ADR-10) and the sibling-crate decision together are why the bench directory looks structurally unlike the rest of the repo.
+That three-layer split (ADR-10) and the separate-crate decision together are why the bench directory looks structurally unlike the rest of the repo.
 
 ### Cross-engine fairness and the macOS fsync problem (ADR-11)
 

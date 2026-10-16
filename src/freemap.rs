@@ -86,7 +86,7 @@ pub struct FreeMap;
 //     freemap-typed page is genuinely free before reclaiming it, so weakening
 //     the predicate would let the sweep double-reclaim a live page. (The note
 //     that stood here had this backwards, and cited `src/transaction.rs` — a
-//     file that no longer exists.)
+//     file that no longer exists; it is now the `src/transaction/` directory.)
 //   * `init_page` <- `FreeMapTree::create`, `cow_descend`'s absent-leaf
 //     materialization, and `page`'s page-type construction.
 //

@@ -172,8 +172,10 @@ impl TransactionManager {
     ///
     /// This is the crash recovery path. All N superblock slots (where
     /// N is discovered from disk — see the probe below) are read,
-    /// `Superblock::select()` picks the one with the highest
-    /// txn_counter and a valid XXH3 checksum, and a torn write to the
+    /// the winner is the slot with the highest txn_counter and a valid XXH3
+    /// checksum (the same filter_map + max_by_key that the test-only
+    /// `Superblock::select` mirrors, inlined below so the winning buffer
+    /// stays available for `decrypt_body`), and a torn write to the
     /// most-recently-targeted slot silently falls back to the next
     /// best survivor. No log replay required.
     ///
@@ -191,8 +193,9 @@ impl TransactionManager {
     ///      bytes of an otherwise-valid slot would look like garbage,
     ///      and short-circuiting would skip past the legitimate
     ///      successor slots. Reading a few extra pages is cheap.
-    ///   2. Pass all candidates to `Superblock::select`, which uses
-    ///      `deserialize` to filter on XXH3 checksum + MAGIC bytes.
+    ///   2. Run all candidates through `deserialize` (inlined filter_map +
+    ///      max_by_key, not `Superblock::select`) to filter on XXH3 checksum +
+    ///      MAGIC bytes.
     ///      Data pages that happen to sit at positions < MAX_SUPERBLOCKS
     ///      (e.g., in a database where N=2 and there's a data page at
     ///      page 2) fail the magic check and are harmlessly ignored.

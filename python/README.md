@@ -247,7 +247,9 @@ with db.transaction() as tx:
 
 ```python
 s = db.stats()
-# Stats(handle_count=1234, total_pages=567, file_size_bytes=4644864)
+# Stats(handle_count=1234, total_pages=567, file_size_bytes=4644864,
+#       spillway_logical_bytes=None, spillway_max_bytes=None)
+# The spillway fields stay None until an overflow spill first opens the spillway.
 
 with db.transaction() as tx:
     # defrag is available on both objects; `tx.defrag(...)` is the same call.
@@ -271,7 +273,7 @@ The four fields:
 
 - `cache_hits` — `PageCache.get` returned a cached page without disk I/O.
 - `cache_misses` — `PageCache.get` had to load from disk (and validate the page's XXH3 checksum).
-- `pages_allocated` — `PageCache.new_page` invocations; counts attempted allocations even when the cache subsequently rejects with `CacheFullError` at the strict `cache_max_bytes` cap.
+- `pages_allocated` — page allocations, counting both file extensions (`PageCache.new_page`) and reuses of pages freed by earlier commits (`PageCache.claim_page`); `new_page` counts attempted allocations even when the cache subsequently rejects with `CacheFullError` at the strict `cache_max_bytes` cap.
 - `fsync_calls` — successful `PageIo.fsync` invocations; three per commit (pre-drain flush + main pages flush + superblock).
 
 The counters are point-in-time snapshots; they do not update after the call. Read them again to observe new totals. They reset implicitly on `close()` + reopen because the underlying engine state is rebuilt; nothing is persisted to disk.
@@ -489,7 +491,7 @@ Useful for:
 
 Versioning is two-tiered. **File level**: each superblock carries a packed `format_version` u32 — upper 16 bits = MAJOR, lower 16 bits = MINOR. The open-time gate compares MAJOR only: a 1.3 binary opens a 1.7 file cleanly, a 1.3 binary rejects a 2.0 file. **Page level**: each non-superblock page carries a one-byte format version in its header, letting individual page layouts evolve within a major without a file-wide bump — the basis for lazy per-page upgrade on future versions.
 
-Cross-minor *read* compatibility is absolute within a major. *Write* compatibility is narrower: starting with the first post-1.0 minor bump, a binary at MINOR = *m* opening a file at MINOR = *m' > m* will be restricted to read-only to avoid clobbering fields the binary doesn't know about. Until 1.1 ships this check is a no-op because no minor variants exist.
+Cross-minor *read* compatibility is absolute within a major. *Write* compatibility is narrower: a binary at MINOR = *m* opening a file at MINOR = *m' > m* is opened read-only (mutations raise `ReadOnlyModeError`) to avoid clobbering fields the binary doesn't know about. The check is live: it fires whenever a file's MINOR exceeds the binary's.
 
 ### Pre-1.0 caveat
 

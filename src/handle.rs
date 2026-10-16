@@ -5,7 +5,7 @@
 // — `delete_tagged(Handle, Tag)` cannot be called with its arguments
 // transposed, and "no tag" is the absence of a `Tag` (`Option<Tag>`), never the
 // in-band sentinel `0`. These types live ABOVE the engine: nothing in
-// transaction.rs / handle_table.rs / membership_index.rs knows about them;
+// transaction/ / handle_table.rs / membership_index.rs knows about them;
 // lib.rs converts at the edge via `.get()` / `From`. The on-disk format and the
 // radix-tree key arithmetic stay raw integers (ISSUES.md I120/I126).
 //

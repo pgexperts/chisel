@@ -47,7 +47,7 @@ use crate::page::{self, PageType, CHECKSUM_OFFSET, DATA_PAGE_HEADER_SIZE, PAGE_S
 
 // Slot directory entry size — must match the layout documented above.
 // Changing this is an on-disk format break.
-// pub(crate) so transaction.rs can derive MAX_INLINE_VALUE from it (I117),
+// pub(crate) so transaction/mod.rs can derive MAX_INLINE_VALUE from it (I117),
 // making that constant impossible to drift out of sync with the slot layout.
 pub(crate) const SLOT_ENTRY_SIZE: usize = 6; // offset(2) + length(2) + flags(2)
 const SLOT_FLAG_LIVE: u16 = 0x0001;

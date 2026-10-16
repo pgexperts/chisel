@@ -13,7 +13,7 @@
 //   entry via COW. Therefore, reading a value and immediately writing it
 //   back under the same handle is an observable no-op for callers but
 //   relocates the physical storage — exactly what a compactor needs.
-//   This module relies on that invariant from `transaction.rs` /
+//   This module relies on that invariant from the `transaction/` module /
 //   `handle_table.rs`; if it were ever weakened, defrag would silently
 //   corrupt references.
 //
@@ -333,7 +333,7 @@ mod tests {
     use crate::page_cache::PageCache;
     use crate::page_io::PageIo;
 
-    // Build a committed-once manager, mirroring transaction.rs's `fresh_manager`
+    // Build a committed-once manager, mirroring `fresh_manager` in transaction/tests.rs
     // (private to that module, hence duplicated here).
     fn fresh_manager() -> TransactionManager {
         let file = tempfile::NamedTempFile::new().unwrap();
