@@ -69,8 +69,8 @@ impl EngineMode {
     }
 
     /// True iff `Engine::internal_counters()` returns `Some(_)` for this
-    /// mode. Currently only `ChiselStrict` (the other engines are
-    /// black-box). The post-processor uses this to decide whether to
+    /// mode: the two Chisel modes, `ChiselStrict` and `ChiselMemory` (the
+    /// redb and SQLite engines are black-box). The post-processor uses this to decide whether to
     /// fill the Chisel-internals appendix table for a cell.
     pub fn supports_internal_counters(self) -> bool {
         matches!(self, Self::ChiselStrict | Self::ChiselMemory)
@@ -508,8 +508,9 @@ fn op_is_mutating(op: &Operation) -> bool {
 
 /// Run one scenario cell end-to-end:
 ///   1. Open a fresh engine in `mode` at a tempfile path
-///   2. Run `prepopulate_workload` untimed (each Allocate in its own tx
-///      for simplicity; pre-pop time is excluded from the measurement)
+///   2. Run `prepopulate_workload` untimed, batched into transactions of
+///      at most POPULATE_TX_MAX_RECORDS ops / POPULATE_TX_BUDGET_BYTES of
+///      payload (pre-pop time is excluded from the measurement)
 ///   3. Snapshot file size + counters (the "before" state for deltas)
 ///   4. Start wall-clock timer
 ///   5. Iterate `scenario_workload.ops`, calling apply_op on each;
@@ -652,9 +653,13 @@ mod tests {
             assert_eq!(
                 mode.supports_internal_counters(),
                 expected,
-                "only ChiselStrict reports internal counters; got {mode:?}"
+                "among the micro-grid modes only ChiselStrict reports internal counters; got {mode:?}"
             );
         }
+        // EngineMode::ALL is the micro-grid column set and omits
+        // ChiselMemory (scenario tier only), so the loop above never sees
+        // it. Pin it explicitly: it is a Chisel engine and does report.
+        assert!(EngineMode::ChiselMemory.supports_internal_counters());
     }
 
     #[test]

@@ -11,16 +11,30 @@
 //
 //   2. Reclamation throughput. Pages freed in one commit are reusable in the
 //      next. This bench measures the page count before and after a churn
-//      cycle, reported via Criterion throughput annotations.
+//      cycle.
 //
-// NOTE ON WHAT IS ACTUALLY REPORTED: only Criterion's wall-clock timings and
-// throughput annotations. This file writes NO aux metrics — it constructs no
-// `AuxMetricsWriter` (only micro_grid.rs does), and the `file_size_bytes` /
-// `pages_allocated` values it reads are `black_box`'d and discarded. Three
-// comments here used to claim otherwise; they are corrected in place below.
-// Wiring up an aux writer so the flat-high-water and reclamation numbers are
-// genuinely trend-tracked is real work, and worth doing — but until it is
-// done, this file must not say it has been.
+// What is reported:
+//   - Criterion wall-clock timings and throughput annotations, for all three
+//     groups. Units differ: group 1 reports round-trips/sec (Elements(1));
+//     groups 2 and 3 report records/sec (Elements(live_count)).
+//   - One JSONL line per case of groups 1 and 2 in
+//     `bench/results/freemap_churn_aux.jsonl` (the same `CellAuxMetrics`
+//     shape micro_grid writes: `row` = group name, `mode` = benchmark-id
+//     function, `size` = case label). `file_size_delta_bytes` is the file
+//     high-water change across one steady-state churn cycle (property 1:
+//     should be ~0); `counters.pages_allocated` is the page allocations
+//     across it (property 2; see group 2's doc for how to read it).
+//   These come from a SEPARATE UNTIMED pass per case (`capture_churn_aux`),
+//   not from the timed closures: the timed closures read nothing back, so
+//   the aux capture cannot perturb the measurement.
+//   The file is this bench's own rather than micro_grid's `aux_metrics.jsonl`
+//   because `AuxMetricsWriter::create` truncates; sharing one file would
+//   clobber whichever bench ran first. Nothing reads it yet (no summary
+//   renderer or CI wiring); it exists so the two properties above can be
+//   trend-tracked.
+//   Group 3 is not recorded: `CellAuxMetrics` has no field for
+//   `freemap_orphans_reclaimed`, and the orphan sweep is not one of the two
+//   properties this bench exists to track.
 //
 // Why public-API rather than freemap_tree internals:
 //   `FreeMapTree`, `PageCache`, and the structural allocator are all
@@ -49,6 +63,7 @@
 // (CLAUDE.md: perf regressions are trend-tracked, not pass/fail).
 
 use chisel::{Chisel, DefragOptions, Options, PAGE_SIZE};
+use chisel_bench::runner::{counter_delta, AuxMetricsWriter, CellAuxMetrics, CellId};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
 use tempfile::NamedTempFile;
@@ -126,6 +141,33 @@ fn churn_cycle(db: &mut Chisel, handles: Vec<chisel::Handle>, size: usize) -> Ve
     new_handles
 }
 
+/// Untimed aux capture for one case: bring `db` to the same steady state the
+/// timed setup does (populate, one warm-up churn cycle), then run ONE more
+/// churn cycle bracketed by `file_size_bytes` / `counters` reads. The caller
+/// opens `db` exactly as its timed setup does, so the recorded cycle is the
+/// one the timed rows measure.
+fn capture_churn_aux(
+    mut db: Chisel,
+    live_count: usize,
+    size_bytes: usize,
+    cell_id: CellId,
+) -> CellAuxMetrics {
+    let handles = populate(&mut db, live_count, size_bytes);
+    let handles = churn_cycle(&mut db, handles, size_bytes);
+
+    let counters_before = db.counters().expect("counters before");
+    let size_before = db.file_size_bytes().expect("size before");
+    let _ = churn_cycle(&mut db, handles, size_bytes);
+    let counters_after = db.counters().expect("counters after");
+    let size_after = db.file_size_bytes().expect("size after");
+
+    CellAuxMetrics {
+        cell_id,
+        file_size_delta_bytes: size_after as i64 - size_before as i64,
+        counters: counter_delta(Some(counters_before), Some(counters_after)),
+    }
+}
+
 /// Bench group 1: DELETE-CHURN-FLAT (in-memory engine).
 ///
 /// Measures the cost of `cycles` delete/realloc commit pairs at a fixed live
@@ -137,11 +179,9 @@ fn churn_cycle(db: &mut Chisel, handles: Vec<chisel::Handle>, size: usize) -> Ve
 /// The flat-high-water property: `file_size_bytes` at the end of the last
 /// cycle should be <= `file_size_bytes` at the end of the warm-up cycle.
 /// This bench does NOT assert that numerically — assertions on raw bench
-/// numbers are explicitly forbidden by project conventions. It does not
-/// record it either: the value is `black_box`'d to keep the optimizer honest
-/// and then dropped. Observing the property today means reading the timings
-/// and running the engine by hand; see the module note above.
-fn bench_delete_churn_flat(c: &mut Criterion) {
+/// numbers are explicitly forbidden by project conventions. It records it
+/// instead, as `file_size_delta_bytes` in the aux file (see the module note).
+fn bench_delete_churn_flat(c: &mut Criterion, aux: &mut AuxMetricsWriter) {
     // (live_count, size_bytes, label)
     let cases: &[(usize, usize, &str)] = &[
         (500, 256, "500x256B"),
@@ -149,11 +189,36 @@ fn bench_delete_churn_flat(c: &mut Criterion) {
         (100, 16384, "100x16KB"),
     ];
 
-    let mut group = c.benchmark_group("freemap-churn-flat");
+    let group_name = "freemap-churn-flat";
+    let mut group = c.benchmark_group(group_name);
 
     for &(live_count, size_bytes, label) in cases {
-        // Throughput: one unit = one (delete + realloc) round-trip.
-        group.throughput(criterion::Throughput::Elements(live_count as u64));
+        let cache_bytes = CACHE_PAGES as u64 * PAGE_SIZE as u64;
+        let db = Chisel::open_in_memory_with_options(
+            Options::default()
+                .cache_max_bytes(cache_bytes)
+                .spillway_max_bytes(cache_bytes * 1024),
+        )
+        .expect("open chisel aux");
+        aux.append(&capture_churn_aux(
+            db,
+            live_count,
+            size_bytes,
+            CellId {
+                row: group_name,
+                mode: "in-memory",
+                size: label,
+            },
+        ))
+        .expect("append freemap_churn aux");
+
+        // Throughput: one unit = one (delete + realloc) round-trip, and each
+        // timed iteration runs exactly one `churn_cycle`, so Elements(1) makes
+        // Criterion's reported rate literally round-trips/sec. This used to be
+        // Elements(live_count), i.e. records churned/sec: trend data recorded
+        // before this change is normalised by live_count and must be divided
+        // by live_count to compare with data after it.
+        group.throughput(criterion::Throughput::Elements(1));
 
         group.bench_with_input(BenchmarkId::new("in-memory", label), &(), |b, _| {
             // Setup: open a fresh in-memory engine and populate `live_count`
@@ -187,11 +252,9 @@ fn bench_delete_churn_flat(c: &mut Criterion) {
                     (db, handles)
                 },
                 |(mut db, handles)| {
-                    // Timed: one delete+realloc round-trip.
+                    // Timed: one delete+realloc round-trip. Nothing is read
+                    // back here; the untimed aux pass records the high-water.
                     let new_handles = churn_cycle(&mut db, handles, size_bytes);
-                    // black_box both engine and handles to prevent the
-                    // optimizer from eliding the work.
-                    black_box(db.file_size_bytes().expect("file_size_bytes"));
                     black_box(new_handles.len());
                     // Return the engine rather than dropping it here.
                     // `iter_batched` drops the routine's output AFTER
@@ -216,22 +279,48 @@ fn bench_delete_churn_flat(c: &mut Criterion) {
 /// few or zero NEW pages beyond what the freemap already tracks.
 ///
 /// `pages_allocated` here is `ChiselCounters::pages_allocated`, which counts
-/// `PageCache::new_page` calls (= file extensions). After the warm-up, the
-/// second-commit delta should be close to 0 (reusing freed pages) rather than
-/// `live_count` (extending for every new record). This is observable through
-/// the Chisel public counters API.
+/// BOTH file extensions (`PageCache::new_page`) AND freemap reuses
+/// (`PageCache::claim_page`) — see `ChiselCounters` in src/stats.rs. It is
+/// therefore NOT ~0 under healthy reclamation: a realloc commit that reuses
+/// every freed page still counts each claim. Reclamation shows up as this
+/// counter paired with a ~0 `file_size_delta_bytes` (pages handed out, file
+/// not extended); a broken freemap shows a similar counter with the file
+/// growing by the extension count.
 ///
-/// Report-only, and — like group 1 — NOT currently trend-tracked: the
-/// `pages_allocated` delta is `black_box`'d, not written anywhere. This used
-/// to claim results go to bench/results/aux_metrics.jsonl "via the
-/// AuxMetricsWriter pattern"; no `AuxMetricsWriter` is constructed in this
-/// file at all. See the module note at the top.
-fn bench_reclamation_pages_allocated(c: &mut Criterion) {
+/// Report-only. One aux line per case is written from an untimed pass (see
+/// the module note at the top); the timed closure reads nothing back.
+fn bench_reclamation_pages_allocated(c: &mut Criterion, aux: &mut AuxMetricsWriter) {
     let cases: &[(usize, usize, &str)] = &[(200, 256, "200x256B"), (100, 4096, "100x4KB")];
 
-    let mut group = c.benchmark_group("freemap-reclamation-pages-allocated");
+    let group_name = "freemap-reclamation-pages-allocated";
+    let mut group = c.benchmark_group(group_name);
 
     for &(live_count, size_bytes, label) in cases {
+        {
+            let tf = NamedTempFile::new().expect("tempfile aux");
+            let cache_bytes = CACHE_PAGES as u64 * PAGE_SIZE as u64;
+            let db = Chisel::open(
+                tf.path(),
+                Options::default()
+                    .cache_max_bytes(cache_bytes)
+                    .spillway_max_bytes(cache_bytes * 1024),
+            )
+            .expect("open chisel aux");
+            aux.append(&capture_churn_aux(
+                db,
+                live_count,
+                size_bytes,
+                CellId {
+                    row: group_name,
+                    mode: "chisel-file",
+                    size: label,
+                },
+            ))
+            .expect("append freemap_churn aux");
+            // `capture_churn_aux` consumed and dropped the engine, so the
+            // tempfile is unlinked (end of this block) only after close.
+        }
+
         group.throughput(Throughput::Elements(live_count as u64));
 
         group.bench_with_input(BenchmarkId::new("chisel-file", label), &(), |b, _| {
@@ -253,22 +342,10 @@ fn bench_reclamation_pages_allocated(c: &mut Criterion) {
                     (db, handles, tf)
                 },
                 |(mut db, handles, tf)| {
-                    let counters_before = db.counters().expect("counters before");
-                    let size_before = db.file_size_bytes().expect("size before");
-
+                    // Timed: one delete+realloc round-trip. The counter and
+                    // file-size deltas are recorded by the untimed aux pass,
+                    // so their reads stay out of this span.
                     let new_handles = churn_cycle(&mut db, handles, size_bytes);
-
-                    let counters_after = db.counters().expect("counters after");
-                    let size_after = db.file_size_bytes().expect("size after");
-
-                    // Report both metrics through black_box so the optimizer
-                    // cannot eliminate the measurement calls.
-                    black_box(
-                        counters_after
-                            .pages_allocated
-                            .saturating_sub(counters_before.pages_allocated),
-                    );
-                    black_box(size_after as i64 - size_before as i64);
                     black_box(new_handles.len());
                     // Return engine + tempfile so Criterion drops them after
                     // `measurement.end`. Dropping the NamedTempFile here
@@ -366,10 +443,20 @@ fn bench_defrag_orphan_sweep(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_delete_churn_flat,
-    bench_reclamation_pages_allocated,
-    bench_defrag_orphan_sweep,
-);
+/// Entry point: owns the aux writer for groups 1 and 2 (one file per bench
+/// run, truncated at start — see the module note) and registers all three
+/// groups.
+fn freemap_churn(c: &mut Criterion) {
+    let mut aux = AuxMetricsWriter::create(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/results/freemap_churn_aux.jsonl"
+    ))
+    .expect("create freemap_churn aux file");
+
+    bench_delete_churn_flat(c, &mut aux);
+    bench_reclamation_pages_allocated(c, &mut aux);
+    bench_defrag_orphan_sweep(c);
+}
+
+criterion_group!(benches, freemap_churn);
 criterion_main!(benches);

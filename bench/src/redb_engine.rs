@@ -90,6 +90,11 @@ impl Engine for RedbEngine {
         }
         let mut tx = self.db.begin_write()?;
         let durability = match self.durability {
+            // Fsync parity: Immediate commits via File::sync_data(), which Rust
+            // std on Apple targets implements as fcntl(F_FULLFSYNC), so
+            // redb-strict pays the same full-fsync cost as chisel-strict and
+            // sqlite-strict (fullfsync=ON). redb's F_BARRIERFSYNC is only on
+            // its Eventual path, i.e. redb-unsafe.
             DurabilityMode::Strict => Durability::Immediate,
             DurabilityMode::Unsafe => Durability::Eventual,
         };
