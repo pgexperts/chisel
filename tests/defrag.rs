@@ -186,10 +186,22 @@ dual_backing_test!(
     test_defrag_stats_are_page_accurate_body
 );
 
-fn test_defrag_respects_max_values_body(b: &Backing) {
-    // `max_values` caps how much work defrag does in one call so
-    // large databases can be incrementally compacted. With a cap of
-    // 2, defrag should relocate at most 2 values.
+// `max_values` caps how much work defrag does in one call so large
+// databases can be incrementally compacted. The cap is checked before each
+// move, so a capped call moves exactly `min(cap, candidates)` values. For the
+// assertion to say anything about the cap, there must be MORE candidates than
+// the cap — otherwise `values_moved == cap` holds even if the cap is ignored.
+// The fixture therefore leaves five survivors scattered across sparse pages,
+// and `test_defrag_uncapped_moves_every_sparse_survivor` pins that premise
+// (all five are candidates) so the capped tests cannot pass vacuously.
+const SPARSE_SURVIVORS: usize = 5;
+
+/// Allocate 50 × 200-byte values (several per 8 KiB page), keep every 10th
+/// (indices 0, 10, 20, 30, 40) and delete the rest, so every data page holding
+/// a survivor is far below the 0.25 sparse threshold. Then run one defrag with
+/// `max_values(cap)` (0 = uncapped), check every survivor still reads back,
+/// and return `values_moved`.
+fn defrag_sparse_survivors(b: &Backing, cap: usize) -> u64 {
     use chisel::DefragOptions;
     let mut db = open_chisel(b);
 
@@ -199,34 +211,73 @@ fn test_defrag_respects_max_values_body(b: &Backing) {
         .collect();
     db.commit().unwrap();
 
+    let keep = |i: usize| i % 10 == 0;
     db.begin().unwrap();
-    for &h in &handles[2..] {
-        db.delete(h).unwrap();
+    for (i, &h) in handles.iter().enumerate() {
+        if !keep(i) {
+            db.delete(h).unwrap();
+        }
     }
     db.commit().unwrap();
+    assert_eq!((0..50).filter(|&i| keep(i)).count(), SPARSE_SURVIVORS);
 
     db.begin().unwrap();
     let result = db
         .defrag(
             DefragOptions::default()
                 .sparse_threshold(0.25)
-                .max_values(2),
+                .max_values(cap),
         )
         .unwrap();
     db.commit().unwrap();
 
-    assert!(
-        result.values_moved <= 2,
-        "max_values=2 should cap values_moved to 2, got {}",
-        result.values_moved
-    );
-    // Surviving data is still readable.
-    for (i, &h) in handles[..2].iter().enumerate() {
-        assert_eq!(db.read(h).unwrap(), [i as u8; 200]);
+    // Every survivor — moved or not — is still readable under its handle.
+    for (i, &h) in handles.iter().enumerate() {
+        if keep(i) {
+            assert_eq!(db.read(h).unwrap(), [i as u8; 200]);
+        }
     }
+    result.values_moved
+}
+
+fn test_defrag_uncapped_moves_every_sparse_survivor_body(b: &Backing) {
+    assert_eq!(
+        defrag_sparse_survivors(b, 0),
+        SPARSE_SURVIVORS as u64,
+        "fixture premise: all survivors are on sparse pages, so an uncapped \
+         defrag must relocate every one"
+    );
+}
+
+dual_backing_test!(
+    test_defrag_uncapped_moves_every_sparse_survivor,
+    test_defrag_uncapped_moves_every_sparse_survivor_body
+);
+
+fn test_defrag_respects_max_values_body(b: &Backing) {
+    let moved = defrag_sparse_survivors(b, 2);
+    assert_eq!(
+        moved, 2,
+        "max_values=2 with {SPARSE_SURVIVORS} candidates must move exactly 2, got {moved}"
+    );
 }
 
 dual_backing_test!(
     test_defrag_respects_max_values,
     test_defrag_respects_max_values_body
+);
+
+fn test_defrag_respects_max_values_of_one_body(b: &Backing) {
+    // The smallest non-zero cap: distinguishes a correct `>=` check from an
+    // off-by-one that lets one extra move through before stopping.
+    let moved = defrag_sparse_survivors(b, 1);
+    assert_eq!(
+        moved, 1,
+        "max_values=1 with {SPARSE_SURVIVORS} candidates must move exactly 1, got {moved}"
+    );
+}
+
+dual_backing_test!(
+    test_defrag_respects_max_values_of_one,
+    test_defrag_respects_max_values_of_one_body
 );

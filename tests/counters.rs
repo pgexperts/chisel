@@ -36,11 +36,16 @@ fn counters_track_allocate_and_commit() {
     db.commit().unwrap();
 
     let after = db.counters().unwrap();
-    // Commit calls fsync twice (data pages + superblock). Anything below
-    // this is a regression in the commit protocol.
-    assert!(
-        after.fsync_calls >= baseline.fsync_calls + 2,
-        "commit must perform at least 2 fsyncs (data + superblock); saw {} -> {}",
+    // Commit is a three-fsync protocol (src/transaction/commit.rs): the I28
+    // pre-drain flush, the data-pages flush, and the superblock fsync.
+    // PageCache::flush fsyncs even when nothing is dirty, so the count is
+    // fixed regardless of workload. Pinned with == (as in
+    // tests/spillway_integration.rs) so both directions fail: a dropped
+    // fsync weakens durability ordering, an extra one is a perf regression.
+    assert_eq!(
+        after.fsync_calls,
+        baseline.fsync_calls + 3,
+        "commit must perform exactly 3 fsyncs (I28 pre-drain + data + superblock); saw {} -> {}",
         baseline.fsync_calls,
         after.fsync_calls,
     );
@@ -96,7 +101,7 @@ fn counters_reset_on_close_and_reopen() {
     // The reopen path does some work (reads superblocks, possibly writes
     // none). We pin the upper bound: post-reopen totals must be much
     // smaller than the first-session totals (which included a commit
-    // and therefore at least 2 fsyncs from the commit alone, plus the
+    // and therefore 3 fsyncs from the commit alone, plus the
     // create_new bootstrap fsyncs).
     assert!(
         c2.fsync_calls <= 1,
@@ -116,7 +121,17 @@ fn counters_snapshot_does_not_mutate_when_engine_continues() {
     let _ = db.allocate(b"x").unwrap();
     db.commit().unwrap();
 
-    // The original snapshot must not have moved.
+    // Comparing `snap` to its clone alone is a tautology (a clone taken
+    // before the work equals the original whether or not either moved), so
+    // first prove the engine's live counters DID advance. Only then does
+    // `snap` staying equal to `snap_copy` show it is a detached value.
+    let live = db.counters().unwrap();
+    assert!(
+        live.fsync_calls > snap.fsync_calls,
+        "commit must advance the live fsync counter; saw {} -> {}",
+        snap.fsync_calls,
+        live.fsync_calls,
+    );
     assert_eq!(
         snap, snap_copy,
         "ChiselCounters is a snapshot, not a live view"

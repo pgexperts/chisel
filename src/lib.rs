@@ -585,9 +585,8 @@ impl Chisel {
     ///
     /// The spillway, when engaged, adds zero additional fsyncs to
     /// this protocol (its content does not need to survive a crash).
-    /// `tests/spillway_integration.rs::no_spill_workload_preserves_two_fsync_commit`
-    /// pins the count to `== 3`; the test name retains the older
-    /// "two_fsync" label from the original spec.
+    /// `tests/spillway_integration.rs::no_spill_workload_preserves_three_fsync_commit`
+    /// pins the count to `== 3`.
     ///
     /// # Errors
     /// `NoActiveTransaction` if none is open — and that is the ONLY error this
