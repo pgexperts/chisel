@@ -312,8 +312,8 @@ impl ChiselError {
     /// block of the enum above. Adding a fatal variant without adding it here
     /// silently leaves it classified operational, so the manager would keep
     /// serving requests over questionable on-disk state — a durability hole,
-    /// not a compile error (the `#[non_exhaustive]` enum has no exhaustiveness
-    /// check to catch the omission).
+    /// not a compile error (`matches!` has no exhaustiveness check to catch
+    /// the omission; the in-crate `variant_table!` tests below are the guard).
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,

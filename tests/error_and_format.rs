@@ -14,7 +14,8 @@
 //   * named-root behaviour through a live handle: encode_root_name
 //     validation via set_root_name (empty, too-long, embedded NUL, and a
 //     happy-path max-length name), table-full and slot reuse, clear,
-//     and transactional revert on rollback, rollback_to, and reopen.
+//     transactional revert on rollback and rollback_to, and persistence
+//     across reopen.
 //
 // Page-module tests (checksum, layout constants) moved into src/page.rs's
 // test mod on 2026-05-22 as part of the I35 pub→pub(crate) reshape; they
