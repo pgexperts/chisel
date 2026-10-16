@@ -5,6 +5,12 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Default every job to a read-only token. Only publish-pypi needs more, and
+# its own job-level block (which replaces this one outright, not merges with
+# it) grants exactly id-token: write for Trusted Publishing.
+permissions:
+  contents: read
+
 jobs:
   # I59 (ISSUES.md, 2026-05-22): early cargo test gate so a broken tagged
   # commit fails fast instead of after the long wheel build.
@@ -13,6 +19,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      # GAP-3 (issue #126): first, and before the long build, refuse a tag
+      # whose version disagrees with the manifests the wheels and sdist take
+      # their version from. Tag runs only: a workflow_dispatch smoke-build
+      # from a branch has no release version to compare against.
+      - name: Tag matches the manifest versions
+        if: github.ref_type == 'tag'
+        env:
+          # Via env, never spliced into `run:` -- ${{ }} substitutes before
+          # the shell parses, so an interpolated tag would be command text.
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: .github/scripts/check-release-version.sh "$RELEASE_TAG"
       - uses: Swatinem/rust-cache@v2
       # `--release` compiles out #[cfg(debug_assertions)] tests (e.g.
       # page_cache::claim_page_asserts_on_dirty_page in page_cache.rs).
@@ -113,6 +130,25 @@ jobs:
       - name: Build sdist
         working-directory: python
         run: maturin sdist -o ../dist
+
+      # GAP-3 (issue #126): the wheels are import-tested by cibuildwheel, but
+      # the sdist was uploaded untested -- a missing source file or broken
+      # build config in it would surface only on a user's `pip install`.
+      # Build it from the tarball into a fresh venv (pip compiles the
+      # extension, hence the Rust toolchain step) and run the suite from
+      # outside the checkout, so `import chisel` resolves to the installed
+      # package and not to python/chisel in the source tree.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install the sdist and run the test suite against it
+        run: |
+          python -m venv "$RUNNER_TEMP/sdist-venv"
+          . "$RUNNER_TEMP/sdist-venv/bin/activate"
+          pip install --upgrade pip
+          pip install dist/*.tar.gz pytest hypothesis
+          cd "$RUNNER_TEMP"
+          python -c 'import chisel, sys; f = chisel.__file__; print(f); sys.exit(0 if "site-packages" in f else "chisel imported from outside the venv: " + f)'
+          pytest "$GITHUB_WORKSPACE/python/tests"
 
       - uses: actions/upload-artifact@v7
         with:

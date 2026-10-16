@@ -1,5 +1,9 @@
 [build-system]
-requires = ["maturin>=1.5,<2.0"]
+# 1.12 floor: the first release that both emits PEP 639 License-Expression /
+# License-File for the `license` / `license-files` keys below (1.9.2+) and can
+# build this workspace's sdist at all -- 1.11 and older abort on the README.md
+# the root crate and this package both contribute (maturin #2987).
+requires = ["maturin>=1.12,<2.0"]
 build-backend = "maturin"
 
 [project]
@@ -12,7 +16,19 @@ version = "1.0.0"
 description = "Python binding for the Chisel transactional storage engine"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+# PEP 639 form, so the wheel carries the license text (.dist-info/licenses/)
+# and METADATA gains License-Expression / License-File; the legacy
+# `{ text = ... }` table put only the word "MIT" in metadata and shipped no
+# license file in the wheel at all.
+#
+# python/LICENSE.txt is a copy of the repo-root LICENSE, needed because
+# license-files paths resolve relative to this file and may not climb out of
+# it; ci.yml's python job fails if the two drift apart. It is deliberately NOT
+# named plain LICENSE: maturin relocates this pyproject.toml to the sdist root,
+# where the root crate's own LICENSE already sits, and refuses the second file
+# at the same path ("was already added"), so the sdist would not build.
+license = "MIT"
+license-files = ["LICENSE.txt"]
 authors = [{ name = "Christophe Pettus" }]
 classifiers = [
   "Programming Language :: Python :: 3",

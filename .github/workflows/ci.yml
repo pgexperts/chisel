@@ -15,6 +15,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Every job here only reads the checkout; none posts comments, check runs,
+# or releases through GITHUB_TOKEN (artifact upload uses the runner's own
+# token, not this one). Pinning the token to read-only means a compromised
+# action or dependency build script cannot push to the repo, whatever the
+# repository's default token setting happens to be.
+permissions:
+  contents: read
+
 jobs:
   # TESTS-CI-6 (issue #110): matrixed over macOS as well as Linux. It was
   # ubuntu-only, and the engine's platform-sensitive surface is precisely the
@@ -120,14 +128,6 @@ jobs:
   # crates. That was a defensible call for a two-dependency tree; it is a more
   # substantial one now that the crate pulls a full crypto stack.
   #
-  # Permissions notes:
-  #   * `pull-requests: write` lets the action post per-line annotations
-  #     on PR runs.
-  #   * `checks: write` is needed on push-to-main runs — without it the
-  #     action's annotation-posting step trips "Resource not accessible
-  #     by integration" because GitHub restricts GITHUB_TOKEN's check-run
-  #     write scope on push events by default.
-  #
   # No `ignore:` list right now. The previous RUSTSEC-2025-0020 ignore
   # (pyo3 0.22.x PyString::from_object overflow) was removed when I75
   # landed and bumped pyo3 from 0.22 to 0.24 (patched in 0.24.1+). If
@@ -175,6 +175,69 @@ jobs:
       - name: Build chisel library with MSRV toolchain
         run: cargo build --verbose -p chisel-storage
 
+  # TESTS-CI-8 (issue #123): line/region coverage of the engine crate, so a
+  # coverage regression is at least visible per run (job summary + lcov
+  # artifact) rather than unmeasured.
+  #
+  # Report-only by design, following ADR 0023's pattern for bench.yml: the
+  # setup steps (checkout, toolchain, cache, tool install) are bare and gate,
+  # since a failure there means the job never ran and a green check would be
+  # a lie; every step from the instrumented run onward is step-level
+  # `continue-on-error: true`, so no coverage figure, report-rendering or
+  # upload failure can red the check. Job-level continue-on-error is not
+  # used: ADR 0023 rejected it for bench.yml because it would also hide the
+  # breakage that must still gate (there, a bench compile failure; here, a
+  # broken setup). A test failure under instrumentation is not lost
+  # either -- the `test` job gates on the same suite. There is deliberately
+  # no --fail-under threshold.
+  #
+  # Scoped to `-p chisel-storage`: --workspace would pull in chisel-py, a pyo3
+  # `extension-module` cdylib whose test binary cannot link without
+  # libpython, and bench/chisel-ffi coverage is not what this tracks.
+  #
+  # Tests run once (--no-report); both reports below are rendered from that
+  # single run's profile data.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Run tests under coverage instrumentation
+        continue-on-error: true
+        run: cargo llvm-cov --no-report -p chisel-storage
+
+      - name: Write lcov report
+        continue-on-error: true
+        run: cargo llvm-cov report -p chisel-storage --lcov --output-path lcov.info
+
+      - name: Summarize coverage in the job summary
+        continue-on-error: true
+        run: |
+          {
+            echo '### chisel-storage coverage'
+            echo '```'
+            cargo llvm-cov report -p chisel-storage
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: coverage-lcov
+          path: lcov.info
+
   # I58 (ISSUES.md, 2026-05-22): a dedicated `bench-tests` job once
   # ran `cd bench && cargo test --verbose` because bench/ was a
   # sibling crate (not workspace member), and `cargo test` from root
@@ -194,6 +257,13 @@ jobs:
         python-version: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v5
+
+      # python/LICENSE.txt exists only because PEP 639 license-files cannot
+      # reference a path outside python/, so the wheel's copy has to live
+      # there (python/pyproject.toml explains the name). Fail if it drifts
+      # from the canonical root LICENSE.
+      - name: python/LICENSE.txt matches the root LICENSE
+        run: cmp LICENSE python/LICENSE.txt
 
       - uses: dtolnay/rust-toolchain@stable
 
