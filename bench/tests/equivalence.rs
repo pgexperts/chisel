@@ -142,11 +142,12 @@ fn scenario_delete_and_allocate<E: Engine>(engine: &mut E) {
 // === Per-engine constructors ===
 
 fn make_chisel() -> ChiselEngine {
-    // 256 pages × 8 KiB = 2 MiB strict cache cap (no spillway in bench
-    // engines). Must be large enough for the largest single-tx allocation
-    // in any equivalence scenario: scenario_large_overflow allocates 1 MiB,
-    // which requires ~130 overflow pages plus handle-table and freemap COW
-    // pages. 256 pages gives comfortable headroom.
+    // 256 pages × 8 KiB = 2 MiB page-cache budget. This is not a hard cap on
+    // a transaction's dirty set: `open_in_memory` enables the spillway at
+    // 1024 × the cache budget (2 GiB here), so dirty pages beyond the cache
+    // spill rather than failing the transaction. So the cache size does not
+    // bound the largest single-tx allocation here (scenario_large_overflow's
+    // 1 MiB fits either way).
     ChiselEngine::open_in_memory(256).expect("open chisel")
 }
 
