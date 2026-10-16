@@ -8,7 +8,9 @@
 // Ordering note: Tests 14a and 14b exercise the core spill-then-commit and
 // spill-then-rollback paths. Test 15 guards against fsync regressions on
 // no-spill workloads. Tests 16a and 16b cover the opt-out (spillway disabled).
-// Test 17 covers crash recovery via the lazy-open truncate-on-open guarantee.
+// Test 17 covers crash recovery via the lazy-open discard-stale-sidecar
+// guarantee. The final test covers the encrypted on-disk sidecar: spilled
+// pages must reach `<db_path>.spillway` as ciphertext, never plaintext.
 
 use chisel::{Chisel, ChiselError, DrainInsertion, Options};
 
@@ -238,12 +240,16 @@ fn spillway_max_bytes_zero_creates_no_spillway_file() {
 
 #[test]
 fn crash_mid_spill_recovers_to_last_committed_state() {
-    // Design intent: Spillway::open_file uses `truncate(true)`, so any
-    // pre-existing content at the spillway path is discarded unconditionally
-    // on open. The spillway is lazy-opened on the FIRST spill (see
-    // ensure_spillway in page_cache.rs). We therefore need the post-crash
-    // reopen to actually trigger a spill — this forces ensure_spillway to run,
-    // which opens (and truncates) the garbage-filled spillway path.
+    // Design intent: Spillway::open_file creates the sidecar exclusively
+    // (`create_new`, i.e. O_EXCL, plus O_NOFOLLOW and mode 0600 on unix). A
+    // pre-existing entry is never adopted: if it is a plain file this user
+    // owns with a single link it is treated as crash debris, unlinked, and the
+    // file re-created fresh; a symlink, foreign-owned file, or extra hard link
+    // is refused as a plant (see reclaim_stale_sidecar in spillway.rs). The
+    // spillway is lazy-opened on the FIRST spill (see ensure_spillway in
+    // page_cache.rs). We therefore need the post-crash reopen to actually
+    // trigger a spill — this forces ensure_spillway to run, which discards the
+    // garbage-filled file left at the spillway path.
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -274,8 +280,8 @@ fn crash_mid_spill_recovers_to_last_committed_state() {
 
     // Step 3: reopen the database with a tiny cache so that the first
     // transaction definitely spills, forcing ensure_spillway to run.
-    // ensure_spillway calls Spillway::open_file which opens with
-    // truncate(true) — clearing the orphaned garbage from Step 2.
+    // ensure_spillway calls Spillway::open_file, which unlinks the orphaned
+    // garbage from Step 2 (a plain file we own) and creates a fresh sidecar.
     let cache_max_bytes = 4 * 8192; // 4 pages — tiny enough to force spill
     let opts = Options::default()
         .cache_max_bytes(cache_max_bytes)
@@ -291,7 +297,7 @@ fn crash_mid_spill_recovers_to_last_committed_state() {
 
     // Step 4: the spillway file must now exist (lazily opened by the spill)
     // but be empty (truncated at commit). The garbage from Step 2 is gone —
-    // open_file's truncate(true) discarded it when ensure_spillway ran.
+    // open_file discarded it and re-created the file when ensure_spillway ran.
     let post_recovery_size = std::fs::metadata(&spillway_path)
         .map(|m| m.len())
         .unwrap_or(0);
@@ -372,4 +378,105 @@ fn stats_exposes_spillway_capacity_across_lifecycle() {
         Some(spillway_cap),
         "max_bytes is unchanged across commit"
     );
+}
+
+// I159 (#147): the encrypted spill path on the PRODUCTION backing. The
+// page_cache.rs unit tests cover encrypted spills only against
+// SpillwayLocation::InMemory, and every other test in this file is plaintext;
+// `Chisel::open` always uses SpillwayLocation::Path, so nothing else checks that
+// the on-disk `<db_path>.spillway` sidecar holds ciphertext. The sidecar is
+// truncated at commit, so the plaintext scan must run while the spilling
+// transaction is still open.
+#[test]
+fn encrypted_spill_writes_only_ciphertext_to_sidecar() {
+    use chisel::Key;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    // A raw key avoids the Argon2id cost; key derivation is upstream of the
+    // page cipher and does not change what the spill path writes.
+    fn key() -> Key {
+        Key::raw(vec![0x5A; 32])
+    }
+
+    // 16 bytes that will not occur by chance in AEAD output. Values are this
+    // unit repeated, so any plaintext page carrying part of a value contains at
+    // least one complete copy; searching for the whole unit (not a single byte)
+    // keeps a random ciphertext match out of reach.
+    const SENTINEL: &[u8; 16] = b"#SPILL-SENTINEL#";
+    fn value(i: usize) -> Vec<u8> {
+        // Prefix the index so each value is distinct (a mis-mapped handle on
+        // reopen would compare unequal) without breaking the repeated unit.
+        let mut v = (i as u64).to_le_bytes().to_vec();
+        v.extend(SENTINEL.repeat(256));
+        v
+    }
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    let dir = tempdir().unwrap();
+    let db_path: PathBuf = dir.path().join("enc-spill.chisel");
+    let spillway_path: PathBuf = {
+        let mut p = db_path.as_os_str().to_owned();
+        p.push(".spillway");
+        PathBuf::from(p)
+    };
+
+    // Same spill recipe as Task 17: a 4-page cache against 20 values of ~4 KiB
+    // overflows the dirty cap well before the loop ends.
+    let cache_max_bytes = 4 * 8192;
+    let opts = Options::default()
+        .cache_max_bytes(cache_max_bytes)
+        .spillway_max_bytes(1024 * cache_max_bytes)
+        .encryption_key(key());
+    let mut db = Chisel::open(&db_path, opts).unwrap();
+
+    db.begin().unwrap();
+    let mut handles = Vec::new();
+    for i in 0..20 {
+        let v = value(i);
+        handles.push((db.allocate(&v).unwrap(), v));
+    }
+
+    // Non-vacuity: the engine must actually have spilled, to the on-disk
+    // sidecar, before the absence of the sentinel means anything.
+    let logical = db.stats().unwrap().spillway_logical_bytes;
+    assert!(
+        logical.is_some_and(|b| b > 0),
+        "workload must spill mid-transaction; spillway_logical_bytes = {logical:?}"
+    );
+    let sidecar = std::fs::read(&spillway_path).expect("sidecar must exist after a spill");
+    assert!(!sidecar.is_empty(), "sidecar must hold the spilled pages");
+    assert!(
+        !contains(&sidecar, SENTINEL),
+        "plaintext value bytes found in the encrypted spillway sidecar ({} bytes)",
+        sidecar.len()
+    );
+
+    // Drain copies the sealed blobs verbatim into the main file; nothing there
+    // may be plaintext either.
+    db.commit().unwrap();
+    drop(db);
+    let main = std::fs::read(&db_path).unwrap();
+    assert!(
+        !contains(&main, SENTINEL),
+        "plaintext value bytes found in the encrypted main file"
+    );
+
+    // Every value survives spill → drain → reopen with the key.
+    let db = Chisel::open(
+        &db_path,
+        Options::default()
+            .create_if_missing(false)
+            .encryption_key(key()),
+    )
+    .unwrap();
+    for (h, expected) in &handles {
+        assert_eq!(
+            &db.read(*h).unwrap(),
+            expected,
+            "handle {h} content corrupt"
+        );
+    }
 }
