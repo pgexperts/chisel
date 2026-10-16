@@ -467,11 +467,11 @@ if db.is_poisoned:
 
 ## Thread safety
 
-Calls into a `Chisel` instance are **serialized**, not concurrent. Every per-operation method holds the GIL for its whole duration and takes an internal `Mutex`, so two threads calling the same instance at once cannot corrupt memory or interleave partway through an operation — a concurrent `read()` from several threads is safe and is covered by the test suite.
+Calls into a `Chisel` instance are **serialized**, not concurrent. Every method that reaches the engine takes an internal lock for its whole duration, so two threads calling the same instance at once cannot corrupt memory or interleave partway through an operation — concurrent reads, and reads alongside another thread's commits, are safe and are covered by the test suite.
 
 What is *not* safe is sharing **transaction state** across threads. There is one active transaction per instance, so two threads must not interleave transactions on the same `Chisel`: thread A's `commit()` will commit thread B's writes, and a `Savepoint` or `Transaction` object is not meaningful outside the thread that is driving it. Either confine a transaction to one thread, or use one instance per thread (the underlying Rust `Chisel` is `Send`, so an instance can also be handed from one thread to another).
 
-The consequence to plan for is **latency, not safety**: only `chisel.open()` releases the GIL. Every other call holds it, so a long-running engine operation — a large commit's three fsyncs, a big `defrag()` — blocks *all* other Python threads in the process for its duration, not just threads touching this database. If that matters, keep such operations off threads that are servicing latency-sensitive work.
+Engine calls **release the GIL** while they run — `chisel.open()`, `chisel.rekey()`, `close()`, and every method on `Chisel`, `Transaction`, and `Savepoint` that reaches the engine. A long-running operation such as a large commit's three fsyncs, a big `defrag()`, or a passphrase `add_key()` / `rotate_key()` / `remove_key()` (each passphrase derivation is a deliberately slow Argon2id run) therefore does not stall other Python threads. Other threads calling into the *same* `Chisel` wait on its internal lock until the operation finishes; threads doing unrelated Python work, or using a different instance, keep running.
 
 ## In-memory mode
 

@@ -16,7 +16,9 @@
 // near-zero uncontended cost and still allows the cross-thread HANDOFF
 // the engine supports (a handle migrating between threads, one writer at
 // a time — see test_threading.py), which `unsendable` would have
-// forbidden. The full rationale lives on the `inner` field below.
+// forbidden. The full rationale lives on the `inner` field below. Since
+// I156 the Mutex is also the ONLY serialization point: every engine call
+// releases the GIL before taking it (see `with_inner_io`).
 //
 // Re-entry hazard (ISSUES.md I21): a SAME-THREAD re-entry — e.g. a future
 // engine API that takes a Python callback, dispatches into Python while
@@ -25,9 +27,10 @@
 // panic as the old RefCell did. Both are noisy at the point of misuse. No
 // such callback API exists today — every public method takes Python
 // values and returns them; no engine callback escapes back into Python.
-// If one is introduced, either wrap each `lock()` in `try_lock()` and
-// raise an explicit reentrancy error, or release the lock before calling
-// back into Python.
+// Such a callback would also have to re-attach to the GIL while holding
+// the lock, which breaks the detach-then-lock order and can deadlock
+// across threads too. If one is introduced, release the lock before
+// calling back into Python.
 //
 // Lifetime pinning: PyTransaction and PySavepoint each hold a
 // `Py<PyChisel>` (a strong Python reference), so the Rust-side
@@ -94,23 +97,24 @@ pub struct PyChisel {
     //
     // I75 (ISSUES.md, 2026-05-22): Mutex (not RefCell) because PyO3
     // 0.24+ requires `#[pyclass]` types to be Sync. RefCell is !Sync;
-    // Mutex provides Sync at near-zero uncontended cost. The
-    // GIL+Python-level serialization argument from the original
-    // pre-I75 design is still true at the Python level, but PyO3 0.24
+    // Mutex provides Sync at near-zero uncontended cost. PyO3 0.24
     // enforces Sync as a *compile-time* property the GIL cannot
-    // satisfy. Mutex also preserves the cross-thread-handoff use case
-    // (test_threading.py asserts a Chisel handle can migrate between
-    // threads — single-writer migration, not concurrent access),
-    // which the `unsendable` annotation would have forbidden.
+    // satisfy. Since I156 engine calls run with the GIL released, so
+    // this Mutex is what actually serializes them (lock order: see
+    // `with_inner_io`). Mutex also preserves the cross-thread-handoff
+    // use case (test_threading.py asserts a Chisel handle can migrate
+    // between threads), which the `unsendable` annotation would have
+    // forbidden.
     //
     // I21 (still relevant): same-thread re-entry on the lock would
     // deadlock (std::sync::Mutex is non-reentrant) rather than
     // panicking as RefCell did. The bug-surfacing property is
     // preserved — both forms are noisy at the point of misuse. No
     // current API surface invites such re-entry; if a future callback
-    // API is added, either wrap each `lock()` in `try_lock()` and
-    // raise an explicit reentrancy error, or release the lock before
-    // calling back into Python.
+    // API is added, release the lock before calling back into Python.
+    // (`try_lock()` is no longer a reentrancy detector: with the GIL
+    // released, a held lock usually just means another thread is
+    // mid-call.)
     inner: Mutex<Option<Chisel>>,
 }
 
@@ -296,13 +300,19 @@ impl PyChisel {
         // Drop the engine; this releases the flock and closes the file.
         // Safe to call repeatedly — second call is a no-op.
         //
-        // Note: this runs Drop on the inner Chisel while the GIL is
-        // held. That is intentional — if a Drop impl ever needs to
-        // report an error (currently none do), it must go through the
-        // Chisel::close method. An in-flight transaction is silently
-        // discarded by shadow paging; the last committed state remains
-        // durable on disk.
-        let _ = self.inner.lock().unwrap_or_else(|e| e.into_inner()).take();
+        // Runs detached like every engine call (I156): Drop does file
+        // I/O, and if another thread is mid-call this waits on the Mutex
+        // until that call finishes — with the GIL held, the wait would
+        // freeze every Python thread for the length of the other call.
+        // The engine is dropped inside the closure, under the Mutex: a
+        // returned Option<Chisel> would be dropped back on the GIL side,
+        // and holding the lock through the drop means a thread queued
+        // behind close() sees None (ClosedError), never a half-dropped
+        // engine. Errors from Drop are not reportable (currently none
+        // are produced); an in-flight transaction is silently discarded
+        // by shadow paging and the last committed state remains durable
+        // on disk.
+        self.locked(|slot| drop(slot.take()));
         Ok(())
     }
 
@@ -319,11 +329,14 @@ impl PyChisel {
 
     #[getter]
     fn is_poisoned(&self) -> bool {
-        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_ref() {
+        // Cheap once the lock is held, but detached anyway: a health
+        // check polled from another thread would otherwise sit on the
+        // GIL for as long as a concurrent commit or key operation holds
+        // the Mutex (I156).
+        self.locked(|slot| match slot.as_ref() {
             Some(c) => c.is_poisoned(),
             None => true, // closed == poisoned from the caller's POV
-        }
+        })
     }
 
     fn begin(&self) -> PyResult<()> {
@@ -635,44 +648,75 @@ impl PyChisel {
 
     // These two helpers are the ONLY place the closed/poisoned
     // distinction collapses to its typed errors — callers above never
-    // see a bare None. We intentionally do NOT release the GIL around
-    // the engine call: Chisel owns `Cell<bool>` internally so `&Chisel`
-    // is not `Sync`, and the single-client embedded design means
-    // there is no concurrent Python work to overlap with anyway (see
-    // MEMORY: project_chisel_single_client_design). The GIL prevents
-    // CROSS-THREAD re-entry into the RefCell, but not same-thread
-    // re-entry through a hypothetical future callback API — see the
-    // module-level I21 note at the top of this file.
+    // see a bare None.
     //
-    // Consequence: long-running engine calls (e.g. a large commit's
-    // fsync, a big defrag) will block ALL other Python threads in this
-    // process. `open()` itself does release the GIL around the initial
-    // filesystem setup — see the `py.detach` there — but per-op calls do
-    // not. If future work wants to overlap Python work with Chisel I/O,
-    // the fix is (a) make Chisel's interior state Sync-safe and release
-    // the GIL here via `Python::detach`, or (b) move the GIL release into
-    // the engine layer. The GIL is held at every call site today, so these
-    // helpers take no `Python` token.
-    fn with_inner_io<R>(&self, f: impl FnOnce(&Chisel) -> chisel::Result<R>) -> PyResult<R> {
-        // Recover from a poisoned Mutex rather than panicking. The engine never
-        // panics while holding the lock (fatal conditions return
-        // ChiselError::Poisoned, surfaced to Python as PoisonedError), so the
-        // Mutex should never poison; but if some future engine debug_assert or
-        // panic ever did fire under the lock, `into_inner()` degrades to the
-        // normal poisoned-engine path instead of bricking every subsequent call
-        // (including close() and is_poisoned()) with a PanicException.
-        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let c = guard.as_ref().ok_or_else(closed_err)?;
-        f(c).map_err(to_py_err)
+    // I156 (#144): every engine call releases the GIL. Commit (three
+    // fsyncs), defrag, and the key-slot operations (a passphrase
+    // add_key / rotate_key / remove_key runs one or two deliberately
+    // slow Argon2id derivations, 19 MiB, t=2) would otherwise freeze
+    // every Python thread in the process, not just threads using this
+    // handle.
+    // The engine Mutex, not the GIL, is what serializes calls on one
+    // handle; Chisel only has to be Send for that (Mutex<T: Send> is
+    // Sync), which open() already relies on when it moves a fresh
+    // engine across its own detach.
+    //
+    // Lock order — the invariant that keeps this deadlock-free: detach
+    // FIRST, then lock, call, and unlock entirely inside the detached
+    // closure (see `locked`). A thread therefore never waits for the
+    // Mutex while holding the GIL, and never waits for the GIL while
+    // holding the Mutex. The tempting alternative — lock under the GIL,
+    // then detach around just the engine call — inverts that: thread A
+    // holds the Mutex and blocks re-attaching while thread B holds the
+    // GIL and blocks on the Mutex. For the same reason nothing inside
+    // the closure may call `Python::attach`. The `Send` bounds keep
+    // `Bound`/`Python` out of it, but a captured `Py<T>` is `Send`, so
+    // this is a convention, not a compile-time guarantee. In particular
+    // `to_py_err` attaches, which is why errors are converted to Python
+    // exceptions only after `locked` returns.
+    //
+    // The helpers take no `Python` token so that the ~55 call sites
+    // (PyChisel, PyTransaction, PySavepoint) keep their signatures;
+    // `locked` obtains one with `Python::attach`, which is a cheap
+    // thread-local check because the GIL is already held at every call
+    // site.
+    fn with_inner_io<R: Send>(
+        &self,
+        f: impl FnOnce(&Chisel) -> chisel::Result<R> + Send,
+    ) -> PyResult<R> {
+        self.locked(|slot| slot.as_ref().map(f))
+            .ok_or_else(closed_err)?
+            .map_err(to_py_err)
     }
 
-    fn with_inner_mut_io<R>(
+    fn with_inner_mut_io<R: Send>(
         &self,
-        f: impl FnOnce(&mut Chisel) -> chisel::Result<R>,
+        f: impl FnOnce(&mut Chisel) -> chisel::Result<R> + Send,
     ) -> PyResult<R> {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let c = guard.as_mut().ok_or_else(closed_err)?;
-        f(c).map_err(to_py_err)
+        self.locked(|slot| slot.as_mut().map(f))
+            .ok_or_else(closed_err)?
+            .map_err(to_py_err)
+    }
+
+    /// Release the GIL, then run `f` on the engine slot under the Mutex.
+    /// The guard is dropped before `detach` returns, so the GIL is
+    /// re-acquired only after the Mutex is free (lock order above).
+    fn locked<T: Send>(&self, f: impl FnOnce(&mut Option<Chisel>) -> T + Send) -> T {
+        let inner = &self.inner;
+        Python::attach(|py| {
+            py.detach(|| {
+                // Recover from a poisoned Mutex rather than panicking. The
+                // engine never panics while holding the lock (fatal conditions
+                // return ChiselError::Poisoned, surfaced to Python as
+                // PoisonedError), so the Mutex should never poison; but if some
+                // future engine debug_assert or panic ever did fire under the
+                // lock, `into_inner()` degrades to the normal poisoned-engine
+                // path instead of bricking every subsequent call (including
+                // close() and is_poisoned()) with a PanicException.
+                let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                f(&mut guard)
+            })
+        })
     }
 }
 
