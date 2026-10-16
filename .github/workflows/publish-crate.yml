@@ -6,6 +6,12 @@ on:
   release:
     types: [published]
 
+# Default every job to a read-only token. `publish` declares its own block,
+# which replaces this one outright (job-level permissions do not merge), so it
+# lists contents: read alongside id-token: write.
+permissions:
+  contents: read
+
 jobs:
   # Mirrors wheels.yml's cargo-test-gate: a GitHub Release can in principle be
   # cut against a commit that never went through ci.yml (e.g. a hand-pushed
@@ -18,6 +24,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      # GAP-3 (issue #126): the release's tag must name the version being
+      # published. Without this, a release cut from a tag that predates the
+      # version bump would publish whatever Cargo.toml says under the wrong
+      # tag -- or fail late, at the irreversible step, on an
+      # already-published version.
+      - name: Release tag matches the manifest versions
+        env:
+          # Via env, never spliced into `run:` (script-injection hygiene; see
+          # swift-release.yml's upload step for the full rationale).
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: .github/scripts/check-release-version.sh "$RELEASE_TAG"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
       - name: Install cargo-audit

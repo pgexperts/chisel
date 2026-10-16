@@ -6,6 +6,12 @@ on:
   release:
     types: [published]
 
+# Default every job to a read-only token. `upload` declares its own block,
+# which replaces this one outright, granting contents: write for the release
+# asset (write implies read, so its checkout still works).
+permissions:
+  contents: read
+
 jobs:
   # A release can be cut against a commit that never went through swift.yml
   # (a hand-pushed tag), so re-verify rather than trusting the release event.
@@ -14,6 +20,35 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      # The version check reads pyproject.toml with tomllib (3.11+); the
+      # macOS image's system python3 is not guaranteed to be that new.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # GAP-3 (issue #126), checked before the long xcframework build.
+      #
+      # ADR 0031: a consumer pinning this tag resolves the tag's own
+      # Package.swift, so its binary-target url must already name this tag's
+      # asset -- swift/release/prepare.sh writes it before tagging. The
+      # checksum gate in `upload` cannot catch a stale url: a manifest still
+      # pointing at the previous release's download would pass it whenever
+      # the checksum line was updated, and consumers would fetch the wrong
+      # (or a missing) zip.
+      - name: Release tag matches the manifest versions and Package.swift url
+        env:
+          # Via env, never spliced into `run:` (see the upload step below).
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          .github/scripts/check-release-version.sh "$RELEASE_TAG"
+          EXPECTED="url: \"https://github.com/pgexperts/chisel/releases/download/$RELEASE_TAG/Chisel.xcframework.zip\""
+          if ! grep -qF "$EXPECTED" Package.swift; then
+            echo "::error::Package.swift's binaryTarget url does not name the release tag '$RELEASE_TAG'."
+            echo "::error::Expected: $EXPECTED"
+            echo "::error::Found:    $(grep -oE 'url: \"[^\"]*\"' Package.swift || echo '<no url line>')"
+            echo "::error::Run swift/release/prepare.sh $RELEASE_TAG, commit, and move the tag."
+            exit 1
+          fi
+          echo "ok        Package.swift url names $RELEASE_TAG"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p chisel-ffi
       - name: Build xcframework
