@@ -44,7 +44,7 @@
 //        flushed by `cache.flush()` in commit phase 1 BEFORE the superblock
 //        swap in phase 2 — this is what makes shadow paging crash-safe.
 //
-// Handle allocation policy (enforced by transaction.rs, not this module):
+// Handle allocation policy (enforced by the transaction/ module, not this module):
 // handles are monotonic from `next_handle`, starting at 1 (handle 0 is
 // reserved as the "no handle" sentinel), and are never reused ONCE
 // COMMITTED. Delete writes a tombstone entry (HandleFlags::Deleted) in
@@ -107,7 +107,7 @@ const MAX_DEPTH: u32 = 6;
 // page type puts its version at byte 1 (the offset is dispatched on
 // PageType wherever a reader needs it).
 const FLAG_LEAF: u8 = 0x01;
-// I50 (ISSUES.md, 2026-05-22): `pub(crate)` so transaction.rs's
+// I50 (ISSUES.md, 2026-05-22): `pub(crate)` so transaction/recovery.rs's
 // open_existing depth-walk can match against the named constant
 // instead of a raw `0x02` literal. The on-disk flag value is part of
 // the format and must stay in lockstep with FLAG_LEAF.
@@ -215,7 +215,7 @@ impl HandleTable {
     ///
     /// Read-only: walks the tree without touching any page. Safe to call on
     /// either `committed_roots` or `current_roots` — this is how
-    /// transaction.rs serves reads from outside an active transaction.
+    /// the transaction/ module serves reads from outside an active transaction.
     pub fn lookup(
         &self,
         cache: &mut PageCache,
@@ -586,7 +586,7 @@ impl HandleTable {
 
     /// Companion to `set_depth`. Production code reconstructs depth via
     /// `recover_depth` (at open and on each rollback) and stores it via
-    /// `set_depth`; the handle-table insert path in transaction.rs reads
+    /// `set_depth`; the handle-table insert path in transaction/mutate.rs reads
     /// it back to snapshot the pre-mutation descent depth for rollback
     /// (see `saved_ht_depth`). Also handy for forensic / debug-print use.
     pub fn depth(&self) -> u32 {

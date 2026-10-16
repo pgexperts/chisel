@@ -2,7 +2,7 @@
 // Chisel::stats() and Chisel::counters() for observability: handle count,
 // page count, raw file size, and the cumulative engine-activity counters.
 // Defined as its own module so that lib.rs and the public API don't have to
-// pull in transaction.rs just to expose these numbers.
+// pull in transaction/ just to expose these numbers.
 //
 // Layer 1 despite reading like a top-of-stack observability concern: this
 // module has no `use` statements at all, and layers are assigned by
@@ -18,7 +18,7 @@
 /// Read-only summary of database size/usage. Populated by the transaction
 /// manager; no methods here because there are no invariants to enforce.
 ///
-/// I36 (ISSUES.md, 2026-05-22): `#[non_exhaustive]` so adding a fifth
+/// I36 (ISSUES.md, 2026-05-22): `#[non_exhaustive]` so adding a future
 /// summary field (e.g. live-handle/total-handle ratio for retirement
 /// pressure) is not a breaking change. The companion `ChiselCounters`
 /// has carried the same attribute since the bench-suite series landed.

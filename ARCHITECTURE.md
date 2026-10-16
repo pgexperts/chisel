@@ -130,12 +130,12 @@ flowchart BT
 | 1 | `handle.rs` | Public `Handle` (`u64`) and `Tag` (`NonZeroU32`) newtypes for the API surface. | `#[repr(transparent)]` on `Handle` is load-bearing — the bench adapter transmutes `&[u64]` → `&[Handle]` (I120/I126). Lives ABOVE the engine; the engine stays raw-integer. |
 | 1 | `stats.rs` | Two snapshot structs: `Stats` (`handle_count`, `total_pages`, `file_size_bytes`, spillway bytes) and `ChiselCounters` (cache hits/misses, pages allocated, fsync calls — cumulative-from-open engine activity). | Both are point-in-time snapshots, not live views. `ChiselCounters` is `#[non_exhaustive]` so future counters can be added without a breaking change. Layer 1 because the module has zero imports (issue #161) — its consumers, `PageCache` at layer 3 and `TransactionManager` at layer 6, are therefore reading downward, which is what "`PageCache::counters()` aggregates the four counters" below has always described. |
 | 1 | `crypto/mod.rs` | At-rest crypto core: XChaCha20-Poly1305 `PageCipher` (page + body seal/open), envelope KDF (HKDF-SHA256 raw / Argon2id passphrase), DEK wrap/unwrap, zeroizing `Key`/`Argon2Params`. | Standalone — touches no engine layer. Only vetted RustCrypto primitives; all randomness OS-sourced. `ENC_PAGE_SIZE = 8232`, `NONCE_LEN = 24`, `TAG_LEN = 16`, `DEK_LEN = 32`. |
-| 1 | `superblock/` (`mod.rs` + `crypto_header.rs`) | In-memory `Superblock` struct, `serialize`/`deserialize`, `select()` across N candidate slots; `crypto_header.rs` holds the plaintext crypto-header + 8-slot key-slot table and the sealed-body decrypt path. | Magic + checksum + `superblock_count ∈ 2..=16` filter slots before tie-breaking by `txn_counter`. Encrypted DBs seal the sensitive body under the DEK. |
+| 1 | `superblock/` (`mod.rs` + `crypto_header.rs`) | In-memory `Superblock` struct, `serialize`/`deserialize`, slot selection across N candidates (production: inlined in `open_existing`; `select()` is its `#[cfg(test)]` mirror); `crypto_header.rs` holds the plaintext crypto-header + 8-slot key-slot table and the sealed-body decrypt path. | Magic + checksum + `superblock_count ∈ 2..=16` filter slots before tie-breaking by `txn_counter`. Encrypted DBs seal the sensitive body under the DEK. |
 | 2 | `page_io.rs` | Raw `pread`/`pwrite` of fixed-**stride** pages, exclusive `flock`, `fsync`, in-memory `Vec<u8>` backing. Tracks cumulative successful `fsync_calls` via `Cell<u64>`. Stride = `PAGE_SIZE` (plaintext) or `ENC_PAGE_SIZE` (encrypted), set once via `set_stride`. | The **only** module that touches the filesystem; crypto-agnostic (moves `stride`-byte blobs at `page_id * stride`). |
 | 2 | `lru.rs` | O(1) intrusive doubly-linked LRU index over `u64` page ids (`FxHashMap`-backed, I77). | Replaces the O(n) `VecDeque::retain` LRU; consumed only by `page_cache`. |
 | 3 | `page_cache.rs` | LRU cache over `PageIo`, dirty tracking, checksum validation on load, `PageCipher` seal/open at the I/O boundary, spillway overflow, `CacheFull`/`SpillwayFull` errors. Owns three `Cell<u64>` engine-activity counters (cache hits/misses, pages allocated) and aggregates them with `PageIo::fsync_count` into `counters()`. Defines `DrainInsertion` (re-exported by `lib.rs`), the drain-phase LRU placement policy. | Strict cap at `max_pages` — dirty pages are pinned against eviction and spill to the sidecar rather than growing the cache (cap = `spillway_max_bytes`, which bounds the spillway's LIVE resident set, not the sidecar file's length); `CacheFull` at `max_pages` when the spillway is disabled (`spillway_max_bytes=0`); checksums verified on disk LOAD only. |
 | 3 | `spillway.rs` | Sidecar `<db>.spillway` file for dirty pages the LRU is forced to spill. Per-slot XXH3 over `page_id ‖ payload`; crypto-agnostic (plaintext 8192-byte page or sealed 8232-byte blob). | Never `fsync`ed; truncated at commit/rollback and re-created at open — its content is always discardable uncommitted state. Created `O_EXCL | O_NOFOLLOW` mode 0600; a pre-existing entry is unlinked only if it is a plain file this uid owns (see "File permissions" below). |
-| 4 | `freemap.rs` | Single-page bitmap primitive: `allocate_first` / `mark_free` on one `[u8; PAGE_SIZE]` buffer. | Pure buffer manipulation; no cache or I/O. Composed into the multi-page tree by `freemap_tree.rs`. |
+| 4 | `freemap.rs` | Single-page bitmap primitive on one `[u8; PAGE_SIZE]` buffer: `first_free_bit_from` (non-mutating lowest-free finder) + `clear_bit` (claim), `mark_free` (reclaim), `is_free` (read-only query). | Pure buffer manipulation; no cache or I/O. Composed into the multi-page tree by `freemap_tree.rs`. |
 | 4 | `freemap_tree.rs` | COW radix tree of FreeMap leaves; the full multi-page freemap. | All structural COW pages sourced out-of-band (never from the bitmap); session-COW dedup (one COW per node per commit). |
 | 4 | `data_page.rs` | Slotted page layout (R1): slot directory grows forward, packed value data grows backward. The directory is append-only — nothing is ever reclaimed within a page. | Slot indices are immutable for the page's lifetime; the handle table stores `(page_id, slot_index)` and relies on it. There is no intra-page compaction: reclamation is whole-page. |
 | 4 | `overflow.rs` | Singly-linked overflow chains for values > inline threshold. | `total_length` repeated on every chain page; `next_page == 0` terminates; cycle detection bounded by `total_length / OVERFLOW_PAYLOAD` (I14). |
@@ -191,7 +191,7 @@ sequenceDiagram
 |---|---|
 | Before the first flush | No durable change; the previous committed superblock is still active; the transaction is simply lost. |
 | Between flush #1/#2 and persist_freemap completion | Some new pages on disk are unreferenced (orphans); the previous committed superblock still wins on next open; orphans get truncated or overwritten by the next allocation (see I4). |
-| During the superblock write (slot torn) | The N-1 other slots still hold valid earlier states; `Superblock::select` ignores the torn slot (checksum fails) and picks the highest valid surviving counter. |
+| During the superblock write (slot torn) | The N-1 other slots still hold valid earlier states; recovery ignores the torn slot (checksum fails) and picks the highest valid surviving counter. |
 | Between superblock write and fsync #3 | The kernel may have buffered the new superblock; a crash here means the buffer never reached disk, recovery picks the previous superblock — transaction lost cleanly. |
 | Anywhere, on `fsync` failure | The `TransactionManager` is poisoned. Per Linux fsyncgate (post-2018), a failed `fsync()` cannot be safely retried — the kernel may have discarded the dirty pages already. Recovery is `close()` + reopen, which runs the same shadow-paging recovery and returns the database to its last-durable state. (See I1.) |
 
@@ -207,7 +207,7 @@ sequenceDiagram
     participant L as lib.rs Chisel::open
     participant IO as page_io::PageIo
     participant TM as TransactionManager::open_existing
-    participant SB as Superblock::select
+    participant SB as Superblock::deserialize
 
     U->>L: open(path, options)
     L->>L: validate options.superblock_count ∈ 2..=16
@@ -321,9 +321,9 @@ bytes        | field                              | type
 Bytes **324..8184** are conditional on whether the database is encrypted:
 
 - **Plaintext DB:** the whole range is reserved (zeroed for forward compat), and every sensitive body field above (root pointers, `total_pages`, `next_handle`, `freemap_depth`, `named_roots`) is stored in plaintext at its offset.
-- **Encrypted DB:** bytes **324..1356** hold the plaintext crypto-header + 8-slot key-slot table (8-byte prefix at 324..332, slots at 332..1356). The sensitive body fields are NOT plaintext — they are **sealed under the DEK** as a `nonce ‖ tag ‖ ciphertext` sub-blob. The plaintext portion (magic, format version, txn counter, page size, superblock count, crypto-header) retains its XXH3 checksum so `select()` still works before any decryption. See the [On-disk encryption](#on-disk-encryption) subsection for the exact key-slot record layout.
+- **Encrypted DB:** bytes **324..1356** hold the plaintext crypto-header + 8-slot key-slot table (8-byte prefix at 324..332, slots at 332..1356). The sensitive body fields are NOT plaintext — they are **sealed under the DEK** as a `nonce ‖ tag ‖ ciphertext` sub-blob. The plaintext portion (magic, format version, txn counter, page size, superblock count, crypto-header) retains its XXH3 checksum so slot selection still works before any decryption. See the [On-disk encryption](#on-disk-encryption) subsection for the exact key-slot record layout.
 
-`Superblock::select` reads up to `MAX_SUPERBLOCKS` (= 16) candidate pages, calls `deserialize` on each (which fails fast on bad checksum / wrong magic / out-of-range `superblock_count`), and `max_by_key`s on `txn_counter`. Ties break by lowest slot index (deterministic but rare in practice — only seen during the `create_new` seeding window before the first user commit).
+Recovery (`TransactionManager::open_existing`) reads up to `MAX_SUPERBLOCKS` (= 16) candidate pages, calls `deserialize` on each (which fails fast on bad checksum / wrong magic / out-of-range `superblock_count`), and `max_by_key`s on `txn_counter`, keeping the winning raw buffer for `decrypt_body`. `Superblock::select` is the `#[cfg(test)]` mirror of the same filter_map + max_by_key. `max_by_key` returns the LAST maximum, so ties break by highest slot index (deterministic but rare in practice — only seen during the `create_new` seeding window before the first user commit).
 
 The `superblock_count` field being **in every slot** is what lets `open_existing` discover N at recovery time without out-of-band metadata: read the first MAX_SUPERBLOCKS pages blindly, the winning slot tells you N. Higher N (3..16) trades 8 KB per slot for survival of consecutive torn writes (see R4).
 
@@ -388,7 +388,7 @@ bytes              | field                         | type
 
 Repeating `total_length` on every chain page lets any page answer "how big is this value?" without walking the chain. `next_page == 0` is a safe terminator because page 0 is always a superblock — it cannot be a legitimate overflow target.
 
-Cycle detection in `read`/`delete` bounds the walk by `total_length / OVERFLOW_PAYLOAD` (I14): a corrupt chain that loops forever cannot exceed the number of pages required to store the advertised total length, so the walker returns `CorruptPage` rather than spinning.
+Cycle detection in `read`/`collect_chain_pages` bounds the walk by `total_length / OVERFLOW_PAYLOAD` (I14): a corrupt chain that loops forever cannot exceed the number of pages required to store the advertised total length, so the walker returns `CorruptPage` rather than spinning.
 
 ### Handle table pages
 
@@ -518,7 +518,7 @@ bytes              | field                         | type
 8184..8192         | XXH3 checksum                 | u64 LE
 ```
 
-`allocate_first` returns the lowest free page id by scanning bytes for non-zero values and using `trailing_zeros` to find the bit.
+`first_free_bit_from(buf, lo)` returns the lowest free bit `>= lo` by scanning bytes for non-zero values and using `trailing_zeros` to find the bit; it does not mutate. Claiming is a separate step: `FreeMapTree::allocate_first` picks the bit with `first_free_bit_from`, then `clear_bit` marks it in use. `mark_free` sets a bit on reclaim, and `is_free` is the read-only query behind `FreeMapTree::is_free` (used by the defrag orphan sweep, `FreemapRecycle::reclaim_orphans`).
 
 ```text
 FreeMapInterior page (PageType = 0x07)
@@ -625,7 +625,7 @@ Slot packing (R1) means a single data page can hold many small values. Freeing a
 
 ### Freemap reclamation
 
-Free pages enter the freemap during commit's `persist_freemap`: the transaction's `txn_freed_pages` (collected from `delete()` calls) are marked free in the COW radix tree, touching (and COW-rewriting) only the leaves and spine nodes that cover the freed ids. Subsequent transactions then prefer freemap-reuse over file extension — `freemap::cow_alloc`, reached through `FreemapRecycle::cow_alloc_into`, tries `FreeMapTree::allocate_first` first and falls back to `cache.new_page` if the freemap is empty or exhausted.
+Free pages enter the freemap during commit's `persist_freemap`: the transaction's `txn_freed_pages` (collected from the delete/update paths, including overflow chains via `Overflow::collect_chain_pages`) are marked free in the COW radix tree, touching (and COW-rewriting) only the leaves and spine nodes that cover the freed ids. Subsequent transactions then prefer freemap-reuse over file extension — `freemap::cow_alloc`, reached through `FreemapRecycle::cow_alloc_into`, tries `FreeMapTree::allocate_first` first and falls back to `cache.new_page` if the freemap is empty or exhausted.
 
 `cow_alloc` is the single freemap-aware allocator, and it is not just for data pages. Data-page inserts reach it through `insert_into_data_page`; handle-table COW and membership-index COW reach it by injecting `|c| self.freemap.cow_alloc_into(c, &mut tree, reuse)` as the `alloc` closure that `HandleTable::insert` / `delete` and the membership-index mutators call. Routing those structures through the freemap rather than the monotonic `new_page` is what lets them reach a bounded steady-state page count ACROSS COMMITS instead of leaking one page per mutation forever. That bound does not hold within a single transaction — `cow_alloc` reuses only what the *committed* bitmap marks free, and nothing this transaction frees reaches that bitmap until commit. The transaction-scoped recycle pool below is what bounds the within-transaction case.
 
@@ -719,12 +719,12 @@ Key-slot record (128 bytes; trailing bytes reserved/zero)
 
 Two KEK derivation paths:
 
-- **Raw key** (`Key::Raw`): KEK = HKDF-SHA256(ikm=key material, salt=slot salt, info=`"chisel-kek"`).
+- **Raw key** (`Key::Raw`): KEK = HKDF-SHA256(ikm=key material, salt=slot salt, info=`"chisel-kek-v1"`; the `-v1` is the KDF-construction version, so a future KDF revision can coexist — changing it is a format break, see `KEK_INFO` in `src/crypto/mod.rs`).
 - **Passphrase** (`Key::Passphrase`): KEK = Argon2id(password, salt, m/t/p from the slot's stored parameters).
 
 The DEK wrapping uses detached XChaCha20-Poly1305 with AAD bound to the slot's KDF metadata, so an attacker cannot swap a slot's KDF parameters to force mis-derivation without breaking the tag.
 
-**Superblock body protection.** The sensitive body — root pointers (`root_handle_table`, `root_freemap_page`, `root_membership_index_page`), `total_pages`, `next_handle`, `freemap_depth`, and the `named_roots` table — is sealed under the DEK as a `nonce ‖ tag ‖ ciphertext` sub-blob whose AAD binds it to the superblock's identity. The plaintext portion (magic, format version, txn counter, page size, superblock count, crypto-header) retains its XXH3 checksum so the A/B torn-write selector (`select()`) still works before any decryption.
+**Superblock body protection.** The sensitive body — root pointers (`root_handle_table`, `root_freemap_page`, `root_membership_index_page`), `total_pages`, `next_handle`, `freemap_depth`, and the `named_roots` table — is sealed under the DEK as a `nonce ‖ tag ‖ ciphertext` sub-blob whose AAD binds it to the superblock's identity. The plaintext portion (magic, format version, txn counter, page size, superblock count, crypto-header) retains its XXH3 checksum so the A/B torn-write selection still works before any decryption.
 
 **Format version.** Encrypted databases stamp file-level **MAJOR = 2, MINOR = 0**; plaintext stays MAJOR = 1. The open-time gate hard-rejects an encrypted database on an encryption-unaware binary with `UnsupportedFormatVersion`, preventing ciphertext from being silently misread as page data. No per-page (I31) change is needed — the logical page image is unchanged.
 
@@ -761,7 +761,7 @@ Bulk DEK rotation is implemented as `Chisel::rekey` (ADR 0018) — the operation
 - **Slot packing (R1)** — multiple values per data page. Each value occupies one slot; the slot directory grows forward and value data grows backward from the page's checksum.
 - **Dead slot** — a data-page slot whose handle-table entry has been tombstoned. Nothing marks it on the page (it keeps `SLOT_FLAG_LIVE`); it is dead only in `SlotPacker`'s live-slot count. Never reused by `insert()`, and reclaimed only when the entire page is freed.
 - **Stride** — the on-disk unit size read/written per page: `PAGE_SIZE` (8192) plaintext, `ENC_PAGE_SIZE` (8232) encrypted. Recorded in the crypto-header; set on `PageIo` via `set_stride`.
-- **Superblock** — the page (one of N slots at the file head) that names the current handle-table root, freemap root, membership-index root, named roots, and durability metadata. Picked by `Superblock::select` on open.
+- **Superblock** — the page (one of N slots at the file head) that names the current handle-table root, freemap root, membership-index root, named roots, and durability metadata. Picked on open by the filter_map + max_by_key in `TransactionManager::open_existing`.
 - **Tombstone (handle)** — a `HandleEntry` with `HandleFlags::Deleted`. The slot stays allocated; the handle is permanently retired and never reused. Applies to committed handles: an id minted by a transaction that rolls back is re-minted, since `next_handle` rewinds with the rest of `Roots`. See "permanent-burn policy" in [Handle stability](#handle-stability).
 - **txn_counter** — monotonically-increasing u64 in every committed superblock. Used by `select` to pick the winner across slots and by the round-robin to decide which slot to write next.
 - **Watermark rollback (I3)** — the rollback strategy: cache + file are truncated to `committed_roots.total_pages`. Pages allocated during the transaction (id ≥ watermark) get dropped; freemap-reused pages (id < watermark) get their dirty cache entries discarded. No undo log. Rollback also re-derives the handle-table and membership-index depths from the restored roots (those in-memory radix depths are not part of the snapshot; I99 / C1).

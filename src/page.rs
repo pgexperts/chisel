@@ -106,9 +106,10 @@ pub const MAGIC: u32 = 0x4348534C; // "CHSL"
 // changes within a major are the invariant that makes this safe).
 // Write safety across minors is a separate concern — a binary at minor
 // M opening a file at minor M' > M can read but not safely write
-// without clobbering fields it doesn't know about; this check is
-// deferred until the first 1.1 release (at which point the gate grows
-// a "newer minor ⇒ refuse writes" arm). See ISSUES.md I29.
+// without clobbering fields it doesn't know about. The open path
+// handles that by forcing such a file read-only (not rejecting it);
+// see the I29 write-gate in `TransactionManager::open_existing`
+// (src/transaction/recovery.rs).
 //
 // Pre-1.0 files (format_version = 1 or 2 in the old flat scheme) have
 // major byte = 0 and are rejected with UnsupportedFormatVersion — a

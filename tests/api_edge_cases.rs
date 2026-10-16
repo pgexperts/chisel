@@ -321,7 +321,7 @@ dual_backing_test!(
 );
 
 fn test_delete_many_bad_handle_mid_batch_stops_at_first_error_body(b: &Backing) {
-    // Documented semantics (transaction.rs::delete_many): on first error the
+    // Documented semantics (transaction/mutate.rs::delete_many): on first error the
     // loop returns; handles deleted before the failure remain deleted in the
     // current txn. Caller decides commit vs rollback.
     let mut db = open_chisel(b);
@@ -407,7 +407,7 @@ dual_backing_test!(
 //
 // The direct `force_poison_for_test` hook lives behind #[cfg(test)] on
 // TransactionManager and is only reachable from in-crate unit tests. The
-// existing crash_recovery.rs suite covers poison via real fatal-I/O
+// existing src/recovery_tests.rs suite covers poison via real fatal-I/O
 // injection; these tests exist to verify that a fresh, non-poisoned
 // handle is the baseline state and that stats() reflects committed-only
 // durable data after a reopen (which is the other half of the poison

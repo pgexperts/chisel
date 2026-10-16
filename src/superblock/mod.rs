@@ -1,7 +1,7 @@
 // superblock.rs — Foundation layer (layer 1). Superblock layout, (de)serialization,
 // and the dual-superblock selection rule that makes commits atomic.
 //
-// Shadow-paging commit protocol (see transaction.rs for the orchestration):
+// Shadow-paging commit protocol (see transaction/lifecycle.rs for the orchestration):
 //   1. Write all new/COW'd data pages; fsync the data file.
 //   2. Write the new superblock to slot `new_txn_counter % superblock_count`.
 //      With the default N=2 this alternates slot 0/1; with N>2 (ISSUES.md

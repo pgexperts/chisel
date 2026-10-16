@@ -367,7 +367,7 @@ See [ARCHITECTURE.md#on-disk-encryption](ARCHITECTURE.md#on-disk-encryption) for
 | `get_root_name(name)` | Look up a named root (takes `&self`) |
 | `clear_root_name(name)` | Remove a named root |
 | `handles()` | Enumerate all live handles; repeatable within a session, order unspecified (takes `&self`) |
-| `stats()` | Handle count, page count, file size (takes `&self`) |
+| `stats()` | Handle count, page count, file size, spillway gauges (`spillway_logical_bytes` / `spillway_max_bytes`, `None` until the spillway is first used) (takes `&self`) |
 | `counters()` | Engine-activity counters: cache hits/misses, fsync calls, pages allocated (takes `&self`) |
 | `file_size_bytes()` | Physical size of the database file in bytes (takes `&self`) |
 | `defrag(options)` | Consolidate sparse pages |
@@ -479,7 +479,7 @@ Chisel divides the database file into 8 KB pages. The superblock(s) at the file'
 1. Writes all dirty pages (handle-table COW copies, new data pages, new overflow pages, the updated freemap) and calls `fsync`. At this point every page the new superblock will reference is durable on the storage medium.
 2. Writes the new superblock to the next slot in the round-robin (`txn_counter % superblock_count`) and calls `fsync`. This is the **linearization point** — before this returns, the transaction is not crash-safe; after it returns, the new state is observable on recovery.
 
-If the process crashes at any point in the protocol, the previously-active superblock still points at a consistent set of pages. On the next `open()`, Chisel runs `Superblock::select` over all slots, picks the one with the highest transaction counter and a valid checksum, and ignores any torn or corrupt slots in favor of their siblings. No log replay, no partial recovery.
+If the process crashes at any point in the protocol, the previously-active superblock still points at a consistent set of pages. On the next `open()`, Chisel scans all slots, picks the one with the highest transaction counter and a valid checksum, and ignores any torn or corrupt slots in favor of their siblings. No log replay, no partial recovery.
 
 Every page carries an XXH3 checksum validated on load; cache hits skip revalidation, relying on the exclusive `flock` to prevent any other process from scribbling on the file.
 

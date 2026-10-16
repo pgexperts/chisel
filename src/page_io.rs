@@ -111,7 +111,7 @@ pub struct PageIo {
     cached_page_count: Cell<u64>,
     // I112: test-only fault injector. Checked at the top of read_page/
     // write_page/fsync; cfg(test) so it is compiled out of production builds
-    // entirely (same discipline as transaction.rs::fail_next_membership_op).
+    // entirely (same discipline as transaction/fault.rs::fail_next_membership_op).
     #[cfg(test)]
     fault: Cell<Fault>,
 }
@@ -402,7 +402,7 @@ impl PageIo {
     /// returned as an `IoError` rather than silently truncating/padding.
     ///
     /// Note: not durable until `fsync()` is called. See the shadow-paging
-    /// commit protocol in transaction.rs.
+    /// commit protocol in transaction/lifecycle.rs.
     pub fn write_page_unit(&mut self, page_id: u64, blob: &[u8]) -> Result<()> {
         if self.read_only {
             return Err(ChiselError::ReadOnlyMode);

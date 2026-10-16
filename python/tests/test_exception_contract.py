@@ -70,7 +70,7 @@ def test_duplicate_savepoint_raises(mem_db):
 # ---------------------------------------------------------------------------
 # 3. InvalidRootNameError
 # ---------------------------------------------------------------------------
-# Name rules (from src/transaction.rs encode_root_name):
+# Name rules (from src/transaction/named_roots.rs encode_root_name):
 #   - must be non-empty
 #   - must be <= NAMED_ROOT_NAME_LEN (24) bytes
 #   - must not contain NUL bytes

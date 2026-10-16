@@ -6,7 +6,7 @@
 //! contracts.
 //!
 //! Poison-path coverage lives in the in-crate unit test
-//! `poisoned_manager_rejects_every_public_entry_point` (src/transaction.rs),
+//! `poisoned_manager_rejects_every_public_entry_point` (src/transaction/tests.rs),
 //! which has access to the `#[cfg(test)]`-gated `force_poison_for_test` hook;
 //! that hook is unreachable from integration tests.
 mod common;
