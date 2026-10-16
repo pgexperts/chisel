@@ -179,10 +179,17 @@ jobs:
   # coverage regression is at least visible per run (job summary + lcov
   # artifact) rather than unmeasured.
   #
-  # Report-only by design: `continue-on-error` at job level means neither a
-  # coverage drop nor a tooling failure here can turn the pipeline red. Only
-  # correctness checks gate (the same rule ADR 0023 applies to bench.yml's
-  # measurements); there is deliberately no --fail-under threshold.
+  # Report-only by design, following ADR 0023's pattern for bench.yml: the
+  # setup steps (checkout, toolchain, cache, tool install) are bare and gate,
+  # since a failure there means the job never ran and a green check would be
+  # a lie; every step from the instrumented run onward is step-level
+  # `continue-on-error: true`, so no coverage figure, report-rendering or
+  # upload failure can red the check. Job-level continue-on-error is not
+  # used: ADR 0023 rejected it for bench.yml because it would also hide the
+  # breakage that must still gate (there, a bench compile failure; here, a
+  # broken setup). A test failure under instrumentation is not lost
+  # either -- the `test` job gates on the same suite. There is deliberately
+  # no --fail-under threshold.
   #
   # Scoped to `-p chisel-storage`: --workspace would pull in chisel-py, a pyo3
   # `extension-module` cdylib whose test binary cannot link without
@@ -192,7 +199,6 @@ jobs:
   # single run's profile data.
   coverage:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
 
@@ -209,12 +215,15 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Run tests under coverage instrumentation
+        continue-on-error: true
         run: cargo llvm-cov --no-report -p chisel-storage
 
       - name: Write lcov report
+        continue-on-error: true
         run: cargo llvm-cov report -p chisel-storage --lcov --output-path lcov.info
 
       - name: Summarize coverage in the job summary
+        continue-on-error: true
         run: |
           {
             echo '### chisel-storage coverage'
@@ -224,6 +233,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v7
+        continue-on-error: true
         with:
           name: coverage-lcov
           path: lcov.info

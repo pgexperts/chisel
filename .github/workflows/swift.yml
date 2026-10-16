@@ -20,6 +20,12 @@ on:
   # the same note in ci.yml (issue #151).
   pull_request:
 
+# The single job only checks out, builds and tests; nothing writes through
+# GITHUB_TOKEN, so it is pinned read-only regardless of the repository's
+# default token setting.
+permissions:
+  contents: read
+
 jobs:
   swift:
     runs-on: macos-14
